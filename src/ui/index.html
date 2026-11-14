@@ -434,11 +434,11 @@
           <summary>Gitee 更新源（可选）</summary>
           <div class="field">
             <label>Gitee 只读 token（一般不用填）</label>
-            <input id="setGiteeToken" type="password" placeholder="留空即可：公开仓库匿名也能读" />
-            <span class="sub">本项目仓库已公开，Gitee 的发行版列表匿名就能读，留空也能用 Gitee 源。
-              只有在「Gitee 被限流（返回 403/429）」或你想读私有分支时才需要填：
-              gitee.com → 设置 → 私人令牌，只勾「projects」即可，它只用于读取发行版列表，
-              不会上传任何东西。</span>
+            <input id="setGithubToken" type="password" placeholder="留空 = 自动读取本机 gh CLI 登录的账号" />
+            <span class="sub">GitHub API 匿名限额 60 次/小时；带认证 5000 次/小时。默认自动读取本机
+              gh CLI 已登录的账号（gh auth token），无需填写；没有 gh CLI 或想用别的账号时才手动填
+              Token（github.com → Settings → Developer settings → Tokens，只读公开仓库即可），
+              token 只用于读取发布列表，不会上传任何东西。</span>
           </div>
         </details>
       </div>

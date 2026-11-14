@@ -736,7 +736,7 @@ function fillSettings(s) {
   $('setIdle').value = s.engine.idleShutdownMinutes;
   if ($('setSourcePref')) $('setSourcePref').value = (s.runtime && s.runtime.sourcePreference) || 'auto';
   if ($('setAutoMirror')) $('setAutoMirror').checked = (s.runtime && s.runtime.autoMirror) !== false;
-  if ($('setGiteeToken')) $('setGiteeToken').value = (s.runtime && s.runtime.giteeToken) || '';
+  if ($('setGithubToken')) $('setGithubToken').value = (s.runtime && s.runtime.githubToken) || '';
   if ($('setMirrorPrefix')) $('setMirrorPrefix').value = (s.runtime && s.runtime.mirrorPrefix) || '';
   if ($('setProxyUrl')) $('setProxyUrl').value = (s.runtime && s.runtime.proxyUrl) || '';
   if ($('setConnections')) $('setConnections').value = Number((s.runtime && s.runtime.downloadConnections) || 8);
@@ -1063,8 +1063,8 @@ function bindSettings() {
   if ($('setAutoMirror')) {
     $('setAutoMirror').addEventListener('change', (e) => save({ runtime: { autoMirror: e.target.checked } }));
   }
-  if ($('setGiteeToken')) {
-    $('setGiteeToken').addEventListener('change', (e) => save({ runtime: { giteeToken: e.target.value.trim() } }));
+  if ($('setGithubToken')) {
+    $('setGithubToken').addEventListener('change', (e) => save({ runtime: { githubToken: e.target.value.trim() } }));
   }
   if ($('setMirrorPrefix')) {
     $('setMirrorPrefix').addEventListener('change', (e) => save({ runtime: { mirrorPrefix: e.target.value.trim() } }));

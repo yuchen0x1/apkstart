@@ -17,6 +17,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - **更新源指向本仓库（yuchen0x1/apkstart）**：更新检查、运行时整包下载都只认
   fork 仓库，不再检查上游 RoutineMiku（其最新版永远比 fork 旧，会造成「已是最新」
   误判）；Gitee 双源逻辑整体移除（fork 没有 Gitee 镜像）。
+- **GitHub API 认证**：自动读取本机 gh CLI 已登录的账号（gh auth token），
+  API 限额从匿名的 60 次/小时提升到 5000 次/小时；也可在设置里手动填 Token。
+  token 只发往 api.github.com，不写日志。
 - 「关于」区改为「更新日志」：移除二维码 / 抖音跳转，只保留原项目地址与
   仓库 Issues 反馈入口。
 

@@ -41,6 +41,41 @@ const SOURCES = {
   },
 };
 
+/**
+ * GitHub API 的认证凭据（可选）。认证后限额 5000 次/小时（匿名只有 60 次/小时，
+ * 而且 Clash 出口是共享 IP，更容易被别人打光）。取用顺序：
+ *   1. 设置 runtime.githubToken（用户手动填）；
+ *   2. 本机 gh CLI 已登录的账号（gh auth token，开发机上通常都有）。
+ * 都没有就返回空串（匿名 60 次/小时，检查更新每会话 2~3 次也够用）。
+ * token 只发往 api.github.com，绝不写日志。
+ */
+let _ghTokenCache = { at: 0, token: '' };
+const GH_TOKEN_TTL = 60 * 60 * 1000;
+
+async function getGithubToken(settings) {
+  const explicit = String((settings && settings.runtime && settings.runtime.githubToken) || '').trim();
+  if (explicit) return explicit;
+  const now = Date.now();
+  if (_ghTokenCache.token && now - _ghTokenCache.at < GH_TOKEN_TTL) return _ghTokenCache.token;
+  let token = '';
+  try {
+    const { execFile } = require('child_process');
+    token = await new Promise((resolve) => {
+      execFile('gh', ['auth', 'token'], { windowsHide: true, timeout: 5000 }, (e, out) => resolve(e ? '' : String(out || '').trim()));
+    });
+    if (token && token.length < 20) token = '';   // gh 未登录时会输出空串/提示语
+  } catch (_) { token = ''; }                     // 没装 gh CLI：匿名额度也够用
+  _ghTokenCache = { at: now, token };
+  return token;
+}
+
+/** api.github.com 请求头（有 token 就带上认证） */
+function ghApiHeaders(token) {
+  const h = { Accept: 'application/vnd.github+json' };
+  if (token) h.Authorization = `Bearer ${token}`;
+  return h;
+}
+
 /** 已知可用的 GitHub 加速前缀。只在用户开启 autoMirror 且未自定义时参与测速。 */
 const KNOWN_MIRRORS = [
   'https://ghfast.top/',
@@ -133,8 +168,8 @@ function openUrl(url, { method = 'GET', timeout = 10000, headers = {}, redirects
 }
 
 /** 取一小段 JSON（带重定向、超时、大小上限） */
-async function getJson(url, timeout = 10000) {
-  const res = await openUrl(url, { timeout });
+async function getJson(url, timeout = 10000, headers = {}) {
+  const res = await openUrl(url, { timeout, headers });
   if (res.statusCode < 200 || res.statusCode >= 300) {
     res.resume();
     throw new Error(`${new URL(url).host} ${res.statusCode}`);
@@ -296,12 +331,13 @@ class Sources {
       const skip = this.blockedReason(id);
       if (skip) return { source: id, name: s.name, web: s.web, error: skip };
       try {
-        const rel = await getJson(`${s.api}/releases/latest`, 9000);
+        const auth = ghApiHeaders(await getGithubToken(this.settings()));
+        const rel = await getJson(`${s.api}/releases/latest`, 9000, auth);
         return { source: id, name: s.name, web: s.web, rel };
       } catch (e) {
         // Gitee 没有正式 release、或 GitHub 被墙，都退回列表取第一条
         try {
-          const list = await getJson(`${s.api}/releases?per_page=10`, 9000);
+          const list = await getJson(`${s.api}/releases?per_page=10`, 9000, ghApiHeaders(await getGithubToken(this.settings())));
           const first = (Array.isArray(list) ? list : []).find((r) => r && !r.draft);
           if (first) return { source: id, name: s.name, web: s.web, rel: first };
         } catch (_) { /* 这个源彻底不可用 */ }
@@ -498,4 +534,4 @@ class Sources {
   }
 }
 
-module.exports = { Sources, SOURCES, measure, KNOWN_MIRRORS, withMirror, mirrorList };
+module.exports = { Sources, SOURCES, measure, KNOWN_MIRRORS, withMirror, mirrorList, getGithubToken, ghApiHeaders };

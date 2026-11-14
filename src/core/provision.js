@@ -13,7 +13,7 @@ const store = require('./store');
 const doctor = require('./doctor');
 const { download, downloadAny, downloadAnyParallel, downloadMulti, head } = require('./download');
 const { ZipArchive, ZipFile } = require('./zip');
-const { Sources } = require('./sources');
+const { Sources, getGithubToken, ghApiHeaders } = require('./sources');
 const { cmpVer } = require('./version');
 
 const IS_WIN = process.platform === 'win32';
@@ -474,7 +474,9 @@ class Provisioner {
   // ---------------- 本项目 GitHub 的运行时整包（轻量版） ----------------
 
   async _fetchJson(url) {
-    const text = await this._fetchText(url).catch(() => '');
+    // api.github.com 匿名限额 60 次/小时：有 gh CLI 凭据或手动 token 就带上认证（5000 次/小时）
+    const headers = url.includes('api.github.com') ? await ghApiHeaders(await getGithubToken(store.getSettings())) : {};
+    const text = await this._fetchText(url, 2 * 1024 * 1024, 30000, headers).catch(() => '');
     try { return JSON.parse(text); } catch (_) { return null; }
   }
 
@@ -693,9 +695,9 @@ class Provisioner {
    * 必须保证 promise 一定会 settle：res.destroy() 之后 'end'/'error' 都不触发
    * （只发 'close'），没有 close 兜底的话部署向导会永久卡死；同时加整体超时。
    */
-  async _fetchText(url, limit = 2 * 1024 * 1024, timeoutMs = 30000) {
+  async _fetchText(url, limit = 2 * 1024 * 1024, timeoutMs = 30000, headers = {}) {
     const { openStream } = require('./download');
-    const res = await openStream(url);
+    const res = await openStream(url, { headers });
     return new Promise((resolve, reject) => {
       let d = '';
       let done = false;
