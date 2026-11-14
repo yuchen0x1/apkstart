@@ -1,4 +1,4 @@
-# ApkStart v0.4.1
+# ApkStart v0.5.0
 
 这一版把上游 **全部 38 条 issue 逐条核对了一遍**（26 已修 / 7 部分 / 4 未修 / 1 信息不足，
 对照表见仓库 `docs/UPSTREAM-ISSUES-AUDIT.md`），并修掉三条 0.4.x 才暴露的回归 + 一个
@@ -51,9 +51,9 @@
 
 ## 下载
 
-- **`ApkStart-0.4.1-Setup.exe`**：完整版，内置全部运行时（emulator + platform-tools + Android 镜像），装完离线可用。
-- **`ApkStart-v0.4.1-win64-portable.zip`**：轻量便携版，解压即用，首次启动在后台下载运行时。
-- **`ApkStart-runtime-v0.4.1.zip`**：运行时整包（轻量版的下载源，也可手动解压到程序目录旁的 `runtime/`）。
+- **`ApkStart-0.5.0-Setup.exe`**：完整版，内置全部运行时（emulator + platform-tools + Android 镜像），装完离线可用。
+- **`ApkStart-v0.5.0-win64-portable.zip`**：轻量便携版，解压即用，首次启动在后台下载运行时。
+- **`ApkStart-runtime-v0.5.0.zip`**：运行时整包（轻量版的下载源，也可手动解压到程序目录旁的 `runtime/`）。
 
 ## 已知问题 / 验证边界
 

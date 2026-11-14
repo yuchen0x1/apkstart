@@ -5,7 +5,7 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [0.4.1] — 2026-11-15
+## [0.5.0] — 2026-11-15
 
 上游 `RoutineMiku/apkstart` 从 v0.3.7 到 v0.4.1 的修复已按逻辑逐条移植（不做整树 merge，
 避免覆盖本分支的安全加固与 UI）。逐条对照与验证方式见 `docs/UPSTREAM-ALIGN-0.4.1.md`；
@@ -245,8 +245,8 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
-[Unreleased]: https://github.com/yuchen0x1/apkstart/compare/v0.4.1...HEAD
-[0.4.1]: https://github.com/yuchen0x1/apkstart/compare/v0.4.0...v0.4.1
+[Unreleased]: https://github.com/yuchen0x1/apkstart/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/yuchen0x1/apkstart/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.4.0
 [0.3.7]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.7
 [0.3.6]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.6
