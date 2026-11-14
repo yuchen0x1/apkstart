@@ -37,6 +37,14 @@ public class ApkAgent
     public delegate IntPtr HookProc(int code, IntPtr wp, IntPtr lp);
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+    // DPI 感知：这个进程收到的是**物理像素**矩形（appwin.js 已经把 DIP 乘过 scale），
+    // 但 powershell.exe 默认是 DPI 不感知的 —— SetWindowPos(738, 1293) 会被系统
+    // 再乘一次 1.25，子窗口实际变成 922x1616：画面放大 + 右/下被裁、点击整体偏左上
+    // （上游 issue #40，125% 缩放下必现，100% 缩放不显现）。
+    // 声明成 PerMonitorV2 与 Electron 宿主一致，坐标 1:1，顺带降低跨进程 SetParent
+    // 因 DPI 上下文不一致被拒的概率（issue #5）。
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr p);
     // 只用来**清掉**旧版本留下的 window region（v0.3.9 曾拿它裁标题栏，结果破坏了命中测试）。
     // 新代码绝不给嵌入窗口设 region，见 Embed 里的说明。
@@ -1037,6 +1045,11 @@ public class ApkAgent
 
     public static void Serve(int port)
     {
+        // 必须在任何窗口操作之前：让本进程按物理像素工作（见 DllImport 处的说明）。
+        // PerMonitorV2 = -4；老系统（<1703）没有这个 API，退回 System DPI Aware。
+        try { if (!SetProcessDpiAwarenessContext(new IntPtr(-4))) SetProcessDPIAware(); }
+        catch { try { SetProcessDPIAware(); } catch { } }
+
         TcpListener l = new TcpListener(IPAddress.Loopback, port);
         l.Start();
         int actual = ((IPEndPoint)l.LocalEndpoint).Port;

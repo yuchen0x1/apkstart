@@ -139,6 +139,15 @@ class AppWindow {
       this.win.show();
       this._push();
     });
+    // 同主窗口的兜底：首帧事件收不到时不能让用户对着「没反应」猜。
+    setTimeout(() => {
+      try {
+        if (this.win && !this.win.isDestroyed() && !this.win.isVisible()) {
+          this.win.show();
+          this._push();
+        }
+      } catch (_) { /* 窗口可能已关 */ }
+    }, 3000).unref?.();
 
     const refit = () => this.scheduleFit();
     this.win.on('resize', refit);
@@ -150,16 +159,25 @@ class AppWindow {
       this.scheduleFit();
     });
     this.win.on('minimize', () => { this.agent.hide().catch(() => {}); });
-    this.win.on('close', () => { this._closing = true; });
+    // 关闭统一收口到 close()：它先 agent.park() 把模拟器窗口从宿主上摘下来藏好，
+    // 再销毁宿主。少了这一步，Windows 会连带销毁嵌入的 Qt 子窗口（qemu 还在跑），
+    // 之后任何应用再打开都拿不到句柄 —— 日志是 `embed failed: emu=0`、窗口全黑，
+    // 只能重启 ApkStart 才恢复（上游 issue #42，实测复现）。
+    // 点 × / Alt+F4 / 任务栏关闭 / 系统关机 都走这条。
+    this.win.on('close', (e) => {
+      if (this._selfClose) return;          // close() 自己收尾时放行
+      if (this._closing) return;            // 已经在收尾（park 还没回来）：放行，别卡住用户
+      e.preventDefault();
+      this._closing = true;
+      this.close({ keepApp: false });
+    });
     this.win.on('closed', () => {
       if (this._selfClose) return;   // close() 自己在 park 完成后收尾
       this.win = null;
       const pkg = this.pkg;
       this.pkg = null;
-      this._closing = false;
-      // Alt+F4 / 任务栏关闭 / 系统关机等路径：这里也要走完整收尾
-      // （上游 v0.3.7 修复：否则安卓应用还留在后台跑，模拟器窗口会被
-      // Windows 重新挂回桌面；走 close() 的路径 _selfClose=true 已处理，不重复）
+      // 只有「宿主被别的东西直接销毁」才会走到这里（应用退出、系统关机）。
+      // 普通关窗已经在 close 事件里 preventDefault 转给 close()，不会重复收尾。
       try { if (this.agent) this.agent.park().catch(() => {}); } catch (_) { /* ignore */ }
       if (this._onCloseApp) { try { this._onCloseApp(pkg); } catch (_) { /* ignore */ } }
       if (this._closedCb) this._closedCb(pkg);

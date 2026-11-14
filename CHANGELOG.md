@@ -10,7 +10,22 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 上游 `RoutineMiku/apkstart` 从 v0.3.7 到 v0.4.1 的修复已按逻辑逐条移植（不做整树 merge，
 避免覆盖本分支的安全加固与 UI）。逐条对照与验证方式见 `docs/UPSTREAM-ALIGN-0.4.1.md`。
 
+对照上游全部 36 条 issue 的核对结果（21 条已修 / 7 条部分 / 5 条未修 / 3 条非代码）
+见 `docs/UPSTREAM-ISSUES-AUDIT.md`；本轮据此新修了三条 0.4.x 回归：
+
 ### 修复
+- **关窗后模拟器窗口被销毁，再打开报 `embed failed: emu=0`、全黑**（上游 #42）：
+  `win.on('close')` 原来只置 `_closing = true`，没走 `close()` 里「先 `agent.park()` 把
+  窗口从宿主上摘下来、再销毁宿主」的路径 —— Windows 会连带销毁嵌入的 Qt 子窗口，qemu 还在
+  但句柄没了，此后任何应用都打不开，只能重启 ApkStart。现在 × / Alt+F4 / 任务栏关闭统一
+  `preventDefault()` 后转给 `close()`。
+- **125% 缩放下画面放大 1.28 倍、右/下被裁、点击整体偏左上**（上游 #40）：窗口代理是
+  `powershell.exe`，默认 DPI 不感知，收到的是物理像素却被系统再乘一次缩放。现在在 `Serve()`
+  最前面声明 PerMonitorV2（老系统退回 System DPI Aware），与 Electron 宿主一致。
+- **首帧事件丢失导致「双击没反应」**（上游 #39）：`ready-to-show` 在某些显卡/虚拟显示器
+  组合下不会回来，进程驻留但没有窗口。主窗口与应用窗口都加了 3 秒兜底 `show()`。
+
+### 修复（上游对齐）
 - **嵌入窗口的 Z 序（黑边 / 未填满 / 点击失效 / 点不动「同意」的真因）**：模拟器窗口原先
   被挂成宿主窗口的子窗口，和 Electron 的网页层（`Chrome_RenderWidgetHostHWND`）是**兄弟**，
   Electron 会持续把网页层抬到最前 —— 黑底盖住安卓画面，鼠标全被网页层吃掉。

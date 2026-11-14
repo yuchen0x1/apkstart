@@ -438,7 +438,21 @@ function createWindow({ show = true } = {}) {
   });
 
   mainWindow.loadFile(path.join(__dirname, 'ui', 'index.html'));
-  if (show) mainWindow.once('ready-to-show', () => mainWindow.show());
+  if (show) {
+    mainWindow.once('ready-to-show', () => mainWindow.show());
+    // 首帧绘制 -> ready-to-show 这条链路在某些显卡/虚拟显示器组合下不会回来
+    // （上游 issue #39：进程驻留、日志停在 prewarm，用户看到的就是「点了没反应」）。
+    // 页面其实早就加载好了（--smoke 能截图），所以 3 秒还没显示就直接亮出来。
+    setTimeout(() => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+          appLog('force-show fallback fired');
+          mainWindow.show();
+          mainWindow.focus();
+        }
+      } catch (_) { /* 窗口可能已销毁 */ }
+    }, 3000).unref?.();
+  }
 
   // 冒烟测试时把渲染进程的报错打到 stdout：界面空白、按钮点了没反应，
   // 十有八九是 app.js 里某个 id 改动后抛了异常，正常运行看不到。

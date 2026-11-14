@@ -510,6 +510,34 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/SetWindowRgn\(emu, IntPtr\.Zero/.test(src), 'embed 时要清掉旧版本残留的 region');
   });
 
+  // 三个「只在真机上才炸」的坑，用源码断言钉住（本机没有部署 build/runtime，
+  // 端到端跑不起来，但至少别在重构时被悄悄改回去）。
+  await test('关窗先 park 再销毁宿主，且代理按物理像素工作、首帧事件有兜底', () => {
+    const base = path.join(__dirname, '..', 'src');
+    const appwin = fs.readFileSync(path.join(base, 'core', 'appwin.js'), 'utf8');
+    const ps1 = fs.readFileSync(path.join(base, 'core', 'win', 'agent.ps1'), 'utf8');
+    const main = fs.readFileSync(path.join(base, 'main.js'), 'utf8');
+
+    // 上游 #42：close 只置标志位的话，宿主销毁会连带销毁嵌入的 Qt 子窗口，
+    // qemu 还在但句柄没了 —— 之后任何应用都 embed failed: emu=0、全黑。
+    assert(/on\('close',\s*\(e\)\s*=>/.test(appwin), 'close 事件必须拿到事件对象才能 preventDefault');
+    assert(/e\.preventDefault\(\)/.test(appwin), '关窗必须先拦下来，等 park 完成');
+    assert(/this\.close\(\{\s*keepApp:\s*false\s*\}\)/.test(appwin), '拦下后要走 close() 统一收尾');
+    assert(/_selfClose/.test(appwin), 'close() 自己触发的关闭不能被二次拦截');
+
+    // 上游 #40：DPI 不感知的 powershell 会把物理像素再乘一次缩放，
+    // 125% 下画面放大 1.28 倍 + 右/下被裁 + 点击整体偏左上。
+    assert(/SetProcessDpiAwarenessContext/.test(ps1), '代理必须声明 PerMonitorV2');
+    assert(/SetProcessDPIAware/.test(ps1), '老系统要能退回 System DPI Aware');
+    const serve = ps1.slice(ps1.indexOf('public static void Serve'));
+    assert(serve.indexOf('SetProcessDpiAwarenessContext') < serve.indexOf('TcpListener'),
+      'DPI 声明必须在任何窗口操作之前');
+
+    // 上游 #39：ready-to-show 收不到时用户看到的是「点了没反应」。
+    assert(/force-show fallback fired/.test(main), '主窗口要有超时兜底显示');
+    assert(/ready-to-show/.test(main), '正常路径仍然优先用 ready-to-show');
+  });
+
   // 「全屏 = 横屏排版」这条链路上，rotate() 会先退出最大化才能改尺寸；如果不把
   // 最大化状态再恢复，「设置里是全屏、窗口却变成居中小窗」就会随机出现
   // （maximize() 在 Windows 上是异步的，紧接着读 isMaximized() 拿到的还是 false）。
