@@ -1,13 +1,18 @@
-# ApkStart
+# ApkStart（增强分支）
 
 <p align="center"><img src="docs/images/logo.png" alt="ApkStart Logo" width="160" /></p>
 
-[![CI](https://github.com/RoutineMiku/apkstart/actions/workflows/ci.yml/badge.svg)](https://github.com/RoutineMiku/apkstart/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/RoutineMiku/apkstart?include_prereleases&sort=semver)](https://github.com/RoutineMiku/apkstart/releases)
+[![CI](https://github.com/yuchen0x1/apkstart/actions/workflows/ci.yml/badge.svg)](https://github.com/yuchen0x1/apkstart/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/yuchen0x1/apkstart?include_prereleases&sort=semver)](https://github.com/yuchen0x1/apkstart/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6.svg)](#)
 
 **Windows 上的安卓应用运行器 —— 让安卓应用像 Windows 原生软件一样被安装和使用。**
+
+> 本仓库是 [RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart) 的**独立增强分支**（已脱离 fork 网络，自行维护与发版）。
+> 相比原项目新增/修复：首次运行引导向导、部署慢速逃生与多源测速、应用窗口鼠标点击修复、
+> Android 11+ 音量命令修复、在线自动更新、本地代理加速、多项安全加固（详见 [CHANGELOG.md](CHANGELOG.md)）。
+> 问题与建议请到 [Issues](https://github.com/yuchen0x1/apkstart/issues) 提交。
 
 - 🖱️ **双击 .apk 即安装**：注册 .apk 文件关联后，在资源管理器里双击 APK，自动解析 → 安装 → 生成桌面图标，全程无需打开任何模拟器界面。
 - 🧩 **每个应用一个桌面图标**：图标从 APK 内部离线提取并转为多尺寸 ICO，双击桌面图标 = 直接启动该应用，与打开一个原生 Windows 软件的体验一致。
@@ -50,15 +55,14 @@
 
 ## 下载即用（不想编译）
 
-两个源内容一致，国内建议用 Gitee：
+从本仓库的 GitHub Releases 下载：
 
-- GitHub：[github.com/RoutineMiku/apkstart/releases](https://github.com/RoutineMiku/apkstart/releases)
-- Gitee：[gitee.com/daily-miku/apkstart/releases](https://gitee.com/daily-miku/apkstart/releases)（国内直连快得多）
+- GitHub：[github.com/yuchen0x1/apkstart/releases](https://github.com/yuchen0x1/apkstart/releases)
 
 安装包：
 
 - **`ApkStart-v*-Setup.exe`**（约 1.3 GB）：**一个 EXE 包含全部运行时**（adb / Android Emulator / 系统镜像），装完首次启动自动把镜像展开到用户目录，**之后不再联网下载任何东西**。装到当前用户目录、不要求管理员权限。
-- 另有轻量版 `ApkStart-v*-win64-portable.zip`（**95 MB**，解压后约 226 MB）：首次启动才在后台下载运行时。运行时的下载源就是**本项目的 GitHub Release**（`ApkStart-runtime-*.zip` 整包），不走 dl.google.com；整包拿不到时才自动退回官方源。
+- 另有轻量版 `ApkStart-v*-win64-portable.zip`（**95 MB**，解压后约 226 MB）：首次启动才在后台下载运行时。运行时的下载源就是**本项目的 GitHub Release**（`ApkStart-runtime-*.zip` 整包）；下载源实测太慢时会自动改走 dl.google.com 官方源分组件下载。
 
 ### 在线更新（自动选较快的源）
 
@@ -74,19 +78,15 @@
 
 更新链路不是死连 GitHub，而是**每次现测现选**：
 
-1. 同时问 GitHub 与 Gitee 的最新版本，取版本号更高的那个（一个源超时/被墙不影响另一个）；
-2. 把「源站直连 / Gitee 同名资产 / 镜像前缀」列成候选，每个地址真下 256KB 测速，
+1. 更新检查与运行时下载只认本仓库（yuchen0x1/apkstart）；
+2. 把「源站直连 / 镜像前缀」列成候选，每个地址真下 256KB 测速，
    只算「收到首字节之后」的吞吐（握手时间不计入，否则高延迟大带宽的源会被误判成慢）；
-3. 按实测速度排序，用最快的那条分块并行下载；失败自动换下一条。
+3. 按实测速度排序，用最快的那条分块并行下载；失败自动换下一条；
+4. 检测到本地代理（Clash 等系统代理）时自动走代理——挂着代理直连 GitHub 只有几十 KB/s，
+   走代理可达每秒数 MB；代理连不通自动回退直连。
 
-设置里的「下载与更新源」可以强制只用某一边（企业网络只放行一个域名时用），
-也可以关掉公共加速镜像、或改用自建镜像前缀。Gitee 附件单文件上限 100MB，
-便携包换用 7-Zip 的 deflate（`-mx=9`）压缩后是 **95.0MB**，所以 Gitee 上也是
-一个能直接双击解压的整包（以前要切成 `.part1/.part2` 手工拼接，那版已经废弃）。
-两个源的同名包体积并不完全一样，客户端按测速结果只挑一个源下完，不会混拼。
-
-两个仓库都是公开的，Gitee 的发行版列表匿名就能读，不需要填任何 token。
-（只有在 Gitee 限流返回 403/429 时，才需要在设置里填一个只读 token 提高额度。）
+设置里的「下载与更新源」可以关闭公共加速镜像、或改用自建镜像前缀；
+「网络代理」可以手动指定代理（留空自动检测系统代理，填 `off` 强制直连）。
 
 
 **开箱即有的默认行为**（不用去设置里找）：
@@ -112,7 +112,7 @@ npm run assoc:on
 # 4. 打包便携版（免安装，可直接分发）
 npm run pack
 # 产出 dist/ApkStart-win64-portable/ApkStart.exe
-# 5. 压成 zip 发布（必须用这个脚本，别用 Compress-Archive：体积会大 5MB、塞不进 Gitee）
+# 5. 压成 zip 发布（必须用这个脚本，别用 Compress-Archive：体积会大 5MB，且 build/zip.js 带体积闸门）
 node build/zip.js dist/ApkStart-win64-portable ApkStart-win64-portable.zip
 ```
 
@@ -240,16 +240,13 @@ Android 版本、freeform 支持、共享目录双向同步，加 `--apk 某应�
 |:---:|
 | ![红果短剧在 ApkStart 兼容模式运行](docs/images/compat-hongguo-playing.png) |
 
-## 关于作者
+## 关于本仓库
 
-ApkStart 由 **RoutineMiku** 开发维护。
+本仓库是 ApkStart 的**独立增强分支**，由 [@yuchen0x1](https://github.com/yuchen0x1) 维护：
 
-- GitHub：<https://github.com/RoutineMiku/apkstart>
-- 微信公众号：扫码关注
-
-<p align="center"><img src="docs/images/brand.png" alt="关于面板：公众号二维码与项目链接" width="560" /></p>
-
-<p align="center"><i>Powered by <b>RoutineMiku</b></i></p>
+- 原项目：[RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart)（感谢原作者的出色工作）
+- 本分支新增/修复内容见 [CHANGELOG.md](CHANGELOG.md)；应用内「设置 → 更新日志」也会展示
+- **问题与建议请提 [Issue](https://github.com/yuchen0x1/apkstart/issues)**，会尽快跟进
 
 ## 参与贡献
 
