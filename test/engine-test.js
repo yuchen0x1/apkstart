@@ -40,6 +40,11 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       const range = req.headers.range;
       if (range) {
         const start = Number(/bytes=(\d+)-/.exec(range)[1]);
+        if (start >= payload.length) {
+          // RFC 7233：Range 越界必须回 416，并带上内容的总长度
+          res.writeHead(416, { 'Content-Range': `bytes */${payload.length}` });
+          return res.end();
+        }
         res.writeHead(206, {
           'Content-Range': `bytes ${start}-${payload.length - 1}/${payload.length}`,
           'Content-Length': payload.length - start,
@@ -48,6 +53,21 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       }
       res.writeHead(200, { 'Content-Length': payload.length });
       return res.end(payload);
+    }
+    // 中途断开的源：模拟并行分块下载遇到网络抖动
+    if (req.url === '/broken-range.bin') {
+      const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+      if (!range) {
+        res.writeHead(200, { 'Content-Length': payload.length });
+        return res.end(payload);
+      }
+      const start = Number(range[1]);
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${payload.length - 1}/${payload.length}`,
+        'Content-Length': payload.length - start,
+      });
+      res.write(payload.subarray(start, Math.min(start + 1024, payload.length)));
+      return setTimeout(() => res.destroy(), 20);
     }
     // 完整支持 start-end 的 Range（用于并行分块测试）
     if (req.url === '/ranged.bin') {
@@ -138,6 +158,25 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     });
     assert(fs.readFileSync(dest).equals(payload), '回退后内容不一致');
     assert(!r.parallel, '不应走并行');
+  });
+
+  await test('并行分块失败：不残留预分配的全零文件（P0-2 回归）', async () => {
+    const dest = path.join(TMP, 'broken-par.bin');
+    let threw = false;
+    try {
+      await downloadParallel(`http://127.0.0.1:${port}/broken-range.bin`, dest, {
+        connections: 2, minChunk: 1, retries: 1,
+      });
+    } catch (_) { threw = true; }
+    assert(threw, '中途断开应当抛错');
+    assert(!fs.existsSync(dest), '失败后必须清理预分配文件，否则换源重试会续传成全零文件');
+  });
+
+  await test('416 + 大小一致但内容全零：重置重下而不是当成品（P0-2 回归）', async () => {
+    const dest = path.join(TMP, 'fake-complete.bin');
+    fs.writeFileSync(dest, Buffer.alloc(payload.length));   // 预分配的全零文件，大小恰好等于总长
+    await download(`http://127.0.0.1:${port}/big.bin`, dest);
+    assert(fs.readFileSync(dest).equals(payload), '应识别出预分配文件并重新完整下载');
   });
 
   server.close();
@@ -400,13 +439,79 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     assert(info.ok && info.api === '34' && info.tag === 'google_apis_playstore', `应判定 API 34 兼容镜像就绪：${JSON.stringify(info)}`);
   });
 
-  await test('完整版品牌资产与抖音联系入口就位', async () => {
+  await test('UI 引用的本地资产都必须存在', async () => {
+    // 通用检查取代「品牌资产 + 推广链接」断言：换推广位 / 改图片名不该把 CI 打红
     const root = path.join(__dirname, '..');
-    assert(fs.existsSync(path.join(root, 'src', 'ui', 'assets', 'douyin-qr.jpg')), '缺少抖音二维码图片');
-    assert(fs.existsSync(path.join(root, 'build', 'fetch-runtime.js')), '缺少完整版运行时组装脚本');
     const html = fs.readFileSync(path.join(root, 'src', 'ui', 'index.html'), 'utf8');
-    assert(html.includes('douyin-qr.jpg'), '关于区未引用抖音二维码');
-    assert(html.includes('https://v.douyin.com/9TIIxVCANig/'), '缺少抖音主页链接');
+    const refs = [...html.matchAll(/(?:src|href)="(assets\/[^"]+|images\/[^"]+)"/g)].map((m) => m[1]);
+    assert(refs.length > 0, '应至少引用一个本地资产');
+    for (const rel of refs) {
+      assert(fs.existsSync(path.join(root, 'src', 'ui', rel)), `UI 引用的资产不存在：${rel}`);
+    }
+    assert(fs.existsSync(path.join(root, 'build', 'fetch-runtime.js')), '缺少完整版运行时组装脚本');
+  });
+
+  await test('extractZip 拒绝越界条目（zip-slip 回归）', async () => {
+    // 构造一个含 ../evil.txt 条目的 stored zip
+    const buildEntry = (name, data) => {
+      const nameBuf = Buffer.from(name);
+      const loc = Buffer.alloc(30);
+      loc.writeUInt32LE(0x04034b50, 0);
+      loc.writeUInt32LE(data.length, 18);
+      loc.writeUInt32LE(data.length, 14);
+      loc.writeUInt16LE(nameBuf.length, 26);
+      const cen = Buffer.alloc(46);
+      cen.writeUInt32LE(0x02014b50, 0);
+      cen.writeUInt16LE(nameBuf.length, 28);
+      cen.writeUInt32LE(data.length, 24);
+      cen.writeUInt32LE(data.length, 20);
+      cen.writeUInt32LE(0, 42);
+      return { loc, nameBuf, data, cen };
+    };
+    const mk = (names) => {
+      const parts = [];
+      const cens = [];
+      let offset = 0;
+      for (const n of names) {
+        const e = buildEntry(n, Buffer.from('x'));
+        parts.push(e.loc, e.nameBuf, e.data);
+        const cen = e.cen;
+        cen.writeUInt32LE(offset, 42);
+        cens.push(cen, e.nameBuf);
+        offset += e.loc.length + e.nameBuf.length + e.data.length;
+      }
+      const cdSize = cens.reduce((s, b) => s + b.length, 0);
+      const eocd = Buffer.alloc(22);
+      eocd.writeUInt32LE(0x06054b50, 0);
+      eocd.writeUInt16LE(names.length, 10);
+      eocd.writeUInt32LE(cdSize, 12);
+      eocd.writeUInt32LE(offset, 16);
+      return Buffer.concat([...parts, ...cens, eocd]);
+    };
+
+    const zipPath = path.join(TMP, 'evil.zip');
+    fs.writeFileSync(zipPath, mk(['ok.txt', '../evil.txt']));
+    const destDir = path.join(TMP, 'ziptest');
+    let threw = false;
+    try { await prov.extractZip(zipPath, destDir); } catch (_) { threw = true; }
+    assert(threw, '含上溯条目的压缩包应当被拒绝');
+    assert(!fs.existsSync(path.join(TMP, 'evil.txt')), '不得写出目标目录之外');
+    assert(!fs.existsSync(path.join(destDir, 'evil.txt')), '不得伪装成目标目录内文件');
+  });
+
+  await test('settings.json 带 BOM 不再静默重置全部配置（#8B 回归）', async () => {
+    const settingsFile = path.join(store.DATA_DIR, 'settings.json');
+    fs.writeFileSync(settingsFile, '\uFEFF' + JSON.stringify({ runtime: { dir: 'D:/my-runtime' } }), 'utf8');
+    const s = store.getSettings();
+    assert(s.runtime.dir === 'D:/my-runtime', `带 BOM 的配置被重置了：runtime.dir=${s.runtime.dir}`);
+  });
+
+  await test('settings 写入白名单：未知键不落盘（P1-4 回归）', async () => {
+    store.saveSettings({ evilKey: 'x', runtime: { dir: 'D:/my-runtime', notReal: 1 } });
+    const raw = JSON.parse(fs.readFileSync(path.join(store.DATA_DIR, 'settings.json'), 'utf8'));
+    assert(!('evilKey' in raw), '未知顶层键不应落盘');
+    assert(!('notReal' in raw.runtime), '未知嵌套键不应落盘');
+    assert(raw.runtime.dir === 'D:/my-runtime', '白名单内的键应正常写入');
   });
 
   console.log(results.join('\n'));

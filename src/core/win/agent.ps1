@@ -68,6 +68,9 @@ public class ApkAgent
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr h);
+    [DllImport("user32.dll")] static extern bool AreDpiAwarenessContextsEqual(IntPtr a, IntPtr b);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, ref PBI pbi, int len, out int ret);
@@ -97,6 +100,9 @@ public class ApkAgent
 
     static IntPtr _host = IntPtr.Zero;
     static IntPtr _emu = IntPtr.Zero;
+    // SetParent 被拒（DPI 上下文不一致，Win10 1703+ 的硬性要求）时的降级模式：
+    // 不 reparent，把模拟器窗口钉在宿主客户区上方并跟随移动。
+    static bool _follow = false;
     static IntPtr _hook = IntPtr.Zero;
     static HookProc _hookProc = null;
     static Thread _hookThread = null;
@@ -425,11 +431,12 @@ public class ApkAgent
     static void QuietSweep()
     {
         bool embedded = _emu != IntPtr.Zero && _host != IntPtr.Zero && GetParent(_emu) == _host;
-        IntPtr e = embedded ? _emu : FindEmulator();
-        if (!embedded && e != IntPtr.Zero && IsWindowVisible(e)) ShowWindow(e, 0);
+        bool ours = embedded || _follow;   // 跟随模式的窗口也是「正在给用户看画面」的，不能压
+        IntPtr e = ours ? _emu : FindEmulator();
+        if (!ours && e != IntPtr.Zero && IsWindowVisible(e)) ShowWindow(e, 0);
         HideToolWindows();
         HideConsoleWindows();
-        if (!embedded && e != IntPtr.Zero) _bootHideUntil = Environment.TickCount + 5000;
+        if (!ours && e != IntPtr.Zero) _bootHideUntil = Environment.TickCount + 5000;
     }
 
     // Only our own runtime counts. The old version returned true for ANY process named
@@ -456,15 +463,34 @@ public class ApkAgent
     {
         if (host == IntPtr.Zero || emu == IntPtr.Zero) return false;
         HideToolWindows();
-        SetParent(emu, host);
+        _follow = false;
+        // Windows 10 1703+ 拒绝「DPI 上下文不一致」的跨进程 SetParent，返回 NULL。
+        // Electron 宿主是 PerMonitorV2，Qt 模拟器窗口可能是另一个版本段 —— 混合 DPI
+        // 多显示器环境下必现（issue #5）。旧实现对失败值不检查，还继续把窗口改成
+        // WS_CHILD，结果一个没有父窗口的"子窗口"彻底乱掉：用户看到嵌入 100% 失败且无提示。
+        // 现在预检 + 失败降级为「跟随模式」：不 reparent，窗口钉在宿主客户区上方移动。
+        IntPtr ctxHost = GetWindowDpiAwarenessContext(host);
+        IntPtr ctxEmu = GetWindowDpiAwarenessContext(emu);
+        bool dpiOk = ctxHost != IntPtr.Zero && ctxEmu != IntPtr.Zero
+            && AreDpiAwarenessContextsEqual(ctxHost, ctxEmu);
+        IntPtr parented = dpiOk ? SetParent(emu, host) : IntPtr.Zero;
+        if (parented == IntPtr.Zero)
+        {
+            // 跟随模式：从任务栏藏起来（不占独立图标），位置由 Fit 按宿主客户区换算
+            _follow = true;
+            int ex = GetWindowLong(emu, GWL_EXSTYLE);
+            ex |= WS_EX_TOOLWINDOW;
+            SetWindowLong(emu, GWL_EXSTYLE, ex);
+            return true;
+        }
         uint style = (uint)GetWindowLong(emu, GWL_STYLE);
         style &= ~WS_POPUP;
         style &= ~(uint)(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_BORDER);
         style |= WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
         SetWindowLong(emu, GWL_STYLE, (int)style);
-        int ex = GetWindowLong(emu, GWL_EXSTYLE);
-        ex &= ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
-        SetWindowLong(emu, GWL_EXSTYLE, ex);
+        int ex2 = GetWindowLong(emu, GWL_EXSTYLE);
+        ex2 &= ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
+        SetWindowLong(emu, GWL_EXSTYLE, ex2);
         return true;
     }
 
@@ -476,20 +502,27 @@ public class ApkAgent
         if (_emu == IntPtr.Zero) return;
         if (w < 16) w = 16;
         if (h < 16) h = 16;
-        // 只有「确实已经嵌进我们窗口」的才允许显示。
-        // 万一 embed 失败（模拟器窗口还没建好 / 句柄换了），Fit 绝不能把它当独立窗口
-        // 顶到桌面上 —— 那正是用户看到的那个 "Android Emulator - apkstart5554" 黑窗。
+        // 只有「确实已经嵌进我们窗口」或处于跟随模式的才允许显示。
+        // 万一 embed 还没完成（模拟器窗口还没建好 / 句柄换了），Fit 绝不能把它当
+        // 独立窗口顶到桌面上 —— 那正是用户看到的那个黑窗。
         bool embedded = _host != IntPtr.Zero && GetParent(_emu) == _host;
-        if (!embedded)
+        if (!embedded && !_follow)
         {
             ShowWindow(_emu, 0);
             return;
         }
+        int ax = x, ay = y;
+        if (!embedded && _follow && _host != IntPtr.Zero && IsWindow(_host))
+        {
+            // 跟随模式：x/y 是宿主客户区坐标，换算成屏幕坐标再摆
+            POINT origin = new POINT();
+            if (ClientToScreen(_host, ref origin)) { ax += origin.X; ay += origin.Y; }
+        }
         // SWP_FRAMECHANGED forces Windows to recompute the whole non-client area and
         // repaint it. It is needed exactly once (right after SetParent); repeating it
         // on every periodic sweep caused visible stutter and wasted GPU/CPU.
-        uint flags = SWP_NOACTIVATE | SWP_SHOWWINDOW | (frame ? SWP_FRAMECHANGED : 0u);
-        SetWindowPos(_emu, HWND_TOP, x, y, w, h, flags);
+        uint flags = SWP_NOACTIVATE | SWP_SHOWWINDOW | (frame && embedded ? SWP_FRAMECHANGED : 0u);
+        SetWindowPos(_emu, HWND_TOP, ax, ay, w, h, flags);
     }
 
     static void Raise()
@@ -501,6 +534,17 @@ public class ApkAgent
     static void Detach()
     {
         if (_emu == IntPtr.Zero) return;
+        if (_follow)
+        {
+            // 跟随模式没有 reparent 过，只要还原任务栏可见性
+            int exFollow = GetWindowLong(_emu, GWL_EXSTYLE);
+            exFollow &= ~WS_EX_TOOLWINDOW;
+            SetWindowLong(_emu, GWL_EXSTYLE, exFollow);
+            _emu = IntPtr.Zero;
+            _host = IntPtr.Zero;
+            _follow = false;
+            return;
+        }
         SetParent(_emu, IntPtr.Zero);
         uint style = (uint)GetWindowLong(_emu, GWL_STYLE);
         style &= ~WS_CHILD;
@@ -520,8 +564,19 @@ public class ApkAgent
     {
         if (_emu == IntPtr.Zero) _emu = FindEmulator();
         IntPtr e = _emu;
-        if (e == IntPtr.Zero) { _host = IntPtr.Zero; return; }
+        if (e == IntPtr.Zero) { _host = IntPtr.Zero; _follow = false; return; }
         ShowWindow(e, 0);
+        if (_follow)
+        {
+            // 跟随模式：只藏起来 + 还原任务栏可见性，没有 reparent 需要摘
+            int exF = GetWindowLong(e, GWL_EXSTYLE);
+            exF &= ~WS_EX_TOOLWINDOW;
+            SetWindowLong(e, GWL_EXSTYLE, exF);
+            _emu = IntPtr.Zero;
+            _host = IntPtr.Zero;
+            _follow = false;
+            return;
+        }
         SetParent(e, IntPtr.Zero);
         uint style = (uint)GetWindowLong(e, GWL_STYLE);
         style &= ~WS_CHILD;
@@ -834,13 +889,18 @@ public class ApkAgent
             if (_embedAt != 0 && now - _embedAt >= 8000) _embedAt = 0;
 
             // 常驻压制：模拟器主窗 / 工具栏 / qemu·netsimd 控制台黑窗，一律不允许露面。
-            // 前 90 秒 120ms 一轮（开机阶段窗口是「刚创建就可见」，慢了就会闪一下），
+            // 前 90 秒 120ms 一轮（开机阶段窗口是「刚创建就可见」，慢了就会闪一下）；
+            // 真藏到过窗口就续期密扫（_bootHideUntil，不再是被声明了却没人读的死变量）；
             // 之后放慢到 400ms —— 仍然能兜住「ApkStart 退出后窗口被重挂到桌面」这类情况。
-            long sweepGap = (now - _bootHideStart < 90000) ? 120 : 400;
+            long sweepGap = (now - _bootHideStart < 90000 || (_bootHideUntil != 0 && now < _bootHideUntil))
+                ? 120 : 400;
             if (_quiet && now - _bootHideSweep > sweepGap)
             {
                 _bootHideSweep = now;
-                QuietSweep();
+                // 前置 gate：机器上没有模拟器进程、也没有可识别的模拟器窗口时，
+                // 整轮扫描都是空转（issue #19 里的「常驻扫描白烧 CPU」）。
+                // FindEmulator/AnyEmulatorProcess 都有进程归属校验，命不中任何人。
+                if (AnyEmulatorProcess() || FindEmulator() != IntPtr.Zero) QuietSweep();
             }
 
             try
@@ -914,7 +974,10 @@ public class ApkAgent
                             _embedAt = Environment.TickCount;
                             _lastToolSweep = 0;
                             Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), true);
-                            Reply(sock, "{\"ok\":" + (ok ? "true" : "false") + ",\"emu\":" + _emu.ToInt64() + "}");
+                            // follow=true：SetParent 被 DPI 不一致拒绝，已降级为窗口跟随。
+                            // JS 侧据此提示用户（不再像旧版那样完全静默失败）。
+                            Reply(sock, "{\"ok\":" + (ok ? "true" : "false") + ",\"emu\":" + _emu.ToInt64()
+                                + ",\"follow\":" + (_follow ? "true" : "false") + "}");
                         }
                     }
                     else if (cmd == "fit")

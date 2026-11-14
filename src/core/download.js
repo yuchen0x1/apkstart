@@ -10,7 +10,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { URL } = require('url');
 
-const UA = 'ApkStart/0.2 (Windows; +https://github.com/apkstart)';
+const UA = 'ApkStart/0.3 (Windows; +https://github.com/RoutineMiku/apkstart)';
 
 function openStream(url, { method = 'GET', headers = {}, redirects = 0 } = {}) {
   return new Promise((resolve, reject) => {
@@ -50,8 +50,13 @@ async function head(url) {
 }
 
 function sha256File(file) {
+  return hashFile(file, 'sha256');
+}
+
+/** 流式计算文件哈希（sha256 / sha1 都用这一份实现） */
+function hashFile(file, algo = 'sha256') {
   return new Promise((resolve, reject) => {
-    const h = crypto.createHash('sha256');
+    const h = crypto.createHash(algo);
     const s = fs.createReadStream(file);
     s.on('data', (c) => h.update(c));
     s.on('end', () => resolve(h.digest('hex')));
@@ -59,14 +64,63 @@ function sha256File(file) {
   });
 }
 
+/** 下载完成后的完整性校验；失败时删文件并抛错（expectSha256 / expectSha1 二选一） */
+async function verifyChecksum(dest, opt) {
+  const { expectSha256, expectSha1 } = opt || {};
+  if (expectSha256) {
+    const actual = await hashFile(dest, 'sha256');
+    if (actual.toLowerCase() !== String(expectSha256).toLowerCase()) {
+      fs.rmSync(dest, { force: true });
+      throw new Error(`SHA-256 校验失败：期望 ${String(expectSha256).slice(0, 12)}… 实际 ${actual.slice(0, 12)}…`);
+    }
+  }
+  if (expectSha1) {
+    const actual = await hashFile(dest, 'sha1');
+    if (actual.toLowerCase() !== String(expectSha1).toLowerCase()) {
+      fs.rmSync(dest, { force: true });
+      throw new Error(`SHA-1 校验失败（下载内容与官方索引不符）：期望 ${String(expectSha1).slice(0, 12)}… 实际 ${actual.slice(0, 12)}…`);
+    }
+  }
+}
+
+/**
+ * 校验本地文件末尾 len 字节与远端是否一致。
+ * 用于 416（Range 越界）时确认「续传文件真的是下载完成的产物」：
+ * 并行分块失败留下的预分配稀疏文件，大小恰好也等于总长，只有比对内容才分得清。
+ * 服务器不支持 Range 时返回 true（放行，保持旧行为）。
+ */
+async function tailMatches(url, dest, size, len) {
+  let res;
+  try {
+    res = await openStream(url, { headers: { Range: `bytes=${size - len}-` } });
+  } catch (_) {
+    return true;   // 校验通道不可用：不因它把可能的完整文件误删
+  }
+  if (res.statusCode !== 206) { res.resume(); return true; }
+  const parts = [];
+  let got = 0;
+  await new Promise((resolve) => {
+    res.on('data', (c) => { parts.push(c); got += c.length; if (got >= len) res.destroy(); });
+    res.on('end', () => resolve());
+    res.on('error', () => resolve());
+    res.on('close', () => resolve());
+  });
+  const remoteBuf = Buffer.concat(parts).subarray(0, len);
+  if (remoteBuf.length < len) return true;   // 远端比声明的小，交给上层大小校验处理
+  const local = Buffer.alloc(len);
+  const fd = fs.openSync(dest, 'r');
+  try { fs.readSync(fd, local, 0, len, size - len); } finally { fs.closeSync(fd); }
+  return remoteBuf.equals(local);
+}
+
 /**
  * 下载到本地文件（自动续传）。
  * @param {string} url
  * @param {string} dest
- * @param {object} opt { onProgress({got,total,percent,speed}), signal, expectSha256, timeoutMs }
+ * @param {object} opt { onProgress({got,total,percent,speed}), signal, expectSha256, expectSha1, idleMs, retries }
  */
 async function download(url, dest, opt = {}) {
-  const { onProgress = () => {}, signal, expectSha256, retries = 2 } = opt;
+  const { onProgress = () => {}, signal, retries = 2 } = opt;
   fs.mkdirSync(path.dirname(dest), { recursive: true });
 
   let attempt = 0;
@@ -81,7 +135,33 @@ async function download(url, dest, opt = {}) {
 
     if (res.statusCode === 416) {
       res.resume();
-      // 已下载完整
+      // 416 = Range 越界，通常表示「已下载完整」。但并行分块失败留下的预分配
+      // 稀疏文件大小恰好也等于总长 —— 不核对就把全零文件当成品，会产出一份
+      // 「大小正确、内容全零」的坏运行时（历史 P0）。以远端总长为准核对。
+      const cr = /\/(\d+)\s*$/.exec(String(res.headers['content-range'] || ''));
+      let remoteTotal = cr ? Number(cr[1]) : 0;
+      if (!remoteTotal) {
+        // eslint-disable-next-line no-await-in-loop
+        const h = await head(url).catch(() => ({ size: 0 }));
+        remoteTotal = h.size || 0;
+      }
+      const actual = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+      if (remoteTotal && actual !== remoteTotal) {
+        fs.rmSync(dest, { force: true });
+        if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
+        throw new Error(`续传状态不一致（本地 ${actual} 字节 / 远端 ${remoteTotal} 字节），已重置下载`);
+      }
+      // 大小一致也不能直接当「已下载完整」：预分配的稀疏文件大小恰好也是总长。
+      // 比对末尾 4KB，内容对不上就重置，宁可重下也不交出一份全零的「成品」。
+      if (remoteTotal && actual === remoteTotal && actual > 0) {
+        // eslint-disable-next-line no-await-in-loop
+        const same = await tailMatches(url, dest, actual, Math.min(4096, actual));
+        if (!same) {
+          fs.rmSync(dest, { force: true });
+          if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
+          throw new Error('续传文件与远端内容不一致（可能是中断留下的预分配文件），已重置下载');
+        }
+      }
       break;
     }
     if (res.statusCode !== 200 && res.statusCode !== 206) {
@@ -162,13 +242,7 @@ async function download(url, dest, opt = {}) {
   const finalSize = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
   onProgress({ got: finalSize, total: finalSize, percent: 100, speed: 0, eta: 0 });
 
-  if (expectSha256) {
-    const actual = await sha256File(dest);
-    if (actual.toLowerCase() !== expectSha256.toLowerCase()) {
-      fs.rmSync(dest, { force: true });
-      throw new Error(`校验失败：期望 ${expectSha256.slice(0, 12)}… 实际 ${actual.slice(0, 12)}…`);
-    }
-  }
+  await verifyChecksum(dest, opt);
   return { file: dest, size: fs.statSync(dest).size };
 }
 
@@ -184,6 +258,14 @@ async function downloadParallel(url, dest, opt = {}) {
     minChunk = 1024 * 1024,
     retries = 3,
   } = opt;
+
+  // 分块下载留下的「带洞」文件（边车元数据还在）绝不能走单流续传：
+  // Range 只知道文件大小，不知道中间哪些块还没下，续出来必然是坏文件。
+  // 删掉整套残骸，让分块流程带元数据重来（它只会补缺的块）。
+  if (fs.existsSync(`${dest}.chunks.json`)) {
+    fs.rmSync(dest, { force: true });
+    fs.rmSync(`${dest}.chunks.json`, { force: true });
+  }
 
   // 已有部分文件 → 交给单流续传
   if (fs.existsSync(dest) && fs.statSync(dest).size > 0) {
@@ -300,6 +382,10 @@ async function downloadParallel(url, dest, opt = {}) {
     }));
   } catch (e) {
     fs.closeSync(fd);
+    // 预分配的稀疏文件在这里就是「全零毒丸」：不删掉的话，上层换源重试会把它
+    // 当成「已下载的部分文件」去续传，远端回 416，一份内容全零、大小正确的
+    // 坏文件就完成了。失败必须连残骸一起清掉。
+    try { fs.rmSync(dest, { force: true }); } catch (_) { /* ignore */ }
     throw e;
   }
   fs.closeSync(fd);
@@ -307,6 +393,7 @@ async function downloadParallel(url, dest, opt = {}) {
   const size = fs.statSync(dest).size;
   onProgress({ got: size, total: size, percent: 100, speed: 0, eta: 0 });
   if (size !== total) throw new Error(`下载不完整：${size}/${total} 字节`);
+  await verifyChecksum(dest, opt);
   return { file: dest, size, parallel: n };
 }
 
@@ -544,6 +631,7 @@ async function downloadMulti(urls, dest, opt = {}) {
   const size = fs.statSync(dest).size;
   tick(true);
   if (size !== total) throw new Error(`下载不完整：${size}/${total} 字节`);
+  await verifyChecksum(dest, opt);
   return { file: dest, size, parallel: n, sources: same.length, multi: true, resumed: resume };
 }
 
@@ -563,5 +651,5 @@ async function downloadAnyParallel(urls, dest, opt = {}) {
 }
 
 module.exports = {
-  download, downloadAny, downloadParallel, downloadAnyParallel, downloadMulti, head, sha256File, openStream,
+  download, downloadAny, downloadParallel, downloadAnyParallel, downloadMulti, head, sha256File, hashFile, openStream,
 };

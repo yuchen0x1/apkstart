@@ -128,6 +128,16 @@ function parseResolvedActivity(pkg, out) {
 }
 
 /**
+ * 设备端 shell 的单引号转义。`adb shell` 之后的整串由**安卓端** sh 解析，
+ * 包名 / 路径这类外部输入直接拼进去，`a; rm -rf /data` 这种构造就是命令注入
+ * （execFile 只保证本机侧不经 shell，管不到设备端）。包名在 apk.js 已做白名单，
+ * 这里是纵深防御，同时保护 apps.json 里的历史数据。
+ */
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
  * adb install 的超时上限本来固定 240s，但 2GB+ 的安装包在慢盘上
  * 「push + 安装 + dexopt」很容易超过 4 分钟：一旦超时就会被当成安装失败，
  * 用户看到的就是「大包装了没反应/失败」。这里按包体放大，上限 20 分钟。
@@ -469,7 +479,7 @@ class AdbClient {
   }
 
   async isInstalled(pkg) {
-    const out = await this.shell(`pm path ${pkg}`);
+    const out = await this.shell(`pm path ${shellQuote(pkg)}`);
     return /package:/.test(out);
   }
 
@@ -493,7 +503,7 @@ class AdbClient {
     if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.value;
     try {
       const out = await this.shell(
-        `cmd package resolve-activity --brief ${pkg}`, { timeout: 10000 },
+        `cmd package resolve-activity --brief ${shellQuote(pkg)}`, { timeout: 10000 },
       );
       const comp = parseResolvedActivity(pkg, out);
       if (comp) {
@@ -509,7 +519,7 @@ class AdbClient {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       // eslint-disable-next-line no-await-in-loop
-      const pid = await this.shell(`pidof ${pkg}`, { timeout: 6000 }).catch(() => '');
+      const pid = await this.shell(`pidof ${shellQuote(pkg)}`, { timeout: 6000 }).catch(() => '');
       if (String(pid).trim()) return { ok: true };
       // eslint-disable-next-line no-await-in-loop
       await sleep(1000);
@@ -518,7 +528,7 @@ class AdbClient {
     try {
       crash = await this.shell(
         `logcat -d -t 250 -v brief AndroidRuntime:E DEBUG:E libc:E 2>/dev/null | `
-        + `grep -i -E '${pkg}|FATAL|ndk_translation|SIGABRT|SIGSEGV|UnsatisfiedLink' | tail -n 30`,
+        + `grep -i -E '${shellQuote(pkg)}|FATAL|ndk_translation|SIGABRT|SIGSEGV|UnsatisfiedLink' | tail -n 30`,
         { timeout: 12000 },
       );
     } catch (_) { /* ignore */ }
@@ -542,8 +552,8 @@ class AdbClient {
     // 这里统一成 am start -n 要的完整组件，避免 pkg/pkg/class 被系统取消。
     const comp = componentArg(pkg, resolved);
     const intent = comp
-      ? ['-n', comp]
-      : ['-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-p', pkg];
+      ? ['-n', shellQuote(comp)]
+      : ['-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-p', shellQuote(pkg)];
     const modes = freeform
       ? [['--windowingMode', '5'], []]
       : [[]];
@@ -579,7 +589,7 @@ class AdbClient {
     // monkey 兜底：部分镜像的 am start -a/-c/-p 解析不到 launcher
     try {
       const out = await this.shell(
-        `monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`, { timeout: 20000 },
+        `monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1`, { timeout: 20000 },
       );
       const alive = await this.waitAppAlive(pkg, 12000);
       if (alive.ok || alive.uncertain) return out;
@@ -597,7 +607,7 @@ class AdbClient {
   }
 
   async forceStop(pkg) {
-    try { await this.shell(`am force-stop ${pkg}`); } catch (_) { /* ignore */ }
+    try { await this.shell(`am force-stop ${shellQuote(pkg)}`); } catch (_) { /* ignore */ }
   }
 
   async runningPackages() {
@@ -716,21 +726,21 @@ class AdbClient {
 
   /** 清除应用数据 */
   async clearData(pkg) {
-    await this.shell(`pm clear ${pkg}`);
+    await this.shell(`pm clear ${shellQuote(pkg)}`);
   }
 
   /** 导出应用数据（Windows/调试版可用 run-as；否则走 adb backup 兜底） */
   async exportAppData(pkg, localTarPath) {
-    const remote = `/sdcard/apkstart-tmp-${pkg}.tar`;
-    const cmd = `run-as ${pkg} tar -cf ${remote} . 2>/dev/null || (cd /data/data/${pkg} && tar -cf ${remote} .)`;
+    const remote = `/sdcard/apkstart-tmp-${pkg}.tar`;   // pull 不经设备 shell，路径里不能带引号
+    const cmd = `run-as ${shellQuote(pkg)} tar -cf ${shellQuote(remote)} . 2>/dev/null || (cd /data/data/${shellQuote(pkg)} && tar -cf ${shellQuote(remote)} .)`;
     await this.shell(cmd);
     await this.pull(remote, localTarPath);
-    await this.shell(`rm -f ${remote}`).catch(() => {});
+    await this.shell(`rm -f ${shellQuote(remote)}`).catch(() => {});
     return localTarPath;
   }
 
   async batteryOptimizeOff(pkg) {
-    try { await this.shell(`dumpsys deviceidle whitelist +${pkg}`); } catch (_) { /* ignore */ }
+    try { await this.shell(`dumpsys deviceidle whitelist +${shellQuote(pkg)}`); } catch (_) { /* ignore */ }
   }
 
   /**
@@ -741,7 +751,7 @@ class AdbClient {
   async grantRuntimePermissions(pkg) {
     let dump = '';
     try {
-      dump = await this.shell(`dumpsys package ${pkg}`, { timeout: 20000 });
+      dump = await this.shell(`dumpsys package ${shellQuote(pkg)}`, { timeout: 20000 });
     } catch (_) {
       return [];
     }
@@ -759,10 +769,10 @@ class AdbClient {
     // 授权一次发完：pm grant 每条一次进程在 Windows 上要 150ms+，
     // 四五个权限就是 1 秒，而这些命令本身没有任何依赖关系。
     const cmds = [];
-    for (const p of denied) cmds.push(`pm grant ${pkg} ${p}`);
+    for (const p of denied) cmds.push(`pm grant ${shellQuote(pkg)} ${p}`);
     // 特殊权限走 appops，否则仍然会弹窗
     const ops = ['MANAGE_EXTERNAL_STORAGE', 'SYSTEM_ALERT_WINDOW', 'REQUEST_INSTALL_PACKAGES', 'WRITE_SETTINGS'];
-    for (const op of ops) cmds.push(`cmd appops set ${pkg} ${op} allow`);
+    for (const op of ops) cmds.push(`cmd appops set ${shellQuote(pkg)} ${op} allow`);
     if (cmds.length) {
       await this.shell(cmds.join(' ; '), { timeout: 20000 }).catch(() => '');
       granted.push(...denied);
@@ -872,5 +882,5 @@ class AdbClient {
 
 module.exports = {
   AdbClient, AdbError, parseStatList, friendlyInstallError, friendlyLaunchError,
-  componentArg, parseResolvedActivity,
+  componentArg, parseResolvedActivity, shellQuote,
 };

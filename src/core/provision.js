@@ -603,13 +603,32 @@ class Provisioner {
     const total = zip.names().length;
     let done = 0;
 
+    // zip-slip 防护：压缩包条目名是不受信任输入，`../`、绝对路径、盘符都能把
+    // 写入点搬到目标目录之外。所有条目一律先规范化并确认落在 destDir 内。
+    const destRoot = path.resolve(destDir);
+    const safeTarget = (name) => {
+      const cleaned = String(name).replace(/\\/g, '/');
+      if (/^[a-zA-Z]:/.test(cleaned) || cleaned.startsWith('/')) {
+        throw new Error(`压缩包内含绝对路径条目，已拒绝解压：${name}`);
+      }
+      const parts = cleaned.split('/').filter((s) => s.length > 0);
+      if (parts.some((s) => s === '..')) {
+        throw new Error(`压缩包内含上溯路径条目，已拒绝解压：${name}`);
+      }
+      const target = path.resolve(destRoot, ...parts);
+      if (target !== destRoot && !target.startsWith(destRoot + path.sep)) {
+        throw new Error(`压缩包条目越界，已拒绝解压：${name}`);
+      }
+      return target;
+    };
+
     try {
       for (const name of zip.names()) {
         if (name.endsWith('/')) {
-          fs.mkdirSync(path.join(destDir, name), { recursive: true });
+          fs.mkdirSync(safeTarget(name), { recursive: true });
           continue;
         }
-        const target = path.join(destDir, name);
+        const target = safeTarget(name);
         fs.mkdirSync(path.dirname(target), { recursive: true });
         const e = zip.entries.get(name);
         if (e.uncompSize > STREAM_THRESHOLD) {
@@ -629,16 +648,57 @@ class Provisioner {
 
   // ---------------- Emulator（Google 官方运行时） ----------------
 
-  /** 抓取一段 XML 文本（带大小上限，索引文件约 400KB） */
-  async _fetchText(url, limit = 2 * 1024 * 1024) {
+  /**
+   * 抓取一段 XML 文本（带大小上限，索引文件约 400KB）。
+   * 必须保证 promise 一定会 settle：res.destroy() 之后 'end'/'error' 都不触发
+   * （只发 'close'），没有 close 兜底的话部署向导会永久卡死；同时加整体超时。
+   */
+  async _fetchText(url, limit = 2 * 1024 * 1024, timeoutMs = 30000) {
     const { openStream } = require('./download');
     const res = await openStream(url);
     return new Promise((resolve, reject) => {
       let d = '';
-      res.on('data', (c) => { d += c; if (d.length > limit) res.destroy(); });
-      res.on('end', () => resolve(d));
-      res.on('error', () => resolve(d));
+      let done = false;
+      const finish = (fn, v) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        fn(v);
+      };
+      const timer = setTimeout(() => {
+        try { res.destroy(); } catch (_) { /* ignore */ }
+        finish(reject, new Error(`索引下载超时（${timeoutMs}ms）：${url}`));
+      }, timeoutMs);
+      res.on('data', (c) => {
+        d += c;
+        if (d.length > limit) {
+          try { res.destroy(); } catch (_) { /* ignore */ }
+          finish(reject, new Error(`索引响应体超过 ${limit} 字节上限：${url}`));
+        }
+      });
+      res.on('end', () => finish(resolve, d));
+      res.on('error', () => finish(resolve, d));
+      res.on('close', () => finish(resolve, d));   // destroy 后的兜底
     });
+  }
+
+  /**
+   * 从一段 <remotePackage> XML 里解析 <complete> 块中的 url + checksum。
+   * 官方索引里每个 archive 自带 sha1，校验值就躺在已经解析过的那份文本里 ——
+   * 之前只抓 url 把 checksum 丢掉，等于整条供应链裸奔（下载物还要被提权执行）。
+   */
+  _parseArchiveEntries(blockXml, base) {
+    const out = [];
+    const re = /<complete>([\s\S]*?)<\/complete>/g;
+    let m;
+    while ((m = re.exec(String(blockXml || '')))) {
+      const seg = m[1];
+      const urlM = /<url>([^<]+)<\/url>/.exec(seg);
+      if (!urlM) continue;
+      const sumM = /<checksum[^>]*>([^<]+)<\/checksum>/.exec(seg);
+      out.push({ url: absUrl(urlM[1], base), sha1: sumM ? sumM[1].trim().toLowerCase() : '' });
+    }
+    return out;
   }
 
   /** 从 SDK 索引里动态解析最新的 Windows emulator 包地址 */
@@ -651,15 +711,18 @@ class Provisioner {
       const block = /<remotePackage path="emulator"[\s\S]*?<\/remotePackage>/.exec(xml);
       if (block) {
         const base = baseOf(SOURCES.sdkIndex);
-        const urls = [...block[0].matchAll(/<url>([^<]+)<\/url>/g)].map((m) => absUrl(m[1], base));
-        const win = urls.find((u) => /windows_x64.*\.zip$/i.test(u));
+        const entries = this._parseArchiveEntries(block[0], base)
+          .filter((x) => /windows_x64.*\.zip$/i.test(x.url));
+        const win = entries.find((x) => x.sha1) || entries[0];
         if (win) {
-          this._cache.emulatorUrl = win;
-          return win;
+          this._cache.emulatorUrl = win.url;
+          this._cache.emulatorSha1 = win.sha1 || '';
+          return win.url;
         }
       }
     } catch (_) { /* 落兜底 */ }
     this._cache.emulatorUrl = SOURCES.emulatorFallback;
+    this._cache.emulatorSha1 = '';
     return SOURCES.emulatorFallback;
   }
 
@@ -673,20 +736,24 @@ class Provisioner {
       try {
         // eslint-disable-next-line no-await-in-loop
         const xml = await this._fetchText(idx);
-        const re = new RegExp(`<remotePackage path="${want.replace(/[;]/g, ';')}"[\\s\\S]*?</remotePackage>`);
+        const re = new RegExp(`<remotePackage path="${want}"[\\s\\S]*?</remotePackage>`);
         const block = re.exec(xml);
         if (block) {
           const base = baseOf(idx);
-          const urls = [...block[0].matchAll(/<url>([^<]+)<\/url>/g)].map((m) => absUrl(m[1], base))
-            .filter((u) => /x86_64.*\.zip$/i.test(u));
-          if (urls.length) {
-            this._cache.sysimgUrl = urls[urls.length - 1];
+          const entries = this._parseArchiveEntries(block[0], base)
+            .filter((x) => /x86_64.*\.zip$/i.test(x.url));
+          // 与 resolveEmulatorUrl 统一：取带校验值的最后一条（即最新版本）
+          const hit = entries.filter((x) => x.sha1).pop() || entries[entries.length - 1];
+          if (hit) {
+            this._cache.sysimgUrl = hit.url;
+            this._cache.sysimgSha1 = hit.sha1 || '';
             return this._cache.sysimgUrl;
           }
         }
       } catch (_) { /* 换下一个索引 */ }
     }
     this._cache.sysimgUrl = SOURCES.sysimgFallback;
+    this._cache.sysimgSha1 = '';
     return SOURCES.sysimgFallback;
   }
 
@@ -937,12 +1004,15 @@ class Provisioner {
     const p = this.ensureDirs();
     await this.guardDisk('emulator', p.root);
     const url = await this.resolveEmulatorUrl();
+    // 索引里带的官方 sha1：镜像前缀换源不影响内容（同一文件的转发），校验仍有效
+    const sha1 = this._cache.emulatorSha1 || '';
     const zip = path.join(p.tmp, 'emulator.zip');
     onProgress({ stage: 'download', message: '下载运行时引擎（约 440MB，走 Google 官方源）…', percent: 1 });
 
     await downloadAnyParallel(this._downloadUrls(url), zip, {
       connections: 8,
       minChunk: 4 * 1024 * 1024,
+      expectSha1: sha1 || undefined,
       onProgress: (pr) => onProgress({
         stage: 'download',
         message: `下载运行时引擎 ${(pr.got / 1048576).toFixed(0)}MB / ${(pr.total / 1048576).toFixed(0)}MB`
@@ -1019,15 +1089,18 @@ class Provisioner {
       const block = new RegExp(`<remotePackage path="${want}"[\\s\\S]*?</remotePackage>`).exec(xml);
       if (block) {
         const base = baseOf(SOURCES.playImgIndex);
-        const urls = [...block[0].matchAll(/<url>([^<]+)<\/url>/g)].map((m) => absUrl(m[1], base))
-          .filter((u) => /x86_64.*\.zip$/i.test(u));
-        if (urls.length) {
-          this._cache.playUrl = urls[urls.length - 1];
+        const entries = this._parseArchiveEntries(block[0], base)
+          .filter((x) => /x86_64.*\.zip$/i.test(x.url));
+        const hit = entries.filter((x) => x.sha1).pop() || entries[entries.length - 1];
+        if (hit) {
+          this._cache.playUrl = hit.url;
+          this._cache.playSha1 = hit.sha1 || '';
           return this._cache.playUrl;
         }
       }
     } catch (_) { /* 落兜底 */ }
     this._cache.playUrl = SOURCES.playImgFallback;
+    this._cache.playSha1 = '';
     return this._cache.playUrl;
   }
 
@@ -1036,11 +1109,13 @@ class Provisioner {
     const p = this.ensureDirs();
     await this.guardDisk('playimg', p.sysImgRoot);
     const url = await this.resolvePlayUrl();
+    const sha1 = this._cache.playSha1 || '';
     const zip = path.join(p.tmp, 'play-sysimg.zip');
     onProgress({ stage: 'download', message: '下载 ARM 兼容镜像（Android 14，约 1.5GB）…', percent: 1 });
     await downloadAnyParallel(this._downloadUrls(url), zip, {
       connections: 8,
       minChunk: 4 * 1024 * 1024,
+      expectSha1: sha1 || undefined,
       onProgress: (pr) => onProgress({
         stage: 'download',
         message: `下载兼容镜像 ${(pr.got / 1048576).toFixed(0)}MB / ${(pr.total / 1048576).toFixed(0)}MB`
@@ -1101,11 +1176,26 @@ class Provisioner {
     try {
       const { openStream } = require('./download');
       const res = await openStream(SOURCES.qemuIndex);
+      // 与 _fetchText 相同的规矩：destroy() 只发 close 不发 end/error，
+      // 没有兜底的话这个 promise 永远不 settle，部署向导就卡死在这里。
       const html = await new Promise((resolve, reject) => {
         let d = '';
-        res.on('data', (c) => { d += c; if (d.length > 512 * 1024) res.destroy(); });
-        res.on('end', () => resolve(d));
-        res.on('error', reject);
+        let done = false;
+        const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); fn(v); };
+        const timer = setTimeout(() => {
+          try { res.destroy(); } catch (_) { /* ignore */ }
+          finish(reject, new Error('QEMU 索引下载超时（30s）'));
+        }, 30000);
+        res.on('data', (c) => {
+          d += c;
+          if (d.length > 512 * 1024) {
+            try { res.destroy(); } catch (_) { /* ignore */ }
+            finish(reject, new Error('QEMU 索引响应体超过 512KB 上限'));
+          }
+        });
+        res.on('end', () => finish(resolve, d));
+        res.on('error', (e) => finish(reject, e));
+        res.on('close', () => finish(resolve, d));
       });
       const files = [...html.matchAll(/href="([^"]*qemu-w64-setup-(\d+)\.exe)"/g)]
         .map((m) => ({ file: m[1], ver: Number(m[2]) }))

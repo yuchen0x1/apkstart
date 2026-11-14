@@ -82,6 +82,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   openSharedDir: () => invoke('share:open'),
 
   openExternal: (url) => invoke('shell:open', url),
+  openPath: (p) => invoke('shell:openPath', p),
   winMinimize: () => invoke('window:minimize'),
   winMaximize: () => invoke('window:maximize'),
   winClose: () => invoke('window:close'),

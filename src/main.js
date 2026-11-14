@@ -645,6 +645,15 @@ async function runLaunch(pkg) {
     if (!embedded) appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
     mark(`embedded=${embedded}`);
     appWin.setState({ ready: true, tip: '' });
+    // DPI 上下文不一致导致 SetParent 被拒时，代理降级为「窗口跟随」模式：
+    // 画面照常显示，但告知用户原因（旧版完全静默，用户只能对着黑窗口猜）。
+    if (embedded && appWin.lastEmbedFollow) {
+      appLog(`embed degraded to follow mode (DPI awareness mismatch): ${pkg}`);
+      send('toast', {
+        type: 'info',
+        message: '当前显示器的 DPI 设置与模拟器不一致，窗口以「跟随模式」显示。若画面有黑边或错位，请把显示器缩放调成 100% 后重试。',
+      });
+    }
     // 嵌入失败（模拟器窗口还没建好）时再补两次：用户看到的是黑窗口，
     // 后台补上就恢复正常，不用让用户手动重开。
     if (!embedded) {
@@ -1135,6 +1144,16 @@ function registerIpc() {
   /** 提权安装 AEHD 驱动：弹出 UAC，用户确认后静默安装 */
   ipcMain.handle('provision:enableAccel', async () => {
     try {
+      // 驱动正被运行中的 VM 占用时，安装脚本 sc stop 必然 1061、sc delete 必然 1072，
+      // 服务会被留在「待删除 + 已禁用」的半残状态 —— 本来好的驱动就这样被点坏。
+      // 这里先拦下，明确告诉用户先停止运行时（历史 P1，实测复现）。
+      if (runtime.vmRunning) {
+        return {
+          ok: false,
+          error: '安卓运行时正在运行，无法重装硬件加速驱动（驱动被虚拟机占用）。'
+            + '请先关闭所有应用窗口并在「运行时」页停止运行时，再回来点「启用」。',
+        };
+      }
       const p = runtime.provisioner.paths();
       const bat = path.join(p.aehdDir, 'silent_install.bat');
       if (!fs.existsSync(bat)) {
@@ -1384,7 +1403,20 @@ function registerIpc() {
     }
   });
 
-  ipcMain.handle('shell:open', (_e, url) => shell.openExternal(url));
+  ipcMain.handle('shell:open', (_e, url) => {
+    // 只放行 http/https：与 setWindowOpenHandler 的策略一致。
+    // file:// / ms-gww 等 scheme 一律交给 shell.openPath / 专用 IPC 处理。
+    const u = String(url || '');
+    if (!/^https?:\/\//i.test(u)) throw new Error('只允许打开 http/https 链接');
+    return shell.openExternal(u);
+  });
+
+  /** 打开本地目录（设置页「打开数据目录」等按钮用；window.open('file://') 会被 open 拦截器吞掉） */
+  ipcMain.handle('shell:openPath', (_e, p) => {
+    const dir = String(p || '');
+    if (!path.isAbsolute(dir)) throw new Error('只允许打开绝对路径');
+    return shell.openPath(dir);
+  });
 
   ipcMain.handle('window:minimize', () => mainWindow?.minimize());
   ipcMain.handle('window:maximize', () => {

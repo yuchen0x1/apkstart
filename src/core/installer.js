@@ -11,6 +11,7 @@ const store = require('./store');
 const { parseApk } = require('./apk');
 const { ZipFile } = require('./zip');
 const { iconToIco, writeShortcut, removeShortcut, safeFileName } = require('./shortcut');
+const { shellQuote } = require('./adb');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -75,7 +76,7 @@ class Installer {
 
   iconFile(pkg) { return store.iconPath(pkg); }
 
-  icoFile(pkg) { return path.join(store.ICON_DIR, `${pkg}.ico`); }
+  icoFile(pkg) { return path.join(store.ICON_DIR, `${safeFileName(pkg)}.ico`); }
 
   shortcutPath(app) {
     const s = store.getSettings();
@@ -387,8 +388,16 @@ class Installer {
 
   async uninstall(pkg, { removeShortcut: rm = true } = {}) {
     const app = store.getApp(pkg);
-    const rt = await this.runtime.ensure();
-    if (rt.ok) await rt.client.uninstall(pkg).catch(() => {});
+    // 卸载不再强制开机：以前无条件 ensure()，为了删一个应用要先冷启动几十秒，
+    // 用户在「还没开机」时点卸载，看到的是长时间的白等。
+    // 运行时在跑就直接卸；没在跑就只清理本地元数据 / 快捷方式 / 图标，
+    // 设备上的残留等下次开机后由 launcher 侧的「应用不存在」路径自然兜底。
+    const online = await this.runtime.client().devices()
+      .then((ds) => ds.some((d) => /^emulator-\d+$/.test(d.serial)))
+      .catch(() => false);
+    if (online) {
+      await this.runtime.ensure().then((rt) => rt.ok && rt.client.uninstall(pkg)).catch(() => {});
+    }
     if (app && rm) {
       removeShortcut(app.shortcutPath);
       removeShortcut(app.startMenuPath);
@@ -422,7 +431,7 @@ class Installer {
     // "Invalid packageName"。先在本地缓存里把它装上再启动，这样「点开应用」永远能进，
     // 不用先手动装一遍——这正是「点击已安装应用直接进入系统」想要的体验。
     if (app && app.apkPath && fs.existsSync(app.apkPath)) {
-      const pkgs = await rt.client.shell(`pm list packages ${pkg}`, { timeout: 8000 }).catch(() => '');
+      const pkgs = await rt.client.shell(`pm list packages ${shellQuote(pkg)}`, { timeout: 8000 }).catch(() => '');
       if (!new RegExp(`package:${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(pkgs)) {
         onLog('应用尚未安装，正在自动安装…');
         await rt.client.install(app.apkPath).catch((e) => onLog(`自动安装失败：${e.message}`));
@@ -440,7 +449,7 @@ class Installer {
         // 先查再睡：常驻容器里热启动往往 1 秒内就能看到进程，
         // 先 sleep 1 秒等于把最快的那条路径硬生生拖慢一秒。
         // eslint-disable-next-line no-await-in-loop
-        const pid = await rt.client.shell(`pidof ${pkg}`, { timeout: 6000 }).catch(() => '');
+        const pid = await rt.client.shell(`pidof ${shellQuote(pkg)}`, { timeout: 6000 }).catch(() => '');
         if (!String(pid).trim()) {
           if (seen) return false; // 起来过又消失 = 真的崩了
         } else {
@@ -490,7 +499,7 @@ class Installer {
         // 兜底：异常退出会留下「半初始化」的数据，导致之后每次都崩。
         // 清一次应用数据再拉起来，成功率最高（用户不必自己去设置里清缓存）。
         onLog('应用连续退出，正在重置应用数据后重试…');
-        await rt.client.shell(`pm clear ${pkg}`, { timeout: 20000 }).catch(() => '');
+        await rt.client.shell(`pm clear ${shellQuote(pkg)}`, { timeout: 20000 }).catch(() => '');
         await sleep(800);
         // pm clear 会把运行时权限一并清掉，必须重新授，否则会卡在系统授权框
         await rt.client.grantRuntimePermissions(pkg).catch(() => {});

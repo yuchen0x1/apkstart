@@ -66,6 +66,10 @@ const DEFAULT_SETTINGS = {
   },
   runtime: {
     dir: '',                 // 空 = %APPDATA%\apkstart\runtime
+    // 安卓数据目录（AVD/快照/已装应用，真正吃盘的地方）。空 = 自动推导。
+    // 这个键一直在被使用（provision.paths()），但此前没在默认值里声明，
+    // 导致设置写入白名单会把用户改的「安卓数据目录」静默丢掉。
+    avdDir: '',
     qemuUrl: '',             // 手动指定 QEMU 安装包地址
     isoUrl: '',              // 手动指定系统镜像地址
     isoPath: '',             // 系统镜像（ISO）路径
@@ -123,9 +127,21 @@ function ensureDirs() {
 }
 
 function readJson(file, fallback) {
+  let text = '';
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    text = fs.readFileSync(file, 'utf8');
   } catch (_) {
+    return fallback;
+  }
+  try {
+    // 带 BOM 的文件（部分编辑器「UTF-8 with BOM」另存 / Set-Content -Encoding utf8BOM）
+    // 以前会让 JSON.parse 抛错 → 走默认值分支 → 再把默认值写回磁盘，
+    // 用户看到的就是「所有配置被静默重置」。strip 掉 BOM 后正常解析。
+    return JSON.parse(text.replace(/^\uFEFF/, ''));
+  } catch (_) {
+    // 真损坏：把原文件改名保留现场（不再覆写），返回默认值。
+    // 用户能拿 .bak 找回原配置，而不是「东西没了」。
+    try { fs.renameSync(file, `${file}.bak-${Date.now()}`); } catch (_) { /* ignore */ }
     return fallback;
   }
 }
@@ -147,6 +163,25 @@ function deepMerge(base, patch) {
     }
   }
   return out;
+}
+
+/** 递归丢弃默认值里没有声明的键（未知键一律不落盘） */
+function filterKnown(base, patch) {
+  const out = {};
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (!(k in base)) continue;
+    if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object' && !Array.isArray(base[k])) {
+      out[k] = filterKnown(base[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/** 包名会拼进文件路径（图标 / APK 备份），白名单之外的一律替换成下划线 */
+function safePathName(name) {
+  return String(name || '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 150);
 }
 
 /**
@@ -186,9 +221,12 @@ const store = {
   },
 
   saveSettings(patch) {
-    const next = deepMerge(this.getSettings(), patch);
+    // 白名单过滤：settings:set 是渲染层直达的通用写入入口，未知键（或被构造的
+    // runtime.*Url 之外的键）一律丢弃，避免配置文件被塞进任意内容。
+    const safe = filterKnown(DEFAULT_SETTINGS, patch);
+    const next = deepMerge(this.getSettings(), safe);
     // 只改了「资源策略」时，把它翻译成具体的三个开关，避免两套配置各说各话
-    if (patch && patch.engine && patch.engine.resourceMode) {
+    if (safe && safe.engine && safe.engine.resourceMode) {
       Object.assign(next.engine, resourcePreset(next.engine.resourceMode));
     }
     writeJson(SETTINGS_FILE, next);
@@ -223,11 +261,13 @@ const store = {
   },
 
   iconPath(pkg) {
-    return path.join(ICON_DIR, `${pkg}.png`);
+    // 包名来自 APK 清单（不受信任输入）。apk.js 已做白名单校验，这里再做一层
+    // 路径净化兜底：`..\..\` 这类构造最多变成一个奇怪的文件名，写不出目录外。
+    return path.join(ICON_DIR, `${safePathName(pkg)}.png`);
   },
 
   apkPath(pkg, version = 'cur') {
-    return path.join(APK_DIR, `${pkg}-${version}.apk`);
+    return path.join(APK_DIR, `${safePathName(pkg)}-${safePathName(version)}.apk`);
   },
 
   ensureDirs,

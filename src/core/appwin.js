@@ -220,13 +220,18 @@ class AppWindow {
       // eslint-disable-next-line no-await-in-loop
       const r = await this.agent.embed(hwnd, this._rect()).catch((e) => ({ ok: false, error: e.message }));
       last = r;
-      if (r && r.ok) return true;
+      if (r && r.ok) {
+        // SetParent 被 DPI 不一致拒绝时代理会降级为「窗口跟随」并置 follow=true
+        this.lastEmbedFollow = !!r.follow;
+        return true;
+      }
       // eslint-disable-next-line no-await-in-loop
       await sleep(attempt < 2 ? 300 : 800);
     }
     // 把失败原因带出去：上层会写进 app.log，出问题时一眼能看出是「没找到模拟器窗口」
     // 还是「SetParent 失败」，不用再靠猜。
     this.lastEmbedError = last ? (last.error || `emu=${last.emu}`) : 'no-response';
+    this.lastEmbedFollow = false;
     return false;
   }
 

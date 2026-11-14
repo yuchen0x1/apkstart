@@ -1201,7 +1201,9 @@ function bindSettings() {
   $('btnOpenData').addEventListener('click', async () => {
     const info = await api.info();
     const dir = info.runtimeDir || info.dataDir;
-    window.open(`file:///${dir.replace(/\\/g, '/')}`);
+    // 以前 window.open('file:///…')：setWindowOpenHandler 只放行 http(s)，
+    // 这个按钮点了永远没反应。改走专用的 openPath IPC。
+    await api.openPath(dir).catch(() => {});
   });
   $('btnBrowseRuntimeDir').addEventListener('click', async () => {
     const info = await api.info();
@@ -1231,7 +1233,7 @@ function bindSettings() {
     $('btnOpenAvdDir').addEventListener('click', async () => {
       const info = await api.dataInfo().catch(() => null);
       const dir = (info && info.avdDir) || (await api.info()).dataDir;
-      window.open(`file:///${String(dir).replace(/\\/g, '/')}`);
+      await api.openPath(String(dir)).catch(() => {});
     });
   }
 

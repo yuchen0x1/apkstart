@@ -10,6 +10,14 @@ const { ResTable } = require('./arsc');
 
 const LAUNCHER_ACTIONS = ['android.intent.action.MAIN'];
 const LAUNCHER_CATS = ['android.intent.category.LAUNCHER'];
+/**
+ * 合法包名：字母/数字/下划线的段，至少两段，段间用点分隔。
+ * 这道校验是安全闸门：包名会被拼进本机文件路径（图标、APK 备份）与设备端
+ * shell 命令，不校验的话，一个 `..\..\..\` 构造的 manifest 就能任意写文件。
+ * 比规范更宽（允许段首是数字）是因为个别真机 APK 就是这么签的；
+ * 关键是它排除了斜杠、反斜杠与空段（`..` 无法通过）。
+ */
+const PKG_RE = /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$/;
 
 function isLauncherActivity(node) {
   const filters = children(node, 'intent-filter');
@@ -34,7 +42,6 @@ function pickIconFromZip(zip) {
     if (/xxxhdpi/i.test(n)) s *= 1.6;
     else if (/xxhdpi/i.test(n)) s *= 1.4;
     else if (/xhdpi/i.test(n)) s *= 1.2;
-    if (/\//.test(n.split('/')[1] || '')) { /* noop */ }
     return { n, s };
   }).sort((a, b) => b.s - a.s);
   for (const c of scored.slice(0, 30)) {
@@ -137,6 +144,9 @@ function parseApkZip(zip, filePath, stat) {
   // attrValue 默认只认 android 命名空间，传 null 表示不限定命名空间。
   const packageName = attrValue(manifest, 'package', null);
   if (!packageName) throw new Error('清单中未找到 package 名');
+  if (!PKG_RE.test(String(packageName))) {
+    throw new Error(`APK 的包名不合法（含路径分隔符或非法字符），已拒绝安装：${String(packageName).slice(0, 80)}`);
+  }
 
   const versionName = attrValue(manifest, 'versionName') || '1.0';
   const versionCodeRaw = attrValue(manifest, 'versionCode');
