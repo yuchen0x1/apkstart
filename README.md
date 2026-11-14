@@ -18,7 +18,9 @@
 - 🧩 **每个应用一个桌面图标**：图标从 APK 内部离线提取并转为多尺寸 ICO，双击桌面图标 = 直接启动该应用，与打开一个原生 Windows 软件的体验一致。
 - 🪟 **应用就是一个窗口**：运行时以**带窗口**模式启动（无头模式下 Android 不出 VSYNC，应用进程活着但屏幕上是空的），ApkStart 把这块窗口改标题、换真实应用图标、按竖屏比例摆好位置，就是一个独立应用窗口；**全屏**铺满屏幕高度并居中，**窗口模式**可自由拖动缩放且按应用记忆尺寸。
 - 🔍 **能被 Windows 搜到**：安装后同时创建桌面 + 开始菜单（`程序\ApkStart\`）快捷方式，按应用名在开始菜单搜索即可直达，任务栏按应用分组。
-- 📁 **数据互通**：`%USERPROFILE%\ApkStartShared` ↔ 安卓内 `/sdcard/ApkStartShared` 持续双向同步，安卓应用存下的文件直接出现在本机。
+- 📁 **数据互通**：`%USERPROFILE%\ApkStartShared` ↔ 安卓内 `/sdcard/ApkStartShared` 持续双向同步，安卓应用存下的文件直接出现在本机。同步按内容哈希（SHA-256）做三方合并，两侧都改会保留两份并生成冲突副本，不会静默覆盖你的文件。
+- 🩺 **装之前先告诉你行不行**：选好 APK 后先做兼容性检查——系统版本够不够、原生库是 ARM 还是 x86（要不要走转译层）、是否依赖 Google Play 服务、是否要求摄像头/GPS/蓝牙、是不是拆分 APK 的分片。结论分「完全兼容 / 基本兼容 / 可能有问题 / 暂不支持」四档并给出理由；拿不准的标「未知」，不编结论。
+- 💾 **导出与备份**：右键任意应用可导出 APK，或生成一个含 `app.apk` + `meta.json` 的备份目录，之后能一键装回。应用私有数据只在应用允许 `run-as`（debuggable）时才会导出——普通应用拿不到就如实写明原因，不会用一个空包冒充「备份成功」。
 - 🪶 **极致轻量**：壳层本身零第三方依赖（连 ZIP / PNG / ICO / AXML 解析都是手写的），运行时按需拉起，空闲自动回收；也可以完全复用你机器上已有的安卓运行时，额外占用为零。
 
 ![主界面](docs/images/app.png)
@@ -198,8 +200,12 @@ apkstart/
 │     ├─ assoc.js          .apk 文件关联（HKCU，免管理员）
 │     ├─ adb.js            adb 客户端（安装/启动/同步/截图/…）
 │     ├─ engine.js         运行时管理：探测/模拟器托管/空闲回收
-│     ├─ sharer.js         本机 ↔ 安卓共享目录双向同步
+│     ├─ sharer.js         本机 ↔ 安卓共享目录双向同步（三方哈希合并）
 │     ├─ installer.js      安装流水线编排
+│     ├─ compat.js         安装前兼容性分析（SDK/ABI/GMS/硬件/拆分）
+│     ├─ backup.js         应用备份与恢复（APK 必得，数据看 run-as）
+│     ├─ ipcguard.js       IPC 调用来源校验（页面边界 + 主框架）
+│     ├─ updater.js        在线更新：校验/解压/替换/回滚
 │     └─ store.js          应用清单与设置持久化
 ├─ engine/                 运行时组件下载缓存（emulator / system-images / platform-tools）
 ├─ tools/platform-tools/   便携 adb 放置处
@@ -219,12 +225,19 @@ ApkStart.exe --launch <包名>      直接启动应用（桌面快捷方式使�
 ## 测试
 
 ```powershell
-npm test                                   # 纯 Node 单元测试 + 引擎链路测试（不需要网络）
+npm test                                   # 全部纯 Node 测试（不需要网络、不需要设备）
+npm run test:sync                          # 也可以单独跑：test:sync / test:updater /
+                                           # test:security / test:compat / test:backup
+npm run test:electron                      # 真实 Electron 冒烟：preload/沙箱/首屏渲染
+npm run test:app                           # 主进程自检：真实 IPC 通道 + 页面渲染
 npm run test:boot                          # 真实引导测试：用 61MB Alpine guest 验证 QEMU 参数/建盘/优雅关机
 npm run selftest                           # 运行时自检：装好 Android 后一键验证 安装→启动→截图→共享目录
 electron test/electron-integration.js      # ICO / 快捷方式集成测试
 electron . --smoke test\shot.png           # 启动应用并截图（界面冒烟）
 ```
+
+当前共 210 个自动化用例，覆盖：ZIP/AXML/ARSC/APK 解析、下载器分块与换源、更新器恶意包、
+共享目录双向同步与冲突、IPC 来源校验、兼容性判定、备份与恢复、日志滚动、快照指纹等。
 
 `npm run selftest` 是装好系统后的「验收命令」——它会对当前设备依次检查 adb 连接、
 Android 版本、freeform 支持、共享目录双向同步，加 `--apk 某应用.apk` 还会完整走一遍
@@ -246,6 +259,8 @@ Android 版本、freeform 支持、共享目录双向同步，加 `--apk 某应�
 
 - 原项目：[RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart)（感谢原作者的出色工作）
 - 本分支新增/修复内容见 [CHANGELOG.md](CHANGELOG.md)；应用内「设置 → 更新日志」也会展示
+- 安全边界与威胁模型见 [SECURITY.md](SECURITY.md)，测试怎么跑见 [docs/TESTING.md](docs/TESTING.md)，
+  本次升级的完整验收记录见 [docs/UPGRADE-REPORT.md](docs/UPGRADE-REPORT.md)
 - **问题与建议请提 [Issue](https://github.com/yuchen0x1/apkstart/issues)**，会尽快跟进
 
 ## 参与贡献

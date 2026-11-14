@@ -7,11 +7,59 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 ## [Unreleased]
 
+## [0.4.0] — 稳定性 · 安全 · 兼容性大版本
+
+这一版没有新功能噱头：把「会丢数据」「会被绕过」「已经过期」的三类问题先解决掉。
+同步改为哈希三方合并、更新器补上路径穿越与回滚、渲染进程开启沙箱、Electron 33 升到 45。
+
+### 新增
+- **安装前兼容性检查**：选好 APK 后、真正安装之前，先按清单里能确定的事实给出结论
+  （完全兼容 / 基本兼容 / 可能有问题 / 暂不支持），并列出具体理由：minSdk 是否超过运行时、
+  targetSdk 是否过老、原生库架构（ARM64 / ARM32 / x86 / x86_64）能否直接执行或要走 ARM 转译层、
+  是否依赖 Google Play 服务、是否要求摄像头/GPS/蓝牙等桌面没有的硬件、是不是拆分 APK 的分片。
+  判定为「可能有问题 / 暂不支持」时会先问一句再装，不会装完才发现打不开。
+  解析不到的信息一律标为未知，不猜结论。新模块 `src/core/compat.js`，19 个用例覆盖。
+- **APK 导出与应用备份**：右键应用可「导出 APK…」到任意位置，或「备份应用…」生成一个
+  含 `app.apk` + `meta.json` 的备份目录；「从备份恢复…」可重新装回。
+  应用私有数据只在应用允许 `run-as`（debuggable）时才会导出成 `data.tar`；
+  普通应用拿不到数据时会明确写出原因（`data-skip.txt`），**不会生成一个空包冒充备份成功**。
+  新模块 `src/core/backup.js`，11 个用例覆盖（含命令构造与恢复分支）。
+- **无人值守自检**：`APKSTART_SELFTEST=1` 启动后自动体检主窗口（preload 是否注入、
+  IPC 是否真通、页面有无脚本错误）并落一份 JSON，供 CI 与打包产物验收使用。
+
+### 安全
+- **渲染进程开启 sandbox**：主窗口与应用窗口都从 `sandbox: false` 改为 `true`。
+  preload 只依赖 `electron` 的 contextBridge/ipcRenderer/webUtils，沙箱下依然可用
+  （已用真实渲染进程验证 81 个接口全部正常）。
+- **IPC 统一来源校验**：90 多个通道在注册前统一包一层，只接受「主框架 + 页面位于
+  src 目录内」的调用；iframe 冒充、页面被导航到外部站点后发起的调用一律拒绝。
+  路径判定用 `path.relative` 做真实边界比较，不用 `startsWith`（`C:\app-evil` 也以
+  `C:\app` 开头，是典型绕过）。新模块 `src/core/ipcguard.js`，11 个用例覆盖。
+- **更新器加固**（`src/core/updater.js` + `src/core/zip.js`）：解压前逐条校验条目路径
+  （拒绝 `../` 穿越、绝对路径、盘符、UNC、符号链接条目）、按 CRC 与声明大小校验内容、
+  下载后核对大小并计算 SHA-256、解压后检查载荷确实是 ApkStart（有主程序 + resources），
+  替换前备份将被覆盖的文件、失败自动回滚。16 个用例用真实恶意 ZIP 字节流验证。
+- **共享目录同步重写**（`src/core/sharer.js`）：不再用「大小 + 修改时间 + 历史方向」判断一致，
+  改为记录 base/local/remote 三份 SHA-256 做三方合并；两侧都改且内容不同时保留两份并生成
+  冲突副本，绝不静默覆盖；写入走临时文件 + 原子替换；删除同步默认关闭，开启后也只移进回收目录。
+  26 个用例覆盖，包括「Windows 上传过的文件在 Android 改（大小不变）必须同步回来」这条回归。
+
+### 变更
+- **Electron 33 → 45.3.2**（Chromium 156 / Node 24）：33 已于 2025-04 结束支持，
+  当前受支持的是 43/44/45 三个大版本。升级后 `console-message` 事件改用新的单参数事件对象。
+  原生模块 `@napi-rs/lzma`（N-API）在 Electron 45 下加载正常。
+- 项目元数据统一指向 `yuchen0x1/apkstart`（下载器 User-Agent、CHANGELOG 链接、状态栏链接、
+  安装包版权信息）；原作者的署名与 MIT 许可证保留在 LICENSE、About 页与 `contributors` 字段。
+
 ### 修复
 - **应用窗口关闭不彻底**（对齐上游 v0.3.7 的修复）：应用窗口右上角 ⨯ 之前直接调用
   Electron 原生 win.close()，绕过 AppWindow.close() 的收尾逻辑——安卓应用留在后台跑、
   模拟器窗口被重新挂回桌面；Alt+F4 / 任务栏关闭 / 系统关机路径同样受影响。
   现在 ⨯ 与 'closed' 事件都走完整收尾（摘下并藏好模拟器窗口 + force-stop 安卓应用）。
+- **新文件不再白等一轮**：共享目录里刚出现的文件第一轮就会同步；
+  只有「已同步过、又在毫秒内被改写」的文件才会本轮跳过（避免把半截内容当成新版本传出去）。
+- **远端文件列表兼容两种 stat 输出**：`mtime|ctime|size|name` 与老的 `size|mtime|name`
+  都能解析，不同 ROM 的 toybox/busybox 排版差异不再导致「设备被当成空目录」。
 
 ## [0.3.9] — 代理接入 + 更新源指向本仓库 + 界面精简
 
@@ -129,14 +177,15 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
-[Unreleased]: https://github.com/RoutineMiku/apkstart/compare/v0.3.7...HEAD
-[0.3.7]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.3.7
-[0.3.6]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.3.6
-[0.3.5]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.3.5
-[0.3.4]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.3.4
-[0.3.3]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.3.3
-[0.3.2]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.3.2
-[0.3.1]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.3.1
-[0.3.0]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.3.0
-[0.2.8]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.2.8
-[0.2.7]: https://github.com/RoutineMiku/apkstart/releases/tag/v0.2.7
+[Unreleased]: https://github.com/yuchen0x1/apkstart/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.4.0
+[0.3.7]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.7
+[0.3.6]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.6
+[0.3.5]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.5
+[0.3.4]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.4
+[0.3.3]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.3
+[0.3.2]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.2
+[0.3.1]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.1
+[0.3.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.0
+[0.2.8]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.2.8
+[0.2.7]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.2.7
