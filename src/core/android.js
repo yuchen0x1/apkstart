@@ -18,6 +18,21 @@ const ACTIONS = {
   dev: 'android.settings.APPLICATION_DEVELOPMENT_SETTINGS',
 };
 
+/**
+ * 解析 `cmd media_session volume --stream 3 --get` 的输出。
+ * Android 11+ 移除了旧的 `media` 工具（报错 media: inaccessible or not found），
+ * 替代命令的输出里带「当前音量 / 上限」两个数字（上限通常 15，不同设备可能不同）。
+ * 输出格式没有稳定文档，防御式解析：取输出里前两个整数，第二个 ≥ 第一个才算数。
+ * @returns {{cur:number, max:number}|null} 解析不出就返回 null（调用方回退 dumpsys）
+ */
+function parseVolumeGet(text) {
+  const ints = [...String(text || '').matchAll(/\d+/g)].map(Number);
+  if (ints.length < 2) return null;
+  const [cur, max] = ints;
+  if (!Number.isFinite(cur) || !Number.isFinite(max) || max <= 0 || cur > max) return null;
+  return { cur, max };
+}
+
 class AndroidSettings {
   constructor(runtime) { this.runtime = runtime; }
 
@@ -42,6 +57,8 @@ class AndroidSettings {
       'echo "density=$(wm density | tail -n1 | tr -dc \'0-9\')"',
       'echo "animw=$(settings get global window_animation_scale)"',
       'echo "sdk=$(getprop ro.build.version.sdk)"',
+      // Android 11+ 移除了 media 工具，音量统一走 cmd media_session（见 setVolume 注释）
+      'echo "volget=$(cmd media_session volume --stream 3 --get 2>/dev/null)"',
       'echo "vol=$(dumpsys audio | grep -m1 -A3 STREAM_MUSIC | grep -o \'streamVolume:[0-9]*\' | head -1 | cut -d: -f2)"',
     ]);
     const get = (k) => {
@@ -49,12 +66,21 @@ class AndroidSettings {
       return m ? m[1].trim() : '';
     };
     const anim = get('animw');
+    // 音量统一归一成 0-100 的百分比（UI 滑杆就是百分比）：media_session 的输出是
+    // 「当前/上限」两个数字（上限通常 15），旧版直接把 0-15 的索引当百分比显示。
+    const vg = parseVolumeGet(get('volget'));
+    let volume = 0;
+    if (vg) volume = Math.round((vg.cur / vg.max) * 100);
+    else {
+      const raw = Number(get('vol')) || 0;
+      volume = Math.min(100, Math.round((raw / 15) * 100));
+    }
     return {
       wifi: get('wifi') === '1',
       airplane: get('air') === '1',
       fontScale: Number(get('font')) || 1,
       density: Number(get('density')) || 0,
-      volume: Number(get('vol')) || 0,
+      volume,
       animationsOff: anim === '0.0' || anim === '0',
       sdk: Number(get('sdk')) || 0,
     };
@@ -76,9 +102,20 @@ class AndroidSettings {
     return { ok: true };
   }
 
+  /**
+   * 设置媒体音量（UI 传百分比 0-100）。
+   * 旧实现 `media volume --stream 3 --set N` 在 Android 11+ 直接报错
+   * 「media: inaccessible or not found」（issue #33），改用替代命令
+   * `cmd media_session volume`，并把百分比对齐到设备的真实音量档位
+   * （--set 的取值是 0..上限，上限从 --get 解析，拿不到就按常见的 15 档处理）。
+   */
   async setVolume(percent) {
     const v = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
-    await this._sh([`media volume --stream 3 --set ${v}`]);
+    const out = await this._sh(['cmd media_session volume --stream 3 --get']);
+    const vg = parseVolumeGet(out);
+    const max = vg ? vg.max : 15;
+    const target = Math.max(0, Math.min(max, Math.round((v / 100) * max)));
+    await this._sh([`cmd media_session volume --stream 3 --set ${target}`]);
     return { ok: true, volume: v };
   }
 
@@ -156,4 +193,4 @@ class AndroidSettings {
   }
 }
 
-module.exports = { AndroidSettings, ACTIONS };
+module.exports = { AndroidSettings, ACTIONS, parseVolumeGet };

@@ -68,6 +68,7 @@ public class ApkAgent
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr h);
     [DllImport("user32.dll")] static extern bool AreDpiAwarenessContextsEqual(IntPtr a, IntPtr b);
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
@@ -437,6 +438,10 @@ public class ApkAgent
         HideToolWindows();
         HideConsoleWindows();
         if (!ours && e != IntPtr.Zero) _bootHideUntil = Environment.TickCount + 5000;
+        // issue #34：embed 几秒后 Chromium 重绘会把自己排回子窗口最上层，把模拟器压到
+        // z 序底部 —— 画面透得出来但 WindowFromPoint 命中的是渲染层，点击全部丢失。
+        // 已在最上层时 GW_HWNDPREV 返回 0、SetWindowPos 是空操作，每轮抬一次代价可忽略。
+        if (embedded && _emu != IntPtr.Zero && GetWindow(_emu, 3u) != IntPtr.Zero) Raise();
     }
 
     // Only our own runtime counts. The old version returned true for ANY process named
@@ -496,7 +501,11 @@ public class ApkAgent
 
     // HWND_TOP: Chromium 的渲染子窗口和模拟器是同级的子窗口，
     // 不主动抬到最前就会被 Chromium 那块黑底盖住（用户看到的就是黑屏）。
-    static readonly IntPtr HWND_TOP = new IntPtr(1);
+    // 注意 Win32 的真实取值：HWND_TOP=0、HWND_BOTTOM=1、HWND_TOPMOST=-1。
+    // 旧版写成 new IntPtr(1) 实际是 HWND_BOTTOM —— 每次 Fit/Raise 都把模拟器
+    // 压到宿主子窗口的最底层，Chromium 渲染层在最上面把点击全部吃掉，
+    // 画面能透出来但鼠标点不动（issue #34/#32/#33，实测修复前后对比齐全）。
+    static readonly IntPtr HWND_TOP = new IntPtr(0);
     static void Fit(int x, int y, int w, int h, bool frame)
     {
         if (_emu == IntPtr.Zero) return;

@@ -180,5 +180,27 @@ console.log('\n[合成 APK：axml + apk 全链路]');
   }
 }
 
+/* ---------------- android.js：音量输出解析（#33 回归） ---------------- */
+console.log('[android.js]');
+const { parseVolumeGet } = require('../src/core/android');
+test('media_session volume --get 输出解析出「当前/上限」', () => {
+  assert(JSON.stringify(parseVolumeGet('volume: 8/15')) === '{"cur":8,"max":15}', '8/15 形式');
+  assert(JSON.stringify(parseVolumeGet('Volume: 8 of 15 on stream 3')) === '{"cur":8,"max":15}', 'of 形式（后面的 stream 3 不参与）');
+  assert(JSON.stringify(parseVolumeGet('15 (max 15)')) === '{"cur":15,"max":15}', '最大档');
+});
+test('旧 media 工具的报错 / 单数字 / 异常输出都解析为 null', () => {
+  assert(parseVolumeGet('media: inaccessible or not found') === null, 'Android 11+ 报错必须回退 dumpsys');
+  assert(parseVolumeGet('') === null, '空输出');
+  assert(parseVolumeGet('5') === null, '只有一个数字无法判定上限');
+  assert(parseVolumeGet('12 4') === null, '当前比上限还大 = 输出不像音量信息');
+});
+test('音量百分比换算：0-15 档映射到 0-100', () => {
+  const vg = parseVolumeGet('volume: 8/15');
+  const percent = Math.round((vg.cur / vg.max) * 100);
+  assert(percent === 53, `8/15 应约为 53%，得到 ${percent}`);
+  const maxed = parseVolumeGet('volume: 15/15');
+  assert(Math.round((maxed.cur / maxed.max) * 100) === 100, '满档应为 100%');
+});
+
 console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
 process.exit(failed ? 1 : 0);
