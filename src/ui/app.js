@@ -373,16 +373,43 @@ function updateStepProgress(component, p) {
   }
 }
 
+/**
+ * 部署实时日志：把 provision:progress 的每一步都落成一行（带时间戳），
+ * 让用户清楚看见「在下载、在流动、在干活」——测速、下载速度、解压进度、
+ * 换源/慢速逃生全部可见，而不是只盯着一条百分比。
+ */
+function appendDeployLog(p) {
+  const box = $('deployLog');
+  const wrap = $('deployLogWrap');
+  if (!box || !wrap) return;
+  const msg = String((p && p.message) || '').trim();
+  if (!msg) return;
+  const line = document.createElement('div');
+  line.className = 'dl-line';
+  if (p && p.stage === 'done') line.classList.add('ok');
+  if (p && p.stage === 'error') line.classList.add('err');
+  const t = new Date().toTimeString().slice(0, 8);
+  line.textContent = `[${t}] ${msg}`;
+  box.appendChild(line);
+  // 长会话防膨胀：最多保留 400 行
+  while (box.children.length > 400) box.removeChild(box.firstChild);
+  wrap.hidden = false;
+  box.scrollTop = box.scrollHeight;
+}
+
 async function deployAll() {
   if (state.setupBusy) return;
   setStepBusy('all', true);
+  appendDeployLog({ stage: 'info', message: '—— 开始部署运行时（手动触发）——' });
   try {
     // 一次调用把 adb / 引擎 / 系统镜像全装完，进度统一显示在唯一那一行
     const r = await api.autoDeploy();
     if (!r || !r.ok) {
+      appendDeployLog({ stage: 'error', message: `部署失败：${(r && r.error) || '请检查网络后重试'}` });
       toast({ title: '准备失败', body: (r && r.error) || '请检查网络后重试', type: 'error', sticky: true });
       return;
     }
+    appendDeployLog({ stage: 'done', message: '运行时组件部署完成' });
     await refreshStatus();
     toast({ title: '组件已就绪，正在自动开机…', body: '首次约 1-3 分钟，之后几秒即可。', type: 'info' });
     const started = await api.runtimeStart();
@@ -1334,6 +1361,8 @@ function bindEvents() {
 
   // 运行时部署：入口已收进设置，这里只处理面板内的按钮
   $('btnDeployAll').addEventListener('click', deployAll);
+  const clr = $('btnClearDeployLog');
+  if (clr) clr.addEventListener('click', () => { const b = $('deployLog'); if (b) b.innerHTML = ''; });
   $('btnMarkInstalled').addEventListener('click', markInstalled);
   $('btnGuideClose').addEventListener('click', () => { $('setupGuide').hidden = true; });
   $('btnSetupAdvanced').addEventListener('click', () => {
@@ -1496,7 +1525,7 @@ function bindEvents() {
     if (v === 'settings') openSettings();
     if (v === 'setup') { showSetup(true); refreshStatus(); }
   });
-  api.on('provision:progress', (p) => updateStepProgress(p.component, p));
+  api.on('provision:progress', (p) => { updateStepProgress(p.component, p); appendDeployLog(p); });
   api.on('update:state', (info) => { if (info) renderUpdate(info); });
   api.on('update:progress', (p) => renderUpdateProgress(p));
 }

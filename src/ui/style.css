@@ -865,3 +865,17 @@ kbd {
 
 /* 更新日志完整展示（发布说明原文，可滚动） */
 #updateNote.notes { display: block; max-height: 240px; overflow: auto; white-space: pre-wrap; }
+
+/* ---------- 部署实时日志 ---------- */
+.deploy-log-wrap { margin: 10px 0 4px; border: 1px solid var(--line, #e4e9ee); border-radius: 10px; overflow: hidden; }
+.deploy-log-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: var(--bg, #f6f8fa); border-bottom: 1px solid var(--line, #e4e9ee); }
+.deploy-log-title { font-size: 12px; font-weight: 650; }
+.deploy-log {
+  max-height: 190px; overflow-y: auto; padding: 8px 10px;
+  background: #0b0d10; color: #b8c7d6;
+  font: 11.5px/1.75 Consolas, 'Courier New', monospace;
+  white-space: pre-wrap; word-break: break-all;
+}
+.deploy-log .dl-t { color: #5f7080; margin-right: 6px; }
+.deploy-log .dl-line.ok { color: #7ddc9a; }
+.deploy-log .dl-line.err { color: #ff9d9d; }

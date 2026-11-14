@@ -426,6 +426,18 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
   });
 
   await test('未安装系统时 ensure 返回 needsSetup', async () => {
+    // 本测试假设「宿主机上没有真实模拟器」：ensure 会尝试接管 5554-5620 端口上的
+    // 存活实例（adoptExisting），开发机自己跑着 ApkStart 时这个前提不成立（实测踩过
+    // ——本机刚部署完自动开机，测试立刻挂）。检测到真实模拟器就跳过。
+    const portAlive = await new Promise((resolve) => {
+      const sock = net.connect({ host: '127.0.0.1', port: 5554 });
+      let done = false;
+      const fin = (v) => { if (done) return; done = true; try { sock.destroy(); } catch (_) { /* ignore */ } resolve(v); };
+      sock.setTimeout(200, () => fin(false));
+      sock.once('connect', () => fin(true));
+      sock.once('error', () => fin(false));
+    });
+    if (portAlive) { results.push('  ↷ 跳过：本机 5554 端口有真实模拟器在跑（ensure 会接管它）'); passed += 1; return; }
     store.saveSettings({ runtime: { installed: false }, engine: { mode: 'builtin' } });
     const rt = new Runtime(TMP);
     // 用假 adb 保证 isOnline 快速失败

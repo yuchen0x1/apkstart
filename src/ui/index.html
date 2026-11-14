@@ -185,6 +185,16 @@
         </div>
         <div id="envCheck" class="env-check" hidden></div>
 
+        <!-- 部署实时日志：测速 / 下载 / 解压 / 换源每一步都落一行，看得见「在流动、在干活」 -->
+        <div id="deployLogWrap" class="deploy-log-wrap" hidden>
+          <div class="deploy-log-head">
+            <span class="deploy-log-title">部署日志</span>
+            <span class="sub" style="flex:1">测速 / 下载 / 解压 / 换源，每一步实时滚动</span>
+            <button class="btn ghost sm" id="btnClearDeployLog">清空</button>
+          </div>
+          <div class="deploy-log" id="deployLog"></div>
+        </div>
+
         <div class="setup-guide" id="setupGuide" hidden>
           <h2>安装 Android 到虚拟磁盘</h2>
           <p class="guide-sub">虚拟机窗口已打开。按下面 6 步操作一次，之后 ApkStart 会直接从磁盘启动，不再需要镜像。</p>
