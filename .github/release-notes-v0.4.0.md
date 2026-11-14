@@ -81,8 +81,12 @@ iframe 冒充、页面被导航到外部站点后发起的调用一律拒绝。
 ## 五、下载
 
 - **`ApkStart-0.4.0-Setup.exe`**：完整版，内置全部运行时（emulator + platform-tools + Android 镜像），装完离线可用。
-- **`ApkStart-v0.4.0-win64-portable.zip`**：轻量便携版，解压即用，首次启动在后台下载运行时。
+- **`ApkStart-v0.4.0-win64-portable.zip`**：轻量便携版（约 141 MB），解压即用，首次启动在后台下载运行时。
 - **`ApkStart-runtime-v0.4.0.zip`**：运行时整包（轻量版的下载源，也可手动解压到程序目录旁的 `runtime/`）。
+
+> 便携包这版涨到约 141 MB：Electron 45 的壳层本身从 225 MB 长到 327 MB（`electron.exe` 单文件 238 MB），
+> 不是往里塞了新东西。这个体积超过 Gitee 附件单文件上限，所以 **v0.4.0 只发 GitHub**，
+> 不再放 Gitee 镜像（应用内更新从 v0.3.9 起就只认 GitHub，升级链路不受影响）。
 
 ## 六、还没验证的部分（不当作已支持）
 

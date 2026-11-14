@@ -50,6 +50,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
   原生模块 `@napi-rs/lzma`（N-API）在 Electron 45 下加载正常。
 - 项目元数据统一指向 `yuchen0x1/apkstart`（下载器 User-Agent、CHANGELOG 链接、状态栏链接、
   安装包版权信息）；原作者的署名与 MIT 许可证保留在 LICENSE、About 页与 `contributors` 字段。
+- **发版流水线随体积调整**：Electron 45 的壳层压后约 141 MB（上一版 99.6 MB），
+  便携包体积闸门从 100 MiB 调到 160 MiB；超过 Gitee 单文件上限时明确跳过 Gitee 同步，
+  不再产出需要手工拼接的 `.part1/.part2`。应用内更新只认 GitHub，不受影响。
 
 ### 修复
 - **应用窗口关闭不彻底**（对齐上游 v0.3.7 的修复）：应用窗口右上角 ⨯ 之前直接调用
