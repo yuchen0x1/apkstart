@@ -59,7 +59,18 @@ class EmulatorEngine {
     // 快照的 ram.bin ≈ 分配给虚拟机的内存（2-4GB）。
     // 冷启动本来就快的机器不该为它付出几个 GB 的磁盘，只在「真慢」时才保存。
     this.snapshotWorthSaving = null;
+    // 「下一次启动强制 -wipe-data」的一次性标记：只由「修复网络」设置。
+    this._forceWipe = false;
   }
+
+  /**
+   * 让「下一次启动」带上 -wipe-data（仅「修复网络」在等待超时后使用）。
+   *
+   * 实测：这个 Android 镜像的 Wi-Fi，在已有用户数据上冷启时经常一直
+   * NO-CARRIER、拿不到 IP；而重置数据后的那次开机是能连上的。
+   * 注意「删掉 userdata 镜像文件」与 emulator 的 `-wipe-data` 并不等价，必须走后者。
+   */
+  forceWipeOnNextStart() { this._forceWipe = true; }
 
   log(line) {
     this._log.push({ t: Date.now(), line });
@@ -373,7 +384,10 @@ class EmulatorEngine {
       'hw.camera.back=none',
       'hw.camera.front=none',
       'hw.gps=no',
-      'hw.sensors.orientation=no',
+      // 方向/加速度传感器必须开：关掉之后安卓拒绝旋转，横竖屏只能靠"转画面"糊弄，
+      // 表现就是画面躺倒、排版不变。开了才能用 wm size 做真正的手机/平板排版切换。
+      'hw.sensors.orientation=yes',
+      'hw.sensors.accelerometer=yes',
     ].join('\n') + '\n';
     fs.writeFileSync(cfgPath, cfg);
 
@@ -559,7 +573,16 @@ class EmulatorEngine {
     // 但退出时照常把内存状态写成 apkstart，下次就直接恢复。
     // 快照要占一份约 2~3GB 的 ram.bin（磁盘紧张的用户可以关掉，只影响启动速度）
     const wantSnapshot = this.settings?.engine?.keepSnapshot !== false;
-    if (wipe || !wantSnapshot) {
+    if (wipe) {
+      // 重置数据时不能加载旧快照（数据都对不上了），但**必须允许保存新快照**：
+      // 修复网络就是靠「重置后第一次开机有网 → 立刻存快照 → 下次恢复」这条链路。
+      // 老写法这里推的是 -no-snapshot，会把保存一起关掉，快照永远存不下来。
+      // 只给 -no-snapshot-load 的话，保存会落到 emulator 的默认快照名 default_boot，
+      // 下次按 -snapshot apkstart 找又找不到 —— 等于白存一次，还得再冷启一遍。
+      // 所以这里连快照名一起给：不强求加载，但存就存到 apkstart 里。
+      if (!wantSnapshot) args.push('-no-snapshot');
+      else args.push('-snapshot', SNAPSHOT_NAME, '-no-snapshot-load');
+    } else if (!wantSnapshot) {
       args.push('-no-snapshot');
     } else if (snapshot !== false) {
       args.push('-snapshot', SNAPSHOT_NAME);
@@ -775,6 +798,72 @@ class EmulatorEngine {
   }
 
   /**
+   * 体检虚拟机内是否真的能联网。
+   *
+   * 为什么需要这一步：安卓虚拟机的 Wi-Fi 配置存在 /data 里，一旦写坏（典型表现是
+   * `cmd wifi list-networks` 里同一个 AndroidWifi 出现两条、网络 id 撞车），
+   * wlan0 就会一直 NO-CARRIER、拿不到 IP。这时「需要联网的页面」在应用里就是一块
+   * 黑屏 —— 用户看到的「红果点同意后黑屏」就是这么来的，跟 GPU/渲染完全无关。
+   *
+   * @param {string} [adbPath] 显式指定 adb 可执行文件（Runtime 有更权威的解析）
+   * @returns {Promise<{ok:boolean, reason:string, gateway?:string, ip?:string}>}
+   */
+  async checkNetwork(adbPath = '', { waitMs = 0, interval = 3000 } = {}) {
+    let adb = adbPath || '';
+    if (!adb) {
+      try { adb = this.provisioner.adbVersionPath() || ''; } catch (_) { adb = ''; }
+    }
+    if (!adb) {
+      // adbVersionPath() 只查「版本文件」，很多安装形态下是空的；
+      // 直接按运行时根目录找 bundled 的 platform-tools 才稳。
+      try { adb = path.join(this.locate().root, 'platform-tools', 'adb.exe'); } catch (_) { adb = ''; }
+    }
+    if (!adb || !fs.existsSync(adb)) adb = 'adb';
+    const port = Number(process.env.ANDROID_ADB_SERVER_PORT) || this.adbPort || 5044;
+    const env = { ...process.env, ANDROID_ADB_SERVER_PORT: String(port) };
+    const sh = (cmd, timeout = 8000) => new Promise((resolve) => {
+      try {
+        execFile(adb, ['-s', this.serial, 'shell', cmd], { timeout, windowsHide: true, env }, (e, out) => {
+          resolve(e ? '' : String(out || ''));
+        });
+      } catch (_) { resolve(''); }
+    });
+    // 安卓的多路由表会让 `ip route` 的主表看起来是空的（默认路由在 per-interface 表里），
+    // 而且 shell 的 uid 不在应用的 network 组里，`ping` 经常误报 "Network is unreachable"，
+    // 哪怕 Wi-Fi 其实已经连上、应用也能正常上网。所以这里只认「有没有拿到 IPv4 地址」，
+    // 再叠加 `cmd wifi status` 的连接状态做交叉确认，不用 ping 判断。
+    const addr = await sh('ip -o addr');
+    const ips = [];
+    const re = /inet ((?:\d{1,3}\.){3}\d{1,3})\//g;
+    let m = re.exec(addr);
+    while (m) {
+      const ip = m[1];
+      if (!/^127\./.test(ip)) ips.push(ip);
+      m = re.exec(addr);
+    }
+    const wifi = await sh('cmd wifi status');
+    const connected = /Wifi is connected/i.test(wifi);
+    if (!ips.length) {
+      // Wi-Fi 关联 + DHCP 往往比 sys.boot_completed 晚几十秒才完成。
+      // 调用方给了 waitMs 就继续等，不要在这一刻就断定「没有网络」。
+      if (waitMs > 0) {
+        const t0 = Date.now();
+        while (Date.now() - t0 < waitMs) {
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((r) => setTimeout(r, interval));
+          // eslint-disable-next-line no-await-in-loop
+          const again = await this.checkNetwork(adbPath, { waitMs: 0 });
+          if (again.ok) return again;
+        }
+      }
+      return { ok: false, reason: connected ? 'no-ip-address' : 'wifi-not-connected', addrs: ips };
+    }
+    const ip = ips[0];
+    const gw = /^10\.0\.2\./.test(ip) ? '10.0.2.2' : ip.replace(/\.\d+$/, '.1');
+    return { ok: true, reason: '', gateway: gw, ip, wifiConnected: connected };
+  }
+
+  /**
    * 启动 + 自动重试。
    * @param {Function} probe 异步回调，返回 'ok' | 'pending' | 'fatal'
    */
@@ -839,9 +928,11 @@ class EmulatorEngine {
     });
     this.profile = profile;
     // 嵌入 Electron 的可见窗口会经历跨进程 SetParent、失焦和 DWM 重绘；
-    // 这类场景下 host/swangle 的交换链可能在失焦后丢失，表现为「安卓仍在跑，窗口全黑」。
-    // 可见模式优先使用 emulator 自己的 software 后端；它仍可保留 WHPX 加速，
-    // 只是把 guest GLES 的呈现改为稳定的 SwiftShader 路径。
+    // 这类场景下 host 的交换链可能在失焦后丢失，表现为「安卓仍在跑，窗口全黑」。
+    // 可见模式因此把软件渲染提到前面，但优先 swangle（ANGLE + SwiftShader）而不是
+    // 裸 software：swangle 同样不依赖显卡交换链，合成路径对 WebView 友好得多，
+    // 而裸 software 会让「点同意进主界面」这种 WebView 重合成场景黑屏。
+    // 两者都仍可保留 WHPX 加速，只是把 guest GLES 的呈现改走 SwiftShader 路径。
     const variants = doctor.planVariants(profile, { preferSoftware: !headless }).slice(0, maxAttempts);
 
     // 记住「上次拉起就崩」的 GPU 后端，下次把它排到最后。
@@ -875,6 +966,12 @@ class EmulatorEngine {
     // eslint-disable-next-line no-await-in-loop
     await this.killOrphanProcesses({ onLog }).catch(() => {});
 
+    // 「修复网络」要求抹掉用户数据。这个标记只对本次 start() 有效：
+    // 在循环外取快照并立刻清掉一次性标记，既保证重试轮次仍然带着 -wipe-data，
+    // 又保证用户下次正常点开应用时绝不会莫名其妙被清数据。
+    const forceWipe = !!this._forceWipe;
+    this._forceWipe = false;
+
     for (let i = 0; i < variants.length; i += 1) {
       const base = variants[i];
       // 端口占用也会导致失败，每次重试重新探测一次
@@ -892,7 +989,9 @@ class EmulatorEngine {
       // eslint-disable-next-line no-await-in-loop
       const avd = this.ensureAvd({
         ...plan,
-        wipe: plan.wipe || !!this.wipePending,
+        // forceWipe 也要参与「删旧快照」：重置数据后旧快照必然加载失败
+        // （实测报 Failed to load snapshot 后退回冷启动），必须先清掉再重建。
+        wipe: plan.wipe || !!this.wipePending || forceWipe,
       });
       // 埋点：上层（main）用它在拉起模拟器**之前**打开黑窗压制。
       // 控制台窗口在 spawn 之后几十毫秒就冒出来，事后再补一次扫描必然闪一下，
@@ -902,8 +1001,7 @@ class EmulatorEngine {
         try { await this.onBeforeSpawn(); } catch (_) { /* ignore */ }
       }
       // eslint-disable-next-line no-await-in-loop
-      this.spawnOnce({ ...plan, wipe: plan.wipe || avd.wipePending }, { headless, onLog, logFile });
-
+      this.spawnOnce({ ...plan, wipe: plan.wipe || avd.wipePending || forceWipe }, { headless, onLog, logFile });
       // 参数错误 / DLL 缺失会立刻退出
       // eslint-disable-next-line no-await-in-loop
       const dead = await this._waitSpawnSettled(2200);
@@ -983,9 +1081,17 @@ class EmulatorEngine {
         // 装完新应用时 installer 会作废快照，避免"重启后应用消失"。
         this.snapshotWorthSaving = true;
         onLog(`运行时就绪（${Math.round(bootMs / 1000)}s，${plan.label}）`);
+        // 开机成功不等于能用：顺手体检网络。虚拟机没网时，需要联网的页面会一直黑屏，
+        // 用户只会说「这个应用黑屏」，很难联想到是网络。这里主动查一次并说清楚。
+        let network = null;
+        try { network = await this.checkNetwork(); } catch (_) { /* 体检失败不算启动失败 */ }
+        if (network && !network.ok) {
+          onLog('⚠ 安卓虚拟机当前没有网络：需要联网的应用（如短剧类）打开后会一直黑屏。'
+            + '可在「设置 → 修复网络」重置安卓数据来修（应用清单会保留，点开时会自动重装）。');
+        }
         return {
           ok: true, serial: this.serial, port, accel: accelInfo, logFile,
-          profile, attempts: this.attempts, bootMs, quickBoot: true,
+          profile, attempts: this.attempts, bootMs, quickBoot: true, network,
         };
       }
 

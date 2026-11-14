@@ -422,6 +422,19 @@ class Installer {
     }
     // 分辨率要在拉起应用之前改，避免 wm size 触发配置变更把刚启动的 Activity 重建
     if (beforeStart) await beforeStart(rt).catch((e) => onLog(`显示适配跳过：${e.message}`));
+    // 拉起来之前先看一眼网络：**只等，不重启**。
+    // 冷启动时 Wi-Fi 关联往往比 sys.boot_completed 晚几十秒，而短剧类应用一进去就拉
+    // 首页数据，没网时首页渲染成整块黑底 —— 这就是「点同意并继续后一直黑屏」的真正原因。
+    // 但启动路径上绝不能做破坏性动作（以前这里调过带冷启动重试的版本，结果 adb 设备
+    // 在安装途中消失，直接变成「应用打不开」）：等不到就先启动，大不了页面稍后加载。
+    if (rt.engine === 'emulator' || rt.engine === 'builtin') {
+      const net = await this.runtime.waitForNetwork({ onLog, timeoutMs: 20000 }).catch(() => null);
+      if (net && net.ok) {
+        onLog(`虚拟机网络就绪（${net.ip || ''}）`);
+      } else {
+        onLog('虚拟机网络还没就绪，先启动应用（联网页面可能稍后才加载出来）');
+      }
+    }
     const settings = store.getSettings();
     const start = () => rt.client.startApp(app ? app.package : pkg, app ? app.activity : null, {
       freeform: settings.freeform,

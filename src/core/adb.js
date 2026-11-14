@@ -817,25 +817,27 @@ class AdbClient {
   async keyForward() { return this._key(125); }
 
   /**
-   * 横竖屏切换。
-   * 不用 Ctrl+←（那是模拟器窗口的 Qt 快捷键，需要键盘焦点落在模拟器上，
-   * 而用户点的是 ApkStart 标题栏上的旋转按钮，焦点在网页层，按键根本传不过去），
-   * 直接走模拟器控制台命令，模拟器会自己把 LCD 转过来并调整窗口比例。
-   */
-  /**
-   * 横竖屏切换。
-   * 这里不用模拟器的 Ctrl+←：那条路只把**画面**转 90°，Android 里还是竖屏，
-   * 用户看到的就是整屏横躺的文字（试过 emu rotate、user_rotation、聚焦后发按键，
-   * 都是这个结果）。真正可行的是把 Android 的逻辑分辨率换成目标方向，
-   * 系统会按新方向重新排版，界面始终是正的；模拟器随后跟着换成同样的比例。
+   * 横竖屏切换 = 切换「手机排版 / 平板排版」。
+   *
+   * 正确做法是改**逻辑显示尺寸**（wm size），让安卓以宽屏重新排版：
+   *   - 竖屏 720x1280 @320dpi ≈ 360dp 宽 → 手机排版；
+   *   - 横屏 1280x720 @320dpi ≈ 640dp 宽 → 平板/分栏排版（>=600dp 就是 tablet）。
+   * 同时把 user-rotation 锁回 0，保证画面是正的。
+   *
+   * 这里既不走模拟器的 Ctrl+←，也不走 emu rotate：那条路只把**画面**转 90°，
+   * Android 里还是竖屏，用户看到的就是整屏横躺的文字（emu rotate / user_rotation /
+   * 聚焦后发按键，三种都试过，都是这个结果）。改 wm size 才会真正触发重新排版。
    */
   async setOrientation(landscape) {
     try {
+      // 无论哪边，先把自动旋转关掉并把用户旋转锁回 0，画面才不会横躺
+      await this.shell('settings put system accelerometer_rotation 0; wm user-rotation lock 0', { timeout: 15000 });
       if (!landscape) {
         await this.shell('wm size reset; wm density reset', { timeout: 15000 });
         return true;
       }
       const sizeOut = await this.shell('wm size', { timeout: 10000 });
+      // 注意：重置过之后这里读到的是「Physical size」，用物理尺寸算横屏分辨率
       const m = /Physical size:\s*(\d+)x(\d+)/.exec(sizeOut);
       const w = m ? Math.max(Number(m[1]), Number(m[2])) : 1280;
       const h = m ? Math.min(Number(m[1]), Number(m[2])) : 720;

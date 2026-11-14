@@ -1214,14 +1214,15 @@ function bindSettings() {
 
   $('btnCleanup').addEventListener('click', async () => {
     const btn = $('btnCleanup');
+    const includeSnapshots = $('chkCleanSnapshots') && $('chkCleanSnapshots').checked;
     btn.disabled = true;
     try {
-      const preview = await api.runtimeCleanup({ apply: false });
+      const preview = await api.runtimeCleanup({ apply: false, includeSnapshots });
       if (!preview.candidates.length) {
         toast({ title: '已经是精简状态', body: '没有可回收的旧镜像或快照。', type: 'ok' });
         return;
       }
-      const r = await api.runtimeCleanup({ apply: true });
+      const r = await api.runtimeCleanup({ apply: true, includeSnapshots });
       if (r.cancelled) return;
       toast({
         title: '清理完成',
@@ -1232,6 +1233,95 @@ function bindSettings() {
       $('usageText').textContent = `共 ${u.totalText} · 可回收 ${u.reclaimableText}（${u.count} 项）`;
     } catch (e) {
       toast({ title: '清理失败', body: e.message, type: 'error' });
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // 重置安卓数据：二级确认（先确认意图，再确认不可撤销），清完刷新占用统计
+  $('btnResetData').addEventListener('click', async () => {
+    const btn = $('btnResetData');
+    btn.disabled = true;
+    try {
+      const first = await api.confirm({
+        type: 'warning',
+        title: '重置安卓数据？',
+        message: '这会把安卓系统还原成「刚装好系统」的干净状态：',
+        detail: '• 删除全部已安装的第三方 app 及其数据、登录态\n'
+          + '• 删除当前 AVD 的快速启动快照\n'
+          + '• 系统镜像本身不受影响，重新打开应用会再次冷启动建数据\n\n'
+          + '此操作不可撤销。是否继续？',
+        buttons: ['取消', '继续'],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      if (!first || first.response !== 1) return;
+      const second = await api.confirm({
+        type: 'warning',
+        title: '再确认一次',
+        message: '已安装的 app 和它们的数据将被永久删除，确定要重置吗？',
+        detail: '可放心的是：系统镜像、其它 AVD、本机的 APK 缓存和图标都不会动。',
+        buttons: ['取消', '确定重置'],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      if (!second || second.response !== 1) return;
+      const r = await api.runtimeResetData();
+      if (!r || !r.ok) {
+        toast({ title: '重置失败', body: (r && r.error) || '请重试', type: 'error' });
+        return;
+      }
+      toast({
+        title: '安卓数据已重置',
+        body: `释放约 ${r.reclaimedMB} MB，已安装应用记录已清空。`,
+        type: 'ok',
+      });
+      const u = await api.runtimeUsage();
+      $('usageText').textContent = `共 ${u.totalText} · 可回收 ${u.reclaimableText}（${u.count} 项）`;
+    } catch (e) {
+      toast({ title: '重置失败', body: e.message, type: 'error' });
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // 修复网络：安卓里联网页面一直黑屏（点「同意并继续」后整屏黑）时用。
+  // 根因是虚拟机 /data 里的 Wi-Fi 配置坏了，wlan0 没起来、没有默认路由。
+  // 镜像不允许 root，只能整体重置 /data；应用清单保留，点开时会自动重装。
+  $('btnRepairNetwork').addEventListener('click', async () => {
+    const btn = $('btnRepairNetwork');
+    btn.disabled = true;
+    try {
+      const ok = await api.confirm({
+        type: 'warning',
+        title: '修复虚拟机网络？',
+        message: '应用里需要联网的页面一直黑屏/转圈，通常是安卓虚拟机没有网络。',
+        detail: '修复方式：重置安卓用户数据，让虚拟机重新获得网络。\n\n'
+          + '• 应用清单会保留，点开应用会自动重装，不用手动装\n'
+          + '• 应用内的登录态、追剧记录等运行时数据会丢失，需要重新登录\n'
+          + '• 只影响当前 AVD，系统镜像和本机 APK 缓存都不动\n\n'
+          + '整个过程约 30–90 秒（要重新冷启动一次）。是否继续？',
+        buttons: ['取消', '开始修复'],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      if (!ok || ok.response !== 1) return;
+      const r = await api.runtimeRepairNetwork();
+      if (!r || !r.ok) {
+        toast({
+          title: '网络仍未恢复',
+          body: (r && r.error) || '重置后虚拟机还是没网，请检查本机网络/防火墙是否拦住了模拟器。',
+          type: 'error',
+        });
+        return;
+      }
+      toast({
+        title: '网络已恢复',
+        body: `网关 ${(r.network && r.network.gateway) || '可达'}。点开应用会自动重装，联网页面不会再黑屏。`,
+        type: 'ok',
+      });
+    } catch (e) {
+      toast({ title: '修复失败', body: e.message, type: 'error' });
     } finally {
       btn.disabled = false;
     }

@@ -316,8 +316,14 @@ async function toggleDisplayMode() {
     display: { mode: displaySettings().mode === 'fullscreen' ? 'window' : 'fullscreen' },
   });
   if (appWin && appWin.isOpen) {
-    if (next.display.mode === 'fullscreen') appWin.win.maximize();
-    else appWin.win.unmaximize();
+    if (next.display.mode === 'fullscreen') {
+      appWin.win.maximize();
+      // 全屏 = 平板横屏排版：让安卓按宽屏重新排版，而不是只把窗口拉大
+      appWin.setLandscape(true).catch(() => {});
+    } else {
+      appWin.win.unmaximize();
+      appWin.setLandscape(false).catch(() => {});
+    }
     appWin.scheduleFit();
   }
   return next.display.mode;
@@ -549,6 +555,10 @@ function buildTray() {
     tray.setContextMenu(menu);
   };
   tray.setToolTip('ApkStart — 安卓应用运行器');
+  // Windows 托盘的惯例是单击就打开主窗口（双击当然也可以）。
+  // 之前只绑了 double-click，用户单击没反应，会以为托盘图标坏了。
+  // 右键才出菜单，所以这里单击直接 showWindow 不会和菜单冲突。
+  tray.on('click', () => showWindow());
   tray.on('double-click', () => showWindow());
   refresh();
   setInterval(refresh, 5000).unref?.();
@@ -726,6 +736,22 @@ async function runLaunch(pkg) {
     const embedded = await appWin.embed();
     if (!embedded) appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
     mark(`embedded=${embedded}`);
+    // 嵌入完成后把窗口从别的窗口底下抬出来。否则上层窗口（浏览器等）会盖住安卓画面，
+    // 用户看到的是「黑屏 / 画面没填满」，鼠标也点不到应用（全被上层窗口吃掉）。
+    // 短暂 topmost 再立刻撤销，只借用一次置顶把 Z 序抬到最前，不会长期霸占顶层。
+    if (appWin.isOpen) {
+      try {
+        appWin.win.show();
+        appWin.win.setAlwaysOnTop(true);
+        appWin.win.moveTop();
+        appWin.win.focus();
+        setTimeout(() => {
+          if (appWin.isOpen) {
+            try { appWin.win.setAlwaysOnTop(false); } catch (_) { /* 窗口已关 */ }
+          }
+        }, 700);
+      } catch (_) { /* 窗口可能刚关闭 */ }
+    }
     appWin.setState({ ready: true, tip: '' });
     // DPI 上下文不一致导致 SetParent 被拒时，代理降级为「窗口跟随」模式：
     // 画面照常显示，但告知用户原因（旧版完全静默，用户只能对着黑窗口猜）。
@@ -1151,8 +1177,11 @@ function registerIpc() {
     const next = store.saveSettings({ display: patch || {} });
     if (appWin && appWin.isOpen) {
       appWin.portrait = portraitSize();
-      if (next.display.mode === 'fullscreen' && !appWin.win.isMaximized()) appWin.win.maximize();
-      if (next.display.mode !== 'fullscreen' && appWin.win.isMaximized()) appWin.win.unmaximize();
+      const full = next.display.mode === 'fullscreen';
+      if (full && !appWin.win.isMaximized()) appWin.win.maximize();
+      if (!full && appWin.win.isMaximized()) appWin.win.unmaximize();
+      // 全屏 = 平板横屏排版（见 toggleDisplayMode 的说明）
+      appWin.setLandscape(full).catch(() => {});
       appWin.scheduleFit();
     }
     return next.display;
@@ -1350,8 +1379,9 @@ function registerIpc() {
 
   ipcMain.handle('runtime:cleanup', async (_e, opts = {}) => {
     // 明确两次确认：先给清单，用户确认后才真正删；且只清理 ApkStart 自己的运行时目录
-    if (!opts.apply) return runtime.cleanup({ apply: false, aggressive: !!opts.aggressive });
-    const preview = runtime.cleanup({ apply: false, aggressive: !!opts.aggressive });
+    const pass = { apply: false, aggressive: !!opts.aggressive, includeSnapshots: !!opts.includeSnapshots };
+    if (!opts.apply) return runtime.cleanup(pass);
+    const preview = await runtime.cleanup(pass);
     const { response } = await dialog.showMessageBox(mainWindow, {
       type: 'warning',
       buttons: ['取消', `清理 ${preview.candidates.length} 项`],
@@ -1359,11 +1389,48 @@ function registerIpc() {
       cancelId: 0,
       title: '确认清理运行时缓存',
       message: `将释放约 ${(preview.candidates.reduce((n, c) => n + c.size, 0) / 1048576).toFixed(0)} MB`,
-      detail: '只删除旧镜像、旧快照、锁文件和非活动 AVD 的缓存，已安装的应用会保留。'
+      detail: (opts.includeSnapshots
+        ? '会先停止运行时，再删除旧镜像、当前 AVD 的快速启动快照、锁文件和非活动 AVD 的缓存。已安装的应用本身保留（只清快照），'
+        : '只删除旧镜像、旧快照、锁文件和非活动 AVD 的缓存，已安装的应用会保留。')
         + '此操作不可撤销，建议先导出诊断报告。',
     });
     if (response !== 1) return { ...preview, cancelled: true };
-    return runtime.cleanup({ apply: true, aggressive: !!opts.aggressive });
+    return runtime.cleanup({ apply: true, aggressive: !!opts.aggressive, includeSnapshots: !!opts.includeSnapshots });
+  });
+
+  // 彻底重置安卓数据：清空 /data 用户分区 + 已装应用 + 快速启动快照，
+  // AVD 还原成「刚装好系统」的干净状态。会真实删除数 GB 数据，UI 必须二次确认。
+  ipcMain.handle('runtime:resetData', async () => {
+    try {
+      const r = await runtime.resetAndroidData();
+      if (!r.ok) return { ok: false, error: r.error };
+      return { ok: true, reclaimed: r.reclaimed, reclaimedMB: Math.round(r.reclaimed / 1048576) };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  // 修复虚拟机网络：重置 /data（保留应用清单，点开应用会自动重装）。
+  // 典型场景：安卓里所有联网页面一直黑屏，其实是 wlan0 没起来、没有默认路由。
+  ipcMain.handle('runtime:repairNetwork', async () => {
+    try {
+      const r = await runtime.repairNetwork({
+        onLog: (m) => send('toast', { type: 'info', message: m }),
+      });
+      return r;
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  // 只做网络体检，不动任何数据（设置页用来显示当前状态）
+  ipcMain.handle('runtime:checkNetwork', async () => {
+    try {
+      const network = await runtime.emulator.checkNetwork(runtime.adbPath());
+      return { ok: !!network.ok, network };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
   });
 
   // ---------------- 运行时自举 ----------------

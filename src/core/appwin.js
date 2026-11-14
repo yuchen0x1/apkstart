@@ -45,14 +45,19 @@ class AppWindow {
   /** 竖屏 / 横屏下窗口内容的目标尺寸（自动缩放到屏幕内） */
   static sizeFor(area, portrait, landscape) {
     const p = portrait || { w: 540, h: 960 };
+    // 留足边距：标题栏 38 + 上下各 24，左右各 40
     const availH = Math.max(360, (area.h || 1040) - TITLEBAR_H - 48);
     const availW = Math.max(300, (area.w || 1920) - 80);
-    if (landscape) {
-      const k = Math.min(availW / p.h, availH / p.w);
-      return { w: Math.round(p.h * k), h: Math.round(p.w * k) };
-    }
-    const k = Math.min(availH / p.h, availW / p.w);
-    return { w: Math.round(p.w * k), h: Math.round(p.h * k) };
+    const k = landscape
+      ? Math.min(availW / p.h, availH / p.w)
+      : Math.min(availH / p.h, availW / p.w);
+    const w = Math.round((landscape ? p.h : p.w) * k);
+    const h = Math.round((landscape ? p.w : p.h) * k);
+    // 双保险：绝不超过屏幕可用区，否则会被系统裁掉，看起来就是「有黑边 / 没填满」
+    return {
+      w: Math.max(320, Math.min(w, Math.round(availW))),
+      h: Math.max(360, Math.min(h, Math.round(availH))),
+    };
   }
 
   _area() {
@@ -293,36 +298,53 @@ class AppWindow {
   }
 
   /**
-   * 横竖屏切换。
-   * 两步：先让 Android 按目标方向重新排版（画面始终是正的），再让模拟器按新比例
-   * 重排一次窗口（它自己会算，CtrL+← 只是触发重排，不会改 Android 的方向），
-   * 最后把我们的窗口换成同样的比例。
+   * 横竖屏切换 = 切换「手机排版 / 平板排版」。
+   *
+   * 关键：**不再去转模拟器的画面**。以前这里先改 wm size、再让 agent 发 Ctrl+←，
+   * 模拟器会把整块画面顺时针/逆时针转 90°，而安卓侧的排版并没有跟着变 ——
+   * 用户看到的就是「画面整个躺倒、还摆不正」。
+   * 现在只做一件事：改逻辑显示尺寸（wm size）+ 锁 user-rotation=0，
+   * 安卓会按新宽度重新排版：360dp 宽是手机，640dp 宽自动进平板/分栏布局。
    */
   async rotate() {
     if (!this.isOpen) return this.state.landscape;
     const next = !this.state.landscape;
     if (this.setOrientation) await this.setOrientation(next).catch(() => {});
-    await sleep(700);
-    await this.agent.rotate(next ? 'left' : 'right').catch(() => {});
-    await sleep(800);
+    // wm size 会触发全局配置变更，应用要重建一次界面，给足时间再贴窗口
+    await sleep(1200);
     const area = this._area();
     const size = AppWindow.sizeFor(area, this.portrait, next);
-    if (!this.win.isMaximized()) {
-      this.win.setContentSize(Math.max(320, size.w), Math.max(420, size.h + TITLEBAR_H));
-      const b = this.win.getBounds();
-      this.win.setPosition(
-        Math.round(area.x + (area.w - b.width) / 2),
-        Math.round(area.y + (area.h - b.height) / 2),
-      );
-    }
+    // 最大化状态下 setContentSize 无效，必须先退出最大化再改尺寸，
+    // 否则窗口仍是竖的，横屏画面被塞进竖窗口 = 黑边 / 未填满。
+    const wasMax = this.win.isMaximized();
+    if (wasMax) this.win.unmaximize();
+    this.win.setContentSize(Math.max(320, size.w), Math.max(420, size.h + TITLEBAR_H));
+    const b = this.win.getBounds();
+    this.win.setPosition(
+      Math.round(area.x + (area.w - b.width) / 2),
+      Math.round(area.y + (area.h - b.height) / 2),
+    );
+    // 退出最大化后把窗口抬到最前，别被别的窗口盖住（盖住就是黑屏 / 点不动）
+    try { this.win.show(); this.win.focus(); } catch (_) { /* 窗口可能刚关 */ }
     this.state.landscape = next;
     this._push();
-    await sleep(250);
-    await this.fitNow();
-    // 模拟器换比例后还会自己再调一次窗口，收尾再贴合一次免得留黑边
-    await sleep(600);
-    await this.fitNow();
+    // wm size 改了 guest framebuffer 尺寸后，Qt 会自己重排好几次；每次都可能把
+    // 嵌入窗口带回旧尺寸，露出黑边 / 画面没填满。连续贴合几轮收敛，之后由
+    // resize 事件的 scheduleFit 兜底。
+    for (let i = 0; i < 6; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(500);
+      // eslint-disable-next-line no-await-in-loop
+      await this.fitNow();
+    }
     return next;
+  }
+
+  /** 需要时切到指定方向（全屏=横屏，窗口=竖屏） */
+  async setLandscape(want) {
+    if (!this.isOpen) return this.state.landscape;
+    if (!!this.state.landscape === !!want) return this.state.landscape;
+    return this.rotate();
   }
 
   toggleMaximize() {

@@ -330,7 +330,7 @@ class Runtime {
       await this.prepare(client);
       // 快照改成「空闲时再存」：立刻存要写 1~3GB，会和用户刚点开的应用抢磁盘 I/O
       this._armSnapshotSave(20000);
-      return { ok: true, client, engine: 'emulator', serial: this.emuSerial, profile: st.profile };
+      return { ok: true, client, engine: 'emulator', serial: this.emuSerial, profile: st.profile, network: st.network || null };
     } catch (e) {
       // 把自动重试/诊断结论原样抛给 UI，避免再包一层含糊的「启动失败」
       return { ok: false, error: e.message, diagnosis: e.diagnosis, report: e.report, attempts: e.attempts };
@@ -864,7 +864,7 @@ class Runtime {
       await this.killOrphanEmulators({ onLog }).catch(() => {});
       try {
         const r = await this.boot({ onLog });
-        if (r.ok) return { ok: true, client: r.client, engine: 'emulator', profile: r.profile };
+        if (r.ok) return { ok: true, client: r.client, engine: 'emulator', profile: r.profile, network: r.network || null };
         return {
           ok: false, error: r.error, env,
           diagnosis: r.diagnosis, report: r.report, attempts: r.attempts, exitCode: r.exitCode,
@@ -1038,11 +1038,149 @@ class Runtime {
 
   usage() { return require('./layers').summary(this.provisioner.paths().root); }
 
-  cleanup({ apply = false, aggressive = false } = {}) {
-    // 运行时正在跑时不能删它的快照，否则可能把当前会话写坏
-    return require('./layers').prune(this.provisioner.paths().root, {
-      apply, aggressive, keepSnapshots: this.vmRunning,
+  /**
+   * 回收运行时里的旧镜像 / 旧 AVD / 锁文件 / 快照。
+   * 之前「点清理却清不掉」的根因：运行时正在跑时 keepSnapshots 把当前 AVD 的
+   * 快速启动快照（≈几 GB 的 ram.img）排除掉了，单 AVD 环境下几乎没有可清项。
+   * 现在调用方可以显式传 includeSnapshots：先停运行时再裁，快照就能真正回收。
+   */
+  async cleanup({ apply = false, aggressive = false, includeSnapshots = false } = {}) {
+    let stoppedVm = false;
+    if (includeSnapshots && this.vmRunning) {
+      await this.stop().catch(() => {});
+      stoppedVm = true;
+    }
+    const report = require('./layers').prune(this.provisioner.paths().root, {
+      apply, aggressive, keepSnapshots: !includeSnapshots && this.vmRunning,
     });
+    // 预览阶段若停了机，给用户一个提示：清完可手动重启运行时
+    return { ...report, apply, stoppedVm };
+  }
+
+  /**
+   * 彻底重置安卓数据（清空 /data 用户分区 + 已装应用 + 快速启动快照），
+   * 把 AVD 还原成「刚装好系统、没有任何第三方 app」的干净状态。
+   * 这一项会真实删除 8–16GB 的用户数据镜像，必须二次确认（UI 负责），且只动
+   * 当前活动 AVD（apkstart.avd），不动只读基础镜像、不动其它 AVD。
+   * 保留 config.ini / hardware-qemu.ini，AVD 仍有效，下次点开应用会重新冷启动建数据。
+   * @returns {{ok:boolean, reclaimed:number, avdDir:string, error?:string}}
+   */
+  async resetAndroidData() {
+    const fs = require('fs');
+    const path = require('path');
+    try {
+      if (this.vmRunning) await this.stop().catch(() => {});
+      const avdDir = path.join(this.provisioner.paths().avdHome, 'apkstart.avd');
+      let reclaimed = 0;
+      if (fs.existsSync(avdDir)) {
+        for (const e of fs.readdirSync(avdDir, { withFileTypes: true })) {
+          const p = path.join(avdDir, e.name);
+          // 删除：用户数据镜像（含 qcow2 差量 + 基址）、快速启动快照、残留锁文件/锁目录。
+          // 保留：config.ini / hardware-qemu.ini / AVD.conf / cache.img / encryptionkey* /
+          //       initrd / modem_simulator / 各类 *.ini / *.txt / *.cache —— 它们是 AVD
+          //       的身份与基础设施，删了 AVD 直接失效或下次开机异常。
+          const isUserdata = /^userdata(-qemu)?(-[0-9]+)?\.img(\.qcow2)?$/.test(e.name)
+            || /^userdata\.img(\.qcow2)?\.\d+$/.test(e.name);
+          const isSnapshot = /^snapshots(\.stale-\d+)?$/.test(e.name);
+          const isLock = /\.lock$/.test(e.name);
+          if (!e.isDirectory() && !isUserdata && !isLock) continue;
+          if (e.isDirectory() && !isSnapshot && !isLock) continue;
+          try {
+            if (e.isDirectory()) {
+              const s = require('./layers').dirSize(p);
+              fs.rmSync(p, { recursive: true, force: true });
+              reclaimed += s;
+            } else {
+              const s = fs.statSync(p).size;
+              fs.rmSync(p, { force: true });
+              reclaimed += s;
+            }
+          } catch (_) { /* 占用中的暂跳，下次再清 */ }
+        }
+      }
+      // 用户数据镜像被删后，用户侧「已安装 app」的记录也要清掉，
+      // 否则桌面/启动器还显示着其实已不存在的 app。
+      try { store.saveApps([]); } catch (_) { /* ignore */ }
+      return { ok: true, reclaimed, avdDir };
+    } catch (e) {
+      return { ok: false, reclaimed: 0, avdDir: '', error: e.message };
+    }
+  }
+
+  /**
+   * 等待虚拟机联网。
+   *
+   * 实测：`sys.boot_completed` 只代表系统起来了，Wi-Fi 关联 + DHCP 还要再等
+   * 十几秒到一分多钟才会拿到 10.0.2.16。短剧类应用一进去就拉首页数据，
+   * 没网时页面渲染成一整块黑底（隐私弹窗是本地页面所以正常显示），
+   * 用户看到的就是「点同意并继续之后一直黑屏」。所以拉起应用前先等网络就绪。
+   *
+   * @returns {Promise<{ok:boolean,reason:string,ip?:string,gateway?:string}>}
+   */
+  async waitForNetwork({ timeoutMs = 90000, onLog = () => {}, adbPath = '' } = {}) {
+    const t0 = Date.now();
+    let last = null;
+    let lastNotice = 0;
+    // 刚重启的虚拟机会有一段时间连 adb 都还没上线，不能一看到 offline 就放弃
+    // （之前就是这样：重置数据后立刻返回 device-offline，被误判成「修复失败」）。
+    let offlineSince = 0;
+    while (Date.now() - t0 < timeoutMs) {
+      // eslint-disable-next-line no-await-in-loop
+      const online = await this.client().isOnline().catch(() => false);
+      if (!online) {
+        if (!offlineSince) offlineSince = Date.now();
+        if (Date.now() - offlineSince > 45000) return { ok: false, reason: 'device-offline' };
+      } else {
+        offlineSince = 0;
+        // eslint-disable-next-line no-await-in-loop
+        last = await this.emulator.checkNetwork(adbPath || this.adbPath()).catch(() => null);
+        if (last && last.ok) return last;
+      }
+      if (Date.now() - lastNotice > 10000) {
+        lastNotice = Date.now();
+        onLog(`正在等待安卓虚拟机联网… ${Math.round((Date.now() - t0) / 1000)}s`);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+    return last || { ok: false, reason: 'timeout' };
+  }
+
+  /**
+   * 修复「安卓虚拟机没有网络」。
+   *
+   * 实测：这个镜像在已有用户数据上冷启时 Wi-Fi 经常一直 NO-CARRIER、拿不到 IP；
+   * 只有 -wipe-data 后的那次开机才稳定连上。所以这里直接重置安卓数据
+   * （应用清单保留，点开应用会自动重装），联网成功后立刻存快照，
+   * 下次恢复时网卡状态一起还原。
+   *
+   * @returns {Promise<{ok:boolean, network?:object, boot?:boolean, wiped?:boolean, error?:string}>}
+   */
+  async repairNetwork({ onLog = () => {} } = {}) {
+    try {
+      onLog('正在修复虚拟机网络：重置安卓数据并重新开机（应用清单会保留，点开时自动重装）…');
+      if (this.vmRunning) await this.stop({ graceful: false }).catch(() => {});
+      // 给上一次的 qemu / netsimd 一点时间退干净，否则 -wipe-data 会撞 AVD 锁
+      await new Promise((r) => setTimeout(r, 2500));
+      this.emulator.forceWipeOnNextStart();
+      const boot = await this.ensure({ onLog });
+      if (!boot || !boot.ok) {
+        return { ok: false, error: (boot && boot.error) || '虚拟机没能启动', boot: false, wiped: true };
+      }
+      // Wi-Fi 关联 + DHCP 比 sys.boot_completed 晚很多（实测最长 2 分多钟），要给足时间。
+      const network = await this.waitForNetwork({ onLog, timeoutMs: 240000 });
+      if (network && network.ok) {
+        // 立刻把「网络正常」的状态存成快照：下次恢复时网卡状态一起还原，
+        // 否则关掉再开又会回到没网状态。
+        try { await this.emulator.saveSnapshotNow(this.adbPath(), { timeout: 90000 }); } catch (_) { /* ignore */ }
+        onLog(`网络已恢复（${network.ip || ''} 网关 ${network.gateway || '可达'}），已存好可用快照。`);
+      } else {
+        onLog('重置后仍未联网。请检查本机网络/防火墙是否拦截了模拟器（netsimd 走本机回环端口）。');
+      }
+      return { ok: !!(network && network.ok), network, boot: true, wiped: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
   }
 
   dispose() {

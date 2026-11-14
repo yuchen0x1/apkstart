@@ -68,14 +68,20 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(p.accel === 'auto');
   });
 
-  await test('可见嵌入模式优先使用 software，避免失焦时 ANGLE 交换链黑屏', () => {
+  await test('可见嵌入模式优先使用 swangle（软件渲染但 WebView 合成正常）', () => {
     const p = doctor.chooseProfile({
       host: doctor.hostInfo(), accel: { ok: true }, emulatorVersion: '37.3.8.0',
       diskMB: 50000, port: 5554, adbPort: 5044,
     });
     const visible = doctor.planVariants(p, { preferSoftware: true });
-    assert(visible[0].gpu === 'software', `可见模式首选应为 software，实际 ${visible[0].gpu}`);
+    // 嵌入窗口会经历跨进程 SetParent / 失焦 / DWM 重绘，host 的交换链可能丢，所以
+    // 可见模式要走软件渲染；但**不能**用裸 software —— 实测它过不了 WebView 合成，
+    // 「点同意并继续」进主界面后整屏黑。swangle 同样是软件渲染，合成路径正常。
+    assert(visible[0].gpu === 'swangle', `可见模式首选应为 swangle，实际 ${visible[0].gpu}`);
     assert(!visible[0].lastResort && visible[0].snapshot !== false);
+    // 关加速的最后一档仍必须是最保守的 software（慢但最兼容）
+    const all = doctor.planVariants(p, { preferSoftware: true });
+    assert(all[all.length - 1].accel === 'off', '最后一档必须是关加速的兜底');
   });
 
   await test('重试矩阵：从最优到最保守，包含软件模拟与冷启动兜底', () => {
@@ -473,7 +479,48 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
 
     const cold = emu.buildArgs({ wipe: true }).join(' ');
     assert(/-wipe-data/.test(cold), 'wipe 时必须带 -wipe-data');
-    assert(/ -no-snapshot( |$)/.test(cold), 'wipe 时不能加载也不能保存快照');
+    // 重置数据后**必须允许保存新快照**：修复网络靠的就是「重置后第一次开机有网 →
+    // 立刻存快照 → 下次恢复时网卡状态一起还原」。旧实现推 -no-snapshot 把保存也关了，
+    // 于是修完网络一关机又回到没网。
+    assert(/-no-snapshot-load/.test(cold), 'wipe 时不能加载旧快照（数据已对不上）');
+    assert(!/ -no-snapshot( |$)/.test(cold), 'wipe 时不能连退出自动保存一起关掉');
+    assert(/-snapshot apkstart/.test(cold), 'wipe 时保存必须落在 apkstart 这个名字上，否则下次按名字找不到');
+  });
+
+  // 窗口代理脚本里有大量中文注释。PowerShell 5.1 读「无 BOM 的 UTF-8」会按 ANSI 解码，
+  // 中文变成乱码后可能把 C# 注释和下一行代码并成一行 —— Add-Type 直接编译失败，
+  // 表现就是「窗口代理启动失败 / 应用窗口不嵌入」。这个坑踩过一次，用测试钉住。
+  await test('窗口代理脚本必须带 UTF-8 BOM（否则中文注释会让 Add-Type 编译失败）', () => {
+    const file = path.join(__dirname, '..', 'src', 'core', 'win', 'agent.ps1');
+    const buf = fs.readFileSync(file);
+    assert(buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf, 'agent.ps1 缺少 UTF-8 BOM');
+  });
+
+  // 模拟器窗口必须是 Chromium 渲染层的「子窗口」，不能是宿主的兄弟子窗口。
+  // 兄弟关系下 Electron 会持续把网页层抬到最前，黑底盖住安卓画面、鼠标全被吃掉
+  // （黑边 / 未填满 / 点击失效 / 点不动同意）。也不能再给嵌入窗口设 window region，
+  // 那会破坏命中测试且在 resize 后露出黑边。
+  await test('嵌入窗口必须挂到网页层之下，且不能再设 window region', () => {
+    const file = path.join(__dirname, '..', 'src', 'core', 'win', 'agent.ps1');
+    const src = fs.readFileSync(file, 'utf8');
+    assert(/FindChromeRender\(host\)/.test(src), '必须查找 Chromium 渲染子窗口');
+    assert(/SetParent\(emu, parent\)/.test(src), 'embed 必须挂到 FindChromeRender 找到的父窗口');
+    assert(/EnsureReparent\(\)/.test(src), '网页层建好之前的嵌入要能补挂');
+    assert(!/CreateRectRgn\(0, clipTop/.test(src), '不能给嵌入窗口设裁剪 region');
+    assert(/SetWindowRgn\(emu, IntPtr\.Zero/.test(src), 'embed 时要清掉旧版本残留的 region');
+  });
+
+  // 启动路径上绝不能做破坏性动作：等网络可以，停掉虚拟机再冷启动不行 ——
+  // 那会在 adb install / am start 途中把设备弄没，直接变成「应用打不开」。
+  await test('拉起应用前只等待网络，绝不重启虚拟机', () => {
+    const installSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'installer.js'), 'utf8');
+    assert(/waitForNetwork\(\{ onLog, timeoutMs: 20000 \}\)/.test(installSrc), '启动路径应只等 20 秒，不重启');
+    assert(!/ensureNetwork/.test(installSrc), '启动路径不能调用会冷启动的 ensureNetwork');
+    const engineSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'engine.js'), 'utf8');
+    assert(/device-offline/.test(engineSrc) && /45000/.test(engineSrc), '刚重启的设备掉线要给宽限，不能立刻判失败');
+    assert(/forceWipeOnNextStart/.test(engineSrc), '修复网络要走「重置数据」这条路');
+    const emuSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'emulator.js'), 'utf8');
+    assert(/_forceWipe/.test(emuSrc) && /async checkNetwork/.test(emuSrc), '模拟器要提供一次性 wipe 标记与网络体检');
   });
 
   await test('新版 emulator 写的 ram.bin 必须被认作完整快照（否则刚存好的 3GB 会被当空壳删掉）', () => {

@@ -37,6 +37,10 @@ public class ApkAgent
     public delegate IntPtr HookProc(int code, IntPtr wp, IntPtr lp);
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr p);
+    // 只用来**清掉**旧版本留下的 window region（v0.3.9 曾拿它裁标题栏，结果破坏了命中测试）。
+    // 新代码绝不给嵌入窗口设 region，见 Embed 里的说明。
+    [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr h, IntPtr rgn, bool redraw);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
@@ -105,6 +109,9 @@ public class ApkAgent
 
     static IntPtr _host = IntPtr.Zero;
     static IntPtr _emu = IntPtr.Zero;
+    // Electron 的网页渲染子窗口（Chrome_RenderWidgetHostHWND）。模拟器要挂在它**下面**，
+    // 原因见 FindChromeRender 的注释 —— 挂错一层就是「黑边 / 未填满 / 点击全失效」。
+    static IntPtr _chromeRender = IntPtr.Zero;
     // SetParent 被拒（DPI 上下文不一致，Win10 1703+ 的硬性要求）时的降级模式：
     // 不 reparent，把模拟器窗口钉在宿主客户区上方并跟随移动。
     static bool _follow = false;
@@ -116,6 +123,9 @@ public class ApkAgent
     static readonly ManualResetEvent _hookReady = new ManualResetEvent(false);
     static readonly ConcurrentQueue<string> _events = new ConcurrentQueue<string>();
     static long _lastToolSweep = 0;
+    // 杂窗扫描要枚举全部顶层窗口 + 逐个查进程归属，比 HideToolWindows 贵得多，
+    // 没必要跟着 120ms 的压制节奏跑；1 秒一次足够盖住「一闪而过的提示框」。
+    static long _lastStraySweep = 0;
     static long _embedAt = 0;
     // 常驻压制：默认一开机就开，把模拟器主窗 + 工具栏 + 控制台黑窗压住。
     // 与「embed 完成就关掉」的旧逻辑不同，它是**常驻**的 —— sweep 会跳过已经嵌进
@@ -326,6 +336,7 @@ public class ApkAgent
             if (sb.Length > 0) sb.Append(",");
             sb.Append("{\"cls\":").Append(JsonStr(cls))
               .Append(",\"title\":").Append(JsonStr(title))
+              .Append(",\"hwnd\":").Append(h.ToInt64())
               .Append(",\"pid\":").Append(pid)
               .Append(",\"w\":").Append(w)
               .Append(",\"h\":").Append(hh)
@@ -429,23 +440,84 @@ public class ApkAgent
         return b.ToString();
     }
 
+    // 兜底：把「我们的运行时进程」创建的任何**多余的顶层可见窗口**都藏起来。
+    // 除了模拟器主窗口（要嵌进宿主）之外，emulator / qemu / netsimd / adb 都可能
+    // 弹出一些一闪而过的东西（Qt 提示框、崩溃对话框、音量条、日志窗…）。
+    // 以前只按类名逐个点名，漏一个就闪一次；这里改成按「进程属于我们的运行时目录」
+    // 判断，覆盖面更全。宿主窗口和模拟器窗口本身不在这个范围，绝不会误伤。
+    //
+    // 注意白名单：QWindowIcon / subWin 是**正在嵌入的 LCD 本身**，藏掉就是全黑 +
+    // 点击失效；Chrome / Electron 的窗口更不允许碰。只有明确的弹窗类才允许隐藏。
+    static void HideStrayWindows()
+    {
+        if (_scopeDirs.Count == 0) return;
+        IntPtr embeddedRoot = _emu;
+        EnumWindows(delegate(IntPtr h, IntPtr p)
+        {
+            if (!IsWindowVisible(h)) return true;
+            if (h == embeddedRoot || h == _host) return true;
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (!IsOurs(pid)) return true;
+            string cls = ClassOf(h);
+            bool safe = cls.IndexOf("QWindowTool", StringComparison.Ordinal) >= 0
+                     || cls.IndexOf("ConsoleWindowClass", StringComparison.Ordinal) >= 0
+                     || cls.IndexOf("CASCADIA_HOSTING_WINDOW_CLASS", StringComparison.Ordinal) >= 0
+                     || (cls.IndexOf("Qt", StringComparison.Ordinal) < 0
+                         && cls.IndexOf("Chrome", StringComparison.Ordinal) < 0);
+            if (!safe) return true;
+            RECT r;
+            if (!GetWindowRect(h, out r)) return true;
+            if ((r.R - r.L) < 8 && (r.B - r.T) < 8) return true;   // 8x8 以下当隐形
+            ShowWindow(h, 0);
+            return true;
+        }, IntPtr.Zero);
+    }
+
     // 常驻压制扫描：只要模拟器窗口还不是「我们某个窗口的子窗口」，就把它藏起来。
     // 这样无论模拟器是在开机、预热，还是 ApkStart 已经退出（窗口被系统重新挂到桌面，
     // 恢复成顶层窗口），用户都不会看到那个叫 "Android Emulator - apkstart5554" 的黑窗。
     // 同时把工具栏（QWindowTool）与所有控制台窗口（qemu / netsimd / emulator）压住。
+
+    // embed 那一刻 Electron 的网页渲染子窗口可能还没建好，FindChromeRender 会返回 0，
+    // 于是模拟器被挂成了宿主的直接子窗口（和网页层是**兄弟**）—— 网页层会持续
+    // 盖住画面并吃掉鼠标。这里在常驻扫描里补挂：一旦发现网页层出现了，就重挂一次。
+    static void EnsureReparent()
+    {
+        if (_emu == IntPtr.Zero || _host == IntPtr.Zero || _follow) return;
+        if (_chromeRender == IntPtr.Zero || !IsWindow(_chromeRender))
+            _chromeRender = FindChromeRender(_host);
+        if (_chromeRender == IntPtr.Zero) return;
+        IntPtr ep = GetParent(_emu);
+        if (ep == _chromeRender) return;
+        if (ep != _host && ep != IntPtr.Zero) return;   // 别的宿主，别乱动
+        RECT r, hr;
+        if (!GetWindowRect(_emu, out r)) return;
+        if (!GetWindowRect(_host, out hr)) return;
+        SetParent(_emu, _chromeRender);
+        // 坐标相对网页层客户区（与宿主客户区一致），保持原屏幕位置
+        SetWindowPos(_emu, IntPtr.Zero, r.L - hr.L, r.T - hr.T,
+                     r.R - r.L, r.B - r.T, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
     static void QuietSweep()
     {
-        bool embedded = _emu != IntPtr.Zero && _host != IntPtr.Zero && GetParent(_emu) == _host;
+        EnsureReparent();
+        IntPtr ep = _emu != IntPtr.Zero ? GetParent(_emu) : IntPtr.Zero;
+        bool embedded = _emu != IntPtr.Zero && ep != IntPtr.Zero
+                     && (ep == _host || ep == _chromeRender);
         bool ours = embedded || _follow;   // 跟随模式的窗口也是「正在给用户看画面」的，不能压
         IntPtr e = ours ? _emu : FindEmulator();
         if (!ours && e != IntPtr.Zero && IsWindowVisible(e)) ShowWindow(e, 0);
         HideToolWindows();
         HideConsoleWindows();
+        long t = Environment.TickCount;
+        if (t - _lastStraySweep > 1000) { _lastStraySweep = t; HideStrayWindows(); }
         if (!ours && e != IntPtr.Zero) _bootHideUntil = Environment.TickCount + 5000;
-        // issue #34：embed 几秒后 Chromium 重绘会把自己排回子窗口最上层，把模拟器压到
-        // z 序底部 —— 画面透得出来但 WindowFromPoint 命中的是渲染层，点击全部丢失。
-        // 已在最上层时 GW_HWNDPREV 返回 0、SetWindowPos 是空操作，每轮抬一次代价可忽略。
-        if (embedded && _emu != IntPtr.Zero && GetWindow(_emu, 3u) != IntPtr.Zero) Raise();
+        // Chromium 的渲染子窗口和模拟器现在是**父子**关系（不是兄弟），网页层不会再把
+        // 画面盖住；这里只在嵌到宿主那一层时保留一次抬升，防止宿主自己的其它子窗口
+        // （比如 devtools 面板）压上来。
+        if (embedded && ep == _host && _emu != IntPtr.Zero && GetWindow(_emu, 3u) != IntPtr.Zero) Raise();
     }
 
     // Only our own runtime counts. The old version returned true for ANY process named
@@ -468,6 +540,71 @@ public class ApkAgent
     }
 
     // ------------------------------------------------------------------ embed / detach
+
+    // 找宿主窗口里的 Chromium 渲染子窗口。
+    // Electron 的网页层（Chrome_RenderWidgetHostHWND）和模拟器窗口如果都是宿主的
+    // 直接子窗口，它们就是「兄弟」，而 Electron 会持续把网页层抬到最前 ——
+    // 于是网页层那块黑底盖住安卓画面、鼠标也全被它吃掉（用户看到的「黑边 /
+    // 未填满 / 点击失效 / 点不动同意」全是这个）。
+    // 把模拟器挂成网页层的**子窗口**后，Z 序与鼠标命中天然优先给模拟器。
+    static IntPtr FindChromeRender(IntPtr host)
+    {
+        if (host == IntPtr.Zero) return IntPtr.Zero;
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(host, delegate(IntPtr c, IntPtr p)
+        {
+            if (ClassOf(c).IndexOf("Chrome_RenderWidgetHostHWND", StringComparison.Ordinal) >= 0)
+            {
+                found = c;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // 诊断用：列出某个窗口的**直接子窗口**。
+    // 「画面被网页层盖住 / 点击全失效」这类问题，第一步就是确认宿主下面到底有几层、
+    // 网页层（Chrome_RenderWidgetHostHWND）是不是真的存在 —— 换了 Electron 大版本后
+    // 它有可能改名或不再作为子窗口存在，那时 FindChromeRender 会返回 0，
+    // 我们必须知道自己退回的是「挂宿主 + 主动抬升」那条老路。
+    static string ListChildren(long hostHwnd)
+    {
+        IntPtr h = hostHwnd != 0 ? new IntPtr(hostHwnd) : _host;
+        if (h == IntPtr.Zero)
+        {
+            IntPtr foundHost = IntPtr.Zero;
+            EnumWindows(delegate(IntPtr w, IntPtr p)
+            {
+                if (ClassOf(w).IndexOf("Chrome_WidgetWin", StringComparison.Ordinal) < 0) return true;
+                uint pid;
+                GetWindowThreadProcessId(w, out pid);
+                if (_appPid != 0 && pid != _appPid) return true;
+                foundHost = w;
+                return false;
+            }, IntPtr.Zero);
+            h = foundHost;
+        }
+        var sb = new StringBuilder();
+        if (h != IntPtr.Zero)
+        {
+            EnumChildWindows(h, delegate(IntPtr c, IntPtr p)
+            {
+                RECT r;
+                GetWindowRect(c, out r);
+                if (sb.Length > 0) sb.Append(",");
+                sb.Append("{\"hwnd\":").Append(c.ToInt64())
+                  .Append(",\"cls\":").Append(JsonStr(ClassOf(c)))
+                  .Append(",\"vis\":").Append(IsWindowVisible(c) ? "true" : "false")
+                  .Append(",\"w\":").Append(r.R - r.L)
+                  .Append(",\"h\":").Append(r.B - r.T)
+                  .Append("}");
+                return true;
+            }, IntPtr.Zero);
+        }
+        return "\"host\":" + h.ToInt64() + ",\"list\":[" + sb + "]";
+    }
+
     static bool Embed(IntPtr host, IntPtr emu)
     {
         if (host == IntPtr.Zero || emu == IntPtr.Zero) return false;
@@ -487,21 +624,28 @@ public class ApkAgent
         childExStyle &= ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
         SetWindowLong(emu, GWL_EXSTYLE, childExStyle);
 
-        IntPtr previousParent = SetParent(emu, host);
-        bool reparented = GetParent(emu) == host;
-        if (!reparented)
+        // 优先挂到网页渲染层之下；网页层还没建好时退回宿主（QuietSweep 会补挂）。
+        _chromeRender = FindChromeRender(host);
+        IntPtr parent = _chromeRender != IntPtr.Zero ? _chromeRender : host;
+        SetParent(emu, parent);
+        bool reparented = GetParent(emu) == parent;
+        if (reparented)
         {
-            // SetParent 失败时不要留下一个无父的 WS_CHILD 窗口：恢复成原来的顶层样式，
-            // 再用跟随模式显示。previousParent 只是诊断信息，不能作为成功标志。
-            SetParent(emu, IntPtr.Zero);
-            SetWindowLong(emu, GWL_STYLE, (int)oldStyle);
-            SetWindowLong(emu, GWL_EXSTYLE, oldExStyle);
-            _follow = true;
-            int ex = GetWindowLong(emu, GWL_EXSTYLE);
-            ex |= WS_EX_TOOLWINDOW;
-            SetWindowLong(emu, GWL_EXSTYLE, ex);
+            // 旧版本给嵌入窗口设过 window region 用来裁标题栏那条溢出；带 region 的
+            // Qt/GL 子窗口命中测试与输入坐标映射会错位（点击失效、按钮点不到），
+            // 旋转改尺寸后 region 还是旧矩形又会在四周露黑边。复用时必须清掉。
+            SetWindowRgn(emu, IntPtr.Zero, false);
             return true;
         }
+        // SetParent 失败时不要留下一个无父的 WS_CHILD 窗口：恢复成原来的顶层样式，
+        // 再用跟随模式显示。previousParent 只是诊断信息，不能作为成功标志。
+        SetParent(emu, IntPtr.Zero);
+        SetWindowLong(emu, GWL_STYLE, (int)oldStyle);
+        SetWindowLong(emu, GWL_EXSTYLE, oldExStyle);
+        _follow = true;
+        int ex = GetWindowLong(emu, GWL_EXSTYLE);
+        ex |= WS_EX_TOOLWINDOW;
+        SetWindowLong(emu, GWL_EXSTYLE, ex);
         return true;
     }
 
@@ -515,12 +659,17 @@ public class ApkAgent
     static void Fit(int x, int y, int w, int h, bool frame)
     {
         if (_emu == IntPtr.Zero) return;
+        // Fit 是 JS 侧每次 resize 都会调的，此时网页层一定已经建好了。
+        // 确保模拟器挂在网页层之下（兄弟关系会被网页层盖住并吃掉鼠标）。
+        EnsureReparent();
         if (w < 16) w = 16;
         if (h < 16) h = 16;
         // 只有「确实已经嵌进我们窗口」或处于跟随模式的才允许显示。
         // 万一 embed 还没完成（模拟器窗口还没建好 / 句柄换了），Fit 绝不能把它当
         // 独立窗口顶到桌面上 —— 那正是用户看到的那个黑窗。
-        bool embedded = _host != IntPtr.Zero && GetParent(_emu) == _host;
+        IntPtr ep = GetParent(_emu);
+        bool embedded = ep != IntPtr.Zero && _host != IntPtr.Zero
+                     && (ep == _host || ep == _chromeRender);
         if (!embedded && !_follow)
         {
             ShowWindow(_emu, 0);
@@ -538,6 +687,9 @@ public class ApkAgent
         // on every periodic sweep caused visible stutter and wasted GPU/CPU.
         uint flags = SWP_NOACTIVATE | SWP_SHOWWINDOW | (frame && embedded ? SWP_FRAMECHANGED : 0u);
         SetWindowPos(_emu, HWND_TOP, ax, ay, w, h, flags);
+        // 绝不给嵌入窗口设 window region：Qt/GL 子窗口一旦带 region，命中测试和
+        // 输入坐标映射会错位（点击失效 / 点不到按钮），旋转改尺寸后 region 还是旧
+        // 矩形又会在四周露黑边。标题栏那条 8px 溢出改由宿主自绘标题栏盖住。
     }
 
     static void Raise()
@@ -549,7 +701,8 @@ public class ApkAgent
     static void Refresh()
     {
         if (_emu == IntPtr.Zero) return;
-        bool embedded = _host != IntPtr.Zero && GetParent(_emu) == _host;
+        IntPtr rp = GetParent(_emu);
+        bool embedded = _host != IntPtr.Zero && (rp == _host || rp == _chromeRender);
         if (!embedded && !_follow) return;
         // 失焦时不调用 SetForegroundWindow/SetFocus：只让 Qt 子窗口重新参与同级
         // 合成并立即处理 WM_PAINT，避免 DWM/Qt 交换链在被遮挡后留下黑帧。
@@ -562,6 +715,7 @@ public class ApkAgent
     static void Detach()
     {
         if (_emu == IntPtr.Zero) return;
+        _chromeRender = IntPtr.Zero;
         if (_follow)
         {
             // 跟随模式没有 reparent 过，只要还原任务栏可见性
@@ -592,6 +746,7 @@ public class ApkAgent
     {
         if (_emu == IntPtr.Zero) _emu = FindEmulator();
         IntPtr e = _emu;
+        _chromeRender = IntPtr.Zero;
         if (e == IntPtr.Zero) { _host = IntPtr.Zero; _follow = false; return; }
         ShowWindow(e, 0);
         if (_follow)
@@ -997,6 +1152,7 @@ public class ApkAgent
                         {
                             _host = want;
                             _hostPid = wantPid;
+                            _chromeRender = FindChromeRender(want);
                             _emu = FindEmulator();
                             bool ok = Embed(_host, _emu);
                             _embedAt = Environment.TickCount;
@@ -1064,6 +1220,10 @@ public class ApkAgent
                     else if (cmd == "windows")
                     {
                         Reply(sock, "{\"ok\":true,\"list\":[" + ListWindows(L(line, "all") == 1) + "]}");
+                    }
+                    else if (cmd == "children")
+                    {
+                        Reply(sock, "{\"ok\":true," + ListChildren(L(line, "host")) + "}");
                     }
                     else if (cmd == "boothide")
                     {

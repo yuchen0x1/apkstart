@@ -181,6 +181,13 @@ class WinAgent extends EventEmitter {
   async windows() { return this.call({ cmd: 'windows' }, 4000); }
 
   /**
+   * 列出宿主窗口的直接子窗口（诊断用）。
+   * 嵌入画面被网页层盖住 / 点击失效时，先看这里：网页层（Chrome_RenderWidgetHostHWND）
+   * 必须存在，模拟器才能挂到它下面；换了 Electron 大版本后它可能改名或消失。
+   */
+  async children(host = 0) { return this.call({ cmd: 'children', host }, 4000); }
+
+  /**
    * 把头号可疑窗口「摘下 + 藏好」。
    * 宿主窗口销毁前必须调用：Windows 会在父窗口销毁时把跨进程的子窗口重新挂到桌面，
    * 并保持它原来的可见状态 —— 桌面上凭空多出来的 Android Emulator 黑窗就是这么来的。
