@@ -193,6 +193,31 @@ function parseApkZip(zip, filePath, stat) {
     }
   }
 
+  // ---- 屏幕方向 ----
+  // 模拟器的窗口比例由 hw.lcd.width/height 在**开机时**决定（wm size 只改逻辑分辨率，
+  // 改不了 Qt 窗口比例），所以横屏应用要铺满窗口，必须在启动运行时之前就用横屏 LCD。
+  // 这里把清单里的 screenOrientation 归一成 landscape / portrait / ''（未知）。
+  // AXML 里的枚举属性通常是 TYPE_INT_DEC，也可能是字符串，两种都认。
+  const ORIENT_INT = {
+    1: 'landscape', 7: 'landscape', 9: 'landscape', 12: 'landscape',
+    2: 'portrait', 8: 'portrait', 10: 'portrait', 13: 'portrait',
+  };
+  const ORIENT_STR = {
+    landscape: 'landscape', sensorLandscape: 'landscape',
+    reverseLandscape: 'landscape', userLandscape: 'landscape',
+    portrait: 'portrait', sensorPortrait: 'portrait',
+    reversePortrait: 'portrait', userPortrait: 'portrait',
+  };
+  const orientationOf = (node) => {
+    if (!node) return '';
+    const v = attrValue(node, 'screenOrientation');
+    if (typeof v === 'number') return ORIENT_INT[v] || '';
+    if (typeof v === 'string') return ORIENT_STR[v] || '';
+    return '';
+  };
+  // 启动 Activity 优先；它没声明就看 <application>（游戏常把方向写在 application 上）
+  const orientation = orientationOf(launcher) || orientationOf(app) || '';
+
   // ---- 图标 ----
   let icon = null;
   const iconAttr = attr(app, 'icon') || attr(app, 'roundIcon');
@@ -257,6 +282,8 @@ function parseApkZip(zip, filePath, stat) {
     minSdk,
     targetSdk,
     launchActivity,
+    // 应用的自然方向：横屏游戏据此选择横屏 LCD，避免「画面居中一条 + 两侧黑边」
+    orientation,
     abis,
     permissions,
     features,

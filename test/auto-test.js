@@ -538,6 +538,56 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/ready-to-show/.test(main), '正常路径仍然优先用 ready-to-show');
   });
 
+  // 上游 #41：模拟器窗口比例由 hw.lcd 在开机时锁死（wm size 只改逻辑分辨率，
+  // emu rotate 只转窗口不转安卓，resize-display 只认内置预设档）。
+  // 唯一可行的路是「按应用方向选 LCD 冷启动」，这条链路的关键分支用测试钉住。
+  await test('横屏应用按 screenOrientation 选 LCD，窗口比例跟着 LCD 走', () => {
+    const { parseApk } = require('../src/core/apk');
+    const { buildApkBytes } = require('./lib/make-apk');
+    const lcd = require('../src/core/lcd');
+    const { AppWindow } = require('../src/core/appwin');
+
+    const write = (name, opt) => {
+      const p = path.join(TMP, name);
+      fs.writeFileSync(p, buildApkBytes(opt));
+      return parseApk(p);
+    };
+    // AXML 里枚举属性是整数，也有应用写成字符串 —— 两种都要认
+    const land = write('land-int.apk', { packageName: 'com.example.land', orientation: 1 });
+    assert(land.orientation === 'landscape', `整数枚举应解析为 landscape，实际 "${land.orientation}"`);
+    const port = write('port-str.apk', { packageName: 'com.example.port', orientation: 'portrait' });
+    assert(port.orientation === 'portrait', `字符串应解析为 portrait，实际 "${port.orientation}"`);
+    const none = write('none-orient.apk', { packageName: 'com.example.none' });
+    assert(none.orientation === '', '清单没声明时必须是空 —— 猜错会把竖屏应用全变成两侧黑边');
+
+    // 决策：用户选过「保持当前」就不再干预
+    assert(lcd.desiredOrientation({ package: 'a', orientation: 'landscape' }) === 'landscape');
+    assert(lcd.desiredOrientation({ package: 'a', orientation: 'landscape', lcdPref: 'keep' }) === '');
+    assert(lcd.desiredOrientation({ package: 'a', orientation: 'landscape', lcdPref: 'portrait' }) === 'portrait',
+      '用户强制值优先于清单');
+    assert(lcd.desiredOrientation(null) === '');
+    assert(lcd.needsRestart('portrait', 'landscape') === true);
+    assert(lcd.needsRestart('landscape', 'landscape') === false);
+    assert(lcd.needsRestart('portrait', '') === false, '方向未知时不能触发重启');
+
+    // 窗口尺寸：横屏 LCD 下无论要不要「横屏排版」，窗口都必须是横的
+    const area = { x: 0, y: 0, w: 1920, h: 1040 };
+    const a = AppWindow.sizeFor(area, { w: 1920, h: 1080 }, true);
+    assert(a.w > a.h, `横屏 LCD 的窗口必须是横的，实际 ${a.w}x${a.h}`);
+    const b = AppWindow.sizeFor(area, { w: 720, h: 1280 }, true);
+    assert(b.w > b.h, '竖屏 LCD 切横屏排版时窗口应是横的');
+    const c = AppWindow.sizeFor(area, { w: 1920, h: 1080 }, false);
+    assert(c.w > c.h, '横屏 LCD 即使不要求横屏排版，窗口也不能变成竖的');
+    assert(lcd.orientBox({ w: 720, h: 1280 }, 'landscape').w === 1280);
+    assert(lcd.orientBox({ w: 720, h: 1280 }, 'portrait').w === 720);
+
+    // 没有加速时不能只丢一句 UNKNOWN：用户要知道去开 WHPX / 装 AEHD
+    const doctor = require('../src/core/doctor');
+    const d = doctor.noAccelDiagnosis();
+    assert(d.code === 'ACCEL', `诊断码应为 ACCEL，实际 ${d.code}`);
+    assert(/WHPX/.test(d.hint) && /AEHD/.test(d.hint), '提示里必须点名两个可选的加速方案');
+  });
+
   // 「全屏 = 横屏排版」这条链路上，rotate() 会先退出最大化才能改尺寸；如果不把
   // 最大化状态再恢复，「设置里是全屏、窗口却变成居中小窗」就会随机出现
   // （maximize() 在 Windows 上是异步的，紧接着读 isMaximized() 拿到的还是 false）。

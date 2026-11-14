@@ -42,22 +42,59 @@ class AppWindow {
 
   get isOpen() { return !!(this.win && !this.win.isDestroyed()); }
 
-  /** 竖屏 / 横屏下窗口内容的目标尺寸（自动缩放到屏幕内） */
-  static sizeFor(area, portrait, landscape) {
-    const p = portrait || { w: 540, h: 960 };
+  /**
+   * 竖屏 / 横屏下窗口内容的目标尺寸（自动缩放到屏幕内）。
+   *
+   * `box` 是模拟器 LCD 的尺寸：横屏应用会以 1920x1080 起模拟器，此时 box 本身就是
+   * 横的，再按 landscape 交换宽高会把画面塞回竖框（两侧黑边 + 点击错位）。
+   * 所以只有「竖屏 LCD 想横过来用」才交换。
+   */
+  static sizeFor(area, box, landscape) {
+    const p = box || { w: 540, h: 960 };
     // 留足边距：标题栏 38 + 上下各 24，左右各 40
     const availH = Math.max(360, (area.h || 1040) - TITLEBAR_H - 48);
     const availW = Math.max(300, (area.w || 1920) - 80);
-    const k = landscape
+    const swap = !!landscape && p.w < p.h;
+    const k = swap
       ? Math.min(availW / p.h, availH / p.w)
       : Math.min(availH / p.h, availW / p.w);
-    const w = Math.round((landscape ? p.h : p.w) * k);
-    const h = Math.round((landscape ? p.w : p.h) * k);
+    const w = Math.round((swap ? p.h : p.w) * k);
+    const h = Math.round((swap ? p.w : p.h) * k);
     // 双保险：绝不超过屏幕可用区，否则会被系统裁掉，看起来就是「有黑边 / 没填满」
     return {
       w: Math.max(320, Math.min(w, Math.round(availW))),
       h: Math.max(360, Math.min(h, Math.round(availH))),
     };
+  }
+
+  /** 当前 LCD 是不是横的（决定窗口比例与旋转按钮是否还有意义） */
+  get lcdLandscape() {
+    return !!(this.lcd && this.lcd.w > this.lcd.h);
+  }
+
+  /**
+   * 换一个 LCD 比例（不重开窗口，只改大小并居中）。
+   * 用在「用户拒绝为横屏应用重启运行时」：窗口得跟着回到当前 LCD 的比例，
+   * 否则就是横窗口套竖画面，比修之前更难看。
+   */
+  applyBox(box) {
+    if (!this.isOpen || !box || !box.w || !box.h) return;
+    this.lcd = { w: box.w, h: box.h };
+    this.portrait = { w: box.w, h: box.h };
+    const wasMax = this.win.isMaximized();
+    if (wasMax) this.win.unmaximize();
+    const area = this._area();
+    const size = AppWindow.sizeFor(area, this.portrait, false);
+    this.win.setContentSize(Math.max(320, size.w), Math.max(420, size.h + TITLEBAR_H));
+    const b = this.win.getBounds();
+    this.win.setPosition(
+      Math.round(area.x + (area.w - b.width) / 2),
+      Math.round(area.y + (area.h - b.height) / 2),
+    );
+    if (wasMax) this.win.maximize();
+    this.state.landscape = this.lcdLandscape;
+    this._push();
+    this.scheduleFit();
   }
 
   _area() {
@@ -77,10 +114,11 @@ class AppWindow {
 
   /**
    * 打开（或复用）应用窗口。
-   * @param {object} o { pkg, label, iconPath, portrait, fullscreen, onClosed }
+   * @param {object} o { pkg, label, iconPath, lcd, fullscreen, onClosed }
+   *   lcd 是模拟器 LCD 尺寸（横屏应用为 1920x1080），窗口按它定比例。
    */
   open(o) {
-    const { pkg, label, iconPath, portrait, fullscreen } = o;
+    const { pkg, label, iconPath, lcd, fullscreen } = o;
     // 保留外部（main）通过 onWindowClosed() 注册的回调：open 可能被反复调用
     this._closedCb = o.onClosed || this._closedCb;
     if (this.isOpen && this.pkg === pkg) {
@@ -91,8 +129,14 @@ class AppWindow {
     this.close({ keepApp: true });
 
     this.pkg = pkg;
-    this.portrait = portrait || { w: 540, h: 960 };
-    this.state = { label: label || '应用', tip: '正在启动安卓运行时…', ready: false, landscape: false };
+    this.lcd = lcd || null;
+    this.portrait = (lcd && lcd.w && lcd.h) ? { w: lcd.w, h: lcd.h } : { w: 540, h: 960 };
+    this.state = {
+      label: label || '应用',
+      tip: '正在启动安卓运行时…',
+      ready: false,
+      landscape: this.lcdLandscape,
+    };
 
     const area = this._area();
     const size = AppWindow.sizeFor(area, this.portrait, false);
@@ -326,6 +370,9 @@ class AppWindow {
    */
   async rotate({ fullscreen = null } = {}) {
     if (!this.isOpen) return this.state.landscape;
+    // 横屏 LCD：窗口比例就是 LCD 的比例，「把窗口转成横的」已经没意义了。
+    // 继续按 wm size 切排版只会让画面在窗口里留边，所以这里直接不做事。
+    if (this.lcdLandscape) return this.state.landscape;
     const next = !this.state.landscape;
     if (this.setOrientation) await this.setOrientation(next).catch(() => {});
     // wm size 会触发全局配置变更，应用要重建一次界面，给足时间再贴窗口

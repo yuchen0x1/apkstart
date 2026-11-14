@@ -660,6 +660,14 @@ class AdbClient {
     return m ? { width: Number(m[1]), height: Number(m[2]) } : null;
   }
 
+  /** 物理分辨率（忽略 wm size 的 Override）—— 它才是模拟器 LCD 的真实尺寸 */
+  async physicalSize() {
+    const out = await this.shell('wm size').catch(() => '');
+    const m = /Physical size:\s*(\d+)x(\d+)/i.exec(String(out));
+    if (m) return { width: Number(m[1]), height: Number(m[2]) };
+    return this.wmSize();
+  }
+
   async androidVersion() {
     return (await this.shell('getprop ro.build.version.release').catch(() => '')).trim();
   }

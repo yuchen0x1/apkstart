@@ -5,15 +5,20 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased]
+## [0.4.1] — 2026-11-15
 
 上游 `RoutineMiku/apkstart` 从 v0.3.7 到 v0.4.1 的修复已按逻辑逐条移植（不做整树 merge，
-避免覆盖本分支的安全加固与 UI）。逐条对照与验证方式见 `docs/UPSTREAM-ALIGN-0.4.1.md`。
-
-对照上游全部 36 条 issue 的核对结果（21 条已修 / 7 条部分 / 5 条未修 / 3 条非代码）
-见 `docs/UPSTREAM-ISSUES-AUDIT.md`；本轮据此新修了三条 0.4.x 回归：
+避免覆盖本分支的安全加固与 UI）。逐条对照与验证方式见 `docs/UPSTREAM-ALIGN-0.4.1.md`；
+上游全部 38 条 issue 的核对结果见 `docs/UPSTREAM-ISSUES-AUDIT.md`
+（26 已修 / 7 部分 / 4 未修 / 1 信息不足）。
 
 ### 修复
+- **横屏应用铺不满窗口**（上游 #41）：模拟器窗口的宽高比由 `hw.lcd.width/height` 在开机时
+  锁死，`wm size` 只改安卓逻辑分辨率、`adb emu rotate` 只转窗口不转安卓排版、
+  `resize-display` 只认内置预设档且实测直接 KO。现在按 APK 清单里的 `android:screenOrientation`
+  选 LCD：横屏应用用横屏 LCD 冷启动，窗口比例跟着 LCD 走。运行时已经在跑且方向不符时会问一次
+  「重启并切换 / 保持当前」（可勾选记住），拒绝就把窗口收回当前比例，与旧版一致。
+  代价是切换方向要一次冷启动（本机实测 33 秒）。
 - **关窗后模拟器窗口被销毁，再打开报 `embed failed: emu=0`、全黑**（上游 #42）：
   `win.on('close')` 原来只置 `_closing = true`，没走 `close()` 里「先 `agent.park()` 把
   窗口从宿主上摘下来、再销毁宿主」的路径 —— Windows 会连带销毁嵌入的 Qt 子窗口，qemu 还在
@@ -24,6 +29,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
   最前面声明 PerMonitorV2（老系统退回 System DPI Aware），与 Electron 宿主一致。
 - **首帧事件丢失导致「双击没反应」**（上游 #39）：`ready-to-show` 在某些显卡/虚拟显示器
   组合下不会回来，进程驻留但没有窗口。主窗口与应用窗口都加了 3 秒兜底 `show()`。
+- **没有硬件加速时只报「UNKNOWN」**（上游 #6/#15/#20/#31/#29 那一类）：全部参数组合失败且
+  `accelOk=false` 时，诊断直接给结论并点名两条可执行的动作（勾选「虚拟机平台」或安装 AEHD），
+  不再让用户对着「已自动重试多组参数」猜。
 
 ### 修复（上游对齐）
 - **嵌入窗口的 Z 序（黑边 / 未填满 / 点击失效 / 点不动「同意」的真因）**：模拟器窗口原先
@@ -237,7 +245,8 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
-[Unreleased]: https://github.com/yuchen0x1/apkstart/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/yuchen0x1/apkstart/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/yuchen0x1/apkstart/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.4.0
 [0.3.7]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.7
 [0.3.6]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.6

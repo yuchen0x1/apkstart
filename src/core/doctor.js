@@ -85,6 +85,23 @@ function lcdFor({ accelOk = true, crisp = true } = {}) {
   return accelOk && crisp ? { w: 720, h: 1280, dpi: 320 } : { w: 540, h: 960, dpi: 240 };
 }
 
+/**
+ * 按应用的自然方向把 LCD 转 90°（像素数与 dpi 不变）。
+ *
+ * 模拟器窗口的宽高比由 hw.lcd.width/height 在**开机时**锁死：把子窗口强设成
+ * 1280x720，Qt 会立刻弹回 405x720（= 720×(720/1280)）；`adb emu rotate` 只把
+ * 窗口转过去、安卓侧 rotation 仍是 0（实测，画面整屏横躺）；`resize-display`
+ * 只支持内置预设档且在这台机器上直接 KO。所以横屏应用要铺满窗口，只能按方向
+ * 选 LCD 冷启动 —— 这是 issue #41 的根因，也是唯一可行的那条路。
+ */
+function orientLcd(lcd, orientation) {
+  if (!lcd || !lcd.w || !lcd.h) return lcd;
+  const wantLandscape = orientation === 'landscape';
+  const isLandscape = lcd.w > lcd.h;
+  if (wantLandscape === isLandscape) return lcd;
+  return { ...lcd, w: lcd.h, h: lcd.w };
+}
+
 function shortPath(p) {
   if (process.platform !== 'win32' || !p || isAsciiPath(p)) return p;
   try {
@@ -447,6 +464,23 @@ function diagnose(lines) {
   };
 }
 
+/**
+ * 没有硬件加速、又试完全部参数组合时的结论。
+ *
+ * issue #20 / #6 / #15 / #31 / #29 都是这一类：机器上 WHPX 与 AEHD 都不可用，
+ * 日志里没有任何可匹配的关键字，最后只剩一句「UNKNOWN · 已自动尝试多组参数」，
+ * 用户完全不知道该做什么。实际情况很明确：x86_64 镜像在多数 CPU 上必须有加速。
+ */
+function noAccelDiagnosis() {
+  return {
+    code: 'ACCEL',
+    title: '本机没有可用的硬件加速，软件模拟没能起来',
+    hint: 'x86_64 安卓镜像在多数 CPU 上必须有 WHPX 或 AEHD 才能开机。'
+      + '请在「Windows 功能」里勾选「虚拟机平台（Hyper-V）」后重启，'
+      + '或在「运行时」页安装 AEHD 驱动，装好后重新点「启动运行时」。',
+  };
+}
+
 /** 人类可读的一行摘要，放在设置页让高级用户知道自动选了什么 */
 function describeProfile(p) {
   return `自动：${(p.memoryMB / 1024).toFixed(1)}GB 内存 · ${p.cores} 核 · ${p.gpu} 渲染 · `
@@ -514,9 +548,9 @@ function vcRedistOk() {
 }
 
 module.exports = {
-  hostInfo, freeDiskMB, isAsciiPath, shortPath, lcdFor, liteProfile,
+  hostInfo, freeDiskMB, isAsciiPath, shortPath, lcdFor, orientLcd, liteProfile,
   versionNumbers, gpuCandidates, chooseProfile, planVariants,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey, imageIdentity,
-  diagnose, describeProfile, writeReport, vcRedistOk,
+  diagnose, noAccelDiagnosis, describeProfile, writeReport, vcRedistOk,
 };

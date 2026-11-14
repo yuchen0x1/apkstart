@@ -33,6 +33,7 @@ function loadBrandIcon(size) {
 const assoc = require('./core/assoc');
 const windowctl = require('./core/windowctl');
 const display = require('./core/display');
+const lcd = require('./core/lcd');
 const { WinAgent } = require('./core/agent');
 const pointer = require('./core/pointer');
 const { AppWindow, TITLEBAR_H } = require('./core/appwin');
@@ -290,25 +291,65 @@ function portraitSize() {
   return display.portraitSize(d.portrait || '540x960');
 }
 
+/**
+ * 窗口该按什么比例：运行时 LCD 优先 —— 横屏应用是拿 1920x1080 起的模拟器，
+ * 再用「竖屏基准」去套就会出现两侧黑边 + 点击错位（issue #41）。
+ */
+function windowBox() {
+  const l = runtime && runtime.emulator && runtime.emulator.lcd;
+  if (l && l.w && l.h) return { w: l.w, h: l.h };
+  return portraitSize();
+}
+
 /** 设置页改动鼠标键位后，立刻按当前窗口焦点同步一次钩子配置 */
 function refreshPointerMapping() {
   if (appWin && appWin.isOpen) appWin.refreshPointer();
   else if (winAgent && winAgent.hooked) winAgent.setHook(false).catch(() => {});
 }
 
-/** 打开（或复用）那个「一个应用一个干净窗口」 */
-function openAppWindow(pkg, tip) {
+/**
+ * 打开（或复用）那个「一个应用一个干净窗口」。
+ * @param {object} [box] 模拟器 LCD 尺寸；横屏应用传 1920x1080，窗口按它定比例
+ */
+function openAppWindow(pkg, tip, box = null) {
   const rec = store.getApp(pkg);
   appWin.open({
     pkg,
     label: (rec && rec.label) || pkg,
     iconPath: rec && rec.icoPath,
-    portrait: portraitSize(),
+    lcd: box || (runtime && runtime.emulator && runtime.emulator.lcd) || null,
     fullscreen: displaySettings().mode === 'fullscreen',
   });
   appWin.setIcon(rec && rec.icoPath);
-  appWin.setState({ tip: tip || '正在启动安卓运行时…', ready: false, landscape: false });
+  appWin.setState({ tip: tip || '正在启动安卓运行时…', ready: false, landscape: appWin.lcdLandscape });
   currentAppPkg = pkg;
+}
+
+/**
+ * 应用方向与当前运行时不一致时问用户：重启运行时（约 1 分钟）换取铺满，还是保持现状。
+ * 不静默重启是底线：那是一次完整冷启动，用户有权拒绝。
+ */
+async function askLcdSwitch(rec, want, current) {
+  const name = (rec && rec.label) || (rec && rec.package) || '这个应用';
+  const { response, checkboxChecked } = await dialog.showMessageBox(
+    (appWin && appWin.win) || mainWindow,
+    {
+      type: 'question',
+      buttons: ['重启并切换', '保持当前'],
+      defaultId: 0,
+      cancelId: 1,
+      title: '需要重启安卓运行时',
+      message: `《${name}》是${lcd.label(want)}应用，当前运行时是${lcd.label(current)}。`,
+      detail: '模拟器的画面比例在开机时就固定了（这是让应用铺满窗口的唯一办法）。'
+        + `改用${lcd.label(want)}模式需要重启安卓运行时，约 1 分钟；已安装的应用和数据都不受影响。`,
+      checkboxLabel: '记住这个应用的选择',
+      checkboxChecked: false,
+    },
+  );
+  if (checkboxChecked && rec && rec.package) {
+    store.upsertApp({ package: rec.package, lcdPref: response === 0 ? want : 'keep' });
+  }
+  return response === 0;
 }
 
 async function toggleDisplayMode() {
@@ -725,15 +766,41 @@ async function runLaunch(pkg) {
   const mark = (s) => appLog(`launch ${pkg} ${s} +${Date.now() - t0}ms`);
   appLog(`launch start ${pkg}`);
   try {
+    // 0) 先决定这个应用该用横屏还是竖屏 LCD。
+    //    模拟器窗口比例开机锁死（issue #41），所以必须赶在拉起运行时之前定下来；
+    //    窗口本身也先按这个比例打开，别等模拟器起来再改（改一次要重排画面）。
+    const rec = store.getApp(pkg);
+    const want = lcd.desiredOrientation(rec);
+    openAppWindow(pkg, '正在启动安卓运行时…', want ? lcd.orientBox(portraitSize(), want) : windowBox());
     // 1) 先把「应用窗口」打开显示启动动画：整个过程看不到安卓桌面，也看不到模拟器窗口
-    openAppWindow(pkg, '正在启动安卓运行时…');
     // 开机阶段把模拟器主窗 + qemu / netsimd 的控制台黑窗藏起来，避免任何闪现。
     // 压制是常驻的（embed 后它会自动跳过被嵌入的那一个窗口，见 appwin.embed）。
     // 这里必须 await：不等压制生效就往下走，黑窗会在启动瞬间露出来。
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
     if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
 
+    // 运行时已经在跑、但 LCD 方向和应用对不上：只有重启运行时才能真的铺满。
+    // 不静默重启 —— 那是 1 分钟的等待，用户有权知道并拒绝（拒绝就按现在的
+    // 逻辑用 wm size 居中显示，和旧版本一样）。
+    let lcdOrientation = want;
+    if (want && runtime.vmRunning && lcd.needsRestart(runtime.lcdOrientation, want)) {
+      const go = await askLcdSwitch(rec, want, runtime.lcdOrientation).catch(() => false);
+      if (go) {
+        appWin.setState({ tip: `正在以${lcd.label(want)}模式重启安卓运行时…`, ready: false });
+        mark(`lcd switch -> ${want}`);
+        await runtime.stop().catch(() => {});
+      } else {
+        lcdOrientation = '';
+        mark(`lcd switch declined (${want})`);
+        // 窗口刚才是按「目标方向」开的，用户选了保持现状就得收回去，
+        // 否则变成横窗口套竖画面（比原来的居中显示更糟）。
+        const cur = runtime.emulator && runtime.emulator.lcd;
+        if (cur && cur.w && cur.h) appWin.applyBox(cur);
+      }
+    }
+
     const r = await installer.launch(pkg, {
+      lcdOrientation,
       onLog: (m) => { send('runtime:log', m); appLog(`  rt ${m}`); },
       onMark: mark,
       beforeStart: async (rt) => {
@@ -1133,7 +1200,7 @@ function registerIpc() {
     if (patch && patch.autoStart !== undefined) applyAutoStart();
     if (patch && patch.display && appWin && appWin.isOpen) {
       // 竖屏基准尺寸变了：只影响后续打开的窗口大小，不打断正在跑的应用
-      appWin.portrait = portraitSize();
+      appWin.portrait = windowBox();
     }
     // 打开「开始菜单快捷方式」时立刻补齐，不用等下次安装
     if (patch && (patch.createStartMenuShortcut === true || patch.createShortcutOnInstall === true)) {
@@ -1190,7 +1257,7 @@ function registerIpc() {
   ipcMain.handle('display:set', async (_e, patch) => {
     const next = store.saveSettings({ display: patch || {} });
     if (appWin && appWin.isOpen) {
-      appWin.portrait = portraitSize();
+      appWin.portrait = windowBox();
       const full = next.display.mode === 'fullscreen';
       if (full && !appWin.win.isMaximized()) appWin.win.maximize();
       if (!full && appWin.win.isMaximized()) appWin.win.unmaximize();

@@ -210,10 +210,14 @@ test('settings 写入白名单放行 update.autoUpdate', () => {
   assert(out.includes('PASS'), '子进程验证失败：' + out);
   fs.rmSync(tmpAppData, { recursive: true, force: true });
 });
-test('CHANGELOG.md 存在且包含当前开发版本条目', () => {
+test('CHANGELOG.md 存在且覆盖当前版本', () => {
   const cl = fs.readFileSync(path.join(__dirname, '..', 'CHANGELOG.md'), 'utf8');
   assert(/## \[0\.3\.7\]/.test(cl), 'CHANGELOG 应包含 0.3.7 条目');
-  assert(/## \[Unreleased\]/.test(cl), 'CHANGELOG 应包含 Unreleased 段');
+  // 发版后 [Unreleased] 会被转正成具体版本号，所以不能只认 Unreleased：
+  // 断言「当前 package.json 的版本在 CHANGELOG 里有条目」，发版前后都成立。
+  const ver = require('../package.json').version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  assert(new RegExp(`## \\[${ver}\\]`).test(cl),
+    `CHANGELOG 应包含当前版本 ${ver} 的条目（或发版前保留 [Unreleased]）`);
 });
 
 /* ---------------- android.js：音量输出解析（#33 回归） ---------------- */

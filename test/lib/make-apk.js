@@ -161,9 +161,17 @@ function buildManifestAxml(opts = {}) {
       children: [],
     });
   }
+  const activityAttrs = [A('name', o.launchActivity)];
+  // screenOrientation：整数按 AXML 枚举（TYPE_INT_DEC）写，字符串按普通字符串写。
+  // 两种都要覆盖 —— 真实 APK 里两种都见过，解析端得都能认。
+  if (typeof o.orientation === 'number') {
+    activityAttrs.push(A('screenOrientation', o.orientation, { type: 0x10 }));
+  } else if (typeof o.orientation === 'string') {
+    activityAttrs.push(A('screenOrientation', o.orientation));
+  }
   app.children.push({
     name: 'activity',
-    attrs: [A('name', o.launchActivity)],
+    attrs: activityAttrs,
     children: [{
       name: 'intent-filter',
       attrs: [],

@@ -233,13 +233,13 @@ class Runtime {
     return args;
   }
 
-  async boot({ install = false, onLog = () => {} } = {}) {
+  async boot({ install = false, onLog = () => {}, lcdOrientation = '' } = {}) {
     const env = await this.provisioner.checkEnv();
     this._hv = env.hypervisor;
 
     // 首选：官方 emulator（自带设备模型与 GPU 转译，体验最好）
     if (env.emulator.ok && env.sysimg.ok) {
-      return this.bootEmulator({ env, onLog });
+      return this.bootEmulator({ env, onLog, lcdOrientation });
     }
 
     return this.bootQemu({ install, env, onLog });
@@ -249,7 +249,7 @@ class Runtime {
    * 用官方 emulator 启动 Android。
    * 与 QEMU+ISO 不同，这里没有"安装系统"这一步：镜像本身就是系统，首次启动即开机。
    */
-  async bootEmulator({ env, onLog = () => {} } = {}) {
+  async bootEmulator({ env, onLog = () => {}, lcdOrientation = '' } = {}) {
     if (this.vmStarting) {
       const started = Date.now();
       while (this.vmStarting && Date.now() - started < 300000) {
@@ -310,6 +310,7 @@ class Runtime {
         headless: this.settings.engine.headless !== false,
         onLog,
         probe,
+        lcdOrientation,
       });
       // start() 失败时是「返回 {ok:false}」而不是抛异常（磁盘不足、多次重试仍失败等）。
       // 老实现不看这个字段，直接把 ok:true 往上返回 —— 上层于是认为「已经就绪」，
@@ -526,14 +527,34 @@ class Runtime {
   }
 
   async prepare(client) {
+    // 接管 / 复用上一会话的模拟器时，本进程并不知道它当时是用横屏还是竖屏 LCD 起的；
+    // 只有设备自己知道（Physical size 不受 wm size 覆盖影响）。
+    // 这里读回来，窗口才能按真实比例打开，而不是拿竖屏框去套横屏画面。
+    if (/^emulator-/.test(String((client && client.serial) || ''))) {
+      try {
+        const s = await client.physicalSize();
+        if (s && s.width && s.height) this.emulator.learnLcd(s);
+      } catch (_) { /* 读不到就沿用上次推断（默认竖屏） */ }
+    }
     if (!this._freeformReady) {
       try { this._freeformReady = await client.ensureFreeform(); } catch (_) { /* ignore */ }
+    }
+    // 横屏 LCD 下不需要（也不允许）留 wm size 覆盖：旧版本「全屏=平板排版」会把
+    // 1280x720 写进 /data 并在重启后继续生效，横屏 LCD 再套一层覆盖就变成
+    // 画面居中一条 + 两侧黑边。每次开机后清一次，之后由窗口比例自己说话。
+    if (!this._lcdNormalized) {
+      this._lcdNormalized = true;
+      if (this.emulator.lcdOrientation === 'landscape') {
+        try { await client.shell('wm size reset; wm density reset', { timeout: 15000 }); } catch (_) { /* ignore */ }
+      }
     }
     this.startWatchdog();
   }
 
   /** 优雅停止：emulator 走控制台关机，QEMU 走 monitor */
   async stop({ graceful = true } = {}) {
+    // 下次开机要重新做一次 LCD 归一（方向可能被换掉）
+    this._lcdNormalized = false;
     const adbPath = this.adbPath();
     if (this.emulator.running()) {
       await this.emulator.stop({ adbPath });
@@ -787,16 +808,16 @@ class Runtime {
    * 幂等入口：预热与用户点击可能同时发生，共用一个 Promise，
    * 避免两边各判断一次「没在线」后各自拉起一台模拟器（AVD 锁冲突 + 双倍内存）。
    */
-  async ensure({ onLog = () => {} } = {}) {
+  async ensure({ onLog = () => {}, lcdOrientation = '' } = {}) {
     if (this._ensurePromise) return this._ensurePromise;
-    const p = this._ensureInner({ onLog });
+    const p = this._ensureInner({ onLog, lcdOrientation });
     this._ensurePromise = p;
     const clear = () => { if (this._ensurePromise === p) this._ensurePromise = null; };
     p.then(clear, clear);
     return p;
   }
 
-  async _ensureInner({ onLog = () => {} } = {}) {
+  async _ensureInner({ onLog = () => {}, lcdOrientation = '' } = {}) {
     const client = this.client();
     if (await client.isOnline()) {
       await this.prepare(client);
@@ -863,7 +884,7 @@ class Runtime {
       // 接管失败时先把这些孤儿清掉，再冷启，保证「关掉再开」一定能起来。
       await this.killOrphanEmulators({ onLog }).catch(() => {});
       try {
-        const r = await this.boot({ onLog });
+        const r = await this.boot({ onLog, lcdOrientation });
         if (r.ok) return { ok: true, client: r.client, engine: 'emulator', profile: r.profile, network: r.network || null };
         return {
           ok: false, error: r.error, env,
@@ -996,6 +1017,9 @@ class Runtime {
   }
 
   get vmRunning() { return this.emulator.running() || !!(this.vmProc && !this.vmProc.killed); }
+
+  /** 当前运行时的 LCD 方向（landscape / portrait）；未知时按竖屏算 */
+  get lcdOrientation() { return this.emulator.lcdOrientation; }
 
   // ---------------- 诊断 / 瘦身（供 UI 调用） ----------------
 

@@ -867,7 +867,7 @@ class EmulatorEngine {
    * 启动 + 自动重试。
    * @param {Function} probe 异步回调，返回 'ok' | 'pending' | 'fatal'
    */
-  async start({ headless = false, onLog = () => {}, probe = null, maxAttempts = 4 } = {}) {
+  async start({ headless = false, onLog = () => {}, probe = null, maxAttempts = 4, lcdOrientation = '' } = {}) {
     if (this.proc && !this.proc.killed) {
       return { ok: true, reused: true, serial: this.serial, port: this.port };
     }
@@ -956,7 +956,14 @@ class EmulatorEngine {
 
     // 屏幕规格在整个启动过程中保持一致，否则每次重试都换分辨率会狂清快照。
     // 分辨率来自 doctor 的 profile（设置里可改「画质」），auto 时按加速状态选。
-    const screen = (profile && profile.lcd) || doctor.lcdFor({ accelOk: accelInfo.ok });
+    // 横屏应用（清单里 screenOrientation=landscape）转 90°：模拟器窗口比例由 LCD
+    // 决定、开机锁死，这是唯一能让游戏铺满窗口的办法（issue #41）。
+    const baseScreen = (profile && profile.lcd) || doctor.lcdFor({ accelOk: accelInfo.ok });
+    const screen = doctor.orientLcd(baseScreen, lcdOrientation);
+    this.lcd = { ...screen };
+    if (lcdOrientation && screen !== baseScreen) {
+      onLog(`按应用方向使用${screen.w > screen.h ? '横屏' : '竖屏'} LCD：${screen.w}x${screen.h}`);
+    }
     this.attempts = [];
     this.lastDiagnosis = null;
     let lastError = '';
@@ -1106,7 +1113,11 @@ class EmulatorEngine {
       await this.killAttempt();
     }
 
-    const d = this.lastDiagnosis || doctor.diagnose(this.recentLog(120));
+    // 全部组合都失败、而且本机根本没有加速：给一句能照做的结论，
+    // 别再让用户对着「UNKNOWN + 已自动重试」猜（issue #20/#6/#15/#31）。
+    let d = this.lastDiagnosis || doctor.diagnose(this.recentLog(120));
+    if ((!d || d.code === 'UNKNOWN') && accelInfo && !accelInfo.ok) d = doctor.noAccelDiagnosis();
+    this.lastDiagnosis = d;
     const report = doctor.writeReport({
       dataDir: store.DATA_DIR, profile, logLines: this.recentLog(300),
       extra: {
@@ -1130,6 +1141,20 @@ class EmulatorEngine {
   }
 
   running() { return !!(this.proc && !this.proc.killed); }
+
+  /**
+   * 当前运行时的 LCD 方向。未知（还没启动过）按竖屏处理 —— 那是绝大多数应用的方向，
+   * 也是老版本一直以来的行为，不能因为「读不到」就把窗口弄成横的。
+   */
+  get lcdOrientation() {
+    return this.lcd && this.lcd.w > this.lcd.h ? 'landscape' : 'portrait';
+  }
+
+  /** 从已运行的设备读回真实 LCD（接管上一会话遗留的模拟器时，不知道当时的启动参数） */
+  learnLcd(size) {
+    if (!size || !size.width || !size.height) return;
+    this.lcd = { w: size.width, h: size.height, dpi: (this.lcd && this.lcd.dpi) || 0 };
+  }
 
   /**
    * 保存 quickboot 快照（下次开机直接恢复内存状态，像 WSA/应用宝的快速启动）。

@@ -411,9 +411,9 @@ class Installer {
     return true;
   }
 
-  async launch(pkg, { onLog = () => {}, beforeStart = null, onMark = () => {} } = {}) {
+  async launch(pkg, { onLog = () => {}, beforeStart = null, onMark = () => {}, lcdOrientation = '' } = {}) {
     const app = store.getApp(pkg);
-    const rt = await this.runtime.ensure({ onLog });
+    const rt = await this.runtime.ensure({ onLog, lcdOrientation });
     onMark('ensure done');
     if (!rt.ok) {
       const err = new Error(rt.error || '运行时不可用');
