@@ -32,16 +32,18 @@ jobs:
       - name: 打包便携版
         run: npm run pack
 
-      # 用 7-Zip 而不是 Compress-Archive：同一个目录，.NET deflate 压出来 105MB，
-      # 7-Zip -mx=9 只要 99.6MB —— 差这 5MB 就决定 Gitee 上放的是「一个能直接解压的
-      # zip」还是「两个必须手工拼接的 part」。build/zip.js 还带体积闸门：超过
-      # 100MiB 直接让 job 失败，避免以后又悄悄退回分片包。
-      - name: 压缩产物（7-Zip，体积闸门 100MiB）
+      # 用 7-Zip 而不是 Compress-Archive：同一个目录，.NET deflate 压出来比 7-Zip -mx=9
+      # 大 5MB 以上。build/zip.js 带体积闸门，超过上限直接让 job 失败，避免以后又悄悄
+      # 退回分片包。
+      # 闸门从 100MiB 调到 160MiB：100MiB 是 Gitee 单文件上限定的，而 Electron 33 → 45
+      # 之后壳层从 225MB 长到 327MB（electron.exe 单文件 238MB），压后实测 140.85MiB，
+      # 按老闸门每次发版都会红。Gitee 那一步已改为「超限就跳过」，不再需要 100MiB。
+      - name: 压缩产物（7-Zip，体积闸门 160MiB）
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
-          node build/zip.js dist/ApkStart-win64-portable "ApkStart-$tag-win64-portable.zip" --limit-mb 100
+          node build/zip.js dist/ApkStart-win64-portable "ApkStart-$tag-win64-portable.zip" --limit-mb 160
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Item "ApkStart-$tag-win64-portable.zip" | Select-Object Name, Length
 
@@ -75,11 +77,11 @@ jobs:
           if (-not $ok) { Write-Error "上传失败: $zip"; exit 1 }
           gh release view $tag --json assets --jq '.assets[].name'
 
-      # 同步到 Gitee：国内直连 GitHub 只有几十 KB/s，Gitee 通常能跑几 MB/s。
-      # 便携包压紧后约 99.6MB，在 Gitee 单文件上限（100MB）以内，直接放一个整包，
-      # 用户点开就能解压；只有超限时 publish-gitee.js 才退回 .part1/.part2 分片。
-      # Setup（1.4GB）与运行时整包（1.4GB）超限太多，只留在 GitHub ——
-      # 应用端对「哪个源有资产」是取并集的，不影响更新。
+      # 同步到 Gitee（历史镜像）：国内直连 GitHub 只有几十 KB/s，Gitee 通常能跑几 MB/s。
+      # Electron 45 之后便携包压后约 141MB，已经放不进 Gitee 单文件 100MB 的上限，
+      # 因此这一步在超限时会明确跳过（见下面的 size 判断），不再产出需要手工拼接的
+      # .part1/.part2。Setup（1.4GB）与运行时整包（1.4GB）本来只留在 GitHub。
+      # 应用内更新（updater.js）从 v0.3.9 起只认 GitHub，Gitee 缺资产不影响升级。
       # Gitee 同步「缺 token / 网络不通」只告警不阻断：否则整 build job 变红，
       # 下面 needs: build 的 full job 会被整段跳过，连 GitHub 自己的 Setup / 运行时整包都发不出。
       # 缺 token 时这一步仍会在日志里标红（continue-on-error 是「可见但非致命」），不静默。
@@ -89,6 +91,17 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         shell: pwsh
         run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          # Electron 45 之后壳层 327MB → 压后约 141MB，已远超 Gitee 单文件 100MB。
+          # 分片包（.part1/.part2）必须手工拼接，普通用户根本用不了。超限时明确跳过并留
+          # 一条 warning：比每次发版都红一次、或者产出一堆没人能用的分片都诚实。
+          $zip = "ApkStart-$tag-win64-portable.zip"
+          $zipMB = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          if ((Get-Item $zip).Length -gt 100MB) {
+            Write-Warning "便携包 $zipMB MB 超过 Gitee 单文件上限（100MB），本版跳过 Gitee 同步；GitHub Release 资产完整，不影响下载与自动更新。"
+            exit 0
+          }
           # 以前这里是「没配 token 就静默跳过、这一步仍显示成功」——
           # v0.3.4 就这样在 Gitee 上悄悄少了一个版本，事后才发现。
           # 现在缺 token 直接让这一步失败，宁可红一次也别再无声无息。
@@ -96,14 +109,12 @@ jobs:
             Write-Error "缺少 GITEE_TOKEN：Gitee 这一版不会有安装包。请在 Settings → Secrets and variables → Actions 添加 GITEE_TOKEN（勾选 projects + pull_requests 之外的 releases 权限即可）。"
             exit 1
           }
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
           # 发布说明与 GitHub 用同一份，别让 Gitee 那边只剩一句「便携版安装包」
           $notes = ".github/release-notes-$tag.md"
           if (Test-Path $notes) {
-            node tools/publish-gitee.js $tag --zip "ApkStart-$tag-win64-portable.zip" --notes $notes
+            node tools/publish-gitee.js $tag --zip $zip --notes $notes
           } else {
-            node tools/publish-gitee.js $tag --zip "ApkStart-$tag-win64-portable.zip"
+            node tools/publish-gitee.js $tag --zip $zip
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
