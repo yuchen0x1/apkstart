@@ -319,10 +319,10 @@ async function toggleDisplayMode() {
     if (next.display.mode === 'fullscreen') {
       appWin.win.maximize();
       // 全屏 = 平板横屏排版：让安卓按宽屏重新排版，而不是只把窗口拉大
-      appWin.setLandscape(true).catch(() => {});
+      appWin.setLandscape(true, { fullscreen: true }).catch(() => {});
     } else {
       appWin.win.unmaximize();
-      appWin.setLandscape(false).catch(() => {});
+      appWin.setLandscape(false, { fullscreen: false }).catch(() => {});
     }
     appWin.scheduleFit();
   }
@@ -1181,7 +1181,7 @@ function registerIpc() {
       if (full && !appWin.win.isMaximized()) appWin.win.maximize();
       if (!full && appWin.win.isMaximized()) appWin.win.unmaximize();
       // 全屏 = 平板横屏排版（见 toggleDisplayMode 的说明）
-      appWin.setLandscape(full).catch(() => {});
+      appWin.setLandscape(full, { fullscreen: full }).catch(() => {});
       appWin.scheduleFit();
     }
     return next.display;

@@ -306,7 +306,7 @@ class AppWindow {
    * 现在只做一件事：改逻辑显示尺寸（wm size）+ 锁 user-rotation=0，
    * 安卓会按新宽度重新排版：360dp 宽是手机，640dp 宽自动进平板/分栏布局。
    */
-  async rotate() {
+  async rotate({ fullscreen = null } = {}) {
     if (!this.isOpen) return this.state.landscape;
     const next = !this.state.landscape;
     if (this.setOrientation) await this.setOrientation(next).catch(() => {});
@@ -316,15 +316,21 @@ class AppWindow {
     const size = AppWindow.sizeFor(area, this.portrait, next);
     // 最大化状态下 setContentSize 无效，必须先退出最大化再改尺寸，
     // 否则窗口仍是竖的，横屏画面被塞进竖窗口 = 黑边 / 未填满。
-    const wasMax = this.win.isMaximized();
-    if (wasMax) this.win.unmaximize();
+    //
+    // 但「全屏 → 横屏」这条路径上窗口本来就该是最大化的：maximize() 在 Windows 上是
+    // 异步的，紧接着调 isMaximized() 可能还是 false，所以这里不接受调用方猜，
+    // 由 fullscreen 参数显式指定（null = 沿用当前状态，即标题栏旋转按钮那条路）。
+    const wantMax = fullscreen === null ? this.win.isMaximized() : !!fullscreen;
+    if (this.win.isMaximized()) this.win.unmaximize();
     this.win.setContentSize(Math.max(320, size.w), Math.max(420, size.h + TITLEBAR_H));
     const b = this.win.getBounds();
     this.win.setPosition(
       Math.round(area.x + (area.w - b.width) / 2),
       Math.round(area.y + (area.h - b.height) / 2),
     );
-    // 退出最大化后把窗口抬到最前，别被别的窗口盖住（盖住就是黑屏 / 点不动）
+    // 该是全屏就恢复最大化：否则设置里写着「全屏」，窗口却变成一个居中的小窗
+    if (wantMax) this.win.maximize();
+    // 改尺寸 / 退出最大化后把窗口抬到最前，别被别的窗口盖住（盖住就是黑屏 / 点不动）
     try { this.win.show(); this.win.focus(); } catch (_) { /* 窗口可能刚关 */ }
     this.state.landscape = next;
     this._push();
@@ -341,10 +347,10 @@ class AppWindow {
   }
 
   /** 需要时切到指定方向（全屏=横屏，窗口=竖屏） */
-  async setLandscape(want) {
+  async setLandscape(want, opts = {}) {
     if (!this.isOpen) return this.state.landscape;
     if (!!this.state.landscape === !!want) return this.state.landscape;
-    return this.rotate();
+    return this.rotate(opts);
   }
 
   toggleMaximize() {

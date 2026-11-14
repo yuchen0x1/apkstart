@@ -510,8 +510,19 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/SetWindowRgn\(emu, IntPtr\.Zero/.test(src), 'embed 时要清掉旧版本残留的 region');
   });
 
-  // 启动路径上绝不能做破坏性动作：等网络可以，停掉虚拟机再冷启动不行 ——
-  // 那会在 adb install / am start 途中把设备弄没，直接变成「应用打不开」。
+  // 「全屏 = 横屏排版」这条链路上，rotate() 会先退出最大化才能改尺寸；如果不把
+  // 最大化状态再恢复，「设置里是全屏、窗口却变成居中小窗」就会随机出现
+  // （maximize() 在 Windows 上是异步的，紧接着读 isMaximized() 拿到的还是 false）。
+  await test('切方向后必须按全屏状态恢复最大化，且不再转模拟器画面', () => {
+    const appwinSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'appwin.js'), 'utf8');
+    const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+    assert(!/this\.agent\.rotate\(/.test(appwinSrc), '不能再给模拟器发 Ctrl+←（只转画面、排版不变）');
+    assert(/fullscreen = null/.test(appwinSrc) || /fullscreen =/.test(appwinSrc), 'rotate 要能接收显式的全屏状态');
+    assert(/if \(wantMax\) this\.win\.maximize\(\)/.test(appwinSrc), '切完方向要恢复最大化');
+    assert(/setLandscape\(true, \{ fullscreen: true \}\)/.test(mainSrc), '进全屏时必须显式告知要保持最大化');
+  });
+
+  // 启动路径上绝不能做破坏性动作：等网络可以，停掉虚拟机再冷启动不行 ——  // 那会在 adb install / am start 途中把设备弄没，直接变成「应用打不开」。
   await test('拉起应用前只等待网络，绝不重启虚拟机', () => {
     const installSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'installer.js'), 'utf8');
     assert(/waitForNetwork\(\{ onLog, timeoutMs: 20000 \}\)/.test(installSrc), '启动路径应只等 20 秒，不重启');
