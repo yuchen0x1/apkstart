@@ -1543,6 +1543,12 @@ function registerIpc() {
     };
   });
 
+  /** 代理探测结果缓存重置（设置页改了 runtime.proxyUrl 后立即生效） */
+  ipcMain.handle('proxy:reset', () => {
+    require('./core/proxy').resetCache();
+    return { ok: true };
+  });
+
   /** 引导向导的开关：打开期间 autoDeploy 直接让路（见 autoDeploy 顶部的 wizardOpen 分支） */
   ipcMain.handle('wizard:open', () => {
     wizardOpen = true;

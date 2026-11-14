@@ -406,12 +406,12 @@
         <div class="group-title">下载与更新源</div>
         <div class="field">
           <label>更新与下载源</label>
-          <select id="setSourcePref">
-            <option value="auto">自动选择较快的源（推荐）</option>
-            <option value="gitee">只用 Gitee（国内通常最快）</option>
-            <option value="github">只用 GitHub</option>
-          </select>
-          <span class="sub">「自动」会同时问 GitHub 与 Gitee 的最新版本，把每个下载地址都真下 256KB 测一次速度，再从最快的那个地址下载；其中一个源不通不影响更新。</span>
+          <span class="sub">本版本从 GitHub（yuchen0x1/apkstart）检查更新与下载运行时，不走 Gitee；下载地址会逐个实测测速，从最快的开始。</span>
+        </div>
+        <div class="field">
+          <label>网络代理（可选）</label>
+          <input id="setProxyUrl" type="text" placeholder="留空 = 自动检测系统代理 / 环境变量；填 off 强制直连" />
+          <span class="sub">检测到 Clash / v2rayN 等本地代理（系统代理已开启）时，下载与查新自动走代理——挂着代理直连 GitHub 往往只有几十 KB/s，走代理可达每秒数 MB。代理连不通会自动回退直连，本地地址永不走代理。</span>
         </div>
         <div class="field switch-field">
           <div>
@@ -667,7 +667,7 @@
           </div>
           <div class="update-bar" id="updateBar" hidden><i id="updateBarFill"></i></div>
           <span class="sub" id="updateNote">
-            从 GitHub（RoutineMiku/apkstart）获取最新版本；轻量版会下载便携包并自动替换程序文件，
+            从 GitHub（yuchen0x1/apkstart）获取最新版本；轻量版会下载便携包并自动替换程序文件，
             运行时、已装应用与快照都不受影响。
           </span>
           <div class="row" style="margin-top:6px;">
@@ -683,28 +683,15 @@
       </div>
 
       <div class="group" id="aboutGroup">
-        <div class="group-title">关于</div>
+        <div class="group-title">更新日志</div>
         <div class="about-box">
-          <div class="about-brand">
-            <img class="about-logo" src="assets/logo.png" alt="ApkStart Logo" draggable="false" />
-          </div>
-          <div class="about-qrs">
-            <div class="about-qr">
-              <img src="assets/wechat-qr.jpg" alt="微信公众号二维码" width="112" height="112" />
-              <span class="about-qr-tip">扫码关注公众号</span>
-            </div>
-            <div class="about-qr">
-              <img src="assets/douyin-qr.jpg" alt="抖音二维码" width="112" height="112" />
-              <span class="about-qr-tip">抖音 · 日常MIKU</span>
-            </div>
-          </div>
           <div class="about-info">
             <div class="about-name">ApkStart <span class="about-ver" id="aboutVer"></span></div>
             <p class="note">双击即装的 Windows 安卓应用启动器：APK 安装、桌面快捷方式、独立窗口运行、文件双向互通。</p>
             <div class="about-links">
-              <a href="https://github.com/RoutineMiku/apkstart" target="_blank" rel="noopener">GitHub · RoutineMiku/apkstart</a>
-              <a href="https://v.douyin.com/9TIIxVCANig/" target="_blank" rel="noopener">抖音 · @日常MIKU（联系作者）</a>
-              <span class="powered">Powered by <b>RoutineMiku</b></span>
+              <a href="https://github.com/yuchen0x1/apkstart/blob/main/CHANGELOG.md" target="_blank" rel="noopener">更新日志（CHANGELOG）</a>
+              <a href="https://github.com/yuchen0x1/apkstart/issues" target="_blank" rel="noopener">问题反馈（提 Issue）</a>
+              <span class="powered">基于开源项目 ApkStart 二次开发 · 原项目：<a href="https://github.com/RoutineMiku/apkstart" target="_blank" rel="noopener">RoutineMiku/apkstart</a></span>
             </div>
           </div>
         </div>

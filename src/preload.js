@@ -88,6 +88,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   sysDrives: () => invoke('sys:drives'),
   wizardOpen: () => invoke('wizard:open'),
   wizardClose: () => invoke('wizard:close'),
+  proxyReset: () => invoke('proxy:reset'),
   winMinimize: () => invoke('window:minimize'),
   winMaximize: () => invoke('window:maximize'),
   winClose: () => invoke('window:close'),

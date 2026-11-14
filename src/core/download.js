@@ -7,31 +7,82 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const tls = require('tls');
 const crypto = require('crypto');
 const { URL } = require('url');
 
 const UA = 'ApkStart/0.3 (Windows; +https://github.com/RoutineMiku/apkstart)';
+const proxyMod = require('./proxy');
 
-function openStream(url, { method = 'GET', headers = {}, redirects = 0 } = {}) {
+function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy = false } = {}) {
   return new Promise((resolve, reject) => {
     if (redirects > 6) return reject(new Error('重定向次数过多'));
     const u = new URL(url);
     const mod = u.protocol === 'http:' ? http : https;
-    const req = mod.request(url, {
-      method,
-      timeout: 30000,
-      headers: { 'User-Agent': UA, 'Accept-Encoding': 'identity', ...headers },
-    }, (res) => {
+
+    (async () => {
+      // 本地代理（Clash 等，经系统代理/环境变量/设置检测）：有就走代理，
+      // 代理本身连不上再回退直连 —— 挂着 Clash 的机器直连 GitHub 只有几十 KB/s，
+      // 走代理实测十几 MB/s。noProxy 用于这次回退，避免死循环。
+      // 回环地址（本地测试服务器/本地服务）永不走代理（标准 NO_PROXY 语义）
+      const loopback = /^(127\.|localhost$|\[::1\]|::1$)/i.test(u.hostname);
+      let proxy = null;
+      if (!noProxy && !loopback) {
+        try { proxy = await proxyMod.getActiveProxy(); } catch (_) { proxy = null; }
+      }
+      const base = { method, headers: { 'User-Agent': UA, 'Accept-Encoding': 'identity', ...headers } };
+      let req;
+      if (proxy && u.protocol === 'https:') {
+        // https 经代理：CONNECT 隧道上做端到端 TLS。
+        // 注意：agent:false 时 Node 会忽略 options.createConnection（agent:false 新建的
+        // 默认 Agent 不带它）→ 直接对代理端口做 TLS 握手 → 必然失败。必须显式传一个
+        // 自定义 Agent；隧道内是端到端请求，path 用纯路径、Host 用目标域名。
+                const tunnelAgent = new https.Agent({ keepAlive: false, maxSockets: 1 });
+        // 关键：https.Agent 构造函数【不读】options.createConnection（那是 http.Agent 的行为），
+        // 默认的 createConnection 会拿请求里的 host:port（代理地址）直接做 TLS 握手 —— 必挂。
+        // 覆盖实例方法：先 CONNECT 隧道，再在隧道上 TLS（servername=目标域名），返回已握手的 TLSSocket。
+        tunnelAgent.createConnection = (opts2, cb2) => {
+          proxyMod.tunnel(proxy, u.hostname, 443).then((raw) => {
+            const ts = tls.connect({ socket: raw, servername: u.hostname });
+            ts.once('secureConnect', () => cb2(null, ts));
+            ts.once('error', (e) => cb2(e));
+          }, (e) => cb2(e));
+        };
+        req = https.request({
+          host: proxy.host, port: proxy.port, method,
+          path: u.pathname + u.search,
+          headers: { ...base.headers, Host: u.host }, agent: tunnelAgent, timeout: 30000,
+        }, (res) => finishReq(res, req));
+      } else if (proxy && u.protocol === 'http:') {
+        // http 经代理：绝对路径转发
+        req = http.request({
+          host: proxy.host, port: proxy.port, method,
+          path: u.href, headers: { ...base.headers, Host: u.host },
+          agent: false, timeout: 30000,
+        }, (res) => finishReq(res, req));
+      } else {
+        req = mod.request(url, { ...base, timeout: 30000 }, (res) => finishReq(res, req));
+      }
+      req.on('error', (e) => {
+        // 代理连不通（没开代理软件/端口变了）：立即回退直连，不能让用户卡死。
+        // 注意不能用宽泛的 /connect/i —— 'disconnected' 里也有 connect，会误匹配。
+        const etext = `${(e && e.code) || ''}${(e && e.name) || ''}${(e && e.message) || ''}`;
+        if (proxy && !noProxy && /代理 CONNECT|ECONNREFUSED|ETIMEDOUT|AggregateError/i.test(etext)) {
+          return resolve(openStream(url, { method, headers, redirects, noProxy: true }));
+        }
+        reject(e);
+      });
+      req.end();
+    })().catch(reject);
+
+    function finishReq(res, req) {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
         res.resume();
         const next = new URL(res.headers.location, url).href;
-        return resolve(openStream(next, { method, headers, redirects: redirects + 1 }));
+        return resolve(openStream(next, { method, headers, redirects: redirects + 1, noProxy }));
       }
       resolve(res);
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(new Error('连接超时')); });
-    req.end();
+    }
   });
 }
 

@@ -90,9 +90,10 @@ const DEFAULT_SETTINGS = {
     mirrorPrefix: '',
     // 下载并发数：分块下载的连接数。默认 8，弱网/被限速时可调到 16。
     downloadConnections: 8,
+    proxyUrl: '',            // 网络代理（可选）：空=自动检测系统代理/环境变量；off=强制直连
     // 更新/下载的源选择。auto = 同时问 GitHub 与 Gitee、并对每个下载地址实测
     // 128KB 速度，谁快用谁；也可以强制只走某一边（企业网络只放行一个域名时有用）。
-    sourcePreference: 'auto',
+    sourcePreference: 'github',   // fork 只有 GitHub 一个源：查新/整包只走本仓库
     // 自动尝试公共 GitHub 加速镜像（ghfast / gh-proxy）。关掉后只用直连 + 自定义前缀。
     // 这两个是第三方服务，只是转发公开的 release 文件，不涉及账号信息。
     autoMirror: true,

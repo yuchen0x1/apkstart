@@ -16,10 +16,13 @@
  */
 const https = require('https');
 const http = require('http');
+const tls = require('tls');
 const { URL } = require('url');
 const { cmpVer } = require('./version');
+const proxyMod = require('./proxy');
 
-const OWNER_GH = 'RoutineMiku';
+// fork 版更新源：只认本仓库（GitHub），不再检查上游 RoutineMiku 的发布
+const OWNER_GH = 'yuchen0x1';
 const OWNER_GITEE = 'daily-miku';
 const REPO = 'apkstart';
 
@@ -51,32 +54,81 @@ const KNOWN_MIRRORS = [
  */
 const SAMPLE_BYTES = 256 * 1024;
 
-function openUrl(url, { timeout = 10000, headers = {}, redirects = 0 } = {}) {
+function openUrl(url, { method = 'GET', timeout = 10000, headers = {}, redirects = 0, noProxy = false } = {}) {
   return new Promise((resolve, reject) => {
     if (redirects > 6) return reject(new Error('重定向次数过多'));
     let u;
     try { u = new URL(url); } catch (_) { return reject(new Error('地址无效')); }
     const mod = u.protocol === 'http:' ? http : https;
-    const req = mod.request(url, {
-      method: 'GET',
-      timeout,
-      headers: {
-        'User-Agent': 'ApkStart/0.3 (Windows)',
-        'Accept-Encoding': 'identity',
-        ...headers,
-      },
-    }, (res) => {
-      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-        res.resume();
-        const next = new URL(res.headers.location, url).href;
-        openUrl(next, { timeout, headers, redirects: redirects + 1 }).then(resolve, reject);
-        return;
+
+    (async () => {
+      // 与 download.js 同一套代理策略：检测到本地代理（系统代理/环境变量）就走，
+      // 代理连不通自动回退直连。查新 API 与测速都从这里走，挂 Clash 的机器
+      // 「检查更新」从几十秒降到几百毫秒，测速结果也反映代理的真实带宽。
+      // 回环地址（本地测试服务器/本地服务）永不走代理（标准 NO_PROXY 语义）
+      const loopback = /^(127\.|localhost$|\[::1\]|::1$)/i.test(u.hostname);
+      let proxy = null;
+      if (!noProxy && !loopback) {
+        try { proxy = await proxyMod.getActiveProxy(); } catch (_) { proxy = null; }
       }
-      resolve(res);
-    });
-    req.on('timeout', () => req.destroy(new Error('连接超时')));
-    req.on('error', reject);
-    req.end();
+      const base = {
+        method,
+        headers: {
+          'User-Agent': 'ApkStart/0.3 (Windows)',
+          'Accept-Encoding': 'identity',
+          ...headers,
+        },
+      };
+      let req;
+      if (proxy && u.protocol === 'https:') {
+        // agent:false 会忽略 options.createConnection（Node 新建默认 Agent 不带它），
+        // 必须显式给自定义 Agent；隧道内是端到端请求，path 用纯路径、Host 用目标域名。
+                const tunnelAgent = new https.Agent({ keepAlive: false, maxSockets: 1 });
+        // 关键：https.Agent 构造函数【不读】options.createConnection（那是 http.Agent 的行为），
+        // 默认的 createConnection 会拿请求里的 host:port（代理地址）直接做 TLS 握手 —— 必挂。
+        // 覆盖实例方法：先 CONNECT 隧道，再在隧道上 TLS（servername=目标域名），返回已握手的 TLSSocket。
+        tunnelAgent.createConnection = (opts2, cb2) => {
+          proxyMod.tunnel(proxy, u.hostname, 443).then((raw) => {
+            const ts = tls.connect({ socket: raw, servername: u.hostname });
+            ts.once('secureConnect', () => cb2(null, ts));
+            ts.once('error', (e) => cb2(e));
+          }, (e) => cb2(e));
+        };
+        req = https.request({
+          host: proxy.host, port: proxy.port, method,
+          path: u.pathname + u.search,
+          headers: { ...base.headers, Host: u.host }, agent: tunnelAgent, timeout,
+        }, finishReq);
+      } else if (proxy && u.protocol === 'http:') {
+        req = http.request({
+          host: proxy.host, port: proxy.port, method,
+          path: u.href, headers: { ...base.headers, Host: u.host },
+          agent: false, timeout,
+        }, finishReq);
+      } else {
+        req = mod.request(url, { ...base, timeout }, finishReq);
+      }
+      req.on('timeout', () => req.destroy(new Error('连接超时')));
+      req.on('error', (e) => {
+        // 不能用宽泛的 /connect/i —— 'disconnected' 里也有 connect，会误匹配
+        const etext = `${(e && e.code) || ''}${(e && e.name) || ''}${(e && e.message) || ''}`;
+        if (proxy && !noProxy && /代理 CONNECT|ECONNREFUSED|ETIMEDOUT|AggregateError/i.test(etext)) {
+          return resolve(openUrl(url, { timeout, headers, redirects, noProxy: true }));
+        }
+        reject(e);
+      });
+      req.end();
+
+      function finishReq(res) {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          const next = new URL(res.headers.location, url).href;
+          openUrl(next, { timeout, headers, redirects: redirects + 1, noProxy }).then(resolve, reject);
+          return;
+        }
+        resolve(res);
+      }
+    })().catch(reject);
   });
 }
 
@@ -233,29 +285,23 @@ class Sources {
     return `暂时跳过（${Math.ceil((until - Date.now()) / 60000)} 分钟内不再尝试）`;
   }
 
-  /** 各源的最新 release（并发，任何一个失败都不影响另一个） */
+  /** 最新 release。fork 版只认 GitHub 本仓库（yuchen0x1/apkstart），不走 Gitee：
+   *  Gitee 镜像同步的是上游仓库，版本号只会更旧，回退过去反而会把
+   *  「已有新版本」误判成「已是最新」。 */
   async fetchReleases() {
-    const prefs = String((this.settings().runtime || {}).sourcePreference || 'auto');
-    const ids = prefs === 'github' || prefs === 'gitee' ? [prefs] : ['github', 'gitee'];
-    // 公开仓库的 releases 接口匿名就能读；仓库若是私有的，Gitee 会回 404
-    // "Not Found Project"（而不是 401），那种情况才需要在这里填一个只读 token。
-    // 另外匿名调用有频率限制，感兴趣的用户可以填 token 提高额度。
-    const token = String((this.settings().runtime || {}).giteeToken || '').trim();
-    const withToken = (id, url) => (id === 'gitee' && token
-      ? `${url}${url.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(token)}`
-      : url);
+    const ids = ['github'];
 
     const jobs = ids.map(async (id) => {
       const s = SOURCES[id];
       const skip = this.blockedReason(id);
       if (skip) return { source: id, name: s.name, web: s.web, error: skip };
       try {
-        const rel = await getJson(withToken(id, `${s.api}/releases/latest`), 9000);
+        const rel = await getJson(`${s.api}/releases/latest`, 9000);
         return { source: id, name: s.name, web: s.web, rel };
       } catch (e) {
         // Gitee 没有正式 release、或 GitHub 被墙，都退回列表取第一条
         try {
-          const list = await getJson(withToken(id, `${s.api}/releases?per_page=10`), 9000);
+          const list = await getJson(`${s.api}/releases?per_page=10`, 9000);
           const first = (Array.isArray(list) ? list : []).find((r) => r && !r.draft);
           if (first) return { source: id, name: s.name, web: s.web, rel: first };
         } catch (_) { /* 这个源彻底不可用 */ }

@@ -738,6 +738,7 @@ function fillSettings(s) {
   if ($('setAutoMirror')) $('setAutoMirror').checked = (s.runtime && s.runtime.autoMirror) !== false;
   if ($('setGiteeToken')) $('setGiteeToken').value = (s.runtime && s.runtime.giteeToken) || '';
   if ($('setMirrorPrefix')) $('setMirrorPrefix').value = (s.runtime && s.runtime.mirrorPrefix) || '';
+  if ($('setProxyUrl')) $('setProxyUrl').value = (s.runtime && s.runtime.proxyUrl) || '';
   if ($('setConnections')) $('setConnections').value = Number((s.runtime && s.runtime.downloadConnections) || 8);
   $('setAudio').checked = s.engine.audio !== false;
   $('setLiteMode').checked = s.engine.liteMode !== false;
@@ -1045,8 +1046,19 @@ function bindSettings() {
     });
   }
   $('setIdle').addEventListener('change', (e) => save({ engine: { idleShutdownMinutes: Number(e.target.value) || 0 } }));
-  if ($('setSourcePref')) {
-    $('setSourcePref').addEventListener('change', (e) => save({ runtime: { sourcePreference: e.target.value } }));
+  if ($('setProxyUrl')) {
+    $('setProxyUrl').addEventListener('change', (e) => {
+      const v = e.target.value.trim();
+      save({ runtime: { proxyUrl: v } });
+      // 主进程的代理探测结果有 10 分钟缓存：设置改完立即失效重测
+      api.proxyReset().catch(() => {});
+      toast({
+        title: '代理设置已更新',
+        body: v === 'off' ? '已强制直连（不使用任何代理）'
+          : (v ? `代理已设为 ${v}，立即生效` : '将自动检测系统代理 / 环境变量'),
+        type: 'ok',
+      });
+    });
   }
   if ($('setAutoMirror')) {
     $('setAutoMirror').addEventListener('change', (e) => save({ runtime: { autoMirror: e.target.checked } }));
