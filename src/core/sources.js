@@ -438,6 +438,12 @@ class Sources {
     return sorted;
   }
 
+  /** 某个候选地址的实测速度（B/s）。没测过或失败返回 -1（预检「整包是否太慢」用） */
+  speedOf(url) {
+    const c = this._rankCache.get(url);
+    return c && c.ok ? c.speed : -1;
+  }
+
   /** 测速缓存清空（用户改了镜像前缀 / 换了网络后调用） */
   reset() {
     this._rankCache.clear();

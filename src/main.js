@@ -322,7 +322,13 @@ async function toggleDisplayMode() {
 
 /** 首次运行把 adb / emulator / 系统镜像一次装完，不再分 1~5 步 */
 let deploying = false;
-async function autoDeploy() {
+// 引导向导打开期间暂停后台自动部署：用户正在选「装到哪个盘」，
+// 后台却已经往默认目录（C 盘）开下，选择就失去意义了。向导关闭后重新安排。
+let wizardOpen = false;
+let wizardAutoDeployTimer = null;
+async function autoDeploy({ force = false } = {}) {
+  // 向导打开期间拦截的是「后台定时」的自动部署；向导自己点「开始安装」走 force=true
+  if (!force && wizardOpen) return { ok: false, error: 'wizard' };
   if (deploying || !store.getSettings().autoDeploy) return { ok: false, error: 'skipped' };
   deploying = true;
   const progress = (p) => send('provision:progress', { ...p, component: p.component || 'all' });
@@ -891,7 +897,7 @@ function registerIpc() {
   ipcMain.handle('display:toggle', () => toggleDisplayMode());
 
   ipcMain.handle('shortcut:rebuild', async () => ({ ok: true, fixed: await installer.ensureShortcuts() }));
-  ipcMain.handle('runtime:autoDeploy', () => autoDeploy());
+  ipcMain.handle('runtime:autoDeploy', () => autoDeploy({ force: true }));
   // 关闭「深度裁剪」时把被 pm disable-user 的系统包恢复回来
   ipcMain.handle('settings:restoreSystem', async () => runtime.restoreSystemApps());
   // 鼠标键位改变：只同步配置，不再无条件卸载（右键返回/滚轮可能仍需要钩子）
@@ -1418,6 +1424,75 @@ function registerIpc() {
     return shell.openPath(dir);
   });
 
+  /**
+   * 本机所有盘符与剩余空间（首次运行引导用）。
+   * 优先 fs.statfs（Node ≥18.15，毫秒级、无外部进程）；不可用时退回 CIM 查询。
+   * recommended：剩余空间最大且 ≥8GB 的非系统盘 —— 运行时 + 安卓数据默认就该去那里，
+   * 别再把 C 盘塞爆（用户反馈最集中的问题之一）。
+   */
+  ipcMain.handle('sys:drives', async () => {
+    const drives = [];
+    try {
+      for (let i = 65; i <= 90; i += 1) {
+        const letter = String.fromCharCode(i);
+        const root = `${letter}:\\`;
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const st = await fs.promises.statfs(root);
+          const total = Number(st.blocks) * Number(st.bsize);
+          const free = Number(st.bavail) * Number(st.bsize);
+          if (total > 0) drives.push({ drive: `${letter}:`, root, free, total });
+        } catch (_) { /* 不存在的盘符 */ }
+      }
+    } catch (_) { /* statfs 不可用 */ }
+    if (!drives.length) {
+      try {
+        const { execFile } = require('child_process');
+        const ps = 'Get-CimInstance Win32_LogicalDisk | Select-Object DeviceName,FreeSpace,Size | ConvertTo-Json';
+        const r = await new Promise((resolve) => {
+          execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+            { windowsHide: true, timeout: 10000, maxBuffer: 4 * 1024 * 1024 }, (e, stdout) => resolve(e ? '' : String(stdout || '')));
+        });
+        const j = JSON.parse(r.trim() || '[]');
+        for (const d of (Array.isArray(j) ? j : [j])) {
+          if (!d || !d.DeviceName) continue;
+          const total = Number(d.Size) || 0;
+          const free = Number(d.FreeSpace) || 0;
+          if (total > 0) drives.push({ drive: d.DeviceName, root: d.DeviceName + '\\', free, total });
+        }
+      } catch (_) { /* 连 CIM 都拿不到就空着，向导不推荐默认盘 */ }
+    }
+    const systemDrive = String(process.env.SystemDrive || 'C:').toUpperCase();
+    const needBytes = 8 * 1024 * 1024 * 1024;
+    const sorted = [...drives].sort((a, b) => b.free - a.free);
+    const nonSystem = sorted.find((d) => d.drive.toUpperCase() !== systemDrive && d.free >= needBytes);
+    const recommended = (nonSystem || sorted.find((d) => d.free >= needBytes) || sorted[0] || null);
+    return {
+      drives,
+      systemDrive,
+      recommended: recommended ? recommended.drive : '',
+      recommendedRoot: recommended ? recommended.root : '',
+    };
+  });
+
+  /** 引导向导的开关：打开期间 autoDeploy 直接让路（见 autoDeploy 顶部的 wizardOpen 分支） */
+  ipcMain.handle('wizard:open', () => {
+    wizardOpen = true;
+    if (wizardAutoDeployTimer) { clearTimeout(wizardAutoDeployTimer); wizardAutoDeployTimer = null; }
+    return { ok: true };
+  });
+  ipcMain.handle('wizard:close', () => {
+    wizardOpen = false;
+    // 向导关掉但没装完（用户跳过）：恢复旧版行为，20 秒后照常后台自动部署
+    if (wizardAutoDeployTimer) clearTimeout(wizardAutoDeployTimer);
+    wizardAutoDeployTimer = setTimeout(() => {
+      wizardAutoDeployTimer = null;
+      autoDeploy().catch(() => {});
+    }, 20000);
+    if (wizardAutoDeployTimer.unref) wizardAutoDeployTimer.unref();
+    return { ok: true };
+  });
+
   ipcMain.handle('window:minimize', () => mainWindow?.minimize());
   ipcMain.handle('window:maximize', () => {
     if (!mainWindow) return;
@@ -1766,6 +1841,15 @@ if (!gotLock) {
               console.log('[smoke] saved', file);
             };
             await snap(out);
+            if (process.argv.includes('--wizard')) {
+              // 引导向导第 1 页已在主截图里；翻到第 2 页（选盘）再拍一张。
+              // 故意不点「开始安装」——那会真的开始下载运行时。
+              await mainWindow.webContents.executeJavaScript(
+                "const b=document.getElementById('wizardNext'); if (b && !b.hidden) b.click(); true;",
+              );
+              await new Promise((r) => setTimeout(r, 1200));
+              await snap(out.replace(/\.png$/i, '-wizard.png'));
+            }
             if (process.argv.includes('--perf')) {
               // 拍一张「性能与资源占用」区（设置页里控件最多的一块）
               await mainWindow.webContents.executeJavaScript(

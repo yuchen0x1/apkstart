@@ -102,6 +102,16 @@ const MIN_SIZE = {
   aeHD: 64 * 1024,
 };
 
+/**
+ * 运行时整包的「慢速逃生」阈值。
+ * GitHub 直连/公共镜像被限速是常态（实测出现过 0.14MB/s ≈ 剩余 164 分钟），
+ * 而官方 dl.google.com 在国内走 Google CDN 节点，实测 3~20MB/s。
+ * 整包测速低于阈值就别硬扛：立刻改走官方分组件下载。
+ */
+const PACK_MIN_SPEED_BPS = 512 * 1024;      // 预检：最快候选低于 0.5MB/s 直接放弃整包
+const PACK_STALL_AFTER_MS = 30 * 1000;      // 中途逃离：下载 30 秒后仍平均低于阈值
+const PACK_STALL_SPEED_BPS = 256 * 1024;    //   → 中断整包，换官方源（断点已保留）
+
 function run(cmd, args, { timeout = 60000, cwd, windowsHide = true } = {}) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout, cwd, windowsHide, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -539,24 +549,56 @@ class Provisioner {
       .rank(this._downloadUrls(pack.url), { onProgress: (pp) => onProgress({ stage: 'download', message: pp.message, percent: 1 }) })
       .catch(() => this._downloadUrls(pack.url));
 
+    // 预检：最快的候选都慢得不可接受 → 立刻放弃整包，改走官方分组件下载。
+    // （autoDeploy 会捕获这里的错误并自动切到 installEmulator/installSystemImage，
+    // 官方源在国内走 Google CDN，实测 3~20MB/s；整包在 GitHub 上被限速到几十 KB/s
+    // 时，干等 164 分钟毫无意义。）
+    const bestSpeed = this.sources.speedOf(urls[0]);
+    if (bestSpeed > 0 && bestSpeed < PACK_MIN_SPEED_BPS) {
+      throw new Error(`GitHub 运行时整包实测过慢（${(bestSpeed / 1048576).toFixed(2)} MB/s），自动改用官方源分组件下载`);
+    }
+
     onProgress({ stage: 'download', message: `下载运行时（约 1.5 GB，只需一次，${conn} 线程）…`, percent: 2 });
+    // 中途逃离看门狗：测速采样只有 256KB，可能「采样快、长跑慢」。
+    // 下载 30 秒后平均速度仍低于 256KB/s 就中断整包（断点已保留，边车元数据在），
+    // 让上层 autoDeploy 改走官方源 —— 宁可多一次切换，不让用户在坏源上耗一小时。
+    const abort = new AbortController();
+    let watchStart = 0;
+    let watchGot = 0;
+    const packProgress = (pr) => {
+      if (!watchStart && pr.got > 0) { watchStart = Date.now(); watchGot = pr.got; }
+      if (watchStart && !abort.signal.aborted) {
+        const elapsed = Date.now() - watchStart;
+        const got = Math.max(0, pr.got - watchGot);
+        if (elapsed > PACK_STALL_AFTER_MS && got / (elapsed / 1000) < PACK_STALL_SPEED_BPS) {
+          abort.abort();
+        }
+      }
+      const pct = pr.percent != null ? pr.percent : (total ? Math.round((pr.got / total) * 100) : 0);
+      const mb = `${(pr.got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`;
+      const sp = Number(pr.speed) > 0 ? ` · ${(pr.speed / 1048576).toFixed(2)} MB/s` : '';
+      const eta = Number(pr.eta) > 0 ? ` · 剩余约 ${Math.ceil(pr.eta / 60)} 分钟` : '';
+      onProgress({
+        stage: 'download',
+        message: `下载运行时 ${mb}${sp}${eta}`,
+        percent: Math.max(1, Math.min(90, Math.round(pct * 0.9))),
+        speed: pr.speed,
+      });
+    };
     // 分块并行（8 线程）比单流快得多：GitHub 对单连接限速很常见，单流实测只有
     // 一两百 KB/s，8 线程能跑满本地带宽。中途断掉会退回单流续传。
-    await downloadMulti(urls, zip, {
-      connections: conn,
-      onProgress: (pr) => {
-        const pct = pr.percent != null ? pr.percent : (total ? Math.round((pr.got / total) * 100) : 0);
-        const mb = `${(pr.got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`;
-        const sp = Number(pr.speed) > 0 ? ` · ${(pr.speed / 1048576).toFixed(2)} MB/s` : '';
-        const eta = Number(pr.eta) > 0 ? ` · 剩余约 ${Math.ceil(pr.eta / 60)} 分钟` : '';
-        onProgress({
-          stage: 'download',
-          message: `下载运行时 ${mb}${sp}${eta}`,
-          percent: Math.max(1, Math.min(90, Math.round(pct * 0.9))),
-          speed: pr.speed,
-        });
-      },
-    });
+    try {
+      await downloadMulti(urls, zip, {
+        connections: conn,
+        signal: abort.signal,
+        onProgress: packProgress,
+      });
+    } catch (e) {
+      if (abort.signal.aborted) {
+        throw new Error('GitHub 运行时整包下载过慢（30 秒平均不足 256KB/s），自动改用官方源分组件下载');
+      }
+      throw e;
+    }
     if (fileSize(zip) < 200 * 1024 * 1024) throw new Error('运行时整包下载不完整，可重试续传');
 
     onProgress({ stage: 'extract', message: '解压运行时（约 1 分钟）…', percent: 91 });

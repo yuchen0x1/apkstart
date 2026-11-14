@@ -257,6 +257,7 @@ async function downloadParallel(url, dest, opt = {}) {
     onProgress = () => {},
     minChunk = 1024 * 1024,
     retries = 3,
+    signal,
   } = opt;
 
   // 分块下载留下的「带洞」文件（边车元数据还在）绝不能走单流续传：
@@ -325,6 +326,7 @@ async function downloadParallel(url, dest, opt = {}) {
   };
 
   const fetchChunk = async (c) => {
+    if (signal && signal.aborted) throw new Error('下载已取消');
     const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` } });
     if (res.statusCode !== 206) {
       res.resume();
@@ -340,6 +342,10 @@ async function downloadParallel(url, dest, opt = {}) {
         clearTimeout(idle);
         if (err) reject(err); else resolve();
       };
+      // 外部中断（上层判定这个源太慢、要换路）：立刻断流抛出，别在坏源上耗着。
+      // abort 触发后 close/error 都会来，但 finish 已 settle，重复无害。
+      const onAbort = () => { res.destroy(); finish(new Error('下载已取消')); };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
       let idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（长时间无数据）')); }, idleMs);
       const kick = () => {
         clearTimeout(idle);
@@ -427,6 +433,7 @@ async function downloadMulti(urls, dest, opt = {}) {
     connections = 8,
     onProgress = () => {},
     minChunk = 2 * 1024 * 1024,
+    signal,
     // 每个分块的重试次数。3 次在「三个源里有两个偶尔停摆」的链路上不够用：
     // 1.4GB 的运行时包一旦有块耗尽重试，整包作废重下。给到 6 次（每源两轮）。
     // 重试是从断点继续的（c.pos 保留），不会重复下载已收到的字节。
@@ -537,6 +544,7 @@ async function downloadMulti(urls, dest, opt = {}) {
   const slowBps = Number(opt.slowBps) > 0 ? Number(opt.slowBps) : 120 * 1024;
 
   const fetchChunk = async (c) => {
+    if (signal && signal.aborted) throw new Error('下载已取消');
     const url = same[c.src % same.length].url;
     const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` } });
     if (res.statusCode !== 206) {
@@ -560,6 +568,9 @@ async function downloadMulti(urls, dest, opt = {}) {
         clearTimeout(idle);
         if (err) reject(err); else resolve();
       };
+      // 外部中断：立刻断流抛出（保留了 c.pos 断点，换路重下不浪费已收字节）
+      const onAbort = () => { res.destroy(); finish(new Error('下载已取消')); };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
       let idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（长时间无数据）')); }, idleMs);
       const kick = () => {
         clearTimeout(idle);
@@ -608,6 +619,11 @@ async function downloadMulti(urls, dest, opt = {}) {
           }
           throw new Error('分块未完整返回');
         } catch (e) {
+          // 外部中断（上层判定源太慢换路）：不再重试，立刻保留断点退出
+          if (signal && signal.aborted) {
+            saveMeta();
+            throw new Error(`分块失败（${c.start}-${c.end}）：${e.message}`);
+          }
           c.tries += 1;
           if (c.tries >= retries) {
             // 记下已完成的部分（边车），下次从缺的块继续，而不是从头再下 1.4GB

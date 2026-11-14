@@ -89,6 +89,75 @@
 <!-- 右键菜单 -->
 <div class="ctxmenu" id="ctxmenu"></div>
 
+<!-- 首次运行引导向导 -->
+<div class="modal-mask" id="wizardMask">
+  <div class="modal wizard-modal">
+    <header class="modal-head">
+      <h2 id="wizardTitle">欢迎使用 ApkStart</h2>
+      <span class="wizard-step" id="wizardStep">第 1 步 / 共 3 步</span>
+      <button class="icon-btn" id="wizardCloseBtn" hidden>
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </header>
+    <div class="modal-body">
+      <!-- 第 1 页：欢迎 -->
+      <section class="wizard-page" id="wizardPage1">
+        <p class="wizard-lead">三步开始：<b>选一个安装位置</b> → <b>自动下载运行时</b> → 双击 APK 即用。</p>
+        <ul class="wizard-list">
+          <li><b>要下载什么</b>：adb 工具、Android 运行时引擎、Android 14 系统镜像（合计约 1.6&nbsp;GB）。镜像就是安卓系统本身，这个体积压不下去了；不用整个下完才能用，装完这次以后不再下载。</li>
+          <li><b>要多久</b>：会先实测多个下载源、谁快用谁——GitHub 整包被限速时会自动改走官方源分组件下载（官方源实测可达每秒数 MB），通常 3~8 分钟。</li>
+          <li><b>装在哪里</b>：下一步选择。<span class="wizard-warn">默认会推荐剩余空间最大的非系统盘，避免把 C 盘塞满。</span>以后随时可以在「设置 → 系统集成」里改。</li>
+        </ul>
+      </section>
+      <!-- 第 2 页：位置与源 -->
+      <section class="wizard-page" id="wizardPage2" hidden>
+        <div class="field">
+          <label>安装到哪个盘？</label>
+          <div class="drive-grid" id="wizardDrives">
+            <div class="sub">正在读取磁盘信息…</div>
+          </div>
+          <span class="sub" id="wizardDriveNote">推荐 = 剩余空间充足的非系统盘。运行时与安卓数据（约 5~8 GB 起步，会持续增长）都会放在这里。</span>
+        </div>
+        <div class="field">
+          <label>目录预览</label>
+          <div class="wizard-dirs" id="wizardDirs"></div>
+        </div>
+        <div class="field">
+          <label>下载源</label>
+          <div class="row">
+            <select class="input" id="wizardSource" style="max-width:420px;">
+              <option value="auto" selected>自动：实测挑选最快的源（推荐）</option>
+              <option value="official">只用官方源（dl.google.com，国内通常最快）</option>
+            </select>
+          </div>
+          <span class="sub">「自动」模式下 GitHub 整包实测太慢（如被限速到几十 KB/s）会自动切换官方源分组件下载；无论哪个源，下载完成都会校验官方校验值。</span>
+        </div>
+      </section>
+      <!-- 第 3 页：部署 -->
+      <section class="wizard-page" id="wizardPage3" hidden>
+        <div class="wizard-progress" id="wizardProgressBox">
+          <div class="bar"><i id="wizardBar"></i></div>
+          <div class="wizard-progress-text" id="wizardProgressText">准备中…</div>
+        </div>
+        <div id="wizardDone" hidden>
+          <p class="wizard-lead ok">✅ 运行时就绪！</p>
+          <p class="sub">把任意 .apk 拖进窗口、或在资源管理器双击 .apk 文件即可安装；桌面会生成应用图标，点开就是独立应用窗口。</p>
+        </div>
+        <div id="wizardFail" hidden>
+          <p class="wizard-lead bad" id="wizardFailMsg"></p>
+          <p class="sub">可以回到上一步换一个位置重试；也可以关闭向导，在「设置 → 运行状态」里查看详细原因与手动修复。</p>
+        </div>
+      </section>
+    </div>
+    <footer class="wizard-foot">
+      <button class="btn ghost sm" id="wizardSkip">跳过引导</button>
+      <span style="flex:1"></span>
+      <button class="btn ghost sm" id="wizardBack" hidden>上一步</button>
+      <button class="btn primary sm" id="wizardNext">下一步</button>
+    </footer>
+  </div>
+</div>
+
 <!-- 设置 -->
 <div class="modal-mask" id="settingsMask">
   <div class="modal">

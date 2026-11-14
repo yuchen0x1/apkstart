@@ -1472,6 +1472,189 @@ function bindEvents() {
 
 /* ---------------- 启动 ---------------- */
 
+/* ---------------- 首次运行引导向导 ---------------- */
+
+const wizard = {
+  page: 1,
+  drives: [],
+  selectedDrive: '',
+  recommendedDrive: '',
+  deploying: false,
+  bar: 0,
+};
+
+/** 向导进度条的阶段映射：把各阶段（adb / 引擎 / 镜像 / 整包）的 percent 折算成单调递增的 0-100 */
+function wizardMapPercent(p) {
+  const msg = String(p.message || '');
+  const pct = Number(p.percent) || 0;
+  let mapped = null;
+  if (/adb/i.test(msg)) mapped = 2 + pct * 0.08;
+  else if (/引擎/.test(msg)) mapped = 10 + pct * 0.30;
+  else if (/镜像|展开/.test(msg)) mapped = 45 + pct * 0.50;
+  else if (/下载运行时/.test(msg)) mapped = 5 + pct * 0.45;   // GitHub 整包：一个文件含全部组件
+  return mapped;
+}
+
+function wizardUpdateProgress(p) {
+  if (!wizard.deploying) return;
+  const mapped = wizardMapPercent(p);
+  if (mapped != null) wizard.bar = Math.max(wizard.bar, Math.min(99, mapped));
+  const bar = document.getElementById('wizardBar');
+  const text = document.getElementById('wizardProgressText');
+  if (bar) bar.style.width = `${wizard.bar.toFixed(1)}%`;
+  if (text && p.message) text.textContent = p.message;
+}
+
+function wizardShowPage(n) {
+  wizard.page = n;
+  for (let i = 1; i <= 3; i += 1) {
+    const el = document.getElementById(`wizardPage${i}`);
+    if (el) el.hidden = i !== n;
+  }
+  const step = document.getElementById('wizardStep');
+  const titles = { 1: '欢迎使用 ApkStart', 2: '选择安装位置', 3: '正在准备运行时' };
+  if (step) step.textContent = `第 ${n} 步 / 共 3 步`;
+  const title = document.getElementById('wizardTitle');
+  if (title) title.textContent = titles[n] || 'ApkStart';
+  const back = document.getElementById('wizardBack');
+  const next = document.getElementById('wizardNext');
+  const closeBtn = document.getElementById('wizardCloseBtn');
+  if (back) back.hidden = n === 1;
+  if (closeBtn) closeBtn.hidden = n !== 3;
+  if (next) {
+    next.hidden = false;
+    next.textContent = n === 1 ? '下一步' : n === 2 ? '开始安装' : '完成';
+    next.disabled = false;
+  }
+  const skip = document.getElementById('wizardSkip');
+  if (skip) skip.hidden = n === 3 && wizard.deploying;
+  // 第 3 页完成/失败态下「完成」才可点；部署中不允许点
+  if (n === 3 && wizard.deploying && next) next.disabled = true;
+  if (n === 3 && !wizard.deploying && next) {
+    const okBox = document.getElementById('wizardDone');
+    next.disabled = !(okBox && !okBox.hidden);
+    next.textContent = okBox && !okBox.hidden ? '开始使用' : '返回修改';
+  }
+}
+
+function wizardDirsPreview() {
+  const box = document.getElementById('wizardDirs');
+  if (!box) return;
+  const drive = wizard.selectedDrive || '';
+  const runtime = drive ? `${drive}\\ApkStart\\runtime` : '';
+  const avd = drive ? `${drive}\\ApkStart\\avd` : '';
+  box.innerHTML = ''
+    + `<div>运行时（引擎 + 系统镜像）：<b>${esc(runtime || '未选择')}</b></div>`
+    + `<div>安卓数据（应用、存档、快照）：<b>${esc(avd || '未选择')}</b></div>`;
+}
+
+function renderWizardDrives() {
+  const box = document.getElementById('wizardDrives');
+  if (!box) return;
+  if (!wizard.drives.length) {
+    box.innerHTML = '<div class="sub">未读取到可用磁盘（可以在设置里手动填路径）</div>';
+    return;
+  }
+  box.innerHTML = wizard.drives.map((d) => {
+    const freeGB = (d.free / 1073741824).toFixed(0);
+    const totalGB = (d.total / 1073741824).toFixed(0);
+    const sys = d.drive.toUpperCase() === String((state.settings && state.settings.__systemDrive) || 'C:').toUpperCase();
+    const rec = d.drive === wizard.recommendedDrive;
+    const pct = d.total ? Math.max(2, Math.round((d.free / d.total) * 100)) : 0;
+    const low = d.free < 8 * 1073741824;
+    return `<div class="drive-item${d.drive === wizard.selectedDrive ? ' on' : ''}" data-drive="${esc(d.drive)}" title="剩余 ${freeGB} GB / 共 ${totalGB} GB">`
+      + `<div class="d-letter">${esc(d.drive)}${sys ? '<span class="d-tag sys">系统盘</span>' : ''}</div>`
+      + `<div class="d-free">剩余 ${freeGB} GB（${pct}%）${rec ? '<span class="d-tag">推荐</span>' : ''}</div>`
+      + `${low ? '<div class="d-free" style="color:#c23b3b">空间不足（需 8GB+）</div>' : ''}`
+      + `</div>`;
+  }).join('');
+  for (const item of box.querySelectorAll('.drive-item')) {
+    item.addEventListener('click', () => {
+      wizard.selectedDrive = item.getAttribute('data-drive') || '';
+      renderWizardDrives();
+      wizardDirsPreview();
+      // 选盘即保存：就算用户之后跳过向导，选择也已生效（改目录在部署前不需要重启）
+      const drive = wizard.selectedDrive;
+      if (drive) {
+        api.setSettings({
+          runtime: { dir: `${drive}\\ApkStart\\runtime`, avdDir: `${drive}\\ApkStart\\avd` },
+        }).then((s) => { state.settings = s; }).catch(() => {});
+      }
+    });
+  }
+}
+
+async function wizardStartDeploy() {
+  const src = document.getElementById('wizardSource');
+  if (src) {
+    await api.setSettings({ runtime: { preferGithubRuntime: src.value !== 'official' } })
+      .then((s) => { state.settings = s; }).catch(() => {});
+  }
+  wizard.deploying = true;
+  wizard.bar = 0;
+  wizardShowPage(3);
+  const r = await api.autoDeploy().catch((e) => ({ ok: false, error: e.message }));
+  wizard.deploying = false;
+  const done = document.getElementById('wizardDone');
+  const fail = document.getElementById('wizardFail');
+  const failMsg = document.getElementById('wizardFailMsg');
+  const bar = document.getElementById('wizardBar');
+  const text = document.getElementById('wizardProgressText');
+  if (r && r.ok) {
+    if (bar) bar.style.width = '100%';
+    if (text) text.textContent = '运行时已就绪';
+    if (done) done.hidden = false;
+    if (fail) fail.hidden = true;
+  } else {
+    if (failMsg) failMsg.textContent = `部署未完成：${(r && r.error) || '未知原因'}`;
+    if (fail) fail.hidden = false;
+    if (done) done.hidden = true;
+  }
+  wizardShowPage(3);
+}
+
+function wizardFinish() {
+  api.setSettings({ wizardDone: true }).then((s) => { state.settings = s; }).catch(() => {});
+  api.wizardClose().catch(() => {});
+  const mask = document.getElementById('wizardMask');
+  if (mask) mask.classList.remove('on');
+  refreshStatus().catch(() => {});
+}
+
+async function bindWizard() {
+  if (!document.getElementById('wizardMask')) return;
+  document.getElementById('wizardSkip').addEventListener('click', wizardFinish);
+  document.getElementById('wizardCloseBtn').addEventListener('click', wizardFinish);
+  document.getElementById('wizardBack').addEventListener('click', () => wizardShowPage(wizard.page === 3 ? 2 : 1));
+  document.getElementById('wizardNext').addEventListener('click', () => {
+    if (wizard.page === 1) wizardShowPage(2);
+    else if (wizard.page === 2) wizardStartDeploy();
+    else wizardFinish();   // 完成态才可点（wizardShowPage 已控制 disabled）
+  });
+  api.on('provision:progress', (p) => wizardUpdateProgress(p));
+
+  // 首次运行才弹：已完成向导、或运行时已经就绪（老用户升级）都不打扰
+  const s = state.settings || {};
+  if (s.wizardDone === true) return;
+  if (state.status && state.status.needsSetup === false) {
+    api.setSettings({ wizardDone: true }).then((x) => { state.settings = x; }).catch(() => {});
+    return;
+  }
+  // 拉磁盘列表：推荐 = 剩余最多且 ≥8GB 的非系统盘
+  const drv = await api.sysDrives().catch(() => null);
+  if (drv) {
+    wizard.drives = drv.drives || [];
+    wizard.recommendedDrive = drv.recommended || '';
+    wizard.selectedDrive = drv.recommended || '';
+    state.settings = { ...(state.settings || {}), __systemDrive: drv.systemDrive || 'C:' };
+  }
+  renderWizardDrives();
+  wizardDirsPreview();
+  api.wizardOpen().catch(() => {});
+  wizardShowPage(1);
+  document.getElementById('wizardMask').classList.add('on');
+}
+
 async function init() {
   bindEvents();
   bindSettings();
@@ -1482,6 +1665,7 @@ async function init() {
   await refreshApps();
   refreshAndroid();
   selfCheck();
+  bindWizard();
   setInterval(refreshStatus, 6000);
   setInterval(refreshApps, 15000);
   setInterval(selfCheck, 60000);

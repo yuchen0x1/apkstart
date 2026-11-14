@@ -83,6 +83,11 @@ contextBridge.exposeInMainWorld('apkstart', {
 
   openExternal: (url) => invoke('shell:open', url),
   openPath: (p) => invoke('shell:openPath', p),
+
+  // 首次运行引导向导
+  sysDrives: () => invoke('sys:drives'),
+  wizardOpen: () => invoke('wizard:open'),
+  wizardClose: () => invoke('wizard:close'),
   winMinimize: () => invoke('window:minimize'),
   winMaximize: () => invoke('window:maximize'),
   winClose: () => invoke('window:close'),

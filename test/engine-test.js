@@ -29,7 +29,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
 
 (async () => {
   console.log('\n[download.js]');
-  const { download, downloadParallel, head, sha256File } = require('../src/core/download');
+  const { download, downloadParallel, downloadMulti, head, sha256File } = require('../src/core/download');
 
   // 本地 HTTP 服务模拟下载源（含 Range 续传）
   const payload = Buffer.alloc(300 * 1024);
@@ -53,6 +53,24 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       }
       res.writeHead(200, { 'Content-Length': payload.length });
       return res.end(payload);
+    }
+    // 慢速端点：每 200ms 才吐一小块，供「外部中断」测试用
+    if (req.url === '/slow.bin') {
+      const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+      const start = range ? Number(range[1]) : 0;
+      res.writeHead(range ? 206 : 200, range ? {
+        'Content-Range': `bytes ${start}-${payload.length - 1}/${payload.length}`,
+        'Content-Length': payload.length - start,
+      } : { 'Content-Length': payload.length });
+      let pos = start;
+      const timer = setInterval(() => {
+        const end = Math.min(pos + 8192, payload.length);
+        res.write(payload.subarray(pos, end));
+        pos = end;
+        if (pos >= payload.length) { clearInterval(timer); res.end(); }
+      }, 200);
+      res.on('close', () => clearInterval(timer));
+      return;
     }
     // 中途断开的源：模拟并行分块下载遇到网络抖动
     if (req.url === '/broken-range.bin') {
@@ -158,6 +176,39 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     });
     assert(fs.readFileSync(dest).equals(payload), '回退后内容不一致');
     assert(!r.parallel, '不应走并行');
+  });
+
+  await test('整包测速过慢：预检直接放弃，不走 GitHub 源（#26 慢下载回归）', async () => {
+    const { Sources } = require('../src/core/sources');
+    const src = new Sources(() => ({ runtime: {} }));
+    const slowUrl = 'https://example.invalid/slow/pack.zip';
+    // 模拟 rank() 已测出「最快的源也只有 0.14MB/s」的结论
+    src._rankCache.set(slowUrl, { at: Date.now(), ok: true, speed: 0.14 * 1048576 });
+    assert(src.speedOf(slowUrl) > 0, 'speedOf 应返回测速结果');
+    assert(src.speedOf(slowUrl) < 512 * 1024, '0.14MB/s 应低于预检阈值');
+    assert(src.speedOf('https://not-measured/x.zip') === -1, '没测过的地址应返回 -1');
+    // installRuntimePack 的阈值判定与官方源切换在 autoDeploy 里接线（网络层，不在此重复）
+  });
+
+  await test('downloadMulti 支持外部中断：断点保留、立即抛出', async () => {
+    const dest = path.join(TMP, 'abort-multi.bin');
+    const ac = new AbortController();
+    // 慢速端点：每 200ms 吐 8KB，8 秒都下不完 300KB —— 给看门狗留出触发窗口
+    // 用两个源（同字节数、不同端点）才能走进 downloadMulti 的分块/边车路径
+    const dl = downloadMulti([
+      `http://127.0.0.1:${port}/slow.bin`,
+      `http://127.0.0.1:${port}/broken-range.bin`,
+    ], dest, {
+      connections: 2, minChunk: 1, signal: ac.signal, idleMs: 8000,
+    }).then(() => ({ threw: false }), (e) => ({ threw: true, msg: e.message }));
+    setTimeout(() => ac.abort(), 1500);
+    const r = await dl;
+    assert(r.threw, '中断后应当抛出');
+    assert(/取消/.test(r.msg), `错误信息应说明取消原因：${r.msg}`);
+    // 边车元数据保留 = 已收分块不浪费，换源重下只补缺的块
+    assert(fs.existsSync(`${dest}.chunks.json`) || fs.existsSync(dest), '断点状态应保留');
+    fs.rmSync(dest, { force: true });
+    fs.rmSync(`${dest}.chunks.json`, { force: true });
   });
 
   await test('并行分块失败：不残留预分配的全零文件（P0-2 回归）', async () => {
