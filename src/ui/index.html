@@ -660,6 +660,15 @@
             从 GitHub（RoutineMiku/apkstart）获取最新版本；轻量版会下载便携包并自动替换程序文件，
             运行时、已装应用与快照都不受影响。
           </span>
+          <div class="row" style="margin-top:6px;">
+            <input type="checkbox" id="setAutoUpdate" class="switch" />
+            <span class="inline-note" style="margin-left:8px;">发现新版本自动下载并重启安装</span>
+          </div>
+          <span class="sub">开启后：检测到新版本会先系统通知，然后后台自动下载；没有应用窗口在前台时自动重启安装，正在使用的应用不会被重启打断（等窗口关闭再装）。关闭则只通知、手动更新。</span>
+          <div class="row" style="margin-top:6px;">
+            <button class="btn ghost sm" id="btnUpdateLog">更新日志</button>
+            <span class="inline-note">有新版本时展示该版发布说明，平时打开仓库 CHANGELOG</span>
+          </div>
         </div>
       </div>
 

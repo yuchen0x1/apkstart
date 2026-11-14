@@ -180,6 +180,42 @@ console.log('\n[合成 APK：axml + apk 全链路]');
   }
 }
 
+/* ---------------- 自动更新设置与更新日志 ---------------- */
+console.log('[update]');
+test('update.autoUpdate 默认开启（发现新版本自动下载并重启安装）', () => {
+  const { DEFAULT_SETTINGS } = require('../src/core/store');
+  assert(DEFAULT_SETTINGS.update && DEFAULT_SETTINGS.update.autoUpdate === true,
+    'update.autoUpdate 应默认为 true');
+});
+test('settings 写入白名单放行 update.autoUpdate', () => {
+  const tmpAppData = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-set-'));
+  // store 的 DATA_DIR 在首次 require 时确定，这里用子进程方式隔离验证
+  // （注意 -e 模式没有 __dirname，store 路径要在父进程算好再注入）
+  const { execFileSync } = require('child_process');
+  const storePath = path.join(__dirname, '..', 'src', 'core', 'store.js');
+  const script = [
+    'const fs = require("fs");',
+    'const path = require("path");',
+    'process.env.APPDATA = ' + JSON.stringify(tmpAppData) + ';',
+    'const store = require(' + JSON.stringify(storePath) + ');',
+    'store.saveSettings({ update: { autoUpdate: false }, bogusKey: 1 });',
+    // store 没有导出 SETTINGS_FILE，按其实现用 DATA_DIR 拼接
+    'const settingsFile = path.join(store.DATA_DIR, "settings.json");',
+    'const raw = JSON.parse(fs.readFileSync(settingsFile, "utf8"));',
+    'if (raw.update.autoUpdate !== false) throw new Error("autoUpdate 未写入");',
+    'if ("bogusKey" in raw) throw new Error("未知键不应落盘");',
+    'console.log("PASS");',
+  ].join('\n');
+  const out = execFileSync(process.execPath, ['-e', script], { encoding: 'utf8' });
+  assert(out.includes('PASS'), '子进程验证失败：' + out);
+  fs.rmSync(tmpAppData, { recursive: true, force: true });
+});
+test('CHANGELOG.md 存在且包含当前开发版本条目', () => {
+  const cl = fs.readFileSync(path.join(__dirname, '..', 'CHANGELOG.md'), 'utf8');
+  assert(/## \[0\.3\.7\]/.test(cl), 'CHANGELOG 应包含 0.3.7 条目');
+  assert(/## \[Unreleased\]/.test(cl), 'CHANGELOG 应包含 Unreleased 段');
+});
+
 /* ---------------- android.js：音量输出解析（#33 回归） ---------------- */
 console.log('[android.js]');
 const { parseVolumeGet } = require('../src/core/android');

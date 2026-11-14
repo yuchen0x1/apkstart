@@ -112,6 +112,11 @@ const DEFAULT_SETTINGS = {
   autoStart: true,           // 开机自启，默认开启，用户无需设置
   autoDeploy: true,          // 首次运行自动完成全部部署，不再分 1~5 步
   wizardDone: false,         // 首次运行引导向导：完成或跳过后置 true，不再弹出
+  update: {
+    // 发现新版本：通知后自动下载；没有应用窗口在前台时自动重启安装，
+    // 有应用窗口则等窗口关闭再装（不打断正在玩的应用）。关掉则只通知、手动更新。
+    autoUpdate: true,
+  },
   display: {
     mode: 'window',          // window（竖屏窗口，可自由拉伸） | fullscreen（自动适配屏幕）
     portrait: '900x1600',    // 窗口模式的竖屏分辨率，可在设置里调大小

@@ -862,3 +862,6 @@ kbd {
 .drive-item .d-tag.sys { background: #eef1f4; color: var(--muted); }
 /* hidden 属性会被 .btn / .icon-btn 的 display 声明覆盖（第 1 页的「上一步」就是这样漏出来的） */
 .wizard-foot .btn[hidden], .wizard-modal .icon-btn[hidden], .wizard-modal .drive-item[hidden] { display: none; }
+
+/* 更新日志完整展示（发布说明原文，可滚动） */
+#updateNote.notes { display: block; max-height: 240px; overflow: auto; white-space: pre-wrap; }

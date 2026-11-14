@@ -76,7 +76,8 @@ class AppWindow {
    */
   open(o) {
     const { pkg, label, iconPath, portrait, fullscreen } = o;
-    this._closedCb = o.onClosed || null;
+    // 保留外部（main）通过 onWindowClosed() 注册的回调：open 可能被反复调用
+    this._closedCb = o.onClosed || this._closedCb;
     if (this.isOpen && this.pkg === pkg) {
       this.win.show();
       this.win.focus();
@@ -150,6 +151,7 @@ class AppWindow {
       this.pkg = null;
       this._closing = false;
       if (this._closedCb) this._closedCb(pkg);
+      if (this._windowClosedCb) { try { this._windowClosedCb(pkg); } catch (_) { /* ignore */ } }
     });
     // 只在「应用窗口真正处于前台」且至少一项鼠标映射开启时装全局钩子；
     // 失焦/关闭立即卸载，绝不让 ApkStart 在后台拖慢整个系统的鼠标。
@@ -334,11 +336,15 @@ class AppWindow {
       this._selfClose = false;
       this._closing = false;
       if (this._closedCb) this._closedCb(pkg);
+      if (this._windowClosedCb) { try { this._windowClosedCb(pkg); } catch (_) { /* ignore */ } }
     };
     Promise.resolve(this.agent && this.agent.park()).catch(() => {}).then(done, done);
   }
 
   onCloseApp(cb) { this._onCloseApp = cb; }
+
+  /** 应用窗口关闭（任何路径）后的回调 —— 自动更新的「关窗后安装」钩子用 */
+  onWindowClosed(cb) { this._windowClosedCb = cb; }
 }
 
 module.exports = { AppWindow, TITLEBAR_H };

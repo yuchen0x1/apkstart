@@ -820,10 +820,16 @@ function renderUpdate(info) {
     showUpdateBtn(true);
     btn.textContent = info.asset ? '立即更新' : '打开下载页';
     btn.dataset.mode = info.asset ? 'auto' : 'manual';
+    // 更新日志 = 该版本的发布说明（GitHub Release body），完整展示（可滚动）
     const note = $('updateNote');
-    if (note && info.notes) {
-      const brief = String(info.notes).split('\n').slice(0, 8).join('\n').trim();
-      if (brief) note.textContent = `更新内容：\n${brief}`;
+    if (note) {
+      const body = String(info.notes || '').trim();
+      if (body) {
+        note.textContent = `更新日志（${info.tag}）：\n\n${body}`;
+        note.classList.add('notes');
+      } else {
+        note.classList.remove('notes');
+      }
     }
     if (bar) bar.hidden = true;
   } else {
@@ -910,6 +916,31 @@ function bindUpdate() {
       $('updateState').textContent = `已下载 v${r.version}，正在重启完成安装…`;
     }
   });
+
+  // 自动更新开关：状态在 init() 里按设置回填；这里只负责把改动写回去
+  const au = $('setAutoUpdate');
+  if (au) {
+    au.addEventListener('change', async () => {
+      const s = await api.setSettings({ update: { autoUpdate: au.checked } }).catch(() => null);
+      if (s) state.settings = s;
+      toast({
+        title: au.checked ? '已开启自动更新' : '已关闭自动更新',
+        body: au.checked
+          ? '发现新版本会自动下载并重启安装；正在使用的应用不会被重启打断'
+          : '发现新版本时只通知，更新需在设置里手动进行',
+        type: 'ok',
+      });
+    });
+  }
+  // 更新日志按钮：有新版本看该版本发布页，否则看仓库的 CHANGELOG
+  const logBtn = $('btnUpdateLog');
+  if (logBtn) {
+    logBtn.addEventListener('click', () => {
+      const u = lastUpdate;
+      if (u && u.hasUpdate && u.htmlUrl) api.updateOpenRelease(u.htmlUrl);
+      else api.updateOpenRelease('https://github.com/RoutineMiku/apkstart/blob/main/CHANGELOG.md');
+    });
+  }
 
   // 打开设置时如果还没结果，就顺手查一次（放后台，不打扰）
   runCheck(true).catch(() => {});
@@ -1661,6 +1692,9 @@ async function init() {
   bindUpdate();
   bindAndroid();
   state.settings = await api.getSettings();
+  // 自动更新开关按设置回填（bindUpdate 在 settings 加载前绑定，只能在这里回填）
+  const au = $('setAutoUpdate');
+  if (au) au.checked = !!(state.settings && state.settings.update && state.settings.update.autoUpdate !== false);
   await refreshStatus();
   await refreshApps();
   refreshAndroid();

@@ -593,6 +593,65 @@ async function runInstall(filePath) {
  * 下载并安装新版本，然后由 update-apply 脚本接管「替换 + 重启」。
  * 界面与托盘菜单共用这一条路径。
  */
+// ---------------- 在线自动更新 ----------------
+// 用户要的是「有新版本 → 通知 → 自动下载 → 自动重启安装」：
+//  - prepare（下载+解压）随时可做，不打扰任何人；
+//  - apply（重启安装）只在「没有应用窗口在前台」时自动执行 —— 正在玩的应用
+//    不能被重启打断，等窗口关闭（onWindowClosed 钩子）再装；
+//  - 设置里可整体关掉（update.autoUpdate = false），退回「只通知、手动更新」。
+let autoUpdateJob = null;
+let autoUpdateTag = '';
+
+function applyAutoUpdate() {
+  if (!autoUpdateJob || updateBusy) return;
+  const job = autoUpdateJob;
+  autoUpdateJob = null;
+  notify('正在自动更新', `即将重启并安装 ApkStart ${autoUpdateTag}`);
+  send('update:progress', { stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
+  updater.apply(job);
+  setTimeout(() => { quitting = true; app.quit(); }, 900);
+}
+
+async function autoUpdateFlow(info) {
+  if (updateBusy || autoUpdateJob) return;
+  notify('发现新版本', `ApkStart ${info.tag}，正在自动下载（完成后自动重启安装）…`);
+  send('update:state', info);
+  updateBusy = true;
+  try {
+    const job = await updater.prepare(info);
+    autoUpdateJob = job;
+    autoUpdateTag = info.tag || info.version;
+    appLog(`auto update payload ready: ${job.mode} v${job.version}`);
+    if (appWin && appWin.isOpen && appWin.pkg) {
+      send('toast', {
+        type: 'info',
+        sticky: true,
+        message: `新版本 ${autoUpdateTag} 已下载完成。关闭当前应用窗口后会自动重启安装；也可以在「设置 → 软件更新」里立即安装。`,
+      });
+    } else {
+      applyAutoUpdate();
+    }
+  } catch (e) {
+    appLog(`auto update failed: ${e.message}`);
+    notify('自动更新下载失败', `${e.message}（可在「设置 → 软件更新」手动重试）`);
+  } finally {
+    updateBusy = false;
+  }
+}
+
+/** 处理一次「查到了新版本」：按设置决定自动更新还是只通知 */
+function handleUpdateFound(info) {
+  updateInfo = info;
+  send('update:state', info);
+  if (!info.hasUpdate) return;
+  appLog(`update available ${info.tag} (current v${app.getVersion()}, asset=${info.asset ? info.asset.name : 'none'})`);
+  if (info.asset && store.getSettings().update.autoUpdate !== false) {
+    autoUpdateFlow(info).catch((e) => appLog(`auto update error: ${e.message}`));
+  } else {
+    notify('发现新版本', `ApkStart ${info.tag} 已发布，可在「设置 → 软件更新」里一键更新`);
+  }
+}
+
 async function runUpdate() {
   if (updateBusy) return { ok: false, error: '正在更新中' };
   updateBusy = true;
@@ -601,6 +660,15 @@ async function runUpdate() {
     const info = updateInfo && updateInfo.hasUpdate ? updateInfo : await updater.check();
     updateInfo = info;
     if (!info.hasUpdate) return { ok: false, error: '已经是最新版本' };
+    // 自动更新已经把载荷下载好了：直接装，不再重复下载
+    if (autoUpdateJob) {
+      const job = autoUpdateJob;
+      autoUpdateJob = null;
+      sendProgress({ stage: 'apply', percent: 100, message: '已下载完成，正在替换程序并重启…' });
+      updater.apply(job);
+      setTimeout(() => { quitting = true; app.quit(); }, 900);
+      return { ok: true, version: info.version || autoUpdateTag, mode: job.mode };
+    }
     if (!info.asset) {
       shell.openExternal(info.htmlUrl || Updater.repoUrl()).catch(() => {});
       return { ok: false, error: '该版本没有可直接安装的包，已打开 GitHub 发布页', manual: true };
@@ -1655,6 +1723,10 @@ if (!gotLock) {
       // 但 Android 环境留着，下次点开是秒进而非重新冷启动。
       runtime?.endApp(pkg, { onIdle: onContainerActive }).catch(() => {});
     });
+    // 应用窗口关闭：若自动更新已把新版本下载好，此刻是安全的安装时机
+    appWin.onWindowClosed(() => {
+      if (autoUpdateJob) setTimeout(applyAutoUpdate, 600);
+    });
 
     // 「哪些窗口才算我们的」= 运行时目录 + 随包的 engine 目录。
     // 窗口代理只允许碰这些进程创建的窗口 —— 别的 Qt 应用（微信 4.x 就是 Qt6，
@@ -1782,19 +1854,19 @@ if (!gotLock) {
       }).catch(() => {});
     }, 20000).unref?.();
 
-    // 启动 8 秒后静默查一次新版本（打包后才有意义）。发现新版本只提示，
-    // 绝不自动下载 —— 更新是用户点「立即更新」才做的事。
+    // 启动 8 秒后静默查一次新版本（打包后才有意义）：自动更新开启时
+    // 「通知 → 自动下载 → 空闲时自动重启安装」一条龙；关闭则退回只通知。
+    // 之后每 6 小时再查一次，长期挂着的容器也能收到新版本。
     if (app.isPackaged) {
       setTimeout(() => {
-        updater.check().then((info) => {
-          updateInfo = info;
-          send('update:state', info);
-          if (info.hasUpdate) {
-            appLog(`update available ${info.tag} (current v${app.getVersion()}, asset=${info.asset ? info.asset.name : 'none'})`);
-            notify('发现新版本', `ApkStart ${info.tag} 已发布，可在「设置 → 软件更新」里一键更新`);
-          }
-        }).catch((e) => appLog(`update check failed: ${e.message}`));
+        updater.check().then((info) => handleUpdateFound(info))
+          .catch((e) => appLog(`update check failed: ${e.message}`));
       }, 8000).unref?.();
+      setInterval(() => {
+        if (updateBusy || autoUpdateJob) return;   // 上一轮还没处理完就不叠上来
+        updater.check().then((info) => handleUpdateFound(info))
+          .catch(() => { /* 后台定时检查失败不打扰 */ });
+      }, 6 * 3600 * 1000).unref?.();
     }
 
     // 文件同步 / 通知轮询不再无条件常驻：只在容器里真的有应用窗口时才跑
