@@ -115,7 +115,9 @@ class AppWindow {
         preload: path.join(__dirname, '..', 'preload.js'),
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: false,
+        // 渲染进程只通过 preload 暴露的白名单接口与主进程通信，不需要 Node，
+        // 开启沙箱后即使页面被注入脚本也拿不到进程能力。
+        sandbox: true,
         spellcheck: false,
         backgroundThrottling: false,
       },
@@ -160,8 +162,20 @@ class AppWindow {
     });
     // 只在「应用窗口真正处于前台」且至少一项鼠标映射开启时装全局钩子；
     // 失焦/关闭立即卸载，绝不让 ApkStart 在后台拖慢整个系统的鼠标。
-    this.win.on('focus', () => this._syncHook(true));
-    this.win.on('blur', () => this._syncHook(false));
+    this.win.on('focus', () => {
+      this._syncHook(true);
+      // Electron 窗口重新获得焦点时，Qt 子窗口可能还停留在被遮挡后的黑帧；
+      // 只做无激活重排/重绘，不抢回焦点，也不把鼠标事件发给模拟器。
+      this.agent.refresh?.().catch(() => {});
+    });
+    this.win.on('blur', () => {
+      this._syncHook(false);
+      // 失焦本身不应触发任何前台切换；延迟一次无激活刷新，给 DWM 一个
+      // 处理遮挡变化的机会，避免用户点击其它窗口后留下黑帧。
+      setTimeout(() => {
+        if (this.isOpen) this.agent.refresh?.().catch(() => {});
+      }, 80).unref?.();
+    });
 
     if (fullscreen) this.win.maximize();
     return this.win;

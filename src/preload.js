@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   listApps: () => invoke('apps:list'),
   pickApk: () => invoke('apk:pick'),
   parseApk: (p) => invoke('apk:parse', p),
+  compatApk: (p) => invoke('apk:compat', p),
   installApk: (p) => invoke('apk:install', p),
   launch: (pkg) => invoke('app:launch', pkg),
   uninstall: (pkg) => invoke('app:uninstall', pkg),
@@ -15,6 +16,9 @@ contextBridge.exposeInMainWorld('apkstart', {
   clearData: (pkg) => invoke('app:clearData', pkg),
   pin: (pkg, pinned) => invoke('app:pin', { pkg, pinned }),
   revealApk: (pkg) => invoke('app:revealApk', pkg),
+  exportApk: (pkg) => invoke('app:exportApk', pkg),
+  backupApp: (pkg) => invoke('app:backup', pkg),
+  restoreApp: () => invoke('app:restore'),
   revealApkDir: () => invoke('apk:reveal'),
   openDir: () => invoke('dialog:openDir'),
 

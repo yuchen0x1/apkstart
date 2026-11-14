@@ -68,6 +68,16 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(p.accel === 'auto');
   });
 
+  await test('可见嵌入模式优先使用 software，避免失焦时 ANGLE 交换链黑屏', () => {
+    const p = doctor.chooseProfile({
+      host: doctor.hostInfo(), accel: { ok: true }, emulatorVersion: '37.3.8.0',
+      diskMB: 50000, port: 5554, adbPort: 5044,
+    });
+    const visible = doctor.planVariants(p, { preferSoftware: true });
+    assert(visible[0].gpu === 'software', `可见模式首选应为 software，实际 ${visible[0].gpu}`);
+    assert(!visible[0].lastResort && visible[0].snapshot !== false);
+  });
+
   await test('重试矩阵：从最优到最保守，包含软件模拟与冷启动兜底', () => {
     const p = doctor.chooseProfile({
       host: doctor.hostInfo(), accel: { ok: true }, emulatorVersion: '37.3.8.0',

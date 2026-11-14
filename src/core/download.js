@@ -11,7 +11,7 @@ const tls = require('tls');
 const crypto = require('crypto');
 const { URL } = require('url');
 
-const UA = 'ApkStart/0.3 (Windows; +https://github.com/RoutineMiku/apkstart)';
+const UA = 'ApkStart/0.3 (Windows; +https://github.com/yuchen0x1/apkstart)';
 const proxyMod = require('./proxy');
 
 function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy = false } = {}) {

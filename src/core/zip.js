@@ -11,6 +11,7 @@
  */
 const zlib = require('zlib');
 const fs = require('fs');
+const path = require('path');
 
 const EOCD_SIG = 0x06054b50;
 const CEN_SIG = 0x02014b50;
@@ -22,8 +23,66 @@ const MAX16 = 0xffff;
 // read() 单条目上限：超过就要求调用方走 pipeTo（流式），避免整块进内存
 const MAX_READ = 256 * 1024 * 1024;
 
+/** ZIP 条目里「用了什么压缩方式 + 是不是符号链接」都要判：符号链接能绕过目录边界检查 */
+const S_IFLNK = 0xA000;
+const HOST_UNIX = 3;
+
+/** CRC-32（ZIP 内建校验）。查表法，解压时边解边算，用来发现损坏/篡改的条目。 */
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let k = 0; k < 8; k += 1) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c;
+  }
+  return t;
+})();
+
+function crc32(buf, seed = 0) {
+  let c = ~seed;
+  for (let i = 0; i < buf.length; i += 1) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return ~c >>> 0;
+}
+
 /** 把 BigInt 偏移安全地转成 Number（ZIP 不可能大过 2^53 字节） */
 function toNum(v) { return typeof v === 'bigint' ? Number(v) : v; }
+
+/**
+ * 计算 ZIP 条目解压后的落盘路径，并拒绝一切逃逸写法。
+ *
+ * 只做字符串 startsWith 是不够的：`dest = C:\app\payload` 时，
+ * 条目 `..\payload-evil\x.dll` 拼出来是 `C:\app\payload-evil\x.dll`，
+ * 恰好以 `C:\app\payload` 开头，检查会通过 —— 文件就落到目录外面去了。
+ * 这里用 path.resolve + path.relative 判真正包含关系，并额外拒绝
+ * 绝对路径、盘符、UNC、以及任何 `..` 段。
+ *
+ * @param {string} destRoot 解压根目录
+ * @param {string} entryName ZIP 内的条目名
+ * @returns {string|null} 安全时返回绝对路径；目录类条目返回 null
+ * @throws {Error} 条目名不安全时抛出
+ */
+function safeEntryPath(destRoot, entryName) {
+  const raw = String(entryName == null ? '' : entryName);
+  const name = raw.replace(/\\/g, '/');
+  if (!name || name === '.' || name.endsWith('/')) return null;
+  if (name.startsWith('/') || name.startsWith('//') || /^[a-zA-Z]:/.test(name)) {
+    throw new Error(`更新包含非法绝对路径条目：${raw}`);
+  }
+  if (name.split('/').some((seg) => seg === '..')) {
+    throw new Error(`更新包含路径穿越条目：${raw}`);
+  }
+  const norm = path.posix.normalize(name);
+  if (norm === '.' || norm.startsWith('../') || path.posix.isAbsolute(norm)) {
+    throw new Error(`更新包含路径穿越条目：${raw}`);
+  }
+  const root = path.resolve(destRoot);
+  const target = path.resolve(root, norm);
+  const rel = path.relative(root, target);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`更新条目落在目标目录之外：${raw}`);
+  }
+  return target;
+}
 
 /**
  * 解析 Zip64 扩展字段（0x0001），补全中央目录里被置成 0xffffffff 的字段。
@@ -126,11 +185,16 @@ class ZipArchive {
         },
       );
       const name = buf.toString('utf8', offset + 46, nameEnd);
+      const madeBy = buf.readUInt16LE(offset + 4);
+      const extAttr = buf.readUInt32LE(offset + 38);
       this.entries.set(name, {
         name, flags, method,
+        crc: buf.readUInt32LE(offset + 16),
         compSize: fields.compSize,
         uncompSize: fields.uncompSize,
         localOffset: fields.localOffset,
+        unixMode: (extAttr >>> 16) & 0xffff,
+        symlink: (madeBy >>> 8) === HOST_UNIX && ((extAttr >>> 16) & S_IFLNK) === S_IFLNK,
       });
       offset = nameEnd + extraLen + commentLen;
     }
@@ -165,31 +229,51 @@ class ZipArchive {
 
   /**
    * 流式解压单个条目到可写流。
-   * system.img 这类 GB 级条目无法整块 inflate 进内存（会撞上 Node 的 2GB 单 Buffer 上限），
-   * 必须边解压边落盘。
+   * @param {string} name 条目名
+   * @param {import('stream').Writable} dest 目标可写流
+   * @param {{verify?:boolean}} [opts] verify=true 时校验 CRC32 与解压后大小
    */
-  pipeTo(name, dest) {
+  pipeTo(name, dest, opts = {}) {
     const e = this.entries.get(name);
     if (!e) return Promise.reject(new Error(`条目不存在: ${name}`));
     const buf = this.buf;
+    if (e.localOffset + 30 > buf.length) return Promise.reject(new Error(`本地文件头越界: ${name}`));
     if (buf.readUInt32LE(e.localOffset) !== LOC_SIG) {
       return Promise.reject(new Error(`本地文件头损坏: ${name}`));
     }
     const nameLen = buf.readUInt16LE(e.localOffset + 26);
     const extraLen = buf.readUInt16LE(e.localOffset + 28);
     const start = e.localOffset + 30 + nameLen + extraLen;
-    const raw = buf.subarray(start, start + e.compSize);
+    const end = start + e.compSize;
+    if (end > buf.length) return Promise.reject(new Error(`条目数据越界: ${name}`));
+    const raw = buf.subarray(start, end);
 
     return new Promise((resolve, reject) => {
-      const done = (err) => { if (err) reject(err); else resolve(e.uncompSize); };
-      dest.on('error', done);
-      dest.on('finish', () => done(null));
+      let crc = 0;
+      let bytes = 0;
+      let settled = false;
+      const finish = (err) => {
+        if (settled) return;
+        settled = true;
+        if (err) return reject(err);
+        if (opts.verify && (crc >>> 0) !== (e.crc >>> 0)) {
+          return reject(new Error(`条目校验失败（CRC 不匹配）: ${name}`));
+        }
+        if (opts.verify && bytes !== e.uncompSize) {
+          return reject(new Error(`条目大小不符（${bytes} ≠ ${e.uncompSize}）: ${name}`));
+        }
+        return resolve(e.uncompSize);
+      };
+      dest.on('error', finish);
+      dest.on('finish', () => finish(null));
 
       if (e.method === 0) {
+        crc = crc32(raw);
+        bytes = raw.length;
         dest.end(raw);
         return;
       }
-      if (e.method !== 8) return done(new Error(`不支持的压缩方式 ${e.method}: ${name}`));
+      if (e.method !== 8) return finish(new Error(`不支持的压缩方式 ${e.method}: ${name}`));
 
       const inflater = zlib.createInflateRaw();
       // 分片喂入，避免一次性把 GB 数据塞进 zlib 缓冲区
@@ -197,18 +281,25 @@ class ZipArchive {
       let pos = 0;
       const pump = () => {
         while (pos < raw.length) {
-          const end = Math.min(pos + SLICE, raw.length);
-          const chunk = raw.subarray(pos, end);
-          pos = end;
-          if (!inflater.write(chunk)) {
+          const startPos = pos;
+          pos = Math.min(pos + SLICE, raw.length);
+          if (!inflater.write(raw.subarray(startPos, pos))) {
             inflater.once('drain', pump);
             return;
           }
         }
         inflater.end();
       };
-      inflater.on('error', done);
-      inflater.pipe(dest);
+      inflater.on('error', finish);
+      inflater.on('data', (chunk) => {
+        crc = crc32(chunk, crc);
+        bytes += chunk.length;
+        if (!dest.write(chunk)) {
+          inflater.pause();
+          dest.once('drain', () => inflater.resume());
+        }
+      });
+      inflater.on('end', () => dest.end());
       pump();
     });
   }
@@ -293,11 +384,16 @@ class ZipFile {
         },
       );
       const name = cd.toString('utf8', off + 46, nameEnd);
+      const madeBy = cd.readUInt16LE(off + 4);
+      const extAttr = cd.readUInt32LE(off + 38);
       this.entries.set(name, {
         name, flags, method,
+        crc: cd.readUInt32LE(off + 16),
         compSize: fields.compSize,
         uncompSize: fields.uncompSize,
         localOffset: fields.localOffset,
+        unixMode: (extAttr >>> 16) & 0xffff,
+        symlink: (madeBy >>> 8) === HOST_UNIX && ((extAttr >>> 16) & S_IFLNK) === S_IFLNK,
       });
       off = nameEnd + extraLen + commentLen;
     }
@@ -332,26 +428,67 @@ class ZipFile {
     throw new Error(`不支持的压缩方式 ${e.method}: ${name}`);
   }
 
-  pipeTo(name, dest) {
+  /**
+   * 流式解压单个条目到可写流（文件版：不把整条目读进内存）。
+   * @param {string} name 条目名
+   * @param {import('stream').Writable} dest 目标可写流
+   * @param {{verify?:boolean}} [opts] verify=true 时校验 CRC32 与解压后大小
+   */
+  pipeTo(name, dest, opts = {}) {
     let r;
     try { r = this._range(name); } catch (e) { return Promise.reject(e); }
     const { e, start, end } = r;
     return new Promise((resolve, reject) => {
-      const done = (err) => (err ? reject(err) : resolve(e.uncompSize));
-      dest.on('error', done);
-      dest.on('finish', () => done(null));
+      let crc = 0;
+      let bytes = 0;
+      let settled = false;
+      const finish = (err) => {
+        if (settled) return;
+        settled = true;
+        if (err) return reject(err);
+        if (opts.verify && (crc >>> 0) !== (e.crc >>> 0)) {
+          return reject(new Error(`条目校验失败（CRC 不匹配）: ${name}`));
+        }
+        if (opts.verify && bytes !== e.uncompSize) {
+          return reject(new Error(`条目大小不符（${bytes} ≠ ${e.uncompSize}）: ${name}`));
+        }
+        return resolve(e.uncompSize);
+      };
+      dest.on('error', finish);
+      dest.on('finish', () => finish(null));
       if (e.compSize === 0) { dest.end(); return undefined; }
-      if (e.method !== 0 && e.method !== 8) return done(new Error(`不支持的压缩方式 ${e.method}: ${name}`));
+      if (e.method !== 0 && e.method !== 8) return finish(new Error(`不支持的压缩方式 ${e.method}: ${name}`));
       const src = fs.createReadStream(null, {
         fd: this.fd, autoClose: false, start, end: Math.max(start, end),
       });
-      src.on('error', done);
-      if (e.method === 0) return src.pipe(dest);
+      src.on('error', finish);
+      if (e.method === 0) {
+        src.on('data', (chunk) => { crc = crc32(chunk, crc); bytes += chunk.length; });
+        return src.pipe(dest);
+      }
       const inflater = zlib.createInflateRaw();
-      inflater.on('error', done);
-      return src.pipe(inflater).pipe(dest);
+      inflater.on('error', finish);
+      src.on('data', (chunk) => {
+        if (!inflater.write(chunk)) {
+          src.pause();
+          inflater.once('drain', () => src.resume());
+        }
+      });
+      src.on('end', () => inflater.end());
+      inflater.on('data', (chunk) => {
+        crc = crc32(chunk, crc);
+        bytes += chunk.length;
+        if (!dest.write(chunk)) {
+          inflater.pause();
+          dest.once('drain', () => inflater.resume());
+        }
+      });
+      inflater.on('end', () => dest.end());
+      return undefined;
     });
   }
 }
 
-module.exports = { ZipArchive, ZipFile };
+module.exports = {
+  ZipArchive, ZipFile, safeEntryPath, crc32, S_IFLNK,
+};

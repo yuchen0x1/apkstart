@@ -6,7 +6,7 @@
  * 在 CI 上等于零覆盖。这里用几十行字节拼出一个**合法的**二进制 AXML 清单 +
  * 最小 ZIP，让解析栈永远有可跑的用例。
  *
- * 生成的内容：
+ * 默认生成的内容：
  *   <manifest package="com.example.test" android:versionCode="7" android:versionName="1.2.3">
  *     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34"/>
  *     <application android:label="TestApp" android:icon="res/mipmap-hdpi/ic_launcher.png">
@@ -16,6 +16,9 @@
  *       </activity>
  *     </application>
  *   </manifest>
+ *
+ * buildApkBytes(opts) 可以改：minSdk / targetSdk / abis / permissions /
+ * requiredFeatures / usesLibraries / split / debuggable，用来覆盖兼容性判定。
  */
 const { drawAppIcon } = require('../../src/core/png');
 
@@ -49,7 +52,7 @@ function axmlChunk(type, headerSize, body) {
   return Buffer.concat([u16(type), u16(headerSize), u32(8 + body.length), body]);
 }
 
-/** attrs: [{ ns?, name, type?=0x03, data }] */
+/** attrs: [{ ns?: number, name, type?=0x03, data }] */
 function axmlStartElement(nameIdx, attrs) {
   const attrBufs = attrs.map((a) => Buffer.concat([
     u32(a.ns === undefined ? 0xffffffff : a.ns),
@@ -69,49 +72,152 @@ function axmlEndElement(nsIdx, nameIdx) {
   return axmlChunk(0x0103, 16, Buffer.concat([u32(0), u32(0), u32(nsIdx), u32(nameIdx)]));
 }
 
-/** 生成 AndroidManifest.xml 的二进制 AXML */
-function buildManifestAxml() {
-  const S = [
-    'manifest', 'package', 'com.example.test', 'android', ANDROID_NS,
-    'versionCode', 'versionName', '1.2.3',
-    'uses-sdk', 'minSdkVersion', 'targetSdkVersion',
-    'application', 'label', 'TestApp', 'icon', 'res/mipmap-hdpi/ic_launcher.png',
-    'activity', 'name', '.Main',
-    'intent-filter', 'action', 'android.intent.action.MAIN',
-    'category', 'android.intent.category.LAUNCHER',
-  ];
-  const idx = Object.fromEntries(S.map((s, i) => [s, i]));
-  const ns = idx[ANDROID_NS];
-  const pool = buildStringPool(S);
-  const chunks = [
-    axmlChunk(0x0100, 16, Buffer.concat([u32(0), u32(0), u32(idx.android), u32(ns)])),
-    axmlStartElement(idx.manifest, [
-      { ns: 0xffffffff, name: idx.package, data: idx['com.example.test'], type: 0x03 },
-      { ns, name: idx.versionCode, data: 7, type: 0x10 },
-      { ns, name: idx.versionName, data: idx['1.2.3'], type: 0x03 },
-    ]),
-    axmlStartElement(idx['uses-sdk'], [
-      { ns, name: idx.minSdkVersion, data: 21, type: 0x10 },
-      { ns, name: idx.targetSdkVersion, data: 34, type: 0x10 },
-    ]),
-    axmlEndElement(0xffffffff, idx['uses-sdk']),
-    axmlStartElement(idx.application, [
-      { ns, name: idx.label, data: idx.TestApp, type: 0x03 },
-      { ns, name: idx.icon, data: idx['res/mipmap-hdpi/ic_launcher.png'], type: 0x03 },
-    ]),
-    axmlStartElement(idx.activity, [{ ns, name: idx.name, data: idx['.Main'], type: 0x03 }]),
-    axmlStartElement(idx['intent-filter'], []),
-    axmlStartElement(idx.action, [{ ns, name: idx.name, data: idx['android.intent.action.MAIN'], type: 0x03 }]),
-    axmlEndElement(0xffffffff, idx.action),
-    axmlStartElement(idx.category, [{ ns, name: idx.name, data: idx['android.intent.category.LAUNCHER'], type: 0x03 }]),
-    axmlEndElement(0xffffffff, idx.category),
-    axmlEndElement(0xffffffff, idx['intent-filter']),
-    axmlEndElement(0xffffffff, idx.activity),
-    axmlEndElement(0xffffffff, idx.application),
-    axmlEndElement(0xffffffff, idx.manifest),
-    axmlChunk(0x0101, 16, Buffer.concat([u32(0), u32(0), u32(idx.android), u32(ns)])),
-  ];
-  const all = Buffer.concat([pool, ...chunks]);
+const DEFAULTS = {
+  packageName: 'com.example.test',
+  label: 'TestApp',
+  versionCode: 7,
+  versionName: '1.2.3',
+  minSdk: 21,
+  targetSdk: 34,
+  icon: 'res/mipmap-hdpi/ic_launcher.png',
+  split: '',
+  debuggable: false,
+  launchActivity: '.Main',
+  permissions: [],
+  /** [{ name, required }] */
+  requiredFeatures: [],
+  /** [{ name, required }] */
+  usesLibraries: [],
+  /** 直接控制 lib/<abi>/ 目录；null = 用默认 arm64-v8a */
+  abis: null,
+};
+
+/**
+ * 生成 AndroidManifest.xml 的二进制 AXML
+ * 采用「先登记字符串、再产出 chunk」两段式，避免边写边算索引对不上。
+ */
+function buildManifestAxml(opts = {}) {
+  const o = { ...DEFAULTS, ...opts };
+  const strings = [];
+  const add = (s) => {
+    const i = strings.indexOf(s);
+    if (i >= 0) return i;
+    strings.push(s);
+    return strings.length - 1;
+  };
+
+  // ns=true → android 命名空间；ns=false → 无命名空间（如 package）
+  const A = (name, value, extra = {}) => ({ name, value, ...extra });
+
+  const root = {
+    name: 'manifest',
+    attrs: [
+      { name: 'package', value: o.packageName, ns: false },
+      { name: 'versionCode', value: o.versionCode, type: 0x10 },
+      { name: 'versionName', value: o.versionName },
+    ],
+    children: [],
+  };
+  if (o.split) root.attrs.push({ name: 'split', value: o.split, ns: false });
+
+  root.children.push({
+    name: 'uses-sdk',
+    attrs: [
+      { name: 'minSdkVersion', value: o.minSdk, type: 0x10 },
+      { name: 'targetSdkVersion', value: o.targetSdk, type: 0x10 },
+    ],
+    children: [],
+  });
+
+  for (const p of o.permissions) {
+    root.children.push({ name: 'uses-permission', attrs: [A('name', p, { ns: false })], children: [] });
+  }
+  for (const f of o.requiredFeatures) {
+    const item = typeof f === 'string' ? { name: f, required: true } : f;
+    root.children.push({
+      name: 'uses-feature',
+      attrs: [
+        A('name', item.name, { ns: false }),
+        { name: 'required', value: item.required !== false, type: 0x12 },
+      ],
+      children: [],
+    });
+  }
+
+  const app = {
+    name: 'application',
+    attrs: [A('label', o.label), A('icon', o.icon)],
+    children: [],
+  };
+  if (o.debuggable) app.attrs.push({ name: 'debuggable', value: true, type: 0x12 });
+  for (const l of o.usesLibraries) {
+    const item = typeof l === 'string' ? { name: l, required: true } : l;
+    app.children.push({
+      name: 'uses-library',
+      attrs: [
+        A('name', item.name, { ns: false }),
+        { name: 'required', value: item.required !== false, type: 0x12 },
+      ],
+      children: [],
+    });
+  }
+  app.children.push({
+    name: 'activity',
+    attrs: [A('name', o.launchActivity)],
+    children: [{
+      name: 'intent-filter',
+      attrs: [],
+      children: [
+        { name: 'action', attrs: [A('name', 'android.intent.action.MAIN')], children: [] },
+        { name: 'category', attrs: [A('name', 'android.intent.category.LAUNCHER')], children: [] },
+      ],
+    }],
+  });
+  root.children.push(app);
+
+  // 第一遍：把所有字符串登记进池子
+  const register = (n) => {
+    add(n.name);
+    for (const a of n.attrs) {
+      add(a.name);
+      if (typeof a.value === 'string') add(a.value);
+    }
+    for (const c of n.children) register(c);
+  };
+  add('android');
+  const nsIdx = add(ANDROID_NS);
+  register(root);
+
+  const pool = buildStringPool(strings);
+
+  // 第二遍：索引已固定，产出 chunk
+  const emit = (n) => {
+    const attrs = n.attrs.map((a) => {
+      const isStr = typeof a.value === 'string';
+      return {
+        ns: a.ns === false ? 0xffffffff : nsIdx,
+        name: add(a.name),
+        type: a.type === undefined ? (isStr ? 0x03 : 0x10) : a.type,
+        data: isStr ? add(a.value) : (a.type === 0x12 ? (a.value ? 0xffffffff : 0) : a.value),
+      };
+    });
+    return Buffer.concat([
+      axmlStartElement(add(n.name), attrs),
+      ...n.children.map(emit),
+      axmlEndElement(0xffffffff, add(n.name)),
+    ]);
+  };
+
+  const body = emit(root);
+  const chunks = Buffer.concat([
+    axmlChunk(0x0100, 16, Buffer.concat([u32(0), u32(0), u32(add('android')), u32(nsIdx)])),
+    body,
+    axmlChunk(0x0101, 16, Buffer.concat([u32(0), u32(0), u32(add('android')), u32(nsIdx)])),
+  ]);
+
+  // 注意：emit 里再 add 的都是已登记过的字符串，不会改变已有索引
+  const all = Buffer.concat([pool, chunks]);
+  // 最外层是 RES_XML_TYPE 文件头（8 字节头 + 总长度）
   return Buffer.concat([u16(0x0003), u16(8), u32(8 + all.length), all]);
 }
 
@@ -154,18 +260,24 @@ function buildStoredZip(entries) {
 }
 
 /** 一个可直接被 parseApk 解析的最小 APK 的字节 */
-function buildApkBytes() {
+function buildApkBytes(opts = {}) {
+  const o = { ...DEFAULTS, ...opts };
   const png = drawAppIcon(96);
-  return buildStoredZip([
-    { name: 'AndroidManifest.xml', data: buildManifestAxml() },
+  const abis = o.abis === null ? ['arm64-v8a'] : o.abis;
+  const entries = [
+    { name: 'AndroidManifest.xml', data: buildManifestAxml(o) },
     { name: 'res/mipmap-hdpi/ic_launcher.png', data: png },
-    { name: 'lib/arm64-v8a/libtest.so', data: Buffer.from('ELF-fake') },
     { name: 'classes.dex', data: Buffer.from('dex\n035\0') },
-  ]);
+  ];
+  for (const abi of abis) {
+    entries.push({ name: `lib/${abi}/libtest.so`, data: Buffer.from('ELF-fake') });
+  }
+  return buildStoredZip(entries);
 }
 
 module.exports = {
   ANDROID_NS,
+  DEFAULTS,
   buildManifestAxml,
   buildStoredZip,
   buildApkBytes,

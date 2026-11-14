@@ -170,6 +170,8 @@ class WinAgent extends EventEmitter {
     }, 3000);
   }
 
+  async refresh() { return this.call({ cmd: 'refresh' }, 3000); }
+
   async rotate(dir = 'left') { return this.call({ cmd: 'rotate', dir }, 8000); }
   async hide() { return this.call({ cmd: 'hide' }, 3000); }
   async show() { return this.call({ cmd: 'show' }, 3000); }

@@ -70,7 +70,7 @@ function toast({ title, body = '', type = 'info', progress = null, sticky = fals
   while (wrap.children.length >= 4) wrap.firstElementChild.remove();
 
   const el = document.createElement('div');
-  el.className = `toast ${type === 'error' ? 'error' : ''}`;
+  el.className = `toast ${type === 'error' ? 'error' : ''}${type === 'warn' ? 'warn' : ''}`;
   el.dataset.key = key;
   el.dataset.at = String(Date.now());
   el.dataset.seq = String(++_toastSeq);
@@ -511,9 +511,31 @@ async function installFiles(paths) {
   state.installing = true;
   let ok = 0;
   let failed = 0;
+  let skipped = 0;
 
   for (const p of paths) {
     const name = p.split(/[\\/]/).pop();
+    // 装之前先做兼容性检查：只有「基本兼容」以上才直接装；
+    // 明确有问题的（架构不匹配、系统版本不够、拆分分片）先问用户一句，
+    // 让他在装之前就知道「大概率打不开」，而不是装完再猜为什么。
+    let comp = null;
+    try { comp = (await api.compatApk(p)).compat; } catch (_) { comp = null; }
+    if (comp && (comp.level === 'risky' || comp.level === 'unsupported')) {
+      const why = comp.reasons.filter((r) => r.kind !== 'info').map((r) => `• ${r.text}`).join('\n');
+      const { response } = await api.confirm({
+        type: 'warning',
+        title: `${name}：${comp.label}`,
+        message: '安装前的兼容性检查发现这个包可能跑不起来。',
+        detail: `${why}\n\n评估环境：${comp.env.source}\n\n仍然要继续安装吗？`,
+        okLabel: '仍然安装',
+        danger: true,
+      });
+      if (response !== 1) { skipped += 1; continue; }
+    } else if (comp && comp.level === 'partial') {
+      const why = comp.reasons.filter((r) => r.kind === 'warn').map((r) => r.text).join(' ');
+      if (why) toast({ title: `${name}：${comp.label}`, body: why, type: 'warn' });
+    }
+
     const t = toast({ title: `正在安装 ${name}`, body: '解析 APK…', progress: 8, sticky: true, spinner: true });
     installToast = t;
     let off = () => {};
@@ -548,6 +570,8 @@ async function installFiles(paths) {
   state.installing = false;
   await refreshApps();
   if (ok && !failed) $('search').value = '';
+  // 用户因为兼容性提示主动取消的，给一句明确回执，避免「点了安装却什么都没发生」
+  if (skipped) toast({ title: `已跳过 ${skipped} 个安装`, body: '兼容性检查未通过，按你的选择没有继续安装。' });
 }
 
 /* ---------------- 应用操作 ---------------- */
@@ -606,6 +630,9 @@ const MENU_ITEMS = [
   { key: 'pin', label: '固定到顶部' },
   { divider: true },
   { key: 'reveal', label: '打开 APK 所在位置' },
+  { key: 'exportApk', label: '导出 APK…' },
+  { key: 'backup', label: '备份应用…' },
+  { key: 'restore', label: '从备份恢复…' },
   { key: 'clear', label: '清除应用数据' },
   { divider: true },
   { key: 'uninstall', label: '卸载', danger: true },
@@ -644,6 +671,53 @@ async function handleMenu(act) {
     case 'shortcut': return createShortcut(pkg);
     case 'pin': return api.pin(pkg, !app.pinned).then(refreshApps);
     case 'reveal': return api.revealApk(pkg);
+    case 'exportApk': {
+      try {
+        const r = await api.exportApk(pkg);
+        if (r && r.ok) toast({ title: 'APK 已导出', body: r.path, type: 'ok' });
+      } catch (e) {
+        toast({ title: '导出失败', body: e.message, type: 'error' });
+      }
+      return undefined;
+    }
+    case 'backup': {
+      const t = toast({ title: `正在备份 ${app.label}`, body: '准备中…', sticky: true, spinner: true });
+      try {
+        const r = await api.backupApp(pkg);
+        t.dismiss();
+        if (!r || r.canceled) return undefined;
+        toast({
+          title: `${app.label} 已备份`,
+          body: r.dataIncluded
+            ? `APK 与数据都已保存到 ${r.folder}`
+            : `已保存到 ${r.folder}\n${r.dataNote || ''}`,
+          type: r.dataIncluded ? 'ok' : 'warn',
+          sticky: false,
+        });
+      } catch (e) {
+        t.dismiss();
+        toast({ title: '备份失败', body: e.message, type: 'error' });
+      }
+      return undefined;
+    }
+    case 'restore': {
+      const t = toast({ title: '正在从备份恢复', body: '安装 APK…', sticky: true, spinner: true });
+      try {
+        const r = await api.restoreApp();
+        t.dismiss();
+        if (!r || r.canceled) return undefined;
+        toast({
+          title: r.dataRestored ? '应用与数据已恢复' : '应用已恢复',
+          body: r.note || '',
+          type: r.dataRestored ? 'ok' : 'warn',
+        });
+        await refreshApps();
+      } catch (e) {
+        t.dismiss();
+        toast({ title: '恢复失败', body: e.message, type: 'error' });
+      }
+      return undefined;
+    }
     case 'clear': {
       if (!window.confirm(`清除「${app.label}」的全部数据？此操作不可撤销。`)) return;
       try {
@@ -966,7 +1040,7 @@ function bindUpdate() {
     logBtn.addEventListener('click', () => {
       const u = lastUpdate;
       if (u && u.hasUpdate && u.htmlUrl) api.updateOpenRelease(u.htmlUrl);
-      else api.updateOpenRelease('https://github.com/RoutineMiku/apkstart/blob/main/CHANGELOG.md');
+      else api.updateOpenRelease('https://github.com/yuchen0x1/apkstart/blob/main/CHANGELOG.md');
     });
   }
 

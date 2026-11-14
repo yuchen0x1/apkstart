@@ -263,6 +263,38 @@ class Provisioner {
   }
 
   /**
+   * 新版 emulator 不再随包带 Qt 的软件 OpenGL 插件。窗口要跨进程嵌入 Electron
+   * 时，缺它会回退到系统 OpenGL，失焦/被遮挡后可能整块黑屏。开发目录、便携版
+   * 和安装版都把同一份 LGPL DLL 放在 appRoot/build/vendor；组件下载完成后补到
+   * emulator 根目录，确保「只下载官方分组件」的用户也得到同样的兼容性修复。
+   */
+  ensureSoftwareOpenGL() {
+    const p = this.paths();
+    const target = path.join(p.emulatorDir, 'opengl32sw.dll');
+    if (!fs.existsSync(p.emulatorExe)) return false;
+    if (fileSize(target) > 1024 * 1024) return true;
+    const candidates = [
+      path.join(this.appRoot, 'build', 'vendor', 'opengl32sw.dll'),
+      path.join(this.appRoot, 'vendor', 'opengl32sw.dll'),
+    ];
+    const source = candidates.find((f) => fileSize(f) > 1024 * 1024);
+    if (!source) return false;
+    try {
+      fs.mkdirSync(p.emulatorDir, { recursive: true });
+      fs.copyFileSync(source, target);
+      const notices = [
+        path.join(this.appRoot, 'build', 'vendor', 'Qt-LGPL-3.0.txt'),
+        path.join(this.appRoot, 'vendor', 'Qt-LGPL-3.0.txt'),
+      ];
+      const notice = notices.find((f) => fs.existsSync(f));
+      if (notice) fs.copyFileSync(notice, path.join(p.emulatorDir, 'Qt-LGPL-3.0.txt'));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
    * 磁盘守卫：在下载 / 解压一份大体积组件之前，先确认目标盘有足够可用空间。
    * 否则会下到一半把系统盘撑爆，或解压阶段直接失败（且残留半截文件）。
    * 预留 1GB 缓冲：模拟器/镜像解压后还有快照、用户数据分区会持续膨胀。
@@ -622,6 +654,7 @@ class Provisioner {
     // 停在 99% 之后又跳回「改用官方源补齐」，白下一套 1.4GB。
     onProgress({ stage: 'extract', message: '展开系统镜像（约 1 分钟，只需一次）…', percent: 99 });
     await this.materializeImages((m) => onProgress({ stage: 'extract', message: m, percent: 99 }));
+    this.ensureSoftwareOpenGL();
 
     onProgress({ stage: 'done', message: '运行时已就绪', percent: 100 });
     return { ok: true, name: pack.name, tag: pack.tag };
@@ -1068,6 +1101,10 @@ class Provisioner {
     onProgress({ stage: 'extract', message: '解压运行时引擎…', percent: 88 });
     await this.extractZip(zip, p.root);
     fs.rmSync(zip, { force: true });
+
+    // 运行时引擎安装完成后补齐 Qt 软件 OpenGL 插件，避免只有官方组件下载路径
+    // 时仍然在嵌入窗口里回退到容易失焦黑屏的系统 OpenGL。
+    this.ensureSoftwareOpenGL();
 
     // SDK root 必须同时具备 platform-tools，否则 emulator 拒绝启动
     this.ensurePlatformTools();

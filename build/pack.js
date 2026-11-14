@@ -80,6 +80,10 @@ for (const item of ['package.json', 'src', 'LICENSE']) {
   const src = path.join(ROOT, item);
   if (fs.existsSync(src)) copy(src, path.join(appDir, item));
 }
+// 轻量版首次从官方源下载 emulator 时也需要这份 Qt 软件 OpenGL 插件。
+// 与完整版 build/runtime 使用同一来源，随应用本体分发而不是依赖开发机路径。
+const vendorDir = path.join(ROOT, 'build', 'vendor');
+if (fs.existsSync(vendorDir)) copy(vendorDir, path.join(appDir, 'build', 'vendor'));
 
 // 3. 可选目录
 // engine/ 下只有文档类内容随包分发；大体积运行时组件（emulator、system-images、

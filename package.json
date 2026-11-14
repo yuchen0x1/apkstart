@@ -1,19 +1,22 @@
 {
   "name": "apkstart",
   "productName": "ApkStart",
-  "version": "0.3.9",
+  "version": "0.4.0",
   "description": "极致轻量的 Windows 安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行",
   "main": "src/main.js",
-  "author": "RoutineMiku",
+  "author": "yuchen0x1 <https://github.com/yuchen0x1>",
+  "contributors": [
+    "RoutineMiku (original author, https://github.com/RoutineMiku/apkstart)"
+  ],
   "license": "MIT",
   "private": true,
-  "homepage": "https://github.com/RoutineMiku/apkstart#readme",
+  "homepage": "https://github.com/yuchen0x1/apkstart#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RoutineMiku/apkstart.git"
+    "url": "git+https://github.com/yuchen0x1/apkstart.git"
   },
   "bugs": {
-    "url": "https://github.com/RoutineMiku/apkstart/issues"
+    "url": "https://github.com/yuchen0x1/apkstart/issues"
   },
   "keywords": [
     "android",
@@ -34,7 +37,14 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test": "node test/run-tests.js && node test/engine-test.js && node test/auto-test.js",
+    "test": "node test/run-tests.js && node test/engine-test.js && node test/auto-test.js && node test/sync-test.js && node test/updater-test.js && node test/security-test.js && node test/compat-test.js && node test/backup-test.js",
+    "test:sync": "node test/sync-test.js",
+    "test:updater": "node test/updater-test.js",
+    "test:security": "node test/security-test.js",
+    "test:compat": "node test/compat-test.js",
+    "test:backup": "node test/backup-test.js",
+    "test:electron": "node test/run-electron.js smoke",
+    "test:app": "node test/run-electron.js selftest",
     "pack": "node build/pack.js",
     "runtime": "node build/prepare-runtime.js",
     "build:exe": "node build/prepare-runtime.js && electron-builder --win nsis",
@@ -44,7 +54,7 @@
     "test:boot": "node test/boot-test.js"
   },
   "devDependencies": {
-    "electron": "^33.4.11",
+    "electron": "^45.3.2",
     "electron-builder": "^26.18.0"
   },
   "dependencies": {

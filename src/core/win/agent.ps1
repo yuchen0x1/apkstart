@@ -50,6 +50,7 @@ public class ApkAgent
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr h, IntPtr update, IntPtr region, uint flags);
     [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, HookProc p, IntPtr mod, uint thread);
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
@@ -98,6 +99,9 @@ public class ApkAgent
     const uint SWP_FRAMECHANGED = 0x0020;
     const uint SWP_NOMOVE = 0x0002;
     const uint SWP_NOSIZE = 0x0001;
+    const uint RDW_INVALIDATE = 0x0001;
+    const uint RDW_UPDATENOW = 0x0100;
+    const uint RDW_ALLCHILDREN = 0x0080;
 
     static IntPtr _host = IntPtr.Zero;
     static IntPtr _emu = IntPtr.Zero;
@@ -469,33 +473,35 @@ public class ApkAgent
         if (host == IntPtr.Zero || emu == IntPtr.Zero) return false;
         HideToolWindows();
         _follow = false;
-        // Windows 10 1703+ 拒绝「DPI 上下文不一致」的跨进程 SetParent，返回 NULL。
-        // Electron 宿主是 PerMonitorV2，Qt 模拟器窗口可能是另一个版本段 —— 混合 DPI
-        // 多显示器环境下必现（issue #5）。旧实现对失败值不检查，还继续把窗口改成
-        // WS_CHILD，结果一个没有父窗口的"子窗口"彻底乱掉：用户看到嵌入 100% 失败且无提示。
-        // 现在预检 + 失败降级为「跟随模式」：不 reparent，窗口钉在宿主客户区上方移动。
-        IntPtr ctxHost = GetWindowDpiAwarenessContext(host);
-        IntPtr ctxEmu = GetWindowDpiAwarenessContext(emu);
-        bool dpiOk = ctxHost != IntPtr.Zero && ctxEmu != IntPtr.Zero
-            && AreDpiAwarenessContextsEqual(ctxHost, ctxEmu);
-        IntPtr parented = dpiOk ? SetParent(emu, host) : IntPtr.Zero;
-        if (parented == IntPtr.Zero)
+        // 顶层 Qt 窗口默认是 WS_POPUP。SetParent 对 WS_POPUP 改的是 owner，
+        // 在它仍是 popup 时调用 GetParent 永远不能可靠证明已经成为子窗口。
+        // 先保存并切成 WS_CHILD，再 SetParent；失败时恢复原样后才进入跟随模式。
+        uint oldStyle = (uint)GetWindowLong(emu, GWL_STYLE);
+        int oldExStyle = GetWindowLong(emu, GWL_EXSTYLE);
+        uint childStyle = oldStyle;
+        childStyle &= ~WS_POPUP;
+        childStyle &= ~(uint)(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_BORDER);
+        childStyle |= WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+        SetWindowLong(emu, GWL_STYLE, (int)childStyle);
+        int childExStyle = oldExStyle;
+        childExStyle &= ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
+        SetWindowLong(emu, GWL_EXSTYLE, childExStyle);
+
+        IntPtr previousParent = SetParent(emu, host);
+        bool reparented = GetParent(emu) == host;
+        if (!reparented)
         {
-            // 跟随模式：从任务栏藏起来（不占独立图标），位置由 Fit 按宿主客户区换算
+            // SetParent 失败时不要留下一个无父的 WS_CHILD 窗口：恢复成原来的顶层样式，
+            // 再用跟随模式显示。previousParent 只是诊断信息，不能作为成功标志。
+            SetParent(emu, IntPtr.Zero);
+            SetWindowLong(emu, GWL_STYLE, (int)oldStyle);
+            SetWindowLong(emu, GWL_EXSTYLE, oldExStyle);
             _follow = true;
             int ex = GetWindowLong(emu, GWL_EXSTYLE);
             ex |= WS_EX_TOOLWINDOW;
             SetWindowLong(emu, GWL_EXSTYLE, ex);
             return true;
         }
-        uint style = (uint)GetWindowLong(emu, GWL_STYLE);
-        style &= ~WS_POPUP;
-        style &= ~(uint)(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_BORDER);
-        style |= WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
-        SetWindowLong(emu, GWL_STYLE, (int)style);
-        int ex2 = GetWindowLong(emu, GWL_EXSTYLE);
-        ex2 &= ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
-        SetWindowLong(emu, GWL_EXSTYLE, ex2);
         return true;
     }
 
@@ -538,6 +544,19 @@ public class ApkAgent
     {
         if (_emu == IntPtr.Zero) return;
         SetWindowPos(_emu, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    static void Refresh()
+    {
+        if (_emu == IntPtr.Zero) return;
+        bool embedded = _host != IntPtr.Zero && GetParent(_emu) == _host;
+        if (!embedded && !_follow) return;
+        // 失焦时不调用 SetForegroundWindow/SetFocus：只让 Qt 子窗口重新参与同级
+        // 合成并立即处理 WM_PAINT，避免 DWM/Qt 交换链在被遮挡后留下黑帧。
+        SetWindowPos(_emu, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        RedrawWindow(_emu, IntPtr.Zero, IntPtr.Zero,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     }
 
     static void Detach()
@@ -993,6 +1012,11 @@ public class ApkAgent
                     {
                         if (_emu == IntPtr.Zero) _emu = FindEmulator();
                         Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), false);
+                        Reply(sock, "{\"ok\":true}");
+                    }
+                    else if (cmd == "refresh")
+                    {
+                        Refresh();
                         Reply(sock, "{\"ok\":true}");
                     }
                     else if (cmd == "rotate")

@@ -209,12 +209,17 @@ function autoProfile({ settings = {}, accel, emulatorVersion = '', diskMB = 0, p
  * 失败重试矩阵：从「最优」到「最保守」，最多 4 次。
  * 依次换 GPU 后端 → 关硬件加速走 TCG → 降内存并强制冷启动清快照。
  */
-function planVariants(profile) {
+function planVariants(profile, { preferSoftware = false } = {}) {
   const out = [];
   const gpus = profile.gpuCandidates || [];
   const firstGpu = profile.gpu || gpus[0] || 'software';
   const safeGpu = gpus.find((g) => /software|swiftshader/.test(g)) || firstGpu;
-  const ordered = [firstGpu, ...gpus.filter((g) => g !== firstGpu && /swiftshader|swangle/.test(g))].slice(0, 2);
+  const fallbackGpus = gpus.filter((g) => g !== firstGpu && /software|swiftshader|swangle/.test(g));
+  const ordered = [firstGpu, ...fallbackGpus].slice(0, 2);
+  if (preferSoftware && /software|swiftshader|swangle/.test(safeGpu)) {
+    ordered.splice(ordered.indexOf(safeGpu), 1);
+    ordered.unshift(safeGpu);
+  }
   for (const gpu of ordered) {
     out.push({ ...profile, gpu, label: `${gpu} / ${profile.accel === 'auto' ? '硬件加速' : '软件模拟'}`, wipe: false, snapshot: true });
   }

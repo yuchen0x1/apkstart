@@ -20,6 +20,8 @@ const OUT = path.join(ROOT, 'build', 'runtime');
 const MARK = path.join(OUT, '.prepared');
 // 预置的 /data 初始模板（已格式化的 ext4，xz 压缩）。见下方 userdata.img 处注释。
 const SEED_USERDATA = path.join(__dirname, 'seed', 'userdata.img.gz');
+const VENDOR_SWGL = path.join(__dirname, 'vendor', 'opengl32sw.dll');
+const VENDOR_SWGL_NOTICE = path.join(__dirname, 'vendor', 'Qt-LGPL-3.0.txt');
 
 function sizeOf(p) {
   try { return fs.statSync(p).size; } catch (_) { return 0; }
@@ -138,6 +140,30 @@ async function main() {
     if (!fs.existsSync(s)) continue;
     console.log(`复制 ${dir}…`);
     fs.cpSync(s, path.join(OUT, dir), { recursive: true });
+  }
+
+  // 1.1 Qt 软件 OpenGL：新版 emulator 包没有随附 opengl32sw.dll，跨进程嵌入时
+  // 缺失会回退到系统 OpenGL，并在窗口失焦后出现黑屏。该 DLL 来自 Qt 5.15
+  // LGPL 发行包，只放进 emulator 根目录，Qt 会按名称自动加载。
+  if (fs.existsSync(VENDOR_SWGL)) {
+    const target = path.join(OUT, 'emulator', 'opengl32sw.dll');
+    fs.copyFileSync(VENDOR_SWGL, target);
+    if (fs.existsSync(VENDOR_SWGL_NOTICE)) {
+      fs.copyFileSync(VENDOR_SWGL_NOTICE, path.join(OUT, 'emulator', 'Qt-LGPL-3.0.txt'));
+    }
+    console.log('已加入 Qt 软件 OpenGL：emulator/opengl32sw.dll');
+  }
+
+  // 1.1 Qt 软件 OpenGL：新版 emulator 包没有随附 opengl32sw.dll，跨进程嵌入时
+  // 缺失会回退到系统 OpenGL，并在窗口失焦后出现黑屏。该 DLL 来自 Qt 5.15
+  // LGPL 发行包，只放进 emulator 根目录，Qt 会按名称自动加载。
+  if (fs.existsSync(VENDOR_SWGL)) {
+    const target = path.join(OUT, 'emulator', 'opengl32sw.dll');
+    fs.copyFileSync(VENDOR_SWGL, target);
+    if (fs.existsSync(VENDOR_SWGL_NOTICE)) {
+      fs.copyFileSync(VENDOR_SWGL_NOTICE, path.join(OUT, 'emulator', 'Qt-LGPL-3.0.txt'));
+    }
+    console.log('已加入 Qt 软件 OpenGL：emulator/opengl32sw.dll');
   }
 
   // 1.5 瘦身：删掉固定启动参数下永远不会被加载的文件（约 -400MB）

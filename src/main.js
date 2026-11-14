@@ -6,12 +6,15 @@
 const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, shell, nativeImage, screen, globalShortcut } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const ipcguard = require('./core/ipcguard');
 
 const store = require('./core/store');
 const { Runtime } = require('./core/engine');
 const { Installer } = require('./core/installer');
 const { Sharer } = require('./core/sharer');
 const { parseApk } = require('./core/apk');
+const compat = require('./core/compat');
+const backup = require('./core/backup');
 const { drawAppIcon } = require('./core/png');
 
 // 品牌 Logo（build/render-logo.js 生成）；缺失时回退到程序化绘制的旧版图标
@@ -423,7 +426,7 @@ function createWindow({ show = true } = {}) {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       spellcheck: false,
     },
   });
@@ -434,8 +437,13 @@ function createWindow({ show = true } = {}) {
   // 冒烟测试时把渲染进程的报错打到 stdout：界面空白、按钮点了没反应，
   // 十有八九是 app.js 里某个 id 改动后抛了异常，正常运行看不到。
   if (process.argv.includes('--smoke')) {
-    mainWindow.webContents.on('console-message', (_e, level, message, line, source) => {
-      if (level >= 2) console.log(`[renderer] ${message} (${String(source).split('/').pop()}:${line})`);
+    // Electron 45 起回调只给一个事件对象（旧的多参数形式已废弃，会在控制台告警）
+    mainWindow.webContents.on('console-message', (ev) => {
+      const lv = ev && ev.level;
+      if (lv === 'warning' || lv === 'error') {
+        const from = String(ev.sourceId || '').split('/').pop();
+        console.log(`[renderer] ${ev.message} (${from}:${ev.lineNumber})`);
+      }
     });
   }
 
@@ -791,9 +799,124 @@ function startNotifier() {
   notifier.start();
 }
 
+/**
+ * 无人值守自检：`APKSTART_SELFTEST=1` 启动后自动体检主窗口并退出。
+ *
+ * 升级 Electron、改 IPC 边界这类改动，单元测试看不出「界面其实已经白屏」。
+ * 这里用真实渲染进程走一遍：preload 是否注入、IPC 是否真的通、页面有没有脚本错误。
+ * 只在环境变量打开时执行，正常使用完全不受影响。
+ */
+async function runSelfTestAndExit() {
+  const result = { version: app.getVersion(), electron: process.versions.electron, checks: [] };
+  const push = (name, ok, detail = '') => result.checks.push({ name, ok, detail });
+  const errors = [];
+  try {
+    const wc = mainWindow.webContents;
+    wc.on('console-message', (ev) => {
+      if (ev && ev.level === 'error') errors.push(String(ev.message));
+    });
+    await new Promise((resolve) => {
+      if (!wc.isLoading()) return resolve();
+      wc.once('did-finish-load', resolve);
+      setTimeout(resolve, 15000);
+    });
+    await new Promise((r) => setTimeout(r, 2500));
+
+    // 这一句能拿到结果，就说明 preload 注入、sandbox、IPC 来源校验三件事同时成立
+    const probe = await wc.executeJavaScript(`(async () => {
+      const out = { bridge: typeof window.apkstart, info: null, settings: null, err: '' };
+      try {
+        out.info = await window.apkstart.info();
+        out.settings = await window.apkstart.getSettings();
+      } catch (e) { out.err = String(e && e.message || e); }
+      out.nodes = document.body ? document.body.children.length : 0;
+      return out;
+    })()`);
+
+    push('preload 注入', probe.bridge === 'object', probe.bridge);
+    push('IPC app:info 可用', !!(probe.info && probe.info.version), probe.err || JSON.stringify(probe.info || null));
+    push('IPC settings:get 可用', !!probe.settings && typeof probe.settings === 'object', probe.err);
+    push('页面已渲染', probe.nodes > 0, `${probe.nodes} 个顶层节点`);
+    const real = errors.filter((m) => !/No handler registered|ERR_|Failed to fetch/i.test(m));
+    push('无未处理脚本错误', real.length === 0, real.slice(0, 3).join(' | '));
+  } catch (e) {
+    push('自检执行', false, e && (e.stack || e.message));
+  }
+  result.ok = result.checks.every((c) => c.ok);
+  const json = JSON.stringify(result);
+  // 打包后的 Windows 程序没有控制台，stdout 会直接丢掉 —— 同时落一份文件，
+  // 这样「安装包到底能不能起来」这件事在 CI 上也能被真实断言。
+  try {
+    fs.writeFileSync(path.join(require('os').tmpdir(), 'apkstart-selftest.json'), json, 'utf8');
+  } catch (_) { /* 写不了文件不影响控制台输出 */ }
+  console.log(`SELFTEST_JSON:${json}`);
+  app.exit(result.ok ? 0 : 1);
+}
+
+/** 只有显式设置 APKSTART_SELFTEST=1 才跑，正常启动完全不进这个分支 */
+function scheduleSelfTest() {  if (process.env.APKSTART_SELFTEST !== '1') return;
+  runSelfTestAndExit().catch((e) => {
+    console.error('SELFTEST_JSON:' + JSON.stringify({ ok: false, error: String(e && (e.stack || e.message)) }));
+    app.exit(1);
+  });
+}
+
+/**
+ * 兼容性判定用的运行时环境。
+ * 运行时在线时用真实 API 等级；没启动时按内置运行时（Android 14）评估，
+ * 并在结果里标出来源，避免用户把「按默认值估的」当成实测结论。
+ */
+async function compatEnv() {
+  let sdk = 34;
+  let live = false;
+  try {
+    const st = await runtime.status();
+    if (st && st.sdk) { sdk = Number(st.sdk) || 34; live = true; }
+  } catch (_) { /* 运行时还没起来：用默认值 */ }
+  return {
+    sdk,
+    abis: ['x86_64'],
+    // 内置镜像带 ARM 转译层；缺了会在安装失败时自动切兼容镜像（见 adb.js 的指引）
+    armTranslation: true,
+    // 内置的是 API 34 Google Play 镜像
+    playServices: true,
+    source: live ? `当前运行时（Android ${compat.sdkName(sdk)}）` : '内置运行时（Android 14，来自镜像配置）',
+  };
+}
+
+// ---------------- IPC 安全边界 ----------------
+
+/** 只信任 src 目录下自己那几张页面（index.html / shell.html） */
+const IPC_TRUSTED_ROOT = path.resolve(__dirname);
+
+/**
+ * 给所有 IPC 通道统一加一道来源校验。
+ *
+ * 渲染层能发起的调用有 90 多个，逐个检查容易漏；这里在注册前把 ipcMain.handle
+ * 包一层，凡是「不是主框架」或「页面已经跑到我们自己目录之外」的调用一律拒绝。
+ * 即使渲染层被注入脚本，也没法借 IPC 去读任意文件、装任意 APK、改系统设置。
+ */
+function installIpcGuards() {
+  if (ipcMain.__apkstartGuarded) return;
+  ipcMain.__apkstartGuarded = true;
+  const wrap = (orig) => function guarded(channel, listener) {
+    return orig.call(ipcMain, channel, (event, ...args) => {
+      const verdict = ipcguard.checkEvent(IPC_TRUSTED_ROOT, event);
+      if (!verdict.ok) {
+        console.warn(`[ipc] 拒绝不可信调用 ${channel}：${verdict.reason}`);
+        throw new Error('IPC 调用被拒绝：来源不是本应用页面');
+      }
+      return listener(event, ...args);
+    });
+  };
+  ipcMain.handle = wrap(ipcMain.handle);
+  ipcMain.handleOnce = wrap(ipcMain.handleOnce);
+}
+
 // ---------------- IPC ----------------
 
 function registerIpc() {
+  installIpcGuards();
   ipcMain.handle('app:info', () => ({
     version: app.getVersion(),
     isDev: IS_DEV,
@@ -849,6 +972,22 @@ function registerIpc() {
 
   ipcMain.handle('apk:parse', async (_e, filePath) => parseApk(filePath));
 
+  /**
+   * 安装前兼容性分析：解析 APK + 对照当前运行时环境给出结论。
+   * 只做判断，不改动任何文件，装不装由用户在界面上决定。
+   */
+  ipcMain.handle('apk:compat', async (_e, filePath) => {
+    if (typeof filePath !== 'string' || !/\.(apk|xapk|apks)$/i.test(filePath)) {
+      throw new Error('只支持 .apk / .xapk / .apks 文件');
+    }
+    if (!fs.existsSync(filePath)) throw new Error('文件不存在或已被移动');
+    const info = parseApk(filePath);
+    const result = compat.analyze(info, await compatEnv());
+    // 图标是 Buffer，跨 IPC 传一次就是几百 KB，这里没必要带出去
+    const { iconPng, ...rest } = info;
+    return { info: rest, compat: result };
+  });
+
   ipcMain.handle('apk:install', async (_e, filePath) => {
     const r = await runInstall(filePath);
     return { ok: true, app: r.app, warnings: r.warnings };
@@ -889,6 +1028,63 @@ function registerIpc() {
   ipcMain.handle('apk:reveal', async () => {
     fs.mkdirSync(store.APK_DIR, { recursive: true });
     shell.openPath(store.APK_DIR);
+  });
+
+  // ── 备份 / 导出 ────────────────────────────────────────────
+  ipcMain.handle('app:exportApk', async (_e, pkg) => {
+    const app = store.getApp(pkg);
+    if (!app) throw new Error('应用不存在');
+    if (!app.apkPath || !fs.existsSync(app.apkPath)) {
+      throw new Error('找不到这个应用的安装包（可能安装后被清理过）');
+    }
+    const name = `${backup.sanitizeName(app.label || pkg, 40)}-${backup.sanitizeName(app.versionName || '1.0', 20)}.apk`;
+    const { canceled, filePath } = await dialog.showSaveDialog(mainWindow || undefined, {
+      title: '导出 APK',
+      defaultPath: path.join(app.getPath('downloads'), name),
+      filters: [{ name: 'Android 安装包', extensions: ['apk'] }],
+    });
+    if (canceled || !filePath) return { ok: false, canceled: true };
+    fs.copyFileSync(app.apkPath, filePath);
+    return { ok: true, path: filePath };
+  });
+
+  ipcMain.handle('app:backup', async (_e, pkg) => {
+    const app = store.getApp(pkg);
+    if (!app) throw new Error('应用不存在');
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow || undefined, {
+      title: '选择备份保存到哪个文件夹',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (canceled || !filePaths || !filePaths[0]) return { ok: false, canceled: true };
+
+    // 运行时没起来时也要能备份：APK 是本机文件，不依赖设备；
+    // 只是私有数据这一部分会明确告诉用户「没拿到」。
+    let client = null;
+    try {
+      const c = runtime.client();
+      if (await c.isOnline()) client = c;
+    } catch (_) { client = null; }
+
+    const r = await backup.backupApp({ app, client, dir: filePaths[0], onLog: () => {} });
+    if (!client) {
+      r.dataNote = '运行时未启动，只备份了 APK（应用数据需要设备在线且应用可 run-as）。';
+      backup.writeMeta(r.folder, { ...r.meta, dataNote: r.dataNote });
+    }
+    return { ok: true, ...r };
+  });
+
+  ipcMain.handle('app:restore', async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow || undefined, {
+      title: '选择备份文件夹（里面有 meta.json）',
+      properties: ['openDirectory'],
+    });
+    if (canceled || !filePaths || !filePaths[0]) return { ok: false, canceled: true };
+    const client = runtime.client();
+    if (!(await client.isOnline())) throw new Error('恢复应用需要先启动运行时');
+    const r = await backup.restoreApp({
+      dir: filePaths[0], installer, client, onLog: () => {},
+    });
+    return { ok: true, ...r };
   });
 
   ipcMain.handle('settings:get', () => store.getSettings());
@@ -1108,8 +1304,9 @@ function registerIpc() {
       title: opts.title || '确认',
       message: opts.message || '',
       detail: opts.detail || '',
-      buttons: ['取消', opts.okLabel || '确定'],
-      defaultId: 1,
+      buttons: [opts.cancelLabel || '取消', opts.okLabel || '确定'],
+      // danger：默认焦点落在「取消」上，避免用户连按回车就装了个明知有问题的东西
+      defaultId: opts.danger ? 0 : 1,
       cancelId: 0,
       noLink: true,
     });
@@ -1791,7 +1988,8 @@ if (!gotLock) {
     winAgent.ensure().then(() => armAgent(winAgent)).catch(() => {});
 
     registerIpc();
-    createWindow({ show: !parseArgs(process.argv).silent });
+    createWindow({ show: !parseArgs(process.argv).silent && process.env.APKSTART_SELFTEST !== '1' });
+    scheduleSelfTest();
     buildTray();
     applyAutoStart();
 

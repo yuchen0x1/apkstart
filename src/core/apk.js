@@ -217,6 +217,35 @@ function parseApkZip(zip, filePath, stat) {
     .map((n) => n.split('/')[1])
     .filter(Boolean))];
 
+  // ---- 权限 / 硬件特性 / 依赖库（安装前兼容性分析要用）----
+  const permissions = children(manifest, 'uses-permission')
+    .concat(children(manifest, 'uses-permission-sdk-23'))
+    .map((n) => attrValue(n, 'name', null))
+    .filter((x) => typeof x === 'string' && x)
+    .slice(0, 200);
+
+  const features = children(manifest, 'uses-feature')
+    .map((n) => ({
+      name: attrValue(n, 'name', null) || '',
+      // 没写 required 时默认是 true（Android 的规则）
+      required: attrValue(n, 'required') !== false,
+    }))
+    .filter((f) => f.name);
+
+  const usesLibraries = children(app, 'uses-library')
+    .map((n) => ({
+      name: attrValue(n, 'name', null) || '',
+      required: attrValue(n, 'required') !== false,
+    }))
+    .filter((l) => l.name);
+
+  // 拆分 APK：manifest 上有 split 属性，或属于 config.* 分片
+  const splitName = attrValue(manifest, 'split', null) || (manifest && manifest.attrs
+    ? (manifest.attrs.find((a) => a.name === 'split') || {}).typed : null);
+  const isSplit = typeof splitName === 'string' ? !!splitName : false;
+
+  const debuggable = attrValue(app, 'debuggable') === true || attrValue(app, 'debuggable') === 1;
+
   return {
     ok: true,
     filePath,
@@ -229,6 +258,12 @@ function parseApkZip(zip, filePath, stat) {
     targetSdk,
     launchActivity,
     abis,
+    permissions,
+    features,
+    usesLibraries,
+    isSplit,
+    splitName: typeof splitName === 'string' ? splitName : '',
+    debuggable,
     iconPng: icon ? icon.data : null,
     iconFile: icon ? icon.file : null,
   };

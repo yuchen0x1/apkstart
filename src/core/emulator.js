@@ -481,6 +481,14 @@ class EmulatorEngine {
     // resources/runtime）时 root/avd 不存在也不可写，AVD 要落到用户数据目录。
     const avdHome = doctor.shortPath(this.provisioner.paths().avdHome);
     const adbPort = String(plan.adbPort || process.env.ANDROID_ADB_SERVER_PORT || '5044');
+    // opengl32sw.dll（Qt 软件 OpenGL 渲染器）在新版 Google emulator 包里已不再附带。
+    // 缺失时 Qt 动态 GL 回退到系统 opengl32.dll —— 在部分显卡驱动上绘制全黑
+    // （实测：窗口全黑但输入正常，安卓侧 screencap 有内容），或画面错乱。
+    // 修复：deploy 时从 build/vendor/opengl32sw.dll 补位（Qt 5.15 官方组件，LGPL）；
+    // 就位后强制 QT_OPENGL=software（CPU 渲染，任何 GPU 都稳定）。
+    // 不要用 QT_OPENGL=angle：D3D11 交换链与 SetParent 嵌入冲突（失焦即黑屏、画面错乱）。
+    const emuDir = path.dirname(this.locate().emulatorExe || '');
+    const hasSwGL = emuDir && fs.existsSync(path.join(emuDir, 'opengl32sw.dll'));
     return {
       ...process.env,
       ANDROID_SDK_ROOT: safeRoot,
@@ -490,6 +498,7 @@ class EmulatorEngine {
       ANDROID_ADB_SERVER_PORT: adbPort,
       ANDROID_EMULATOR_USE_SYSTEM_LIBS: '',
       ...(plan.accel === 'off' ? { ANDROID_I_WANT_MY_TCG: 'yes' } : {}),
+      ...(hasSwGL ? { QT_OPENGL: 'software' } : {}),
     };
   }
 
@@ -829,7 +838,11 @@ class EmulatorEngine {
       port: startPort, adbPort,
     });
     this.profile = profile;
-    const variants = doctor.planVariants(profile).slice(0, maxAttempts);
+    // 嵌入 Electron 的可见窗口会经历跨进程 SetParent、失焦和 DWM 重绘；
+    // 这类场景下 host/swangle 的交换链可能在失焦后丢失，表现为「安卓仍在跑，窗口全黑」。
+    // 可见模式优先使用 emulator 自己的 software 后端；它仍可保留 WHPX 加速，
+    // 只是把 guest GLES 的呈现改为稳定的 SwiftShader 路径。
+    const variants = doctor.planVariants(profile, { preferSoftware: !headless }).slice(0, maxAttempts);
 
     // 记住「上次拉起就崩」的 GPU 后端，下次把它排到最后。
     // 实测：AMD Radeon 780M 上 `-gpu host` 能通过 emulator 自己的硬件检查，

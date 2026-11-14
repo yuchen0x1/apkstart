@@ -1,6 +1,6 @@
 appId: com.apkstart.win
 productName: ApkStart
-copyright: Copyright © 2026 ApkStart
+copyright: Copyright © 2026 ApkStart contributors · 原项目 © RoutineMiku (MIT)
 
 directories:
   output: dist/release
@@ -12,6 +12,7 @@ files:
   - src/**/*
   - package.json
   - LICENSE
+  - "build/vendor/**"
   - "!**/*.map"
   - "!**/node_modules/**"
   # 运行时解压 .xz 镜像用（NAPI 预编译，无 ABI 问题）

@@ -16,14 +16,21 @@
  */
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
-const { downloadAnyParallel, downloadMulti } = require('./download');
-const { ZipFile } = require('./zip');
+const { downloadAnyParallel, downloadMulti, sha256File } = require('./download');
+const { ZipFile, safeEntryPath } = require('./zip');
 const { cmpVer } = require('./version');
 const { Sources } = require('./sources');
 
-const OWNER = 'yuchen0x1';   // fork 版更新源：只检查本仓库的发布
+const OWNER = 'yuchen0x1';   // 只检查本仓库的发布
 const REPO = 'apkstart';
+
+// 更新包解压的硬上限：正常便携包 ~180MB（含运行时整包另算），
+// 4GB 足够覆盖任何合理发行版，又能挡住解压炸弹把磁盘写满。
+const MAX_EXTRACT_BYTES = 4 * 1024 * 1024 * 1024;
+const MAX_ENTRIES = 20000;
+const SKIP_ENTRY = /(^|\/)(__MACOSX|\.DS_Store|Thumbs\.db)(\/|$)/i;
 
 /** PowerShell 单引号字符串：内部的 ' 要写成 '' */
 function psq(s) {
@@ -169,15 +176,84 @@ class Updater {
     }
 
     if (/\.zip$/i.test(file)) {
+      const st = fs.statSync(file);
+      if (!st.size) throw new Error('下载到的更新包是空文件，请重试');
+      if (it.asset.size && st.size !== it.asset.size) {
+        // GitHub 与 Gitee 压出来的字节数不同：只要等于其中任意一个已知大小即可
+        const known = new Set([it.asset.size, ...Object.values(it.asset.sizes || {}).map(Number)]);
+        if (!known.has(st.size)) {
+          throw new Error(`更新包大小异常（${st.size} 字节，期望 ${it.asset.size}），可能下载不完整，请重试`);
+        }
+      }
+      this.sha256 = await sha256File(file);
+      try { fs.writeFileSync(`${file}.sha256`, this.sha256); } catch (_) { /* 校验文件写不了不影响主流程 */ }
+      this.onProgress({
+        stage: 'verify', percent: 100,
+        message: `更新包校验：SHA-256 ${this.sha256.slice(0, 16)}…`,
+      });
+
       const out = path.join(dir, 'payload');
       fs.rmSync(out, { recursive: true, force: true });
       fs.mkdirSync(out, { recursive: true });
-      await this._extract(file, out);
-      this.onProgress({ stage: 'ready', percent: 100, message: '更新包已解压完成' });
-      return { mode: 'zip', payload: out, version: it.version };
+      try {
+        await this._extract(file, out);
+        this._flattenPayload(out);
+        this._assertPayload(out, it);
+      } catch (e) {
+        fs.rmSync(out, { recursive: true, force: true });
+        throw e;
+      }
+      this.onProgress({ stage: 'ready', percent: 100, message: '更新包已解压并通过校验' });
+      return { mode: 'zip', payload: out, version: it.version, sha256: this.sha256, zip: file };
     }
     this.onProgress({ stage: 'ready', percent: 100, message: '安装包已下载完成' });
     return { mode: 'setup', payload: file, version: it.version };
+  }
+
+  /**
+   * 有些打包工具会把内容套一层目录（payload\ApkStart\ApkStart.exe）。
+   * 替换脚本是按「载荷根 = 程序根」覆盖的，不摊平就会装到子目录里。
+   */
+  _flattenPayload(dir) {
+    const exeName = path.basename(this.exePath || 'ApkStart.exe');
+    if (fs.existsSync(path.join(dir, exeName))) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir); } catch (_) { return; }
+    if (entries.length !== 1) return;
+    const only = path.join(dir, entries[0]);
+    try {
+      if (!fs.statSync(only).isDirectory()) return;
+      if (!fs.existsSync(path.join(only, exeName))) return;
+      for (const name of fs.readdirSync(only)) {
+        fs.renameSync(path.join(only, name), path.join(dir, name));
+      }
+      fs.rmdirSync(only);
+    } catch (_) { /* 摊平失败就按原样继续，_assertPayload 会给出明确错误 */ }
+  }
+
+  /**
+   * 解压后的载荷必须真的是一份 ApkStart：有主程序、有 resources。
+   * 没有这一步，一个空的/错发的 zip 会把整个安装目录覆盖成一堆无关文件，
+   * 程序下次就起不来了（更新器最怕的「更新完打不开」）。
+   */
+  _assertPayload(dir, it) {
+    const exeName = path.basename(this.exePath || 'ApkStart.exe');
+    const rootExe = path.join(dir, exeName);
+    let found = fs.existsSync(rootExe);
+    if (!found) {
+      // 某些打包方式会把内容套一层目录
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name);
+        if (fs.existsSync(path.join(p, exeName))) { found = true; break; }
+      }
+    }
+    if (!found) {
+      throw new Error(`更新包内容异常：没有找到 ${exeName}，已中止（原程序未被修改）`);
+    }
+    if (!fs.existsSync(path.join(dir, 'resources'))) {
+      throw new Error('更新包内容异常：缺少 resources 目录，已中止（原程序未被修改）');
+    }
+    this.latestPayload = { dir, version: it.version };
   }
 
   /**
@@ -231,22 +307,40 @@ class Updater {
     }
   }
 
+  /**
+   * 安全解压：
+   *  - 每个条目都走 safeEntryPath（path.resolve + path.relative 判真包含关系），
+   *    拒绝绝对路径 / 盘符 / UNC / `../` 穿越；
+   *  - 拒绝符号链接条目（ZIP 里带 symlink 能指向目录外）；
+   *  - 校验 CRC32 与解压后大小（下载损坏或篡改会在这里暴露）；
+   *  - 限制条目数与总解压体积（解压炸弹）。
+   */
   async _extract(zipPath, dest) {
     const zf = new ZipFile(zipPath);
     try {
-      const names = zf.names().filter((n) => !n.endsWith('/'));
+      const names = zf.names().filter((n) => !n.endsWith('/') && !SKIP_ENTRY.test(n));
+      if (names.length > MAX_ENTRIES) throw new Error(`更新包条目过多（${names.length}），已中止`);
+      let total = 0;
+      for (const n of names) {
+        const e = zf.entries.get(n);
+        if (!e) continue;
+        if (e.symlink) throw new Error(`更新包含符号链接条目，已中止：${n}`);
+        total += e.uncompSize || 0;
+        if (total > MAX_EXTRACT_BYTES) throw new Error('更新包解压后体积异常（超过 4GB），已中止');
+      }
       let i = 0;
       for (const n of names) {
         i += 1;
-        const target = path.join(dest, n.replace(/\\/g, '/'));
-        if (!target.startsWith(path.resolve(dest))) continue;   // 防 zip-slip
+        const target = safeEntryPath(dest, n);
+        if (!target) continue;
         fs.mkdirSync(path.dirname(target), { recursive: true });
-        await zf.pipeTo(n, fs.createWriteStream(target));
-        if (i % 20 === 0) {
+        // eslint-disable-next-line no-await-in-loop
+        await zf.pipeTo(n, fs.createWriteStream(target), { verify: true });
+        if (i % 20 === 0 || i === names.length) {
           this.onProgress({
             stage: 'extract',
             percent: Math.min(99, Math.round((i / names.length) * 100)),
-            message: `正在解压 ${i}/${names.length}`,
+            message: `正在解压并校验 ${i}/${names.length}`,
           });
         }
       }
@@ -267,6 +361,12 @@ class Updater {
     fs.mkdirSync(this.updateDir, { recursive: true });
     const waitPid = opts.waitPid || process.pid;
 
+    // 替换前最后一道闸：载荷必须真的是 ApkStart，否则宁可放弃更新
+    if (job.mode === 'zip') {
+      if (!job.payload || !fs.existsSync(job.payload)) throw new Error('更新载荷不存在，已取消更新');
+      this._assertPayload(job.payload, { version: job.version });
+    }
+
     const lines = [
       `$ErrorActionPreference = 'SilentlyContinue'`,
       `$log = ${psq(logFile)}`,
@@ -278,20 +378,41 @@ class Updater {
     ];
 
     if (job.mode === 'zip') {
+      const bak = path.join(this.updateDir, `backup-${job.version}`);
       lines.push(
         `$src = ${psq(job.payload)}`,
         `$dst = ${psq(dir)}`,
+        `$bak = ${psq(bak)}`,
         `$ok = $false`,
+        // 1) 先把「将被覆盖的现有文件」备份出来，替换失败时能原样还原
+        `$files = @(Get-ChildItem -LiteralPath $src -Recurse -File)`,
+        `foreach ($f in $files) {`,
+        `  $rel = $f.FullName.Substring($src.Length).TrimStart('\\')`,
+        `  $target = Join-Path $dst $rel`,
+        `  if (Test-Path -LiteralPath $target) {`,
+        `    $b = Join-Path $bak $rel`,
+        `    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $b) | Out-Null`,
+        `    Copy-Item -LiteralPath $target -Destination $b -Force`,
+        `  }`,
+        `}`,
+        `Note ("backup " + $files.Count + " files")`,
+        // 2) 覆盖（程序文件可能被杀软短暂占用，重试）
         `for ($i = 1; $i -le 12; $i++) {`,
         `  Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force`,
         `  $probe = Join-Path $dst ${psq(path.basename(exe))}`,
-        `  if (Test-Path $probe) { $ok = $true; Note "copy pass $i ok"; break }`,
-        `  Note "copy pass $i failed, retry"; Start-Sleep -Milliseconds 600`,
+        `  if ((Test-Path -LiteralPath $probe) -and ((Get-Item -LiteralPath $probe).Length -gt 0)) { $ok = $true; Note "copy pass $i ok"; break }`,
+        `  Note "copy pass $i failed, retry"; Start-Sleep -Milliseconds 700`,
         `}`,
-        `if (-not $ok) { Note 'copy failed' }`,
-        // 新版本里已经删掉的文件不会因为覆盖而消失，但保留它们无害；
-        // 只清掉本次的解压目录，避免白占几百 MB。
-        `Remove-Item -Path $src -Recurse -Force`,
+        // 3) 失败 → 回滚到备份，并把载荷留在原处供排查
+        `if (-not $ok) {`,
+        `  Note 'copy failed, rolling back'`,
+        `  if (Test-Path -LiteralPath $bak) { Copy-Item -Path (Join-Path $bak '*') -Destination $dst -Recurse -Force; Note 'rollback done' }`,
+        `  Remove-Item -LiteralPath $src -Recurse -Force`,
+        `  exit 1`,
+        `}`,
+        // 4) 成功：清掉备份与解压目录（新版本里已删除的文件不会被清理，保留无害）
+        `Remove-Item -LiteralPath $bak -Recurse -Force`,
+        `Remove-Item -LiteralPath $src -Recurse -Force`,
       );
     } else {
       lines.push(
