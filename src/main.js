@@ -1589,7 +1589,14 @@ function registerIpc() {
     else w.maximize();
     appWin.scheduleFit();
   });
-  ipcMain.handle('shell:close', (e) => { winOf(e)?.close(); });
+  ipcMain.handle('shell:close', (e) => {
+    const w = winOf(e);
+    if (!w) return;
+    // 必须走 AppWindow.close() 的完整收尾（摘下并藏好模拟器窗口 + force-stop 安卓应用），
+    // 直接 win.close() 会绕过收尾：应用留在后台、模拟器窗口被重新挂回桌面（上游 v0.3.7 同款问题）
+    if (appWin && appWin.isOpen && appWin.win === w) appWin.close({ keepApp: false });
+    else w.close();
+  });
   ipcMain.handle('shell:rotate', () => appWin.rotate());
   ipcMain.handle('shell:back', async () => { await runtime.client().keyBack(); });
   ipcMain.handle('shell:forward', async () => { await runtime.client().keyForward(); });

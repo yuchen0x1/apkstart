@@ -150,6 +150,11 @@ class AppWindow {
       const pkg = this.pkg;
       this.pkg = null;
       this._closing = false;
+      // Alt+F4 / 任务栏关闭 / 系统关机等路径：这里也要走完整收尾
+      // （上游 v0.3.7 修复：否则安卓应用还留在后台跑，模拟器窗口会被
+      // Windows 重新挂回桌面；走 close() 的路径 _selfClose=true 已处理，不重复）
+      try { if (this.agent) this.agent.park().catch(() => {}); } catch (_) { /* ignore */ }
+      if (this._onCloseApp) { try { this._onCloseApp(pkg); } catch (_) { /* ignore */ } }
       if (this._closedCb) this._closedCb(pkg);
       if (this._windowClosedCb) { try { this._windowClosedCb(pkg); } catch (_) { /* ignore */ } }
     });
