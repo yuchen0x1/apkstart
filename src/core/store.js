@@ -112,6 +112,9 @@ const DEFAULT_SETTINGS = {
   hideAfterLaunch: false,    // 主进程必须常驻，否则一退出就把 Android 运行时杀掉了
   notifyOnInstall: true,
   autoStart: true,           // 开机自启，默认开启，用户无需设置
+  // 界面语言（upstream #38）：auto = 跟随系统；zh-CN / en-US = 明确指定。
+  // 中文是源语言，英文靠 src/i18n/en-US.json 的词典覆盖；缺条目时回落中文原文。
+  language: 'auto',
   autoDeploy: true,          // 首次运行自动完成全部部署，不再分 1~5 步
   wizardDone: false,         // 首次运行引导向导：完成或跳过后置 true，不再弹出
   update: {

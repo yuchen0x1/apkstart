@@ -9,14 +9,26 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
-const COMMON_ADB_PATHS = [
-  path.join(process.env.LOCALAPPDATA || '', 'Android', 'Sdk', 'platform-tools', 'adb.exe'),
-  'C:\\Android\\platform-tools\\adb.exe',
-  'C:\\adb\\adb.exe',
-  'C:\\LDPlayer\\LDPlayer9\\adb.exe',
-  'C:\\Program Files\\Netease\\MuMuPlayer-12.0\\shell\\adb.exe',
-  'C:\\Program Files\\BlueStacks_nxt\\HD-Adb.exe',
-];
+// 常见安装位置。Windows 那几条是模拟器/手机助手自带的 adb；非 Windows 用
+// Android Studio 与发行版包管理器的位置（upstream #24：以前这张表全是 .exe，
+// 在 Linux 上永远落空，只能靠用户手动填路径）。
+const COMMON_ADB_PATHS = process.platform === 'win32'
+  ? [
+    path.join(process.env.LOCALAPPDATA || '', 'Android', 'Sdk', 'platform-tools', 'adb.exe'),
+    'C:\\Android\\platform-tools\\adb.exe',
+    'C:\\adb\\adb.exe',
+    'C:\\LDPlayer\\LDPlayer9\\adb.exe',
+    'C:\\Program Files\\Netease\\MuMuPlayer-12.0\\shell\\adb.exe',
+    'C:\\Program Files\\BlueStacks_nxt\\HD-Adb.exe',
+  ]
+  : [
+    path.join(os.homedir(), 'Android', 'Sdk', 'platform-tools', 'adb'),
+    path.join(os.homedir(), 'Library', 'Android', 'sdk', 'platform-tools', 'adb'), // macOS 的 Android Studio
+    '/usr/local/bin/adb',
+    '/usr/bin/adb',
+    '/opt/android-sdk/platform-tools/adb',
+    '/opt/android/platform-tools/adb',
+  ];
 
 /**
  * 把 pm install 的原始失败原因翻译成用户能看懂的中文。

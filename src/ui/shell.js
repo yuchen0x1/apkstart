@@ -17,6 +17,9 @@ btn.close.addEventListener('click', () => api.shell.close());
 
 // 标题栏上右键不要弹出 Chromium 的网页菜单；画面区域的右键已由主进程
 // 拦下并映射成「安卓返回」，这里补掉外壳这一圈。
+// 应用窗口的标题栏按钮 tooltip 也要跟着语言走（upstream #38）
+api.i18n().then((p) => { if (window.apkI18n) window.apkI18n.apply(p); }).catch(() => {});
+
 window.addEventListener('contextmenu', (e) => e.preventDefault());
 
 // Ctrl+R 旋转，F11 最大化（和 Windows 习惯一致）

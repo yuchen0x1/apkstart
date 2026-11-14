@@ -4,6 +4,7 @@
  * 双击 apk → apkstart.exe "%1" → 自动安装 → 自动建桌面快捷方式
  */
 const { execFileSync } = require('child_process');
+const platform = require('./platform');
 
 const PROGID = 'ApkStart.apk';
 const EXT = '.apk';
@@ -65,6 +66,9 @@ try {
  * @param {string} [extraArgs] 开发模式下需要先传应用目录，例如 "\"C:\\path\\apkstart\""
  */
 function registerAssociation(exePath, iconPath, extraArgs) {
+  // .apk 关联 = HKCU 注册表 + 通知 shell 刷新，只有 Windows 有这套东西。
+  // 别的地方直接返回「不支持」，让界面把开关置灰（upstream #24）。
+  if (!platform.canIntegrateShell) return { ok: false, error: platform.supportNote() };
   const icon = iconPath || exePath;
   const command = `"${exePath}" ${extraArgs ? extraArgs + ' ' : ''}"%1"`;
 
@@ -99,6 +103,7 @@ function registerAssociation(exePath, iconPath, extraArgs) {
  *  3) 当前默认值是别人的 → 一个字节都不动。
  */
 function unregisterAssociation() {
+  if (!platform.canIntegrateShell) return { ok: true, restored: '' };
   reg(['delete', `${CLASSES}\\${EXT}\\OpenWithProgids`, '/v', PROGID, '/f']);
   reg(['delete', `${CLASSES}\\${PROGID}`, '/f']);
 

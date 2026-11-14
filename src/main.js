@@ -31,6 +31,8 @@ function loadBrandIcon(size) {
   return nativeImage.createFromBuffer(drawAppIcon(size || 256));
 }
 const assoc = require('./core/assoc');
+const platform = require('./core/platform');
+const i18n = require('./i18n');
 const windowctl = require('./core/windowctl');
 const display = require('./core/display');
 const lcd = require('./core/lcd');
@@ -91,6 +93,15 @@ function appLog(line) {
 }
 process.on('uncaughtException', (e) => appLog(`UNCAUGHT ${e && (e.stack || e.message)}`));
 process.on('unhandledRejection', (e) => appLog(`REJECT ${e && (e.stack || e.message || e)}`));
+
+/**
+ * 桌面 / 开始菜单快捷方式：只有 Windows 有这套东西。
+ * 其他平台上当成「无事可做」直接返回空数组 —— 不要让它抛错，也不要在日志里刷红。
+ */
+function ensureShortcuts() {
+  if (!platform.canIntegrateShell) return Promise.resolve([]);
+  return installer.ensureShortcuts().catch(() => []);
+}
 
 /**
  * 完整版（内置运行时）自动接管：
@@ -561,21 +572,26 @@ function buildTray() {
   const refresh = () => {
     const apps = store.getApps().slice(0, 8);
     const menu = Menu.buildFromTemplate([
-      { label: '打开 ApkStart', click: () => showWindow() },
+      { label: i18n.t('打开 ApkStart'), click: () => showWindow() },
       { type: 'separator' },
       ...(apps.length
         ? apps.map((a) => ({ label: a.label, click: () => runLaunch(a.package) }))
-        : [{ label: '还没有安装应用', enabled: false }]),
+        : [{ label: i18n.t('还没有安装应用'), enabled: false }]),
       { type: 'separator' },
       {
-        label: displaySettings().mode === 'fullscreen' ? '切回竖屏窗口' : '全屏（自适应屏幕）',
+        label: displaySettings().mode === 'fullscreen' ? i18n.t('切回竖屏窗口') : i18n.t('全屏（自适应屏幕）'),
         click: () => { toggleDisplayMode(); },
       },
-      { label: '重建桌面/开始菜单快捷方式', click: () => { installer.ensureShortcuts().catch(() => {}); } },
-      { label: '同步共享目录', click: () => sharer.sync() },
-      { label: '设置', click: () => { showWindow(); send('ui:navigate', 'settings'); } },
+      // 快捷方式 / 文件关联都是 Windows 注册表那套，别的系统上不显示这一项
+      ...(platform.canIntegrateShell
+        ? [{ label: i18n.t('重建桌面/开始菜单快捷方式'), click: () => { ensureShortcuts(); } }]
+        : []),
+      { label: i18n.t('同步共享目录'), click: () => sharer.sync() },
+      { label: i18n.t('设置'), click: () => { showWindow(); send('ui:navigate', 'settings'); } },
       {
-        label: updateInfo && updateInfo.hasUpdate ? `发现新版本 ${updateInfo.tag}` : '检查更新',
+        label: updateInfo && updateInfo.hasUpdate
+          ? i18n.t('发现新版本 {tag}', { tag: updateInfo.tag })
+          : i18n.t('检查更新'),
         click: async () => {
           showWindow();
           send('ui:navigate', 'settings');
@@ -584,22 +600,23 @@ function buildTray() {
           if (info && info.hasUpdate && info.asset) {
             const r = await dialog.showMessageBox(mainWindow || undefined, {
               type: 'question',
-              title: '发现新版本',
-              message: `ApkStart ${info.tag} 已发布，当前版本 v${app.getVersion()}。现在更新吗？`,
+              title: i18n.t('发现新版本 {tag}', { tag: info.tag }),
+              message: i18n.t('ApkStart {tag} 已发布，当前版本 v{ver}。现在更新吗？',
+                { tag: info.tag, ver: app.getVersion() }),
               detail: (info.notes || '').slice(0, 600),
-              buttons: ['立即更新', '稍后'],
+              buttons: [i18n.t('立即更新'), i18n.t('稍后')],
               defaultId: 0,
               cancelId: 1,
             });
             if (r.response === 0) runUpdate();
           } else if (info && !info.hasUpdate) {
-            notify('已是最新版本', `ApkStart v${app.getVersion()}`);
+            notify(i18n.t('已是最新版本'), `ApkStart v${app.getVersion()}`);
           }
         },
       },
       { type: 'separator' },
       {
-        label: '退出',
+        label: i18n.t('退出'),
         click: async () => {
           try { appWin.close({ keepApp: true }); } catch (_) { /* ignore */ }
           quitting = true;
@@ -609,7 +626,7 @@ function buildTray() {
     ]);
     tray.setContextMenu(menu);
   };
-  tray.setToolTip('ApkStart — 安卓应用运行器');
+  tray.setToolTip(i18n.t('ApkStart — 安卓应用运行器'));
   // Windows 托盘的惯例是单击就打开主窗口（双击当然也可以）。
   // 之前只绑了 double-click，用户单击没反应，会以为托盘图标坏了。
   // 右键才出菜单，所以这里单击直接 showWindow 不会和菜单冲突。
@@ -833,7 +850,12 @@ async function runLaunch(pkg) {
         }, 700);
       } catch (_) { /* 窗口可能刚关闭 */ }
     }
-    appWin.setState({ ready: true, tip: '' });
+    appWin.setState(appWin.external
+      // 非 Windows：画面只能留在模拟器自己的窗口里。不要显示黑屏，
+      // 直接在应用窗口里写明「去哪看画面」（upstream #24）。
+      ? { ready: false, tip: platform.supportNote() }
+      : { ready: true, tip: '' });
+    if (appWin.external) appLog(`embed unsupported on ${platform.platform}: external window mode`);
     // DPI 上下文不一致导致 SetParent 被拒时，代理降级为「窗口跟随」模式：
     // 画面照常显示，但告知用户原因（旧版完全静默，用户只能对着黑窗口猜）。
     if (embedded && appWin.lastEmbedFollow) {
@@ -845,7 +867,7 @@ async function runLaunch(pkg) {
     }
     // 嵌入失败（模拟器窗口还没建好）时再补两次：用户看到的是黑窗口，
     // 后台补上就恢复正常，不用让用户手动重开。
-    if (!embedded) {
+    if (!embedded && !appWin.external) {
       setTimeout(() => { if (appWin.isOpen) appWin.embed().catch(() => {}); }, 1500);
       setTimeout(() => { if (appWin.isOpen) appWin.embed().catch(() => {}); }, 4000);
     }
@@ -1034,7 +1056,12 @@ function registerIpc() {
     })(),
     exe: process.execPath,
     packaged: app.isPackaged,
+    platform: platform.describe(),
   }));
+
+  // 界面文案（upstream #38）：中文是源语言，词典按中文原文索引。
+  // 渲染层只拿一次「语言 + 词典」，自己遍历 DOM 翻译 —— 不为每条文案走一次 IPC。
+  ipcMain.handle('app:i18n', () => i18n.payload(app.getLocale()));
 
   // 选文件夹（用于把运行时/镜像/已装应用挪到非系统盘）
   ipcMain.handle('dialog:openDir', async (_e, defaultPath) => {
@@ -1198,13 +1225,21 @@ function registerIpc() {
   ipcMain.handle('settings:set', (_e, patch) => {
     const next = store.saveSettings(patch);
     if (patch && patch.autoStart !== undefined) applyAutoStart();
+    // 语言变了（upstream #38）：主进程的菜单/对话框是下次打开才读到新语言，
+    // 托盘菜单得重建一次，否则托盘里还是旧语言直到重启。
+    if (patch && patch.language !== undefined) {
+      i18n.setLanguage(i18n.resolve(next.language, app.getLocale()));
+      appLog(`i18n language switched to ${i18n.getLanguage()}`);
+      try { if (tray) tray.destroy(); } catch (_) { /* ignore */ }
+      buildTray();
+    }
     if (patch && patch.display && appWin && appWin.isOpen) {
       // 竖屏基准尺寸变了：只影响后续打开的窗口大小，不打断正在跑的应用
       appWin.portrait = windowBox();
     }
     // 打开「开始菜单快捷方式」时立刻补齐，不用等下次安装
     if (patch && (patch.createStartMenuShortcut === true || patch.createShortcutOnInstall === true)) {
-      installer.ensureShortcuts().catch(() => {});
+      ensureShortcuts();
     }
     // 鼠标键位变了：立刻按当前焦点重装/卸载钩子，不用等下次切窗口
     if (patch && patch.engine && (
@@ -1270,7 +1305,11 @@ function registerIpc() {
 
   ipcMain.handle('display:toggle', () => toggleDisplayMode());
 
-  ipcMain.handle('shortcut:rebuild', async () => ({ ok: true, fixed: await installer.ensureShortcuts() }));
+  ipcMain.handle('shortcut:rebuild', async () => ({
+    ok: platform.canIntegrateShell,
+    fixed: await ensureShortcuts(),
+    unsupported: platform.canIntegrateShell ? undefined : platform.supportNote(),
+  }));
   ipcMain.handle('runtime:autoDeploy', () => autoDeploy({ force: true }));
   // 关闭「深度裁剪」时把被 pm disable-user 的系统包恢复回来
   ipcMain.handle('settings:restoreSystem', async () => runtime.restoreSystemApps());
@@ -2034,6 +2073,11 @@ if (!gotLock) {
     runtime = new Runtime(APP_ROOT);
     // 启动即留一行痕迹：出问题时用户把 app.log 发过来就能看到版本与数据目录
     appLog(`start v${app.getVersion()} data=${store.DATA_DIR} pid=${process.pid}`);
+    // 平台能力一行进日志：跨平台反馈里第一眼就能确认「在什么系统上、支持级别是什么」
+    appLog(`platform ${platform.platform} support=${platform.supportLevel()} embed=${platform.canEmbed}`);
+    // 生效语言 = 设置里的 language（auto 时看系统语言）。所有 t() 从这里往后都是对的。
+    i18n.setLanguage(i18n.resolve(store.getSettings().language, app.getLocale()));
+    appLog(`i18n language=${i18n.getLanguage()} (pref=${store.getSettings().language}, system=${app.getLocale()})`);
     const l = launcherInfo();
     installer = new Installer(runtime, {
       launcherTarget: l.target,
@@ -2141,6 +2185,24 @@ if (!gotLock) {
     buildTray();
     applyAutoStart();
 
+    // 非 Windows：别让用户点开应用才发现「窗口嵌入没有、运行时也下载不了」。
+    // 启动就说清楚支持级别与可行路径（upstream #24）。只提示一次，之后可在日志里查。
+    if (platform.supportLevel() !== 'full' && process.env.APKSTART_SELFTEST !== '1') {
+      setTimeout(async () => {
+        try {
+          await dialog.showMessageBox(mainWindow || undefined, {
+            type: 'warning',
+            buttons: ['知道了'],
+            defaultId: 0,
+            noLink: true,
+            title: '平台支持说明',
+            message: `ApkStart 在当前平台上只能部分工作（${platform.platform}）`,
+            detail: platform.supportNote(),
+          });
+        } catch (_) { /* 没有窗口就只写日志 */ }
+      }, 1200).unref?.();
+    }
+
     // 磁盘余量：小于 3GB 时安卓根本起不来（写镜像/快照都会失败）。
     // 与其让用户看着「打不开」不明所以，不如开门见山告诉他往哪儿改。
     {
@@ -2156,7 +2218,7 @@ if (!gotLock) {
     }
 
     // 老版本只建过桌面快捷方式 / 图标是 null：启动即自动补齐，不用用户操作
-    installer.ensureShortcuts().then((fixed) => {
+    ensureShortcuts().then((fixed) => {
       if (fixed && fixed.length) {
         windowctl.refreshShell().catch(() => {});
         notify('快捷方式已补齐', fixed.join('、'));

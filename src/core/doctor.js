@@ -38,6 +38,8 @@ function hostInfo() {
     homeAscii: isAsciiPath(home),
     tmp: os.tmpdir(),
     rdp: /RDP/i.test(String(process.env.SESSIONNAME || '')) || !!process.env.CLIENTNAME,
+    // 支持级别与加速能力：跨平台反馈里第一眼就能看出「这台系统到底能干什么」
+    support: require('./platform').describe(),
   };
 }
 
@@ -67,16 +69,19 @@ function gpuCandidates(emulatorVersion) {
   const [major, minor, patch] = versionNumbers(emulatorVersion);
   const modern = major > 36 || (major === 36 && (minor > 4 || (minor === 4 && patch >= 9)));
   return modern
-    // 顺序即「自动模式的尝试优先级」（对齐上游 v0.3.6 的修复）：
+    // 顺序即「自动模式的尝试优先级」：
     // 1) host        —— 用真实显卡渲染，最省 CPU、最跟手；
     // 2) swangle     —— ANGLE 跑在 SwiftShader 之上的软件渲染。比裸 software/swiftshader
     //                  对 Android WebView 的合成层友好得多（红果/抖音这类「点同意后进主界面
     //                  黑屏」就是裸软件渲染过不了 WebView 合成导致的），因此排在第二顺位；
     // 3) software    —— 纯 SwiftShader 兜底，兼容性 OK 但 WebView 合成易黑屏，仅最后才用；
-    // 4) swiftshader —— 旧名兜底。
-    // 注意 safeGpu（关闭加速的 TCG 兜底）仍取 software，保证「慢但最兼容」。
-    ? ['host', 'swangle', 'software', 'swiftshader']
-    : ['host', 'swiftshader_indirect', 'swiftshader'];
+    // 4) swiftshader —— 旧名兜底；
+    // 5) lavapipe    —— SwiftShader 之外的另一条软件 Vulkan 路径。issue #29 那类
+    //                  「带窗口就起不来、无窗口正常」的机器多半是宿主 Vulkan/GL 驱动初始化
+    //                  失败；换一条完全不同的软件 Vulkan 实现有机会绕过，也让用户多一个
+    //                  可手动指定的后端（设置 → 渲染后端）。
+    ? ['host', 'swangle', 'software', 'swiftshader', 'lavapipe']
+    : ['host', 'swiftshader_indirect', 'swiftshader', 'lavapipe'];
 }
 
 /** Windows 8.3 短路径：中文用户名 / 中文安装目录时 emulator 会找不到文件 */
@@ -238,7 +243,7 @@ function planVariants(profile, { preferSoftware = false } = {}) {
   const gpus = profile.gpuCandidates || [];
   const firstGpu = profile.gpu || gpus[0] || 'software';
   const safeGpu = gpus.find((g) => /software|swiftshader/.test(g)) || firstGpu;
-  const fallbackGpus = gpus.filter((g) => g !== firstGpu && /software|swiftshader|swangle/.test(g));
+  const fallbackGpus = gpus.filter((g) => g !== firstGpu && /software|swiftshader|swangle|lavapipe/.test(g));
   const ordered = [firstGpu, ...fallbackGpus].slice(0, 2);
   if (preferSoftware) {
     // 可见窗口优先「ANGLE + SwiftShader」(swangle)：它同样是软件渲染，不会出现 host
@@ -489,14 +494,48 @@ function describeProfile(p) {
 }
 
 /** 导出诊断报告（纯文本，便于发邮件/贴 issue） */
+/** 报告里要写清是哪个版本导出的 —— 跨版本比对时这一步省不掉 */
+function pkgVersion() {
+  try { return require('../../package.json').version; } catch (_) { return ''; }
+}
+
+/**
+ * 报告为空时（没有尝试记录、没有 emulator 日志）该怎么说。
+ *
+ * issue #25 / #20 的情形：用户附上的报告里只有 `attempts: []` 和一句 UNKNOWN，
+ * 因为「开机是懒启动」—— 没点开过应用，就一次都没拉过模拟器；或者 ApkStart
+ * 重启过，上次失败的记录被清掉了。报告本身不该在这种情况下沉默：它应该告诉
+ * 用户「这份报告什么也没记到，以及怎么导一份有内容的」。
+ */
+function emptyReportNote(extra) {
+  const attempts = extra && Array.isArray(extra.attempts) ? extra.attempts : [];
+  const hadFailure = !!(extra && extra.lastFailure);
+  if (attempts.length || hadFailure) return [];
+  return [
+    '',
+    '== 这份报告为什么是空的 ==',
+    '本次导出时，ApkStart 没有过任何一次开机尝试记录，也没有上次失败的落盘记录。',
+    '常见原因（都在 app.log 里能看到对应轨迹）：',
+    '  1. 还没打开过任何应用 —— 安卓运行时是「点开应用才开机」的懒启动，没点就不会有尝试记录；',
+    '  2. ApkStart 刚重启过 —— 内存里的尝试记录只在本次运行内有效，上一次的失败记录会被清掉；',
+    '  3. 问题发生在「装 APK」或「窗口嵌入」阶段，根本没走到开机 —— 那时看下面的会话日志。',
+    '想导出一份有内容的报告，请按顺序做：',
+    '  1. 在 ApkStart 里打开那个出问题的应用，等到报错（或黑屏 30 秒以上）；',
+    '  2. 不要关闭、不要重启 ApkStart，立刻右键托盘图标 →「导出诊断报告」；',
+    '  3. 如果 ApkStart 直接崩了，重启后再导出：它会把上次失败的记录（last-failure.json）一起带上。',
+  ];
+}
+
 function writeReport({ dataDir, profile, logLines = [], extra = {} }) {
   const dir = path.join(dataDir, 'logs');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `diagnostic-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`);
   const d = diagnose(logLines);
+  const sessionLog = Array.isArray(extra.sessionLog) ? extra.sessionLog : [];
   const body = [
     'ApkStart 诊断报告',
     `生成时间：${new Date().toLocaleString()}`,
+    `应用版本：${extra.appVersion || pkgVersion()}`,
     '',
     '== 本机 ==',
     JSON.stringify(hostInfo(), null, 2),
@@ -508,12 +547,18 @@ function writeReport({ dataDir, profile, logLines = [], extra = {} }) {
     '== 诊断 ==',
     `${d.code}：${d.title}`,
     d.hint,
+    ...emptyReportNote(extra),
     '',
     '== 附加信息 ==',
     JSON.stringify(extra, null, 2),
     '',
     '== 运行时日志（末尾 300 行）==',
-    ...(Array.isArray(logLines) ? logLines.slice(-300) : String(logLines || '').split('\n')),
+    ...(Array.isArray(logLines) && logLines.length
+      ? logLines.slice(-300)
+      : ['（没有 emulator.log：本次还没有拉起过模拟器）']),
+    '',
+    '== 应用日志（app.log 末尾 200 行：点开应用 → 引导 → 安装 的轨迹）==',
+    ...(sessionLog.length ? sessionLog.slice(-200) : ['（app.log 为空或被轮转）']),
   ].join('\n');
   fs.writeFileSync(file, body, 'utf8');
   return { file, diagnosis: d };

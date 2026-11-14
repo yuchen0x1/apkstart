@@ -17,6 +17,7 @@ const { Provisioner } = require('./provision');
 const { EmulatorEngine } = require('./emulator');
 const doctor = require('./doctor');
 const container = require('./container');
+const platform = require('./platform');
 
 const LOG_DIR = path.join(store.DATA_DIR, 'logs');
 const MONITOR_PORT = 5556;
@@ -234,6 +235,12 @@ class Runtime {
   }
 
   async boot({ install = false, onLog = () => {}, lcdOrientation = '' } = {}) {
+    // 内置运行时（emulator 包 + AEHD 驱动 + Windows 版镜像下载）只有 Windows 一套。
+    // 别的系统上如果还走这条路，会在下载/解压/装驱动里各失败一次，报错还各不相同。
+    // 这里提前说清楚，并指向唯一的可行路径：「连接已有运行时」（upstream #24）。
+    if (!platform.canProvision && (this.settings.engine.mode || 'builtin') !== 'attach') {
+      throw new Error(platform.supportNote());
+    }
     const env = await this.provisioner.checkEnv();
     this._hv = env.hypervisor;
 
@@ -1043,6 +1050,9 @@ class Runtime {
       : (persisted ? persisted.exitCode : null);
     let logLines = this.emulator.recentLog(300);
     if (!logLines.length && this.emulator.tailLogFile) logLines = this.emulator.tailLogFile(300);
+    // 连 emulator.log 都没有（模拟器一次都没拉起过）：把 app.log 带上。
+    // 否则报告里就是 attempts: [] + 空日志，谁也看不出发生过什么（issue #25）。
+    const sessionLog = this.emulator.tailAppLog ? this.emulator.tailAppLog(200) : [];
     return doctor.writeReport({
       dataDir: store.DATA_DIR,
       profile,
@@ -1056,6 +1066,12 @@ class Runtime {
         runtimeDir: env.root,
         serial: this.emuSerial,
         bootLog: this.bootLog,
+        sessionLog,
+        runtimeState: {
+          vmRunning: this.vmRunning,
+          engineMode: (this.settings.engine || {}).mode || 'builtin',
+          logsDir: path.join(store.DATA_DIR, 'logs'),
+        },
       },
     });
   }

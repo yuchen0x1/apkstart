@@ -10,6 +10,7 @@ const { BrowserWindow, screen, nativeImage } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { hookOptions } = require('./pointer');
+const platform = require('./platform');
 
 const TITLEBAR_H = 38;
 /**
@@ -300,6 +301,16 @@ class AppWindow {
    */
   async embed() {
     if (!this.isOpen) return false;
+    // 非 Windows / 没有原生代理：嵌入这条路根本不存在。
+    // 以前这里照样进 4 次重试，每次都要等一条 6 秒的 TCP 超时，用户看到的是
+    // 「启动卡很久 → 黑屏 → 没有任何提示」。现在直接置 external：画面留在
+    // 模拟器自己的窗口里，应用窗口只显示一句说明（upstream #24）。
+    if (!platform.canEmbed || !this.agent || this.agent.available === false) {
+      this.external = true;
+      this.lastEmbedError = platform.canEmbed ? 'no-native-agent' : 'platform-cannot-embed';
+      this.lastEmbedFollow = false;
+      return false;
+    }
     let last = null;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       if (!this.isOpen) return false;
@@ -325,6 +336,8 @@ class AppWindow {
 
   async fitNow() {
     if (!this.isOpen) return;
+    // 外部窗口模式：画面不在我们窗口里，贴合没有任何意义（也不该调代理）
+    if (this.external) return;
     await this.agent.fit(this._rect()).catch(() => {});
   }
 

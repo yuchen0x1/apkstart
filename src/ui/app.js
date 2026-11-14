@@ -831,6 +831,7 @@ function fillSettings(s) {
   $('setDeviceSharedDir').value = s.deviceSharedDir || '';
   const d = s.display || {};
   $('setAutoStart').checked = s.autoStart !== false;
+  if ($('setLanguage')) $('setLanguage').value = s.language || 'auto';
   const eng = s.engine || {};
   if ($('setResourceMode')) $('setResourceMode').value = eng.resourceMode || 'balanced';
   if ($('setRenderSize')) $('setRenderSize').value = eng.renderSize || 'auto';
@@ -1184,6 +1185,19 @@ function bindSettings() {
   $('setShortcutDir').addEventListener('change', (e) => save({ shortcutDir: e.target.value.trim() }));
   $('setDeviceSharedDir').addEventListener('change', (e) => save({ deviceSharedDir: e.target.value.trim() }));
   $('setAutoStart').addEventListener('change', (e) => save({ autoStart: e.target.checked }));
+  // 语言切换（upstream #38）：主进程先落设置并重建托盘菜单，再让本页整体重译。
+  // 不做整页 reload：窗口里可能正有安装进度、日志在滚动，重载会把它们丢掉。
+  if ($('setLanguage')) {
+    $('setLanguage').addEventListener('change', async (e) => {
+      try {
+        state.settings = await api.setSettings({ language: e.target.value });
+        const payload = await api.i18n();
+        if (window.apkI18n) window.apkI18n.retranslate(payload);
+      } catch (err) {
+        toast({ title: '切换语言失败', body: err.message, type: 'error' });
+      }
+    });
+  }
   $('setDisplayMode').addEventListener('change', async (e) => {
     const mode = e.target.value;
     $('portraitField').hidden = mode === 'fullscreen';
@@ -1892,6 +1906,8 @@ async function bindWizard() {
 }
 
 async function init() {
+  // 先定语言再渲染：否则英文环境下会先闪一屏中文
+  await initI18n();
   bindEvents();
   bindSettings();
   bindUpdate();
@@ -2054,6 +2070,18 @@ async function fixAllIssues(issues) {
     // eslint-disable-next-line no-await-in-loop
     await new Promise((res) => setTimeout(res, 500));
   }
+}
+
+/**
+ * 界面语言（upstream #38）：先取语言与词典，再渲染界面 —— 否则会先闪一屏中文。
+ * 取不到（IPC 异常 / i18n.js 没加载）就按中文继续，界面不能因为翻译而打不开。
+ */
+async function initI18n() {
+  try {
+    if (!window.apkI18n || !api.i18n) return;
+    const payload = await api.i18n();
+    window.apkI18n.apply(payload);
+  } catch (_) { /* 回落中文 */ }
 }
 
 init().catch((e) => {

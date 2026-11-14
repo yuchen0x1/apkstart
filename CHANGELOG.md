@@ -5,6 +5,33 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.0] — 2026-11-15
+
+上游 38 条 issue 里剩下的四条能落地的，这一版全部处理完（结论见
+`docs/UPSTREAM-ISSUES-AUDIT.md`：27 已修 / 7 部分 / 2 未修 / 2 非代码）。
+
+### 新增
+- **英文界面（上游 #38）**：设置里新增「界面语言」（自动 / 简体中文 / English）。
+  中文是源语言，英文由 688 条词典覆盖（含动态模板与数字回填）；缺条目回落中文原文，
+  不会显示空白。日志与诊断报告保持中文。真实渲染验证：英文界面零残留中文、无脚本错误。
+- **平台能力表（上游 #24 的地基）**：新增 `src/core/platform.js`，把散落各处的
+  `process.platform === 'win32'` 收成一处（嵌入 / 运行时分发 / 快捷方式 / 鼠标钩子）。
+
+### 变更
+- **非 Windows 降级运行（上游 #24）**：Linux 上不再「卡很久 → 黑屏 → 无提示」——
+  嵌入直接判定不支持并说明去哪看画面；adb 按 Linux/macOS 常见位置查找；
+  快捷方式与 .apk 关联安全跳过；`connect to an existing runtime` 模式可用；
+  启动时说明支持级别（详见 `docs/PLATFORM-LINUX.md`，未在 Linux 实测）。
+- 诊断报告带上 `platform.describe()`（系统 / 支持级别 / 加速方式，Linux 检查 /dev/kvm）。
+
+### 修复
+- **诊断报告空 `attempts` 自解释（上游 #25）**：报告没有启动尝试时，直接写明原因
+  （懒启动没点开过应用 / 重启后内存记录丢失 / 问题出在装 APK 阶段）与「怎么导一份
+  有内容的」；同时带上 app.log 末尾 200 行的启动轨迹与应用版本号。
+- **带窗口启动失败说清楚（上游 #29）**：新增 `lavapipe` 软件 Vulkan 后端候选；
+  可见模式全部失败时，错误信息直接点名「带窗口渲染冲突」，指向设置里的手动后端；
+  报告记录本次是带窗口还是无窗口（issue #29 的那台机器无法验证，如实标注）。
+
 ## [0.5.0] — 2026-11-15
 
 上游 `RoutineMiku/apkstart` 从 v0.3.7 到 v0.4.1 的修复已按逻辑逐条移植（不做整树 merge，
@@ -246,6 +273,7 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
 [Unreleased]: https://github.com/yuchen0x1/apkstart/compare/v0.5.0...HEAD
+[0.6.0]: https://github.com/yuchen0x1/apkstart/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/yuchen0x1/apkstart/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.4.0
 [0.3.7]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.7

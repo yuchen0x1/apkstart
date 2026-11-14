@@ -934,6 +934,9 @@ class EmulatorEngine {
     // 而裸 software 会让「点同意进主界面」这种 WebView 重合成场景黑屏。
     // 两者都仍可保留 WHPX 加速，只是把 guest GLES 的呈现改走 SwiftShader 路径。
     const variants = doctor.planVariants(profile, { preferSoftware: !headless }).slice(0, maxAttempts);
+    // 报告里要写清这次是「带窗口」还是「无窗口」跑的：同一台机器上两者结果常常不同，
+    // 少了这一个 bit，报告就没法区分「模拟器起不来」和「带窗口渲染起不来」（issue #29）。
+    this.headlessMode = !!headless;
 
     // 记住「上次拉起就崩」的 GPU 后端，下次把它排到最后。
     // 实测：AMD Radeon 780M 上 `-gpu host` 能通过 emulator 自己的硬件检查，
@@ -1126,12 +1129,22 @@ class EmulatorEngine {
         image: choice,
         exitCode: this.lastExitCode,
         exitMeaning: describeExitCode(this.lastExitCode),
+        sessionLog: this.tailAppLog(200),
+        runtimeState: { visible: !this.headlessMode, attempts: this.attempts.length },
       },
     });
+    // 带窗口模式全挂时，把「这是可见模式的失败」说清楚（issue #29）：
+    // 那台机器 headless 正常、带窗口 vCPU 不启动，用户看报告只看到一堆 GPU 变体，
+    // 完全分不清是模拟器坏了还是「窗口渲染」这条链路坏了。
+    const visibleHint = headless ? '' : (
+      '\n\n本次是带窗口模式（画面上要嵌进应用窗口）。如果同一台机器上「无窗口模式」能起来、'
+      + '只有带窗口起不来，那是宿主 GPU/Vulkan 驱动与模拟器 Qt 窗口的冲突，不是安卓镜像的问题：'
+      + '在「设置 → 渲染后端」手动指定 swiftshader 或 lavapipe 再试一次。'
+    );
     const err = new Error(
       `运行时多次尝试仍未能启动（${d.title}）。\n${d.hint}\n\n`
       + `已尝试：${this.attempts.map((a) => `${a.plan} → ${a.diagnosis}`).join('；')}\n`
-      + `诊断报告：${report.file}`,
+      + `诊断报告：${report.file}${visibleHint}`,
     );
     err.diagnosis = d;
     err.report = report.file;
@@ -1293,21 +1306,30 @@ class EmulatorEngine {
    * 用户重启 ApkStart 再导出诊断报告时，内存里的 this._log 已经空了，
    * 旧版报告因此只剩一句 UNKNOWN —— 真实崩溃原因全在日志文件里。
    */
-  tailLogFile(n = 300) {
+  /** 读任意日志文件的末尾 n 行（诊断报告用它带出 app.log 里的启动轨迹） */
+  static tailFile(file, n = 300) {
     try {
-      const file = path.join(store.DATA_DIR, 'logs', 'emulator.log');
       const size = fs.statSync(file).size;
+      if (!size) return [];
       const take = Math.min(size, 2 * 1024 * 1024);
       const fd = fs.openSync(file, 'r');
       try {
         const buf = Buffer.alloc(take);
         fs.readSync(fd, buf, 0, take, size - take);
         const lines = buf.toString('utf8').split(/\r?\n/);
-        // 从头读的话第一行可能被截断，丢掉它
         if (take < size) lines.shift();
         return lines.slice(-n);
       } finally { fs.closeSync(fd); }
     } catch (_) { return []; }
+  }
+
+  tailLogFile(n = 300) {
+    return EmulatorEngine.tailFile(path.join(store.DATA_DIR, 'logs', 'emulator.log'), n);
+  }
+
+  /** app.log 的尾部：里面是「点开应用 → 引导 → 装 APK」的主进程轨迹 */
+  tailAppLog(n = 200) {
+    return EmulatorEngine.tailFile(path.join(store.DATA_DIR, 'logs', 'app.log'), n);
   }
 }
 
