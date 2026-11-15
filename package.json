@@ -64,5 +64,9 @@
   },
   "dependencies": {
     "@napi-rs/lzma": "^1.5.3"
+  },
+  "overrides": {
+    "minimatch@9": "^11.0.8",
+    "minimatch@10": "^11.0.8"
   }
 }
