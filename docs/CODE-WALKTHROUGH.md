@@ -47,10 +47,10 @@ apkstart/
 │     └─ 下载/更新 download.js sources.js updater.js store.js logfile.js
 ├─ build/                    打包流水线（pack.js / prepare-runtime.js / slim-runtime.js / zip.js / seed/）
 ├─ test/                     run-tests.js(8) + engine-test.js(11) + auto-test.js(53) + 一堆实机探针脚本
-├─ tools/                    发布与实机检查脚本（publish-gitee.js、check-*.js、e2e-boot.js）
+├─ tools/                    发布与实机检查脚本（release-notes.js、check-*.js、e2e-boot.js）
 ├─ docs/                     ARCHITECTURE.md、images/、promo/、本文
 ├─ engine/                   运行时下载缓存（gitignored，只有 README）
-└─ .github/workflows/        ci.yml（双 Node 测试）、release.yml（便携版 + 完整版 + Gitee 同步）
+└─ .github/workflows/        ci.yml（双 Node 测试）、release.yml（便携版 + 完整版）
 ```
 
 **分层调用方向**（只允许上层依赖下层）：
@@ -245,14 +245,13 @@ Node 的 `windowsHide` 管不到 emulator 自己 detached 出来的 `qemu` / `ne
 | `npm run selftest` | `scripts/selftest.js` | 对已装设备端到端验收（adb/版本/freeform/共享目录，`--apk` 走完整安装→启动→截图） |
 
 `.github/workflows/ci.yml`：Windows × Node 20/22 跑 `npm test` + `test/pointer-hook-logic.ps1`（防止鼠标键位被改坏）。
-`.github/workflows/release.yml`：tag `v*` → `build` job（便携版 zip → GitHub Release → 同步 Gitee，缺 `GITEE_TOKEN` 直接失败而不是静默跳过）+ `full` job（组装运行时 → xz → NSIS Setup → 上传 Release + 运行时整包 zip）。
+`.github/workflows/release.yml`：tag `v*` → `build` job（便携版 zip → GitHub Release）+ `full` job（组装运行时 → xz → NSIS Setup → 上传 Release + 运行时整包 zip）。发行说明由 `tools/release-notes.js` 统一产出（手写 release-notes → CHANGELOG 段落 → git log 三级兜底），正文不再出现重复的版本大标题。
 
 **发版检查清单**（从历史踩坑总结）：
 1. `package.json` 版本号必须 bump（否则客户端判「已是最新」）；
-2. 写 `.github/release-notes-<tag>.md` 就用它，否则 `--generate-notes`；
+2. 发行说明走 `.github/release-notes-<tag>.md` → CHANGELOG 段落 → git log 兜底（`tools/release-notes.js`），不再用 `--generate-notes`；
 3. `full` job 要 ~40 分钟（xz 压缩 1.1GB）；
-4. Gitee 用 `tools/publish-gitee.js`，整包优先、超限才切分；
-5. 发完核实「发行包 == 代码」：查 zip 内 `agent.ps1` 是否含 `SetScope`/`IsOurs`、`package.json` 版本。
+4. 发完核实「发行包 == 代码」：查 zip 内 `agent.ps1` 是否含 `SetScope`/`IsOurs`、`package.json` 版本。
 
 ---
 
@@ -305,7 +304,7 @@ Node 的 `windowsHide` 管不到 emulator 自己 detached 出来的 `qemu` / `ne
 4. **诊断能力不足**（#20/#25 的报告里 `attempts: []`、`bootLog: []`）：失败时把 `emulator.attempts` 与 emulator.log 尾部写进诊断报告，并把退出码翻译成中文（`3221225477` = 0xC0000005 访问冲突）；
 5. **GPU 兼容层**：`-gpu host` 在部分 NVIDIA 驱动 + emulator 37.3.9 上崩，可在 `badGpu` 机制上扩一条「退出码 0xC0000005 → 自动降级并记住」；
 6. **测试缺口**（按风险排序）：AXML/ARSC 无合成字节用例（真实 APK 夹具缺失时整段跳过 → CI 零覆盖）、`arsc.resolve()` 零断言、`.apks/.xapk` 无用例、`assoc.js` 零覆盖、`pngToIco`/`writeShortcut` 不在 `npm test` 里；
-7. **Gitee 资产与 GitHub 不一致**（v0.3.4 Gitee 只有便携包）：发布流程已有 `publish-gitee.js`，但 CI 需要 `GITEE_TOKEN` secret 才不失败。
+7. **Gitee 不再提供**：发布流程已移除 Gitee 同步（本仓库只发 GitHub Release），`publish-gitee.js` 一并删除；应用内更新源也只认 GitHub。
 
 ### 6.4 部署链上最容易出问题的环节（11 条速查）
 

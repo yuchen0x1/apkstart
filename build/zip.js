@@ -5,11 +5,8 @@
  * 为什么不用 PowerShell 的 `Compress-Archive`：
  * 它走 .NET 自带 deflate（相当于 zlib 6 档），同一个 225MB 目录压出来是
  * 105,213,775 字节；7-Zip 的 deflate（`-mx=9`）只要 99,616,541 字节 —— 差了 5.6MB。
- * 而 Gitee 发行版附件单文件上限是 100MB（实测 104,800,000 字节能上传成功，
- * 105,213,775 就被拆成 part1/part2 让用户没法直接解压）。差这 5MB，
- * 结果就是「国内用户拿到的包要么解压不了，要么得下两份」。
- *
- * 所以这里固定用 7-Zip 压；找不到 7-Zip 才退回 Compress-Archive（并大声提示）。
+ * 便携包是每个用户都要下的东西，能小一点是一点，所以这里固定用 7-Zip 压；
+ * 找不到 7-Zip 才退回 Compress-Archive（并大声提示）。
  *
  * 用法：
  *   node build/zip.js <源目录> <输出.zip> [--limit-mb 100]
@@ -134,7 +131,7 @@ function main() {
     console.log('压缩器：', exe);
     zipWith7z(exe, srcDir, outZip);
   } else {
-    console.warn('⚠️  没找到 7-Zip，退回 Compress-Archive —— 产物会大 5% 左右，可能装不进 Gitee 单文件限额');
+    console.warn('⚠️  没找到 7-Zip，退回 Compress-Archive —— 产物会大 5% 左右');
     zipWithPowershell(srcDir, outZip);
   }
 
@@ -144,7 +141,7 @@ function main() {
   console.log(`  ${entries} 个条目，${size} 字节（${(size / MIB).toFixed(2)} MiB），压缩率 ${(size / stats.bytes * 100).toFixed(1)}%`);
 
   if (size > limitMiB * MIB) {
-    console.error(`✗ 超过 ${limitMiB} MiB 上限（Gitee 附件单文件上限 100MB）。请先给包瘦身，不要靠切分片绕过。`);
+    console.error(`✗ 超过 ${limitMiB} MiB 体积闸门。请先给包瘦身，不要靠切分片绕过。`);
     process.exit(2);
   }
   console.log(`  ✓ 在 ${limitMiB} MiB 以内（余量 ${((limitMiB * MIB - size) / MIB).toFixed(2)} MiB）`);

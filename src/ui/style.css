@@ -870,8 +870,22 @@ kbd {
 /* hidden 属性会被 .btn / .icon-btn 的 display 声明覆盖（第 1 页的「上一步」就是这样漏出来的） */
 .wizard-foot .btn[hidden], .wizard-modal .icon-btn[hidden], .wizard-modal .drive-item[hidden] { display: none; }
 
-/* 更新日志完整展示（发布说明原文，可滚动） */
-#updateNote.notes { display: block; max-height: 240px; overflow: auto; white-space: pre-wrap; }
+/* 更新日志完整展示（发布说明渲染后的 HTML，可滚动） */
+#updateNote.notes { display: block; max-height: 240px; overflow: auto; }
+#updateNote .n-title { font-weight: 650; color: var(--text, #222); margin-bottom: 4px; }
+#updateNote.notes p { margin: 6px 0; }
+#updateNote.notes h4 { margin: 10px 0 4px; font-size: 12.5px; color: var(--text, #222); }
+#updateNote.notes ul { margin: 4px 0; padding-left: 18px; }
+#updateNote.notes li { margin: 2px 0; }
+#updateNote.notes blockquote { margin: 6px 0; padding: 2px 0 2px 9px; border-left: 3px solid var(--line, #dfe5ea); color: var(--muted, #7b828e); }
+#updateNote.notes pre { margin: 6px 0; padding: 8px 10px; background: var(--bg, #f6f8fa); border-radius: 8px; overflow: auto; }
+#updateNote.notes code { font-family: Consolas, "Cascadia Code", monospace; font-size: 11.5px; }
+#updateNote.notes pre code { font-size: 11px; }
+#updateNote.notes table { border-collapse: collapse; margin: 6px 0; font-size: 11.5px; width: 100%; }
+#updateNote.notes th, #updateNote.notes td { border: 1px solid var(--line, #e4e9ee); padding: 3px 8px; text-align: left; }
+#updateNote.notes th { background: var(--bg, #f6f8fa); }
+#updateNote.notes hr { border: none; border-top: 1px solid var(--line, #e4e9ee); margin: 8px 0; }
+#updateNote.notes a { color: var(--brand, #1f6feb); text-decoration: underline; }
 
 /* ---------- 部署实时日志 ---------- */
 .deploy-log-wrap { margin: 10px 0 4px; border: 1px solid var(--line, #e4e9ee); border-radius: 10px; overflow: hidden; }

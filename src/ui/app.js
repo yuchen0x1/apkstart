@@ -21,6 +21,65 @@ function esc(s) {
   ));
 }
 
+/**
+ * 发行说明的 markdown → 简单 HTML（更新日志面板用）。
+ * 只做展示需要的几件事：标题、加粗、行内代码、代码块、列表、引用、表格、链接、分隔线。
+ * 所有文本先过 esc()，链接只放行 http(s)——Release 正文不该变成脚本注入面。
+ * 以前是 textContent 原样整段贴出来，界面上会露出「# 标题」「**加粗**」「| 表格 |」
+ * 这些记号，发布说明写得越认真、面板里看着越乱。
+ */
+function mdToHtml(md) {
+  const inline = (s) => esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  const lines = String(md).replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let code = null, table = null, list = false;
+  let quote = [], para = [];
+  const flushPara = () => { if (para.length) { out.push(`<p>${para.map(inline).join('<br>')}</p>`); para = []; } };
+  const flushList = () => { if (list) { out.push('</ul>'); list = false; } };
+  const flushQuote = () => { if (quote.length) { out.push(`<blockquote>${quote.map(inline).join('<br>')}</blockquote>`); quote = []; } };
+  const flushTable = () => {
+    if (!table) return;
+    out.push(`<table>${table.map((r, i) => `<tr>${r.map((c) => (i ? `<td>${inline(c)}</td>` : `<th>${inline(c)}</th>`)).join('')}</tr>`).join('')}</table>`);
+    table = null;
+  };
+  const flushAll = () => { flushPara(); flushList(); flushQuote(); flushTable(); };
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    if (code !== null) {
+      if (/^```/.test(line)) { out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`); code = null; } else code.push(raw);
+      continue;
+    }
+    if (/^```/.test(line)) { flushAll(); code = []; continue; }
+    if (/^\|/.test(line) && /\|$/.test(line)) {
+      flushPara(); flushList(); flushQuote();
+      const cells = line.slice(1, -1).split('|').map((c) => c.trim());
+      if (cells.every((c) => /^:?-{3,}:?$/.test(c))) continue; // 表头分隔行
+      (table = table || []).push(cells);
+      continue;
+    }
+    flushTable();
+    if (/^#{1,6}\s+/.test(line)) { flushAll(); out.push(`<h4>${inline(line.replace(/^#{1,6}\s+/, ''))}</h4>`); continue; }
+    if (/^>\s?/.test(line)) { flushPara(); flushList(); quote.push(line.replace(/^>\s?/, '')); continue; }
+    flushQuote();
+    if (/^(-{3,}|\*{3,})\s*$/.test(line)) { flushAll(); out.push('<hr>'); continue; }
+    if (/^[-*]\s+/.test(line) || /^\d+\.\s+/.test(line)) {
+      flushPara();
+      if (!list) { out.push('<ul>'); list = true; }
+      out.push(`<li>${inline(line.replace(/^(?:[-*]|\d+\.)\s+/, ''))}</li>`);
+      continue;
+    }
+    flushList();
+    if (!line.trim()) { flushPara(); continue; }
+    para.push(line);
+  }
+  if (code !== null) out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);
+  flushAll();
+  return out.join('');
+}
+
 function initialOf(label) {
   const t = String(label || '?').trim();
   return (t[0] || '?').toUpperCase();
@@ -926,15 +985,17 @@ function renderUpdate(info) {
     showUpdateBtn(true);
     btn.textContent = info.asset ? '立即更新' : '打开下载页';
     btn.dataset.mode = info.asset ? 'auto' : 'manual';
-    // 更新日志 = 该版本的发布说明（GitHub Release body），完整展示（可滚动）
+    // 更新日志 = 该版本的发布说明（GitHub Release body），完整展示（可滚动）。
+    // 按轻量 markdown 渲染成 HTML，面板里不再露出 #、**、表格竖线这些记号。
     const note = $('updateNote');
     if (note) {
       const body = String(info.notes || '').trim();
       if (body) {
-        note.textContent = `更新日志（${info.tag}）：\n\n${body}`;
+        note.innerHTML = `<div class="n-title">更新日志（${esc(info.tag)}）</div>${mdToHtml(body)}`;
         note.classList.add('notes');
       } else {
         note.classList.remove('notes');
+        note.innerHTML = '';
       }
     }
     if (bar) bar.hidden = true;

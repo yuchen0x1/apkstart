@@ -257,7 +257,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
   但保存仍落到 `apkstart` 这个名字上（只给 `-no-snapshot-load` 的话会存进 `default_boot`，
   下次按名字找不到，等于白存一次）。
 
-## [0.4.0] — 稳定性 · 安全 · 兼容性大版本
+## [0.4.0] — 2026-11-15
+
+> 稳定性 · 安全 · 兼容性大版本
 
 这一版没有新功能噱头：把「会丢数据」「会被绕过」「已经过期」的三类问题先解决掉。
 同步改为哈希三方合并、更新器补上路径穿越与回滚、渲染进程开启沙箱、Electron 33 升到 45。
@@ -314,7 +316,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - **远端文件列表兼容两种 stat 输出**：`mtime|ctime|size|name` 与老的 `size|mtime|name`
   都能解析，不同 ROM 的 toybox/busybox 排版差异不再导致「设备被当成空目录」。
 
-## [0.3.9] — 代理接入 + 更新源指向本仓库 + 界面精简
+## [0.3.9] — 2026-11-15
+
+> 代理接入 + 更新源指向本仓库 + 界面精简
 
 ### 新增
 - **本地代理自动接入**：检测到 Clash / v2rayN 等代理（系统代理已开启 / 环境变量 /
@@ -336,7 +340,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - 「关于」区改为「更新日志」：移除二维码 / 抖音跳转，只保留原项目地址与
   仓库 Issues 反馈入口。
 
-## [0.3.8] — 鼠标修复 + 音量修复 + 自动更新上线
+## [0.3.8] — 2026-11-15
+
+> 鼠标修复 + 音量修复 + 自动更新上线
 
 ### 修复（严重）
 - **嵌入后鼠标点击全部丢失**（#34/#32/#33）：agent.ps1 的 `HWND_TOP` 常量误写成
@@ -359,7 +365,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 ### 其它
 - engine 测试在「宿主机自己跑着 ApkStart」时不再误报（检测到 5554 端口存活即跳过）。
 
-## [0.3.7] — 首次运行引导 + 部署提速
+## [0.3.7] — 2026-11-14
+
+> 首次运行引导 + 部署提速
 
 ### 新增
 - 首次运行引导向导：选盘（推荐非系统盘）→ 下载源 → 一键部署，C 盘不再被默认塞满（#14/#10/#35）。
@@ -368,7 +376,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - 首次部署下载极慢（#26）：运行时整包测速低于 0.5MB/s 直接改走官方分组件源
   （实测 3~20MB/s）；下载中途 30 秒平均低于 256KB/s 也会自动中断换源。
 
-## [0.3.6] — 安全加固批次
+## [0.3.6] — 2026-11-14
+
+> 安全加固批次
 
 ### 修复（安全，4 项 P0）
 - APK 包名白名单校验 + 本地路径净化 + adb 设备端 shell 转义：封死「双击恶意 APK
@@ -385,7 +395,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - settings:set 写入白名单；shell:open 只放行 http/https（#2 P1-4）。
 - README 新增「配置要求」与迁盘指引（#30）。
 
-## [0.3.5] — 大包与部署体验
+## [0.3.5] — 2026-11-14
+
+> 大包与部署体验
 
 - 2GB+ APK 可正常安装：解析改流式（不再整包进内存）、.apks/.xapk 流式解包、
   安装超时按包体放大（#21/#13）。
@@ -395,7 +407,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - 修复「改了运行时数据目录还是下到旧目录」；便携版移动/升级后自动重新定位（#23）。
 - 修复全新安装点图标只看到安卓桌面（组件名重复拼包名）。
 
-## [0.3.4] / [0.3.3] — 双源与资源可控
+## [0.3.4] / [0.3.3] — 2026-11-14
+
+> 双源与资源可控
 
 - GitHub / Gitee 双源自动选优（并发问版本、逐源实测测速），Gitee 匿名限流自动熔断。
 - Gitee 放整包（95MB），不再需要 part1/part2 手工拼接。
@@ -403,41 +417,55 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - 修复「窗口代理误伤微信等 Qt 应用」（#17/#19/#27/#28 的根因）：窗口归属按进程路径判定。
 - 修复下载器挂死、分块断点续传、镜像换盘不再清用户数据。
 
-## [0.3.2] — 窗口彻底不外露
+## [0.3.2] — 2026-11-14
+
+> 窗口彻底不外露
 
 - GitHub 在线更新上线（检查 → 下载 → 自动替换重启）；轻量版运行时改走本项目 Release。
 - qemu / netsimd 控制台黑窗彻底压制，模拟器主窗不单独露面。
 - 更新助手改用普通子进程，修复被安全软件静默拦截导致更新卡住。
 
-## [0.3.1] — 冷启动提速
+## [0.3.1] — 2026-11-14
+
+> 冷启动提速
 
 - /data 分区自动初始化（ext4 + FBE），全新安装不再掉进 recovery 循环。
 - 黑窗不再闪现；冷启动 ~22 秒、快照恢复 ~5 秒。
 
-## [0.3.0] — 主界面收敛
+## [0.3.0] — 2026-11-14
+
+> 主界面收敛
 
 - 主界面只留已安装应用，运行时与自检全部收进设置。
 
-## [0.2.8] / [0.2.7] — 稳定性
+## [0.2.8] / [0.2.7] — 2026-11-14
+
+> 稳定性
 
 - 快捷方式加固（桌面 + 开始菜单）、环境自检与磁盘守卫。
 - 声音支持、可选安装位置、卸载清理进程、VC++ 兼容。
 
-## [0.2.6] 及更早
+## [0.2.6] 及更早 — 2026-11-13
 
 - 鼠标映射（左键确认 / 右键返回 / 滚轮平滑滑动，前台限定）。
 - 切换到 Google 官方 Android Emulator 运行时（下载提速 2400 倍）。
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
-[0.6.1]: https://github.com/yuchen0x1/apkstart/compare/v0.6.0...v0.6.1
-[0.6.0]: https://github.com/yuchen0x1/apkstart/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/yuchen0x1/apkstart/compare/v0.4.0...v0.5.0
+[0.6.4]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.4
+[0.6.3]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.3
+[0.6.2]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.2
+[0.6.1]: https://github.com/yuchen0x1/apkstart/blob/main/.github/release-notes-v0.6.1.md
+[0.6.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.0
+[0.5.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.5.0
 [0.4.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.4.0
+[0.3.9]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.9
+[0.3.8]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.8
 [0.3.7]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.7
 [0.3.6]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.6
-[0.3.5]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.5
-[0.3.4]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.4
+[0.3.5]: https://github.com/yuchen0x1/apkstart/blob/main/.github/release-notes-v0.3.5.md
+[0.3.4]: https://github.com/yuchen0x1/apkstart/blob/main/.github/release-notes-v0.3.4.md
+[0.3.3]: https://github.com/yuchen0x1/apkstart/blob/main/.github/release-notes-v0.3.3.md
 [0.3.3]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.3
 [0.3.2]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.2
 [0.3.1]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.3.1

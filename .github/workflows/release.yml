@@ -1,4 +1,7 @@
 name: Release
+# 运行列表里显示「发布 v0.6.4」而不是提交信息——提交信息五花八门
+# （release: / chore(release): / 长短不一的句子），按版本找运行记录时根本没法看。
+run-name: ${{ github.ref_type == 'tag' && format('发布 {0}', github.ref_name) || '手动构建发布' }}
 
 on:
   push:
@@ -21,6 +24,30 @@ jobs:
           node-version: 22
           cache: npm
 
+      # 统一解析一次版本号，后面所有步骤直接用 $env:TAG。
+      # workflow_dispatch 跑在分支上时 ref_name 是分支名，这里改从 package.json 取版本
+      # （显式 UTF-8 读——中文环境下 Get-Content 会按 GBK 解码把 JSON 读坏，见 0.6.4 的教训）。
+      - name: 解析版本号
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v\d') {
+            if ("${{ github.ref_type }}" -eq 'tag') { $tag = "v$tag" }
+            else { $tag = "v" + (node -p "require('./package.json').version") }
+          }
+          "TAG=$tag" >> $env:GITHUB_ENV
+          Write-Output "发布版本：$tag"
+
+      # 发行说明统一由 tools/release-notes.js 产出（手写 release-notes 文件 → CHANGELOG
+      # 段落 → git log 三级兜底），正文一律去掉重复的版本大标题。以前没有手写文件时
+      # 退回 gh --generate-notes，产出的只是「Full Changelog」一行废话，等于没有更新日志。
+      - name: 生成发行说明
+        shell: pwsh
+        run: |
+          node tools/release-notes.js $env:TAG --out RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content RELEASE_NOTES.md -TotalCount 8
+
       - name: 安装依赖（含 Electron 运行时）
         run: npm ci
         env:
@@ -34,39 +61,35 @@ jobs:
 
       # 用 7-Zip 而不是 Compress-Archive：同一个目录，.NET deflate 压出来比 7-Zip -mx=9
       # 大 5MB 以上。build/zip.js 带体积闸门，超过上限直接让 job 失败，避免以后又悄悄
-      # 退回分片包。
-      # 闸门从 100MiB 调到 160MiB：100MiB 是 Gitee 单文件上限定的，而 Electron 33 → 45
-      # 之后壳层从 225MB 长到 327MB（electron.exe 单文件 238MB），压后实测 140.85MiB，
-      # 按老闸门每次发版都会红。Gitee 那一步已改为「超限就跳过」，不再需要 100MiB。
+      # 退回分片包。闸门 160MiB：Electron 33 → 45 之后壳层从 225MB 长到 327MB
+      # （electron.exe 单文件 238MB），压后实测 140.85MiB，留一点余量。
       - name: 压缩产物（7-Zip，体积闸门 160MiB）
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          $tag = $env:TAG
           node build/zip.js dist/ApkStart-win64-portable "ApkStart-$tag-win64-portable.zip" --limit-mb 160
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Item "ApkStart-$tag-win64-portable.zip" | Select-Object Name, Length
 
-      # 创建 Release 并上传轻量便携版（壳层极小，运行时首次启动按需下载）
+      # 创建 Release 并上传轻量便携版（壳层极小，运行时首次启动按需下载）。
+      # 名称统一「ApkStart <tag>」，正文一律用 RELEASE_NOTES.md——
+      # 不再走 --generate-notes（那只会生成「Full Changelog」一行废话）。
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          $tag = $env:TAG
           $zip = "ApkStart-$tag-win64-portable.zip"
-          # 幂等：release 已存在（如重跑 / 重推 tag）就跳过 create，只上传资产
+          $notes = "RELEASE_NOTES.md"
+          # 幂等：release 已存在（如重跑 / 重推 tag）就跳过 create，刷新说明并只上传资产
           $existing = gh release view $tag --json tagName -q .tagName 2>$null
-          # 有手写的发版说明就用它（.github/release-notes-<tag>.md），比 --generate-notes
-          # 的「Full Changelog」有用得多；没有才退回自动生成。
-          $notes = ".github/release-notes-$tag.md"
           if (-not $existing) {
-            if (Test-Path $notes) {
-              gh release create $tag --title "ApkStart $tag" --notes-file $notes
-            } else {
-              gh release create $tag --title "ApkStart $tag" --generate-notes
-            }
+            gh release create $tag --title "ApkStart $tag" --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          } else {
+            # 重跑时把发行说明一并刷新：改完 release-notes 再重跑 workflow 就能修好线上正文
+            gh release edit $tag --title "ApkStart $tag" --notes-file $notes
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
           $ok = $false
@@ -76,47 +99,6 @@ jobs:
           }
           if (-not $ok) { Write-Error "上传失败: $zip"; exit 1 }
           gh release view $tag --json assets --jq '.assets[].name'
-
-      # 同步到 Gitee（历史镜像）：国内直连 GitHub 只有几十 KB/s，Gitee 通常能跑几 MB/s。
-      # Electron 45 之后便携包压后约 141MB，已经放不进 Gitee 单文件 100MB 的上限，
-      # 因此这一步在超限时会明确跳过（见下面的 size 判断），不再产出需要手工拼接的
-      # .part1/.part2。Setup（1.4GB）与运行时整包（1.4GB）本来只留在 GitHub。
-      # 应用内更新（updater.js）从 v0.3.9 起只认 GitHub，Gitee 缺资产不影响升级。
-      # Gitee 同步「缺 token / 网络不通」只告警不阻断：否则整 build job 变红，
-      # 下面 needs: build 的 full job 会被整段跳过，连 GitHub 自己的 Setup / 运行时整包都发不出。
-      # 缺 token 时这一步仍会在日志里标红（continue-on-error 是「可见但非致命」），不静默。
-      - name: 同步便携版到 Gitee
-        continue-on-error: true
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
-          # Electron 45 之后壳层 327MB → 压后约 141MB，已远超 Gitee 单文件 100MB。
-          # 分片包（.part1/.part2）必须手工拼接，普通用户根本用不了。超限时明确跳过并留
-          # 一条 warning：比每次发版都红一次、或者产出一堆没人能用的分片都诚实。
-          $zip = "ApkStart-$tag-win64-portable.zip"
-          $zipMB = [math]::Round((Get-Item $zip).Length / 1MB, 1)
-          if ((Get-Item $zip).Length -gt 100MB) {
-            Write-Warning "便携包 $zipMB MB 超过 Gitee 单文件上限（100MB），本版跳过 Gitee 同步；GitHub Release 资产完整，不影响下载与自动更新。"
-            exit 0
-          }
-          # 以前这里是「没配 token 就静默跳过、这一步仍显示成功」——
-          # v0.3.4 就这样在 Gitee 上悄悄少了一个版本，事后才发现。
-          # 现在缺 token 直接让这一步失败，宁可红一次也别再无声无息。
-          if (-not $env:GITEE_TOKEN) {
-            Write-Error "缺少 GITEE_TOKEN：Gitee 这一版不会有安装包。请在 Settings → Secrets and variables → Actions 添加 GITEE_TOKEN（勾选 projects + pull_requests 之外的 releases 权限即可）。"
-            exit 1
-          }
-          # 发布说明与 GitHub 用同一份，别让 Gitee 那边只剩一句「便携版安装包」
-          $notes = ".github/release-notes-$tag.md"
-          if (Test-Path $notes) {
-            node tools/publish-gitee.js $tag --zip $zip --notes $notes
-          } else {
-            node tools/publish-gitee.js $tag --zip $zip
-          }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   full:
     name: 构建完整版（内置运行时，离线开箱即用）
@@ -129,6 +111,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      - name: 解析版本号
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v\d') {
+            if ("${{ github.ref_type }}" -eq 'tag') { $tag = "v$tag" }
+            else { $tag = "v" + (node -p "require('./package.json').version") }
+          }
+          "TAG=$tag" >> $env:GITHUB_ENV
+          Write-Output "发布版本：$tag"
 
       - name: 安装依赖
         run: npm ci
@@ -177,8 +170,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          $tag = $env:TAG
           $setup = Get-ChildItem dist/release/*Setup.exe | Select-Object -First 1
           if (-not $setup) { Write-Error "未找到 Setup.exe"; exit 1 }
           Write-Output ("上传 {0} ({1:N0} MB)" -f $setup.Name, ($setup.Length / 1MB))
@@ -197,8 +189,7 @@ jobs:
       - name: 打包运行时整包（轻量版下载源）
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          $tag = $env:TAG
           $zip = "ApkStart-runtime-$tag.zip"
           if (-not (Test-Path "build\runtime\emulator\emulator.exe")) { Write-Error "build\runtime 不完整"; exit 1 }
           tar.exe -a -cf $zip -C "build\runtime" .
@@ -210,8 +201,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          $tag = $env:TAG
           $zip = "ApkStart-runtime-$tag.zip"
           $ok = $false
           for ($i = 1; $i -le 3 -and -not $ok; $i++) {

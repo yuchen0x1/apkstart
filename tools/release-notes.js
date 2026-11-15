@@ -1,0 +1,139 @@
+'use strict';
+/**
+ * 生成规范化发行说明（GitHub Release body / 应用内「软件更新」共用一份）。
+ *
+ * 为什么要这个脚本：发行说明的来源曾经有三种——手写 .github/release-notes-*.md、
+ * CHANGELOG.md 对应段落、gh --generate-notes 兜底——正文开头的标题有的带「发行说明」、
+ * 有的裸标题、有的干脆只剩一句没用的 "Full Changelog"，每个版本发布出去格式都不一样。
+ * 这里统一成一条规则：
+ *
+ *   1. 优先 `.github/release-notes-<tag>.md`（手写的完整发行说明）；
+ *   2. 其次 CHANGELOG.md 里该版本的段落（内容原样，去掉标题行）；
+ *   3. 最后 git log 兜底（上个 tag 到本 tag 的提交列表，而不是自动生成的废话）。
+ *
+ * 产出的正文一律**不带重复的版本大标题**：GitHub Release 名称、
+ * 应用内「更新日志（vX.Y.Z）」都已经写了版本号，正文再来一行 `# ApkStart vX.Y.Z`
+ * 只会让每个页面上的版本号都出现两遍。
+ *
+ * 用法：
+ *   node tools/release-notes.js v0.6.4 [--out RELEASE_NOTES.md] [--repo owner/repo] [--root 目录]
+ */
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+const DEFAULT_REPO = 'yuchen0x1/apkstart';
+
+/** 去掉正文开头重复的 H1 版本标题（`# ApkStart v0.6.4` / `# ApkStart v0.3.5 发行说明`） */
+function stripTitle(raw) {
+  let s = String(raw || '').replace(/^﻿/, '').replace(/\r\n?/g, '\n');
+  s = s.replace(/^#\s+[^\n]*\n+/, '');
+  return s;
+}
+
+/** 收尾规整：去首尾空白、折叠 3 个以上连续空行、保证单个结尾换行 */
+function tidy(raw) {
+  let s = String(raw || '').replace(/\r\n?/g, '\n').trim();
+  s = s.replace(/\n{3,}/g, '\n\n');
+  return s ? `${s}\n` : '';
+}
+
+/** 1) 手写发行说明文件 */
+function fromFile(root, tag) {
+  const p = path.join(root, '.github', `release-notes-${tag}.md`);
+  if (!fs.existsSync(p)) return null;
+  return tidy(stripTitle(fs.readFileSync(p, 'utf8')));
+}
+
+/**
+ * 2) CHANGELOG.md 里该版本的段落。
+ * 标题形如 `## [0.6.4] — 2026-11-16`，合并条目 `## [0.3.4] / [0.3.3] — 2026-11-14`，
+ * 末尾还有 `## [0.2.6] 及更早` 这类打包段——只要标题标签里含 [X.Y.Z] 就算命中。
+ */
+function fromChangelog(root, tag) {
+  const p = path.join(root, 'CHANGELOG.md');
+  if (!fs.existsSync(p)) return null;
+  const ver = String(tag).replace(/^v/i, '');
+  const lines = fs.readFileSync(p, 'utf8').replace(/\r\n?/g, '\n').split('\n');
+  const hit = new RegExp(`^## .*\\[${ver.replace(/\./g, '\\.')}\\]`);
+  const isHeading = (l) => /^## /.test(l);
+  const isFooter = (l) => /^\[\d+\.\d+\.\d+[^\]]*\]:\s/.test(l);
+  let i = lines.findIndex((l) => hit.test(l));
+  if (i < 0) return null;
+  const out = [];
+  for (let j = i + 1; j < lines.length; j += 1) {
+    if (isHeading(lines[j]) || isFooter(lines[j])) break;
+    out.push(lines[j]);
+  }
+  return tidy(out.join('\n'));
+}
+
+function git(root, args) {
+  try {
+    return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+/** 3) git log 兜底：上个 tag 到本 tag 的提交列表 */
+function fromGit(root, tag, repo) {
+  const prev = git(root, ['describe', '--tags', '--abbrev=0', `${tag}^`]);
+  const range = prev ? `${prev}..${tag}` : tag;
+  const log = git(root, ['log', '--pretty=format:- %s (%h)', range]);
+  if (!log) return null;
+  const head = '## 更新内容\n\n';
+  const url = `https://github.com/${repo}/compare/${prev}...${tag}`;
+  const tail = prev ? `\n\n完整变更记录：${url}\n` : `\n\n${url}\n`;
+  return `${head}${log}${tail}`;
+}
+
+/**
+ * 组装发行说明。返回 { body, source }：
+ * source ∈ 'release-notes' | 'changelog' | 'git-log'，CI 日志里能看出用的是哪条路。
+ */
+function buildNotes(opts = {}) {
+  const root = opts.root || path.resolve(__dirname, '..');
+  const tag = String(opts.tag || '').replace(/^v/i, '');
+  const repo = opts.repo || DEFAULT_REPO;
+  if (!/^\d+\.\d+\.\d+/.test(tag)) throw new Error(`版本号不合法：${opts.tag}`);
+  const vtag = `v${tag}`;
+  const attempts = [
+    ['release-notes', () => fromFile(root, vtag)],
+    ['changelog', () => fromChangelog(root, vtag)],
+    ['git-log', () => fromGit(root, vtag, repo)],
+  ];
+  for (const [source, fn] of attempts) {
+    const body = fn();
+    if (body && body.trim()) return { body: tidy(body), source };
+  }
+  throw new Error(`找不到 ${vtag} 的任何发行说明来源（release-notes 文件 / CHANGELOG / git log）`);
+}
+
+module.exports = { buildNotes, stripTitle, tidy, fromFile, fromChangelog, fromGit };
+
+if (require.main === module) {
+  const argv = process.argv.slice(2);
+  const tag = argv.find((a) => /^v?\d/.test(a)) || '';
+  const arg = (name, dflt) => {
+    const i = argv.indexOf(name);
+    return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
+  };
+  try {
+    const { body, source } = buildNotes({
+      tag,
+      root: arg('--root', undefined),
+      repo: arg('--repo', DEFAULT_REPO),
+    });
+    const out = arg('--out', '');
+    if (out) {
+      fs.writeFileSync(out, body, 'utf8');
+      console.log(`发行说明已写入 ${out}（来源：${source}，${body.length} 字符）`);
+    } else {
+      process.stdout.write(body);
+    }
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+}
