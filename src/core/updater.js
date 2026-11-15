@@ -206,8 +206,55 @@ class Updater {
       this.onProgress({ stage: 'ready', percent: 100, message: '更新包已解压并通过校验' });
       return { mode: 'zip', payload: out, version: it.version, sha256: this.sha256, zip: file };
     }
-    this.onProgress({ stage: 'ready', percent: 100, message: '安装包已下载完成' });
-    return { mode: 'setup', payload: file, version: it.version };
+    // 安装版：交给外部 NSIS 之前必须先确认「这确实是一份完整的 Windows 程序」。
+    // 一个半截下载 / 错误页被当成 Setup.exe 执行时，安装器会先卸旧再解压失败，
+    // 结果就是安装目录被清空、程序再也起不来。
+    this._assertSetup(file, it.asset);
+    this.sha256 = await sha256File(file);
+    try { fs.writeFileSync(`${file}.sha256`, this.sha256); } catch (_) { /* 校验文件写不了不影响主流程 */ }
+    this.onProgress({
+      stage: 'ready', percent: 100,
+      message: `安装包已校验：SHA-256 ${this.sha256.slice(0, 16)}…`,
+    });
+    return { mode: 'setup', payload: file, version: it.version, sha256: this.sha256 };
+  }
+
+  /**
+   * 安装包（Setup.exe）的下载后校验。
+   *
+   * 便携包有「解压 + 逐条 CRC + 载荷结构」三重校验，安装包此前是裸奔的：
+   * 下载完直接 `Start-Process /S`。这里补上最小但有效的几项 ——
+   * 体积下限、与发布信息的大小一致、MZ 头、PE 签名位置。
+   * 不能覆盖 NSIS 数据区自身损坏（那要靠安装器报错），但能挡住
+   * 「下到一半」「拿到 HTML 错误页」「文件被截断」这类真实故障，
+   * 剩下的风险由 apply() 里的「装前备份 + 装后校验 + 失败回滚」兜住。
+   */
+  _assertSetup(file, asset = {}) {
+    if (!file || !fs.existsSync(file)) throw new Error('安装包不存在，已取消更新');
+    const st = fs.statSync(file);
+    if (!st.size) throw new Error('下载到的安装包是空文件，请重试');
+    if (st.size < 256 * 1024) {
+      throw new Error(`安装包体积异常（${st.size} 字节），可能只下到一半或拿到了错误页，请重试`);
+    }
+    const known = new Set(
+      [asset.size, ...Object.values(asset.sizes || {}).map(Number)].filter((n) => Number(n) > 0),
+    );
+    // GitHub 与 Gitee 压出来的字节数不同：等于其中任意一个已知大小即可
+    if (known.size && !known.has(st.size)) {
+      throw new Error(`安装包大小异常（${st.size} 字节，期望 ${[...known].join(' 或 ')}），可能下载不完整，请重试`);
+    }
+    const head = Buffer.alloc(8192);
+    const fd = fs.openSync(file, 'r');
+    let n = 0;
+    try { n = fs.readSync(fd, head, 0, head.length, 0); } finally { fs.closeSync(fd); }
+    if (n < 64 || head.toString('latin1', 0, 2) !== 'MZ') {
+      throw new Error('安装包不是有效的 Windows 程序（缺少 MZ 头），已取消更新');
+    }
+    const peOff = head.readUInt32LE(0x3c); // e_lfanew
+    if (peOff < 0x40 || peOff + 4 > n || head.toString('latin1', peOff, peOff + 4) !== 'PE\0\0') {
+      throw new Error('安装包不是有效的 Windows 程序（PE 头损坏），已取消更新');
+    }
+    return { size: st.size };
   }
 
   /**
@@ -365,6 +412,8 @@ class Updater {
     if (job.mode === 'zip') {
       if (!job.payload || !fs.existsSync(job.payload)) throw new Error('更新载荷不存在，已取消更新');
       this._assertPayload(job.payload, { version: job.version });
+    } else if (job.mode === 'setup') {
+      this._assertSetup(job.payload, (this.latest && this.latest.asset) || {});
     }
 
     const lines = [
@@ -415,11 +464,54 @@ class Updater {
         `Remove-Item -LiteralPath $src -Recurse -Force`,
       );
     } else {
+      // 安装版：安装器是外部进程，它「先卸旧、再解新」。中途任何一步失败
+      // （磁盘空间不足、杀软拦截、安装包数据区损坏、UAC 被拒）都会把安装目录
+      // 留成空的 —— 0.6.1 → 0.6.2 实测事故，用户重启就再也打不开。
+      // 所以这里不再「下载完就无脑跑 /S」，而是：
+      //   1) 先把现有程序备份出来（跳过 1.4GB 的 resources\runtime，它能重下）
+      //   2) 跑安装器，读 exit code
+      //   3) 装完核对 exe 是否还在、package.json 的 version 是否等于目标版本
+      //   4) 任一不符 → 从备份整目录还原，回到旧版，仍然能启动
+      const bak = path.join(this.updateDir, `backup-${job.version}`);
+      const runtimeDir = path.join(dir, 'resources', 'runtime');
+      const appDir = path.join(dir, 'resources', 'app');
+      const pkgJson = path.join(appDir, 'package.json');
       lines.push(
-        `Note 'run installer'`,
-        `$p = Start-Process -FilePath ${psq(job.payload)} -ArgumentList '/S' -PassThru -Wait`,
-        `Note ("installer exit " + $p.ExitCode)`,
-        `Start-Sleep -Milliseconds 800`,
+        `$dst = ${psq(dir)}`,
+        `$bak = ${psq(bak)}`,
+        `$probe = ${psq(exe)}`,
+        `$pkg = ${psq(pkgJson)}`,
+        `$want = ${psq(String(job.version || '').replace(/^v/i, ''))}`,
+        `$ok = $false`,
+        `Note 'installer: backup first'`,
+        `$null = robocopy $dst $bak /E /XD ${psq(runtimeDir)} /NFL /NDL /NJH /NJS /R:1 /W:1`,
+        `$hasBak = Test-Path -LiteralPath (Join-Path $bak ${psq(path.basename(exe))})`,
+        // 二级兜底：robocopy 整目录失败时，至少把「能启动」必需的东西留一份
+        `if (-not $hasBak -and (Test-Path -LiteralPath $probe)) {`,
+        `  New-Item -ItemType Directory -Force -Path $bak | Out-Null`,
+        `  Copy-Item -LiteralPath $probe -Destination (Join-Path $bak ${psq(path.basename(exe))}) -Force`,
+        `  if (Test-Path -LiteralPath ${psq(appDir)}) { Copy-Item -LiteralPath ${psq(appDir)} -Destination ${psq(path.join(bak, 'resources', 'app'))} -Recurse -Force }`,
+        `  $hasBak = Test-Path -LiteralPath (Join-Path $bak ${psq(path.basename(exe))})`,
+        `}`,
+        `Note ("backup ok=" + $hasBak)`,
+        `if ($hasBak -or -not (Test-Path -LiteralPath $probe)) {`,
+        `  Note 'run installer'`,
+        `  $p = Start-Process -FilePath ${psq(job.payload)} -ArgumentList '/S' -PassThru -Wait`,
+        `  Note ("installer exit " + $p.ExitCode)`,
+        `  Start-Sleep -Milliseconds 500`,
+        `  $gotVer = ''`,
+        `  if (Test-Path -LiteralPath $pkg) { try { $gotVer = [string]((Get-Content -Raw -LiteralPath $pkg | ConvertFrom-Json).version) } catch { } }`,
+        `  $size = 0`,
+        `  if (Test-Path -LiteralPath $probe) { $size = (Get-Item -LiteralPath $probe).Length }`,
+        `  Note ("after install: exe=" + $size + " ver=" + $gotVer)`,
+        `  if ($size -gt 0 -and ($gotVer.Trim() -eq '' -or $gotVer.Trim() -eq $want)) { $ok = $true }`,
+        `  if (-not $ok -and $hasBak) {`,
+        `    Note 'verify failed, rolling back to previous version'`,
+        `    $null = robocopy $bak $dst /E /NFL /NDL /NJH /NJS /R:1 /W:1`,
+        `    Note 'rollback done'`,
+        `  }`,
+        `} else { Note 'backup unavailable, install skipped' }`,
+        `if ($ok) { Remove-Item -LiteralPath $bak -Recurse -Force }`,
       );
     }
 
