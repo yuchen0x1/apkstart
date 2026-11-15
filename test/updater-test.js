@@ -362,7 +362,10 @@ async function main() {
     const okScript = u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false, waitPid: 999999 })
       .replace(/^[ \t]*\$p = Start-Process .*$/m, [
         `  $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\\cmd.exe') -ArgumentList '/c exit 0' -PassThru -Wait`,
-        `  '{"version":"9.9.9"}' | Set-Content -LiteralPath $pkg -Encoding UTF8`,
+        // 故意写成「真实产物那样的 UTF-8 无 BOM + 中文」：PS 5.1 默认按 GBK 读会把
+        // JSON 结构读坏、版本号读成空，从而让「装后核对」这一步静默失效。
+        `  $body = '{"name":"apkstart","version":"9.9.9","description":"极致轻量的 Windows 安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行"}'`,
+        `  [IO.File]::WriteAllText($pkg, $body, (New-Object System.Text.UTF8Encoding($false)))`,
       ].join('\r\n'));
     assert(!/Start-Process -FilePath '[^']*Setup\.exe'/.test(okScript), '测试应替换掉真实的安装器调用');
     const r = runScript(okScript);

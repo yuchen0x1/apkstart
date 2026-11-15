@@ -5,6 +5,29 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.4] — 2026-11-16
+
+> 0.6.3 的「装后版本核对」在中文环境下是失效的。这个问题只有拿真实的 1.4GB 安装包
+> 真机装一遍才会暴露 —— 单元测试里用纯 ASCII 的 JSON 完全测不出来。本版修掉它。
+
+### 修复
+- **安装版更新后的版本核对永远读到空值**：生成的脚本用
+  `Get-Content -Raw | ConvertFrom-Json` 读 `resources\app\package.json`，而 Windows
+  PowerShell 5.1 的 `Get-Content` 默认按 ANSI(GBK) 解码。`package.json` 里的中文描述
+  被解成乱码后连带破坏了 JSON 结构（实测报「未终止的字符串」），`version` 于是读成空。
+  而核对逻辑对空值是宽容的（为了兼容没有 package.json 的旧包），结果就是
+  **「只看 exe 在不在」** —— 装错版本也不会回滚。改成
+  `[IO.File]::ReadAllText($pkg, [Text.Encoding]::UTF8)` 显式按 UTF-8 读；
+  `catch` 里把失败原因写进 `update.log`，下次读不到能直接看到原因。
+- 测试补上真实形态的回归：成功路径写入「UTF-8 无 BOM + 完整中文描述」的
+  `package.json`。已验证这版测试在旧实现下会失败、新实现下通过。
+
+### 验证
+- 用真实的 `ApkStart-0.6.3-Setup.exe`（1,492,979,083 字节）在本机安装版上跑完整流程：
+  `backup ok=True` → `installer exit 0` → `after install: exe=250400768 ver=0.6.3`
+  → 备份清理 → 程序正常启动。备份实测：**0.6 秒 / 334MB**（正确跳过 6.4GB 的
+  `resources\runtime`）。
+
 ## [0.6.3] — 2026-11-16
 
 > 0.6.2 修好了黑屏，但更新器本身还留着一个能让人「更新完就打不开」的坑。

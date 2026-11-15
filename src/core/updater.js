@@ -504,7 +504,13 @@ class Updater {
         `  Note ("installer exit " + $p.ExitCode)`,
         `  Start-Sleep -Milliseconds 500`,
         `  $gotVer = ''`,
-        `  if (Test-Path -LiteralPath $pkg) { try { $gotVer = [string]((Get-Content -Raw -LiteralPath $pkg | ConvertFrom-Json).version) } catch { } }`,
+        // 必须显式按 UTF-8 读：Windows PowerShell 5.1 的 Get-Content 默认用 ANSI(GBK)，
+        // package.json 里的中文会被解成乱码、连带把 JSON 结构弄坏（实测报
+        // 「应为“:”或“}”」），版本号就永远读成空 —— 核对等于没做。
+        `  if (Test-Path -LiteralPath $pkg) {`,
+        `    try { $gotVer = [string]((ConvertFrom-Json ([IO.File]::ReadAllText($pkg, [Text.Encoding]::UTF8))).version) }`,
+        `    catch { Note ("read version failed: " + ($_.Exception.Message -replace '\\r?\\n', ' ')) }`,
+        `  }`,
         `  $size = 0`,
         `  if (Test-Path -LiteralPath $probe) { $size = (Get-Item -LiteralPath $probe).Length }`,
         `  Note ("after install: exe=" + $size + " ver=" + $gotVer)`,
