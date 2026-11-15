@@ -235,7 +235,12 @@ function chooseProfile({
     gpu,
     gpuCandidates: gpus,
     gpuPinned,
-    accel: accelOk ? 'auto' : 'off',
+    // Windows emulator 37.x 不应依赖隐式默认值：检测到 WHPX/AEHD 时明确
+    // 传 `-accel on`，否则某些环境会悄悄走 TCG，开机时间从几十秒变成数分钟。
+    // 没有硬件加速时保留 `off` 作为诊断/重试状态，但由 emulator.js 不再强制
+    // 传 `-accel off`；让官方 emulator 自己选择可用的 TCG 路径，避免部分机器
+    // 因显式 `-accel off` 在 guest 刚启动时触发 0xC0000005。
+    accel: accelOk ? 'on' : 'off',
     accelOk,
     port,
     adbPort,
@@ -300,7 +305,7 @@ function planVariants(profile, { preferSoftware = false } = {}) {
     }
   }
   for (const gpu of ordered) {
-    out.push({ ...profile, gpu, label: `${gpu} / ${profile.accel === 'auto' ? '硬件加速' : '软件模拟'}`, wipe: false, snapshot: true });
+    out.push({ ...profile, gpu, label: `${gpu} / ${profile.accel === 'on' ? '硬件加速' : '软件模拟'}`, wipe: false, snapshot: true });
   }
   out.push({
     ...profile,

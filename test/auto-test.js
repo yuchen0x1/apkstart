@@ -65,7 +65,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const host = { totalMB: 65536, freeMB: 50000, cores: 32, home: 'C:\\x', homeAscii: true, tmp: TMP, platform: 'win32', arch: 'x64', rdp: false };
     const p = doctor.chooseProfile({ host, accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 200000, port: 5554, adbPort: 5044 });
     assert(p.memoryMB <= 3072 && p.cores <= 4, `高配也应封顶：${p.memoryMB}MB / ${p.cores}核`);
-    assert(p.accel === 'auto');
+    assert(p.accel === 'on');
   });
 
   await test('可见嵌入模式优先使用 swangle（软件渲染但 WebView 合成正常）', () => {
@@ -477,6 +477,10 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/-gpu software/.test(fresh));
     assert(!/swiftshader_indirect/.test(fresh));
     assert(/-memory 2048/.test(fresh) && /-cores 2/.test(fresh));
+    const hardware = emu.buildArgs({ gpu: 'host', memoryMB: 2048, cores: 2, accel: 'on', snapshot: false }).join(' ');
+    assert(/-accel on/.test(hardware), '检测到硬件加速时必须显式传 -accel on');
+    const software = emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, accel: 'off', snapshot: false }).join(' ');
+    assert(!/-accel off/.test(software), '软件回退不能强制传 -accel off（部分机器会崩溃）');
     if (!emu.hasSnapshot()) {
       // 没有快照时必须「只禁加载、不禁保存」：-no-snapshot 会连退出自动保存一起关掉，
       // 那样第一次冷启动结束后永远产生不了快照，用户每次点开都是全量引导。

@@ -14,7 +14,7 @@ const { URL } = require('url');
 const UA = 'ApkStart/0.3 (Windows; +https://github.com/yuchen0x1/apkstart)';
 const proxyMod = require('./proxy');
 
-function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy = false } = {}) {
+function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy = false, timeout = 30000 } = {}) {
   return new Promise((resolve, reject) => {
     if (redirects > 6) return reject(new Error('重定向次数过多'));
     const u = new URL(url);
@@ -42,27 +42,42 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
         // 默认的 createConnection 会拿请求里的 host:port（代理地址）直接做 TLS 握手 —— 必挂。
         // 覆盖实例方法：先 CONNECT 隧道，再在隧道上 TLS（servername=目标域名），返回已握手的 TLSSocket。
         tunnelAgent.createConnection = (opts2, cb2) => {
+          // 隧道/TLS 握手阶段没有 socket，request 层的 timeout 事件不会触发，
+          // 必须自己设死线，否则 CONNECT 挂死会让整块下载永久卡住。
+          let done2 = false;
+          const deadline = setTimeout(() => {
+            if (done2) return;
+            done2 = true;
+            cb2(new Error('代理隧道建立超时'));
+          }, timeout);
+          const ok2 = (sock) => { if (!done2) { done2 = true; clearTimeout(deadline); cb2(null, sock); } };
+          const fail2 = (e) => { if (!done2) { done2 = true; clearTimeout(deadline); cb2(e); } };
           proxyMod.tunnel(proxy, u.hostname, 443).then((raw) => {
             const ts = tls.connect({ socket: raw, servername: u.hostname });
-            ts.once('secureConnect', () => cb2(null, ts));
-            ts.once('error', (e) => cb2(e));
-          }, (e) => cb2(e));
+            ts.once('secureConnect', () => ok2(ts));
+            ts.once('error', fail2);
+          }, fail2);
         };
         req = https.request({
           host: proxy.host, port: proxy.port, method,
           path: u.pathname + u.search,
-          headers: { ...base.headers, Host: u.host }, agent: tunnelAgent, timeout: 30000,
+          headers: { ...base.headers, Host: u.host }, agent: tunnelAgent, timeout,
         }, (res) => finishReq(res, req));
       } else if (proxy && u.protocol === 'http:') {
         // http 经代理：绝对路径转发
         req = http.request({
           host: proxy.host, port: proxy.port, method,
           path: u.href, headers: { ...base.headers, Host: u.host },
-          agent: false, timeout: 30000,
+          agent: false, timeout,
         }, (res) => finishReq(res, req));
       } else {
-        req = mod.request(url, { ...base, timeout: 30000 }, (res) => finishReq(res, req));
+        req = mod.request(url, { ...base, timeout }, (res) => finishReq(res, req));
       }
+      // 连接阶段的兜底：timeout 事件没人监听就不会销毁请求 —— TCP 建立但
+      // 响应不来（被墙/隧道挂死）时 fetchChunk 的空闲看门狗还没启动（它要等
+      // 响应头回来才创建），整块下载会永久挂住（实测踩过：8 块下完 7 块，
+      // 剩一块挂着 12 分钟无任何网络活动）。所以必须在请求层 destroy。
+      req.on('timeout', () => req.destroy(new Error('连接超时')));
       req.on('error', (e) => {
         // 代理连不通（没开代理软件/端口变了）：立即回退直连，不能让用户卡死。
         // 注意不能用宽泛的 /connect/i —— 'disconnected' 里也有 connect，会误匹配。

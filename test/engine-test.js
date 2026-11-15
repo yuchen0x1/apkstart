@@ -29,7 +29,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
 
 (async () => {
   console.log('\n[download.js]');
-  const { download, downloadParallel, downloadMulti, head, sha256File } = require('../src/core/download');
+  const { download, downloadParallel, downloadMulti, head, sha256File, openStream } = require('../src/core/download');
 
   // 本地 HTTP 服务模拟下载源（含 Range 续传）
   const payload = Buffer.alloc(300 * 1024);
@@ -86,6 +86,12 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       });
       res.write(payload.subarray(start, Math.min(start + 1024, payload.length)));
       return setTimeout(() => res.destroy(), 20);
+    }
+    // 黑洞端点：收到请求后永远不响应（模拟「TCP 通但被墙/隧道挂死」）。
+    // 回归：openStream 必须在 timeout 后销毁请求，而不是把调用方永久挂住。
+    if (req.url === '/blackhole') {
+      req.resume();
+      return; // 故意不 writeHead / 不 end
     }
     // 完整支持 start-end 的 Range（用于并行分块测试）
     if (req.url === '/ranged.bin') {
@@ -230,7 +236,20 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     assert(fs.readFileSync(dest).equals(payload), '应识别出预分配文件并重新完整下载');
   });
 
+  await test('黑洞端点：请求挂死必须在 timeout 内销毁，而不是永久卡住（真实 1.4GB 更新踩过）', async () => {
+    const t0 = Date.now();
+    let err = null;
+    try {
+      await openStream(`http://127.0.0.1:${port}/blackhole`, { timeout: 1500 });
+    } catch (e) { err = e; }
+    const took = Date.now() - t0;
+    assert(err, `挂死连接必须抛错（实际耗时 ${took}ms 仍未抛出 = 会永久卡住）`);
+    assert(/超时/.test(err.message), `错误应说明是超时：${err.message}`);
+    assert(took < 8000, `应在 timeout 后立刻抛错，实际耗时 ${took}ms`);
+  });
+
   server.close();
+  server.closeAllConnections();   // 黑洞端点还挂着连接，不关会撑住事件循环
 
   console.log('\n[provision.js]');
   const { Provisioner } = require('../src/core/provision');
@@ -429,15 +448,23 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     // 本测试假设「宿主机上没有真实模拟器」：ensure 会尝试接管 5554-5620 端口上的
     // 存活实例（adoptExisting），开发机自己跑着 ApkStart 时这个前提不成立（实测踩过
     // ——本机刚部署完自动开机，测试立刻挂）。检测到真实模拟器就跳过。
-    const portAlive = await new Promise((resolve) => {
-      const sock = net.connect({ host: '127.0.0.1', port: 5554 });
-      let done = false;
-      const fin = (v) => { if (done) return; done = true; try { sock.destroy(); } catch (_) { /* ignore */ } resolve(v); };
-      sock.setTimeout(200, () => fin(false));
-      sock.once('connect', () => fin(true));
-      sock.once('error', () => fin(false));
-    });
-    if (portAlive) { results.push('  ↷ 跳过：本机 5554 端口有真实模拟器在跑（ensure 会接管它）'); passed += 1; return; }
+    // 注意要扫整个偶数端口段：模拟器不一定落在 5554（实测：实例在 5556 上时跳过
+    // 检测漏了它，ensure 接管真实实例后返回 ok=true，用例假失败）。
+    const alive = await Promise.all(
+      Array.from({ length: 34 }, (_, i) => 5554 + i * 2).map((p) => new Promise((resolve) => {
+        const sock = net.connect({ host: '127.0.0.1', port: p });
+        let done = false;
+        const fin = (v) => { if (done) return; done = true; try { sock.destroy(); } catch (_) { /* ignore */ } resolve(v ? p : 0); };
+        sock.setTimeout(200, () => fin(false));
+        sock.once('connect', () => fin(true));
+        sock.once('error', () => fin(false));
+      })),
+    );
+    const hit = alive.filter(Boolean);
+    if (hit.length) {
+      results.push(`  ↷ 跳过：本机模拟器端口被真实实例占用（${hit.join(', ')}），ensure 会接管它`);
+      passed += 1; return;
+    }
     store.saveSettings({ runtime: { installed: false }, engine: { mode: 'builtin' } });
     const rt = new Runtime(TMP);
     // 用假 adb 保证 isOnline 快速失败

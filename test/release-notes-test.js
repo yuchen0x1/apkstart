@@ -130,6 +130,13 @@ test('真实仓库：v0.6.4 走手写文件、正文无重复标题', () => {
   assert(!/^#\s/m.test(r.body), '正文不应再有 H1 标题');
 });
 
+test('真实仓库：当前版本 v0.6.5 有手写发行说明', () => {
+  const r = buildNotes({ tag: 'v0.6.5', root: ROOT });
+  assert.strictEqual(r.source, 'release-notes');
+  assert(r.body.includes('导入本地整包'), '发行说明应包含本版新增能力');
+  assert(!/^#\s/m.test(r.body), '正文不应再有 H1 标题');
+});
+
 console.log('\n[src/ui/app.js mdToHtml]');
 
 /** app.js 是浏览器脚本（无 module 导出），按标记把 mdToHtml 抽出来在 Node 里跑 */

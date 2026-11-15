@@ -661,6 +661,46 @@ class Provisioner {
   }
 
   /**
+   * 从本地导入运行时整包。适用于离线部署、内网机器和下载反复中断的情况；
+   * 导入包与 Release 中的 ApkStart-runtime-<tag>.zip 使用同一目录布局。
+   */
+  async importRuntimePack(zipPath, onProgress = () => {}) {
+    const p = this.ensureDirs();
+    const file = path.resolve(String(zipPath || ''));
+    if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+      throw new Error('运行时整包文件不存在');
+    }
+    if (!/\.zip$/i.test(file)) throw new Error('运行时整包必须是 ZIP 文件');
+    const size = fileSize(file);
+    if (size < 200 * 1024 * 1024) {
+      throw new Error(`运行时整包体积过小（${(size / 1048576).toFixed(1)}MB），可能不是完整运行时`);
+    }
+    await this.guardDisk('runtime', p.root);
+    onProgress({ stage: 'extract', message: '正在导入本地运行时整包…', percent: 2 });
+    await this.extractZip(file, p.root, {
+      onEntry: (_name, done, all) => {
+        if (done % 50 === 0 || done === all) {
+          onProgress({ stage: 'extract', message: `导入运行时 ${done}/${all}`, percent: Math.min(92, 2 + Math.round((done / Math.max(1, all)) * 90)) });
+        }
+      },
+    });
+    onProgress({ stage: 'extract', message: '展开系统镜像…', percent: 94 });
+    await this.materializeImages((m) => onProgress({ stage: 'extract', message: m, percent: 96 }));
+    this.ensureSoftwareOpenGL();
+    const env = await this.checkEnv();
+    if (!env.emulator.ok || !env.sysimg.ok) {
+      throw new Error(`导入后校验失败：${!env.emulator.ok ? '模拟器不可用' : ''}${!env.emulator.ok && !env.sysimg.ok ? '，' : ''}${!env.sysimg.ok ? '系统镜像缺失' : ''}`);
+    }
+    try {
+      fs.writeFileSync(path.join(p.root, '.runtime-pack.json'), JSON.stringify({
+        name: path.basename(file), imported: true, at: new Date().toISOString(),
+      }));
+    } catch (_) { /* 标记写不进去不影响使用 */ }
+    onProgress({ stage: 'done', message: '本地运行时已就绪', percent: 100 });
+    return { ok: true, path: file, root: p.root };
+  }
+
+  /**
    * 下载地址候选：直连优先，其次镜像前缀。
    * 走 Sources 统一处理，好处是「自动镜像（ghfast / gh-proxy）」与用户自定义前缀
    * 只在一个地方维护，且能和多线程下载共用同一份测速缓存。

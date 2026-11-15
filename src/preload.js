@@ -73,6 +73,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   downloadIso: () => invoke('provision:downloadIso'),
   createDisk: (gb) => invoke('provision:createDisk', gb),
   importIso: () => invoke('provision:importIso'),
+  importRuntimePack: () => invoke('provision:importRuntimePack'),
   importDisk: () => invoke('provision:importDisk'),
 
   selfCheck: () => invoke('doctor:selfCheck'),

@@ -722,5 +722,9 @@
   "：用": ": use",
   "：进度到 \u0001% 后点下面的「我已安装完成」（ApkStart 会自动重启并接管）": ": when it reaches \u0001% click “I've finished installing” below (ApkStart restarts and takes over).",
   "：选": ": choose",
-  "；询问是否使用 GPT 时选": "; when asked about GPT choose"
+  "；询问是否使用 GPT 时选": "; when asked about GPT choose",
+  "导入本地整包": "Import local runtime bundle",
+  "全自动：无需选择镜像、无需启用加速、无需调内存；也可导入本地运行时整包": "Fully automatic: no image to pick, no acceleration to enable, no memory to tune; you can also import a local runtime bundle",
+  "本地运行时已导入": "Local runtime imported",
+  "正在导入本地运行时整包…": "Importing local runtime bundle…"
 }

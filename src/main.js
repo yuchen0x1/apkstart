@@ -403,7 +403,7 @@ async function autoDeploy({ force = false } = {}) {
   deploying = true;
   const progress = (p) => send('provision:progress', { ...p, component: p.component || 'all' });
   try {
-    const env = await runtime.provisioner.checkEnv();
+    let env = await runtime.provisioner.checkEnv();
     const needEngine = !env.emulator.ok || !env.sysimg.ok;
     // 轻量版优先用「本项目 GitHub 的运行时整包」：一个文件搞定 emulator + 系统镜像，
     // 下载源和更新源统一在 GitHub 上（国内比 dl.google.com 稳得多）。
@@ -413,6 +413,9 @@ async function autoDeploy({ force = false } = {}) {
         progress({ message: '正在从 GitHub 下载运行时…' });
         await runtime.provisioner.installRuntimePack(progress);
         const afterPack = await runtime.provisioner.checkEnv();
+        // 运行时整包可能只落下 emulator 或系统镜像的一半。后续官方源补齐时
+        // 必须使用这次检查的最新结果，否则会再次下载已经存在的组件（#66）。
+        env = afterPack;
         if (afterPack.emulator.ok && afterPack.sysimg.ok) return { ok: true, source: 'github' };
         progress({ message: '运行时整包不完整，改用官方源补齐…' });
       } catch (e) {
@@ -2202,6 +2205,20 @@ function registerIpc() {
     }
   });
 
+  ipcMain.handle('provision:importRuntimePack', async () => {
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择 ApkStart 运行时整包',
+      filters: [{ name: '运行时整包', extensions: ['zip'] }],
+      properties: ['openFile'],
+    });
+    if (r.canceled) return { ok: false, canceled: true };
+    try {
+      return { ok: true, ...await runtime.provisioner.importRuntimePack(r.filePaths[0], (p) => send('provision:progress', { ...p, component: 'runtime' })) };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
   ipcMain.handle('provision:importDisk', async () => {
     const r = await dialog.showOpenDialog(mainWindow, {
       title: '选择已安装 Android 的虚拟磁盘',
@@ -2302,7 +2319,10 @@ function registerIpc() {
     try {
       try { await assoc.unregisterAssociation(); } catch (_) { /* 取消关联失败不影响卸载 */ }
       const exeDir = path.dirname(process.execPath);
-      const uninstaller = path.join(exeDir, 'uninstaller.exe');
+      // electron-builder NSIS 默认生成的是「Uninstall ApkStart.exe」，旧版只找
+      // uninstaller.exe，导致安装版被误判成便携版、卸载按钮实际什么也没做（#51）。
+      const uninstallerName = fs.readdirSync(exeDir).find((name) => /^Uninstall .*\.exe$/i.test(name));
+      const uninstaller = uninstallerName ? path.join(exeDir, uninstallerName) : '';
       if (!fs.existsSync(uninstaller)) {
         return { ok: true, portable: true, dataDir: store.DATA_DIR, exeDir };
       }

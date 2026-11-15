@@ -444,6 +444,20 @@ class EmulatorEngine {
         this.log(`userdata 扩容：文件 ${size} → ${wantBytes}，文件系统 ${fsBytes} → ${grown}`);
         return { ok: true, created: false, grown: true, size: wantBytes, fsBytes: grown };
       } catch (e) {
+        // 旧版/异常关机留下的 userdata 可能没有干净卸载，resize2fs 会明确要求
+        // 先跑 e2fsck。自动修复后重试一次，避免用户只能手动删掉整个 AVD（#46/#60）。
+        if (/e2fsck|run .*e2fsck|exit 8/i.test(String(e.message || e))) {
+          try {
+            this._e2fsck(img);
+            this._resize2fs(img);
+            userdata.setEncryptFlag(img);
+            const grown = userdata.fsBytes(img);
+            this.log(`userdata 先经 e2fsck 修复后扩容完成：${size} → ${wantBytes}`);
+            return { ok: true, created: false, grown: true, repaired: true, size: wantBytes, fsBytes: grown };
+          } catch (retry) {
+            e = retry;
+          }
+        }
         this.log(`扩容 userdata 失败（继续用现有分区）：${e.message}`);
         // 老分区仍然可用，但必须如实告诉调用方「这次没扩成」，不能让设置页显示成功
         return { ok: false, created: false, size, fsBytes, error: e.message };
@@ -480,6 +494,20 @@ class EmulatorEngine {
     if (r.status !== 0) throw new Error(`qemu-img ${op} 失败: ${(r.stderr || '').trim() || r.status}`);
   }
 
+  /** emulator 自带 e2fsck.exe：修复异常中断留下的 dirty userdata 后再扩容 */
+  _e2fsck(img) {
+    const bin = path.join(path.dirname(this.locate().emulatorExe), 'bin64');
+    const exe = path.join(bin, 'e2fsck.exe');
+    if (!fs.existsSync(exe)) throw new Error('缺少 e2fsck.exe');
+    const r = spawnSync(exe, ['-fy', img], {
+      cwd: bin, windowsHide: true, encoding: 'utf8', timeout: 180000,
+    });
+    // e2fsck: 0=clean, 1=修复完成；2/4/8 都表示不能安全继续。
+    if (r.status !== 0 && r.status !== 1) {
+      throw new Error(`e2fsck 失败: ${(r.stderr || r.stdout || '').trim() || r.status}`);
+    }
+  }
+
   /** emulator 自带 resize2fs.exe（cygwin 版，必须在 bin64 目录下跑才能找到 DLL） */
   _resize2fs(img) {
     const bin = path.join(path.dirname(this.locate().emulatorExe), 'bin64');
@@ -514,7 +542,6 @@ class EmulatorEngine {
       ANDROID_EMULATOR_HOME: avdHome,
       ANDROID_ADB_SERVER_PORT: adbPort,
       ANDROID_EMULATOR_USE_SYSTEM_LIBS: '',
-      ...(plan.accel === 'off' ? { ANDROID_I_WANT_MY_TCG: 'yes' } : {}),
       ...(hasSwGL ? { QT_OPENGL: 'software' } : {}),
     };
   }
@@ -594,7 +621,10 @@ class EmulatorEngine {
       args.push('-no-snapshot');
     }
     if (wipe) args.push('-wipe-data');
-    if (accel === 'off') args.push('-accel', 'off');
+    // 只在确认 WHPX/AEHD 可用时显式打开硬件加速。无加速时不传
+    // `-accel off`：emulator 37.x 在部分 Windows/显卡组合下会在 guest
+    // 刚开始执行时以 0xC0000005 崩溃；不传参数仍会走官方支持的 TCG 路径。
+    if (accel === 'on') args.push('-accel', 'on');
     return args;
   }
 

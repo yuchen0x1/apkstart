@@ -1636,6 +1636,21 @@ function bindEvents() {
 
   // 运行时部署：入口已收进设置，这里只处理面板内的按钮
   $('btnDeployAll').addEventListener('click', deployAll);
+  $('btnImportRuntimePack').addEventListener('click', async () => {
+    const btn = $('btnImportRuntimePack');
+    btn.disabled = true;
+    try {
+      const r = await api.importRuntimePack();
+      if (r.ok) {
+        toast({ title: '本地运行时已导入', body: r.root || '', type: 'ok' });
+        refreshStatus();
+      } else if (!r.canceled) {
+        toast({ title: '导入失败', body: r.error, type: 'error', sticky: true });
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
   const clr = $('btnClearDeployLog');
   if (clr) clr.addEventListener('click', () => { const b = $('deployLog'); if (b) b.innerHTML = ''; });
   $('btnMarkInstalled').addEventListener('click', markInstalled);
