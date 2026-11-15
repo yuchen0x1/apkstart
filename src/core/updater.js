@@ -209,14 +209,16 @@ class Updater {
     // 安装版：交给外部 NSIS 之前必须先确认「这确实是一份完整的 Windows 程序」。
     // 一个半截下载 / 错误页被当成 Setup.exe 执行时，安装器会先卸旧再解压失败，
     // 结果就是安装目录被清空、程序再也起不来。
-    this._assertSetup(file, it.asset);
+    const meta = this._assertSetup(file, it.asset);
     this.sha256 = await sha256File(file);
     try { fs.writeFileSync(`${file}.sha256`, this.sha256); } catch (_) { /* 校验文件写不了不影响主流程 */ }
     this.onProgress({
       stage: 'ready', percent: 100,
       message: `安装包已校验：SHA-256 ${this.sha256.slice(0, 16)}…`,
     });
-    return { mode: 'setup', payload: file, version: it.version, sha256: this.sha256 };
+    // size 带上「这次实际下到的字节数」：apply() 时 this.latest 可能已经指向更新的
+    // 版本（后台又查了一次），拿它的 size 校验这份旧载荷会误判成「大小异常」。
+    return { mode: 'setup', payload: file, version: it.version, sha256: this.sha256, size: meta.size };
   }
 
   /**
@@ -413,7 +415,9 @@ class Updater {
       if (!job.payload || !fs.existsSync(job.payload)) throw new Error('更新载荷不存在，已取消更新');
       this._assertPayload(job.payload, { version: job.version });
     } else if (job.mode === 'setup') {
-      this._assertSetup(job.payload, (this.latest && this.latest.asset) || {});
+      // 用 job.size（这次真正下到的字节数），而不是 this.latest.asset.size ——
+      // 后台若又查到了更新的版本，latest 已经换成别人的大小了。
+      this._assertSetup(job.payload, { size: job.size });
     }
 
     const lines = [

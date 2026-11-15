@@ -291,6 +291,16 @@ async function main() {
     assert(/installer exit/.test(script), '应记录安装器退出码');
   });
 
+  await test('apply(setup) 用载荷自身大小校验，不受「latest 漂移」影响', async () => {
+    const root = mkTmp();
+    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'), 400 * 1024);
+    const u = mkUpdater(root);
+    // 下载完之后后台又查到了 10.0.0：latest 的资产大小完全对不上这份载荷
+    u.latest = { version: '10.0.0', asset: { name: 'ApkStart-10.0.0-Setup.exe', size: 123, sizes: { 'https://x': 456 } } };
+    const script = u.apply({ mode: 'setup', payload: setup, version: '9.9.9', size: 409600 }, { spawn: false });
+    assert(/run installer/.test(script), '应正常生成安装脚本，而不是误判大小异常');
+  });
+
   console.log('\n[安装版脚本真机执行：模拟「装完目录被清空」]');
 
   /**
