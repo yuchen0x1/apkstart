@@ -520,7 +520,7 @@ public class ApkAgent
         if (_chromeRender == IntPtr.Zero || !IsWindow(_chromeRender))
             _chromeRender = FindChromeRender(_host);
         if (_chromeRender == IntPtr.Zero) return;
-        IntPtr ep = GetParent(_emu);
+        IntPtr ep = RealParent(_emu);
         if (ep == _chromeRender) return;
         if (ep != _host && ep != IntPtr.Zero) return;   // 别的宿主，别乱动
         RECT r, hr;
@@ -535,7 +535,7 @@ public class ApkAgent
     static void QuietSweep()
     {
         EnsureReparent();
-        IntPtr ep = _emu != IntPtr.Zero ? GetParent(_emu) : IntPtr.Zero;
+        IntPtr ep = RealParent(_emu);
         bool embedded = _emu != IntPtr.Zero && ep != IntPtr.Zero
                      && (ep == _host || ep == _chromeRender);
         bool ours = embedded || _follow;   // 跟随模式的窗口也是「正在给用户看画面」的，不能压
@@ -637,6 +637,15 @@ public class ApkAgent
         return "\"host\":" + h.ToInt64() + ",\"list\":[" + sb + "]";
     }
 
+    // 真·父窗口。**不能用 GetParent**：对 WS_POPUP 窗口它返回的是 owner，
+    // 而跟随模式恰好把宿主设成了 owner —— 于是「独立顶层窗口」会被误判成
+    // 「已经嵌进宿主」，坐标换算被跳过，画面被摆到屏幕左上角 (0,38)。
+    // GA_PARENT(1) 才是真正的父窗口（顶层窗口返回桌面，不是 owner）。
+    static IntPtr RealParent(IntPtr h)
+    {
+        return h == IntPtr.Zero ? IntPtr.Zero : GetAncestor(h, 1);
+    }
+
     // 模拟器的画面窗口**是否还存在**（不管可见、不管有没有被嵌进宿主）。
     // 这就是「无头运行时」的唯一判据：qemu 活着但窗口没了，之后每次 embed 都会失败，
     // 用户看到的永远是黑窗。
@@ -732,7 +741,7 @@ public class ApkAgent
         // 只有「确实已经嵌进我们窗口」或处于跟随模式的才允许显示。
         // 万一 embed 还没完成（模拟器窗口还没建好 / 句柄换了），Fit 绝不能把它当
         // 独立窗口顶到桌面上 —— 那正是用户看到的那个黑窗。
-        IntPtr ep = GetParent(_emu);
+        IntPtr ep = RealParent(_emu);
         bool embedded = ep != IntPtr.Zero && _host != IntPtr.Zero
                      && (ep == _host || ep == _chromeRender);
         if (!embedded && !_follow)
@@ -766,7 +775,7 @@ public class ApkAgent
     static void Refresh()
     {
         if (_emu == IntPtr.Zero) return;
-        IntPtr rp = GetParent(_emu);
+        IntPtr rp = RealParent(_emu);
         bool embedded = _host != IntPtr.Zero && (rp == _host || rp == _chromeRender);
         if (!embedded && !_follow) return;
         // 失焦时不调用 SetForegroundWindow/SetFocus：只让 Qt 子窗口重新参与同级
@@ -945,7 +954,7 @@ public class ApkAgent
         // not foreground, do nothing instead of typing into someone else's app.
         IntPtr fg = GetForegroundWindow();
         if (_host == IntPtr.Zero || (fg != IntPtr.Zero && GetAncestor(fg, 2) != _host)) return;
-        IntPtr host = _host != IntPtr.Zero ? _host : GetParent(_emu);
+        IntPtr host = _host != IntPtr.Zero ? _host : RealParent(_emu);
 
         uint emuTid, hostTid, dummy;
         emuTid = GetWindowThreadProcessId(_emu, out dummy);

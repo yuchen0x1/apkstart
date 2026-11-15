@@ -169,3 +169,38 @@ wipe 后首次开机联网正常（wlan0 10.0.2.16），快照已存。
    走内置 `repairNetwork`（wipe + 冷启动）恢复，与引擎注释的已知结论一致。
 
 安装方式：ApkStart UI 全流程（CDP 驱动 `apk:install` / `app:launch`）。
+
+## 8. 嵌入黑屏的真根因：`SetParent` 破坏渲染表面（2026-11-16）
+
+现象：应用窗口正常打开、标题栏正常、日志里 `embedded=true`，但画面整块是黑的。
+在这台机器（Windows 11 26xxx + emulator 37.x，`-gpu swangle` 与 `-gpu guest` 都一样）
+实测到的是**嵌入成功了但模拟器的渲染表面失效**，与窗口状态无关：
+
+| 状态 | 窗口句柄/尺寸/可见性 | `PrintWindow` 平均亮度 | 用户观感 |
+|---|---|---|---|
+| `SetParent` 嵌入后 | 全部正常，Qt 子窗口 `vis:true` | **21** | 黑屏 |
+| 摘掉父窗口（顶层） | 正常 | **84~130** | 画面正常 |
+| 跟随模式（不 reparent） | 正常 | 84~130 | 画面正常、点击有响应 |
+
+因此嵌入这条路在部分显卡/驱动组合上根本走不通，靠 `SetParent` 之后的任何
+`SetWindowPos` / `RedrawWindow` / 换 GPU 后端都救不回来。最终方案：
+
+1. 嵌入后用 `PrintWindow` + `GetDIBits` 采一次真实像素（只统计中间 76%，避开模拟器
+   自带的 8px 灰边——整块统计时纯黑也能测出 27，会把黑屏误判成正常）。
+2. 连续 5 次低于阈值（40）→ 调 `follow`：`SetParent(hwnd, 0)`、去掉 WS_CHILD、
+   `WS_EX_TOOLWINDOW`、`SetWindowLongPtr(GWLP_HWNDPARENT, host)` 设为宿主的被拥有窗口。
+3. 跟随模式下每 500ms 校准一次位置（`GetAncestor(hwnd, GA_PARENT)` 换算客户区→屏幕坐标），
+   始终贴合宿主客户区、跟随最小化/拖动。
+
+踩到的两个坑（都已修）：
+
+- `GetParent()` 对 `WS_POPUP` 返回的是 **owner**。跟随模式把宿主设成 owner 后，
+  「独立顶层窗口」被误判成「已嵌入」，坐标换算被跳过，画面被摆到屏幕左上角 (0,38)。
+  改用 `GetAncestor(hwnd, 1 /*GA_PARENT*/)`。
+- `SetParent(hwnd, 0)` 之后模拟器会**另外建一个**顶层窗口（默认出现在 (0,38)、
+  用自己算的尺寸），旧句柄仍然有效但不可见——只判断 `IsWindow` 永远发现不了，
+  所有 `SetWindowPos` 都打在那个看不见的旧窗口上。每次 Fit 先用 `FindEmulator`
+  认一遍真窗口。
+
+判定阈值与开关：`APKSTART_BLACK_MEAN`（默认 40）覆盖阈值，
+`APKSTART_NO_FOLLOW=1` 关掉自动降级（排查时用）。
