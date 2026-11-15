@@ -12,8 +12,9 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: 构建便携版并发布
+  # 先跑一次测试。测试通过后才创建 Release，避免失败的构建留下空 Release。
+  verify:
+    name: 测试
     runs-on: windows-latest
 
     steps:
@@ -24,37 +25,77 @@ jobs:
           node-version: 22
           cache: npm
 
-      # 统一解析一次版本号，后面所有步骤直接用 $env:TAG。
-      # workflow_dispatch 跑在分支上时 ref_name 是分支名，这里改从 package.json 取版本
-      # （显式 UTF-8 读——中文环境下 Get-Content 会按 GBK 解码把 JSON 读坏，见 0.6.4 的教训）。
-      - name: 解析版本号
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v\d') {
-            if ("${{ github.ref_type }}" -eq 'tag') { $tag = "v$tag" }
-            else { $tag = "v" + (node -p "require('./package.json').version") }
-          }
-          "TAG=$tag" >> $env:GITHUB_ENV
-          Write-Output "发布版本：$tag"
-
-      # 发行说明统一由 tools/release-notes.js 产出（手写 release-notes 文件 → CHANGELOG
-      # 段落 → git log 三级兜底），正文一律去掉重复的版本大标题。以前没有手写文件时
-      # 退回 gh --generate-notes，产出的只是「Full Changelog」一行废话，等于没有更新日志。
-      - name: 生成发行说明
-        shell: pwsh
-        run: |
-          node tools/release-notes.js $env:TAG --out RELEASE_NOTES.md
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Get-Content RELEASE_NOTES.md -TotalCount 8
-
-      - name: 安装依赖（含 Electron 运行时）
+      - name: 安装依赖
         run: npm ci
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       - name: 测试
         run: npm test
+
+  # Release 元数据单独准备，后面的便携版和完整版可以并行构建。
+  release:
+    name: 创建 Release
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 解析版本号
+        id: version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9] ]]; then
+            tag="v$(node -p "require('./package.json').version")"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "发布版本：$tag"
+
+      # 发行说明统一由 tools/release-notes.js 产出（手写 release-notes 文件 → CHANGELOG
+      # 段落 → git log 三级兜底），正文一律去掉重复的版本大标题。
+      - name: 生成发行说明
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: node tools/release-notes.js "$TAG" --out RELEASE_NOTES.md
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --json tagName -q .tagName >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "ApkStart $TAG" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$TAG" --title "ApkStart $TAG" --notes-file RELEASE_NOTES.md
+          fi
+
+  build:
+    name: 构建便携版并发布
+    needs: release
+    runs-on: windows-latest
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖（含 Electron 运行时）
+        run: npm ci
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       - name: 打包便携版
         run: npm run pack
@@ -71,27 +112,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Item "ApkStart-$tag-win64-portable.zip" | Select-Object Name, Length
 
-      # 创建 Release 并上传轻量便携版（壳层极小，运行时首次启动按需下载）。
-      # 名称统一「ApkStart <tag>」，正文一律用 RELEASE_NOTES.md——
-      # 不再走 --generate-notes（那只会生成「Full Changelog」一行废话）。
-      - name: 创建 Release
+      # Release 已由 release job 创建；便携版和完整版在这里并行上传各自资产。
+      - name: 上传轻量便携版到 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
           $tag = $env:TAG
           $zip = "ApkStart-$tag-win64-portable.zip"
-          $notes = "RELEASE_NOTES.md"
-          # 幂等：release 已存在（如重跑 / 重推 tag）就跳过 create，刷新说明并只上传资产
-          $existing = gh release view $tag --json tagName -q .tagName 2>$null
-          if (-not $existing) {
-            gh release create $tag --title "ApkStart $tag" --notes-file $notes
-            if ($LASTEXITCODE -ne 0) { exit 1 }
-          } else {
-            # 重跑时把发行说明一并刷新：改完 release-notes 再重跑 workflow 就能修好线上正文
-            gh release edit $tag --title "ApkStart $tag" --notes-file $notes
-            if ($LASTEXITCODE -ne 0) { exit 1 }
-          }
           $ok = $false
           for ($i = 1; $i -le 3 -and -not $ok; $i++) {
             gh release upload $tag $zip --clobber
@@ -102,8 +130,13 @@ jobs:
 
   full:
     name: 构建完整版（内置运行时，离线开箱即用）
+    needs: release
     runs-on: windows-latest
-    needs: build
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+      # electron-builder 的 NSIS/7-Zip 工具缓存放在工作区，便于 actions/cache 复用。
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\.cache\electron-builder
+
     steps:
       - uses: actions/checkout@v4
 
@@ -112,25 +145,31 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: 解析版本号
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v\d') {
-            if ("${{ github.ref_type }}" -eq 'tag') { $tag = "v$tag" }
-            else { $tag = "v" + (node -p "require('./package.json').version") }
-          }
-          "TAG=$tag" >> $env:GITHUB_ENV
-          Write-Output "发布版本：$tag"
-
       - name: 安装依赖
         run: npm ci
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
+      - name: 缓存 electron-builder 工具链
+        uses: actions/cache@v4
+        with:
+          path: .cache/electron-builder
+          key: ${{ runner.os }}-electron-builder-v1-${{ hashFiles('package-lock.json') }}
+
+      # 完整运行时约 1GB，最慢的是每版重新下载并压缩 system.img。
+      # 缓存键只由运行时构建逻辑和运行时兼容代码决定；普通应用/文档改动会直接命中缓存。
+      # 如果需要主动刷新上游 Android 运行时，把 runtime-v1 改成 runtime-v2。
+      - name: 恢复完整运行时缓存
+        id: runtime-cache
+        uses: actions/cache@v4
+        with:
+          path: build/runtime
+          key: ${{ runner.os }}-apkstart-runtime-v1-${{ hashFiles('build/fetch-runtime.js', 'build/prepare-runtime.js', 'build/slim-runtime.js', 'src/core/layers.js', 'src/core/provision.js', 'src/core/download.js', 'build/seed/userdata.img.gz', 'build/vendor/opengl32sw.dll') }}
+
       # 从 Google 官方源组装运行时（emulator + platform-tools + aehd + Play x86_64 镜像）。
-      # 输出到 engine/，与本地开发时的目录结构一致。
+      # 只有缓存未命中时才执行；命中时直接复用上一个版本已经验证过的运行时。
       - name: 组装运行时
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
         run: node build/fetch-runtime.js engine
 
       # prepare-runtime 会把 system.img/vendor.img 压成 xz(LZMA2)。
@@ -138,10 +177,30 @@ jobs:
       # XZ_TIMEOUT_MS 是看门狗：超时自动 kill 并落 gzip 兜底，
       # 绝不重演「stdin 没接 EOF → 0 字节输出 → 挂死 3 小时」。
       - name: 准备运行时（xz 压缩，CI 降档加速）
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
         run: node build/prepare-runtime.js --force
         env:
           XZ_PRESET: '6'
           XZ_TIMEOUT_MS: '3600000'
+
+      - name: 校验完整运行时
+        shell: pwsh
+        run: |
+          $required = @(
+            'build\runtime\emulator\emulator.exe',
+            'build\runtime\platform-tools\adb.exe'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) { throw "运行时缓存或构建产物缺少：$path" }
+          }
+          $images = @(
+            'build\runtime\system-images\android-34\google_apis_playstore\x86_64\system.img.xz',
+            'build\runtime\system-images\android-34\google_apis_playstore\x86_64\system.img.gz'
+          )
+          if (-not ($images | Where-Object { Test-Path $_ })) {
+            throw '运行时缓存或构建产物缺少 system.img 压缩文件'
+          }
+          Write-Output "完整运行时可用"
 
       # 内置微软 VC++ 2015-2022 x64 运行库：安卓模拟器（Qt6）与 qemu 都依赖它，
       # 缺了在「其他电脑」上会直接起不来（0xc0000135 / MSVCP140 缺失）。
@@ -157,9 +216,8 @@ jobs:
           if (-not (Test-Path $out) -or (Get-Item $out).Length -lt 1MB) { Write-Error "vc_redist 下载失败" }
           Get-Item $out | Select-Object Name, Length
 
-      # 不打 git tag 时 electron-builder 不会隐式发布；打了 tag 也会因为本 job 没有
-      # GH_TOKEN 而报 "GitHub Personal Access Token is not set" 后退出 1（之前完整版一直失败的根因）。
-      # 这里显式 --publish never，安装包由后面「上传完整版到 Release」步骤用 gh release upload 上传。
+      # 不打 git tag 时 electron-builder 不会隐式发布；这里显式 --publish never，
+      # 安装包由后面的上传步骤用 gh release upload 上传。
       - name: 构建完整版安装包
         run: npx electron-builder --win nsis --publish never
         env:
