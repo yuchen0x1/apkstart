@@ -1,284 +1,164 @@
-# ApkStart（增强分支）
+# ApkStart
 
-<p align="center"><img src="docs/images/logo.png" alt="ApkStart Logo" width="160" /></p>
+<p align="center"><strong>Windows 上的安卓应用运行器</strong><br/>双击 APK 即安装，应用以独立窗口和桌面图标运行。</p>
 
-[![CI](https://github.com/yuchen0x1/apkstart/actions/workflows/ci.yml/badge.svg)](https://github.com/yuchen0x1/apkstart/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/yuchen0x1/apkstart?include_prereleases&sort=semver)](https://github.com/yuchen0x1/apkstart/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6.svg)](#)
+<p align="center">
+  <a href="https://github.com/yuchen0x1/apkstart/releases"><img src="https://img.shields.io/github/v/release/yuchen0x1/apkstart?sort=semver" alt="Release" /></a>
+  <a href="https://github.com/yuchen0x1/apkstart/actions/workflows/ci.yml"><img src="https://github.com/yuchen0x1/apkstart/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6.svg" alt="Windows 10/11 x64" />
+</p>
 
-**Windows 上的安卓应用运行器 —— 让安卓应用像 Windows 原生软件一样被安装和使用。**
+ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管理所需的 Android 运行时，把安卓应用包装成可以从桌面、开始菜单或资源管理器直接打开的 Windows 应用。
 
-> 本仓库是 [RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart) 的**独立增强分支**（已脱离 fork 网络，自行维护与发版）。
-> 相比原项目新增/修复：首次运行引导向导、部署慢速逃生与多源测速、应用窗口鼠标点击修复、
-> Android 11+ 音量命令修复、在线自动更新、本地代理加速、多项安全加固（详见 [CHANGELOG.md](CHANGELOG.md)）。
-> 问题与建议请到 [Issues](https://github.com/yuchen0x1/apkstart/issues) 提交。
-> 开机失败时程序会自动生成一份**已脱敏**的诊断报告，可在修复窗口一键上报
-> （收集端见 [`collector/`](collector/README.md)，部署后失败会自动上报到你的仓库/邮箱）。
+> 当前版本：**0.6.6**。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 和 [发布说明](docs/releases/release-notes.md)。
 
-## 最新更新
+## 当前界面
 
-### 0.6.6 · 2026-11-16
+首次启动会显示三步引导：选择安装位置、自动下载运行时、开始使用。默认推荐剩余空间较大的非系统盘，避免把 C 盘占满。
 
-- 卸载时清理 ApkStart 生成的应用、运行时、模拟器、镜像、快照、日志、设置、共享目录和临时文件，并自动清除旧版留下的白板快捷方式。
-- 设置改为独立的全屏页面，内容更完整，使用更方便。
-- 完整版本历史见 [发布说明](docs/releases/release-notes.md)。
+<p align="center">
+  <img src="docs/images/onboarding.png" alt="ApkStart 首次运行引导" width="800" />
+</p>
 
-- 🖱️ **双击 .apk 即安装**：注册 .apk 文件关联后，在资源管理器里双击 APK，自动解析 → 安装 → 生成桌面图标，全程无需打开任何模拟器界面。
-- 🧩 **每个应用一个桌面图标**：图标从 APK 内部离线提取并转为多尺寸 ICO，双击桌面图标 = 直接启动该应用，与打开一个原生 Windows 软件的体验一致。
-- 🪟 **应用就是一个窗口**：运行时以**带窗口**模式启动（无头模式下 Android 不出 VSYNC，应用进程活着但屏幕上是空的），ApkStart 把这块窗口改标题、换真实应用图标、按竖屏比例摆好位置，就是一个独立应用窗口；**全屏**铺满屏幕高度并居中，**窗口模式**可自由拖动缩放且按应用记忆尺寸。
-- 🔍 **能被 Windows 搜到**：安装后同时创建桌面 + 开始菜单（`程序\ApkStart\`）快捷方式，按应用名在开始菜单搜索即可直达，任务栏按应用分组。
-- 📁 **数据互通**：`%USERPROFILE%\ApkStartShared` ↔ 安卓内 `/sdcard/ApkStartShared` 持续双向同步，安卓应用存下的文件直接出现在本机。同步按内容哈希（SHA-256）做三方合并，两侧都改会保留两份并生成冲突副本，不会静默覆盖你的文件。
-- 🩺 **装之前先告诉你行不行**：选好 APK 后先做兼容性检查——系统版本够不够、原生库是 ARM 还是 x86（要不要走转译层）、是否依赖 Google Play 服务、是否要求摄像头/GPS/蓝牙、是不是拆分 APK 的分片。结论分「完全兼容 / 基本兼容 / 可能有问题 / 暂不支持」四档并给出理由；拿不准的标「未知」，不编结论。
-- 💾 **导出与备份**：右键任意应用可导出 APK，或生成一个含 `app.apk` + `meta.json` 的备份目录，之后能一键装回。应用私有数据只在应用允许 `run-as`（debuggable）时才会导出——普通应用拿不到就如实写明原因，不会用一个空包冒充「备份成功」。
-- 🪶 **极致轻量**：壳层本身零第三方依赖（连 ZIP / PNG / ICO / AXML 解析都是手写的），运行时按需拉起，空闲自动回收；也可以完全复用你机器上已有的安卓运行时，额外占用为零。
+运行时部署、环境自检、实时日志和修复入口都集中在全屏设置页中。
 
-![主界面](docs/images/app.png)
+<p align="center">
+  <img src="docs/images/settings-runtime.png" alt="ApkStart 设置中的运行时与环境页面" width="800" />
+</p>
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  桌面图标（真实应用图标 .lnk）                              │
-│      │  双击                                               │
-│      ▼                                                     │
-│  ApkStart.exe --launch <包名>                              │
-│      │  运行时未启动？→ 自动拉起（Android Emulator + API34）│
-│      ▼                                                     │
-│  按系统解析出的 LAUNCHER 入口启动（不是 APK 里的主 Activity）│
-│      │  存活观察 18 秒，闪退自动重试 / 重置数据 / 补权限     │
-│      ▼                                                     │
-│  模拟器窗口 = 应用窗口（改标题、换图标、竖屏比例、全屏居中） │
-└────────────────────────────────────────────────────────────┘
-```
+## 能做什么
 
-## 配置要求
+- **双击或拖入 APK 即安装**：支持选择文件、拖放文件，以及注册 `.apk` 关联后从资源管理器双击安装。
+- **每个应用一个入口**：安装后生成桌面和开始菜单快捷方式，应用名称和图标从 APK 中提取。
+- **独立应用窗口**：应用以独立窗口运行，支持全屏、窗口模式、拖动缩放和按应用记忆窗口尺寸。
+- **首次运行向导**：自动选择运行时和安卓数据目录，显示下载进度；向导可以稍后在设置中重新打开。
+- **运行时一键部署**：自动准备 adb、Android Emulator 和 Android 14 系统镜像，支持测速选源、断点续传、换源重试和本地整包导入。
+- **安装前兼容性检查**：安装前检查 Android 版本、ABI、Google Play 依赖、硬件特性和拆分 APK，并用中文说明风险。
+- **文件互通**：`%USERPROFILE%\ApkStartShared` 与安卓侧 `/sdcard/ApkStartShared` 双向同步；冲突文件会保留副本，不会静默覆盖。
+- **导出与备份**：可以导出 APK，也可以生成包含 `app.apk`、`meta.json` 和可选应用数据的备份目录；无法读取私有数据时会明确说明原因。
+- **在线更新**：在「设置 → 软件更新」中检查更新，支持后台下载、安装前校验、失败回滚和安装后版本核对。
+- **完整卸载**：卸载时清理 ApkStart 创建的应用、运行时、镜像、快照、日志、设置、共享目录和遗留快捷方式。
 
-| 项 | 最低 | 推荐 |
-|---|---|---|
-| 系统 | Windows 10 x64（1903+） | Windows 11 |
-| CPU | 4 逻辑核，支持虚拟化（VT-x / AMD-V，或未开启时走软件模拟） | 8 核及以上 |
-| 内存 | 8 GB | 16 GB 及以上 |
-| 磁盘 | 系统镜像 + 数据分区 + 快照约需 **8 GB** 可用空间 | 20 GB 及以上（装大型游戏更宽裕） |
-| 显卡 | 无硬性要求（无加速时自动用软件渲染） | 任何支持 OpenGL ES / Vulkan 的独显或核显 |
-| 网络 | 仅首次部署需要联网下载运行时（完整版离线可用） | — |
+## 安装和首次使用
 
-- Windows 7 / 8 不能运行（依赖 Electron 23+ 与新版 WHPX/AEHD 加速组件）。
-- 没有硬件加速也能跑（纯软件模拟），但应用启动与流畅度明显变慢；推荐在 BIOS 开启虚拟化并勾选「启用或关闭 Windows 功能 → 虚拟机平台」，或使用内置的 AEHD 驱动。
-- **C 盘空间紧张**：安装后可在「设置 → 系统集成」里把「运行时数据目录」与「安卓数据目录」（真正吃盘的那块：数据分区 + 快照）改到其它盘，应用与存档不会丢；已生成的 `%APPDATA%\apkstart\avd` 可以整体剪切到新位置再切换设置。
+### 直接下载
 
-## 下载即用（不想编译）
+从 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases) 下载：
 
-从本仓库的 GitHub Releases 下载：
+| 文件 | 适合场景 |
+|---|---|
+| `ApkStart-v*-Setup.exe` | 安装版，包含完整运行时，首次安装后无需再下载运行时 |
+| `ApkStart-v*-win64-portable.zip` | 便携版，解压即用，首次启动时下载运行时 |
 
-- GitHub：[github.com/yuchen0x1/apkstart/releases](https://github.com/yuchen0x1/apkstart/releases)
+安装版和便携版都会把运行时、安卓数据、应用和快照放在用户数据目录中，更新程序文件不会删除已安装应用。C 盘空间紧张时，可在「设置 → 系统集成」中修改运行时目录和安卓数据目录。
 
-安装包：
+### 第一次启动
 
-- **`ApkStart-v*-Setup.exe`**（约 1.3 GB）：**一个 EXE 包含全部运行时**（adb / Android Emulator / 系统镜像），装完首次启动自动把镜像展开到用户目录，**之后不再联网下载任何东西**。装到当前用户目录、不要求管理员权限。
-- 另有轻量版 `ApkStart-v*-win64-portable.zip`（**95 MB**，解压后约 226 MB）：首次启动才在后台下载运行时。运行时的下载源就是**本项目的 GitHub Release**（`ApkStart-runtime-*.zip` 整包）；下载源实测太慢时会自动改走 dl.google.com 官方源分组件下载。
+1. 在引导第一页点击「下一步」。
+2. 选择安装位置和下载源；自动模式会先测速，再选择更快的来源。
+3. 点击「开始安装」，等待 adb、模拟器和 Android 14 系统镜像部署完成。
+4. 把 APK 拖进主窗口，或点击「安装 APK」选择文件。
+5. 安装完成后双击桌面图标即可启动应用。
 
-### 在线更新（自动选较快的源）
+向导只在首次使用时自动显示。跳过后仍可以打开右上角「设置」→「运行时与环境」→「一键完成」。
 
-设置 → **软件更新** → 「检查更新」，或托盘右键 → 「检查更新」。
+## 系统要求
 
-**自动更新（默认开启）**：发现新版本会先系统通知，然后后台自动下载；没有应用窗口在前台时自动重启安装，正在使用的应用不会被重启打断（等窗口关闭再装）。可在设置里关掉，退回「只通知、手动更新」。
+| 项目 | 要求 |
+|---|---|
+| 操作系统 | Windows 10/11 x64；Windows 7/8 不支持 |
+| CPU | 建议 4 核及以上，并在 BIOS 中开启 VT-x/AMD-V |
+| 内存 | 最低 8 GB，建议 16 GB |
+| 磁盘 | 首次部署至少预留约 8 GB；安装大型应用需要更多空间 |
+| 网络 | 首次部署需要联网；使用完整安装版时，运行时已随安装包提供 |
 
-各版本变更记录见 [CHANGELOG.md](CHANGELOG.md)，应用内的「软件更新」面板也会在发现新版本时展示该版日志。
+硬件加速可使用 AEHD 或 Windows 虚拟机平台（WHPX）。没有硬件加速时可以回退到软件模拟，但启动速度和流畅度会下降。部分依赖真实传感器、基带或强反模拟检测的应用仍可能无法运行。
 
-- 安装版下载 `ApkStart-v*-Setup.exe` 静默安装；
-- 轻量版下载 `ApkStart-v*-win64-portable.zip`，解压后覆盖**程序目录**——运行时目录（`%APPDATA%\apkstart\runtime`）、已装应用与快照都不在程序目录里，所以更新不会丢东西；
-- 替换动作由一段独立 PowerShell 脚本完成（等主进程退出 → 覆盖 → 重新拉起），**不会出现「请手动关闭程序」的弹窗**，也不会在桌面上残留模拟器窗口。
+## 设置页
 
-更新链路不是死连 GitHub，而是**每次现测现选**：
+设置页按功能分为以下区域：
 
-1. 更新检查与运行时下载只认本仓库（yuchen0x1/apkstart）；
-2. 把「源站直连 / 镜像前缀」列成候选，每个地址真下 256KB 测速，
-   只算「收到首字节之后」的吞吐（握手时间不计入，否则高延迟大带宽的源会被误判成慢）；
-3. 按实测速度排序，用最快的那条分块并行下载；失败自动换下一条；
-4. 检测到本地代理（Clash 等系统代理）时自动走代理——挂着代理直连 GitHub 只有几十 KB/s，
-   走代理可达每秒数 MB；代理连不通自动回退直连。
-
-设置里的「下载与更新源」可以关闭公共加速镜像、或改用自建镜像前缀；
-「网络代理」可以手动指定代理（留空自动检测系统代理，填 `off` 强制直连）。
-
-
-**开箱即有的默认行为**（不用去设置里找）：
-
-- 开机自动启动，常驻托盘；双击桌面图标直接进应用。
-- 安装 APK 后自动创建**桌面 + 开始菜单**两份快捷方式，Windows 搜索能直接搜到应用名；老版本漏建的会在启动时自动补齐。
-- 应用窗口是原生渲染（非投屏）：**全屏**铺满屏幕高度并居中、保持手机比例不变形；**窗口模式**保持竖屏，可自由拖动缩放，每个应用的尺寸单独记忆。随时按 `F11` 或右键托盘切换。
-- 安装后自动授予应用申请的运行时权限，不会卡在系统授权框；应用闪退会自动重试、必要时重置应用数据后再拉起。
-- **网络直接用主机的网络**：安卓侧走 QEMU 用户态 NAT，出口复用主机的物理网卡，**不会在 Windows 上创建任何虚拟网卡 / 虚拟交换机**（不需要装驱动、也不多一个网络适配器）。不需要联网下载、不需要改任何网络设置。
+- **运行时与环境**：一键部署、导入本地整包、连接已有运行时、环境自检、部署日志和修复操作。
+- **应用窗口**：全屏/窗口模式、窗口尺寸记忆、鼠标键位和显示相关设置。
+- **文件互通**：配置 Windows 共享目录、安卓侧目录和同步策略。
+- **软件更新**：检查更新、选择更新源、设置代理和控制自动更新。
+- **诊断与卸载**：导出脱敏诊断报告，或完整卸载 ApkStart。
 
 ## 从源码构建
 
+环境要求：Windows x64、Node.js 20 或更高版本。
+
 ```powershell
-# 1. 安装依赖（含 Electron 运行时）
+# 安装依赖
 npm install
 
-# 2. 启动并完成运行时部署（一次性下载 adb / Android Emulator / 系统镜像）
+# 启动开发版
 npm start
 
-# 3.（可选）注册 .apk 双击安装
+# 可选：注册/取消注册 .apk 文件关联
 npm run assoc:on
+npm run assoc:off
 
-# 4. 打包便携版（免安装，可直接分发）
+# 打包便携版
 npm run pack
-# 产出 dist/ApkStart-win64-portable/ApkStart.exe
-# 5. 压成 zip 发布（必须用这个脚本，别用 Compress-Archive：体积会大 5MB，且 build/zip.js 带体积闸门）
-node build/zip.js dist/ApkStart-win64-portable ApkStart-win64-portable.zip
-```
+# 产出：dist/ApkStart-win64-portable/ApkStart.exe
 
-### 单文件 EXE（内置完整运行时，装完不再联网）
-
-如果希望「一个 EXE 发出去，对方双击就能跑，不用等下载」，用这条：
-
-```powershell
-# 先把 engine/ 整理成可分发运行时（system.img 用 xz/LZMA2 极限压缩，3.1GB → 约 1.1GB；
-# 同时裁掉 emulator 里用不到的部分：arm64 的 QEMU、Vulkan 后端、多语言包、qsn/自检工具、VR 资源）
-npm run runtime
-
-# 再打成安装版 EXE（electron-builder nsis 目标，装到当前用户目录）
+# 准备完整运行时并构建安装版
 npm run build:exe
-# 产出 dist/release/ApkStart-<版本>-Setup.exe
+# 产出：dist/release/ApkStart-<版本>-Setup.exe
 ```
 
-体积构成（实测）：Electron 约 180MB、emulator 瘦身后约 480MB、系统镜像 xz 压缩后约 1.1GB，
-最终安装包约 1.32GB（相比 gzip 方案省约 490MB）。能再压的硬下限就在 system.img 那条
-（它就是安卓系统本身，且是 verity 保护的镜像，无法从外部裁掉 GMS 组件）。
-网络默认走主机 NAT，不创建虚拟网卡，所以也不依赖任何额外驱动。
+`npm run build:exe` 会先准备可分发的运行时，再调用 electron-builder 生成安装包。构建过程中会下载或整理 Android Emulator、adb 和系统镜像，因此需要足够磁盘空间和网络。
 
-首次启动会把 xz 镜像展开到 `%APPDATA%\apkstart\system-images`（约 20 秒，只做一次），
-之后每次直接复用。AVD 与已装应用固定存放在 `%APPDATA%\apkstart\avd`，
-即使便携版每次解压到临时目录也不会丢。
-
-## 运行时说明：完全独立，不依赖任何第三方模拟器
-
-ApkStart 是一个**自持**的项目，运行时组件全部由自己下载、校验和管理（位于 `%APPDATA%\apkstart\runtime`）。
-轻量版默认从**本项目的 GitHub Release** 下载整包（`ApkStart-runtime-*.zip`），拿不到才退回下表里的官方源：
-
-| 组件 | 来源 | 大小 | 用途 |
-|---|---|---|---|
-| adb（platform-tools） | dl.google.com 官方源 | ~8 MB | 安装/启动安卓应用 |
-| Android Emulator | dl.google.com 官方源（8 线程并行下载） | ~440 MB | 运行时引擎（自带设备模型与 GPU 转译） |
-| Android 14 通用系统镜像（Google Play x86_64） | dl.google.com 官方源 | 源镜像 ~3.1 GB（xz 后 ~1.1 GB） | 唯一的基础层：x86 应用、仅含 ARM 库的应用、GMS 都能跑，镜像即系统，无需安装 |
-| AEHD 驱动（可选） | dl.google.com 官方源 | ~0.2 MB | 硬件加速（或用 Windows「虚拟机平台」WHPX） |
-
-首次使用时，「运行时」页会引导完成以上部署（**一键部署**）：
-1. adb 与运行时引擎、系统镜像自动下载（官方源实测 10+ MB/s）；
-2. 部署完成后**自动开机**，之后双击桌面图标自动拉起，全程无感。
-
-![运行时部署向导](docs/images/setup.png)
-
-**设备兼容性（自动处理，无需干预）**
-
-- 没有硬件加速时自动回退软件模拟；启动失败按「渲染后端 → 加速方式 → 内存/冷启动」最多 4 组参数自动重试。
-- `-gpu` 按引擎版本自动选择（37.x 用 `software`，老版本用 `swiftshader_indirect`），不再使用已弃用的模式。
-- 内存/核心数按物理内存自动推导（2–4 GB / 2–4 核），数据分区从 16 GB 降到 4 GB；端口动态挑空闲的，中文路径自动转短路径，AVD 锁文件自动清理。
-- 失败原因会翻译成中文并附上修复建议；设置里可「导出诊断报告」。
-- 大文件下载默认 **8 线程分块 + 断点续传**，不支持 Range 的源自动回退单流。
-- 高级用户也可以在设置里切换为「连接已有运行时」（复用 WSA 等的 adb 端口），但这只是可选项，不是依赖。
-- 高级路径：也可以在设置里「连接已有运行时」，复用你机器上其它模拟器（WSA / MuMu 等）已经跑起来的 adb 端口。
-
-**容器式低成本运行**
-
-- **只读基础层**：`system-images/` 全机一份，所有应用共享，不再同时存 AOSP + 兼容两套镜像。
-- **薄可写层**：单个 AVD 用差量用户数据 + 命名 quickboot 快照；关闭最后一个应用窗口后（空闲时）把内存状态存成快照，下次开机走恢复而不是冷启动。
-- **空闲预热（默认开启）**：像 WSA / 应用宝电脑版一样，ApkStart 一启动就在后台把安卓环境引导好（窗口全程隐藏），点应用时只剩一次 `am start`；代价是空闲常驻约 1 GB 内存，设置里可关闭。
-- **冷启动提速**：加速与引擎版本探测结果落盘缓存（按 exe 指纹失效）、跳过无谓的 `wmic` 进程枚举、开机探测改为自适应间隔（350ms 起）、guest 侧准备命令合并成一次 adb 往返；一次启动少等 5–10 秒。
-- **`/data` 由 ApkStart 自己造**：官方系统镜像里的 `userdata.img` 只是 1 MB 全零占位，真正的格式化原本由 SDK 工具完成 —— 直接拉 `emulator.exe` 会跳过这一步，于是 `/data` 挂不上、guest 掉进 recovery 重启循环，表现就是「等好几分钟还是打不开」。现在首次启动会自己生成一份 4 KB block、带 `ENCRYPT`（文件级加密）与 `ext_attr`（SELinux 标签）的 ext4，并用自带的 `qemu-img` + `resize2fs` 撑到配置的容量。实测冷启动 ~23 秒、命中快照 ~10 秒。
-- 快照完整性校验：保存被打断留下的空壳（只有几十字节的 `snapshot.pb`）会被识别并清理；新版 emulator 写的是 `ram.bin`（老版本是 `ram.img`），两种命名都认，不会再把刚存好的 3 GB 快照误判成空壳删掉。
-- **命令窗口彻底不出现**：qemu 的控制台窗口属于 `conhost.exe`，pid 和 qemu 对不上，靠 pid 白名单一个都藏不住；模拟器的网络守护进程 `netsimd` 还会自己再弹一个黑窗。现在改为「启动模拟器**之前**就打开常驻压制 + 按窗口类名/标题兜底（emulator / qemu / netsim）+ 开机 90 秒内 120ms 扫一次」。
-- **打开软件只看到软件界面**：模拟器主窗（`Android Emulator - apkstart5554`）永远不会单独出现在桌面上 —— 它要么被压制隐藏，要么已经被 `SetParent` 嵌进应用窗口。关掉应用窗口时会**先**把它从宿主窗口上摘下来并藏好，**再**销毁宿主（顺序反了 Windows 会把它重新挂到桌面并显示）；应用退出后窗口代理还会继续「守」最多 3 分钟，避免开机途中退出的那台模拟器在几十秒后把黑窗亮出来。
-- **按需下载**：遇到仅含 ARM 原生库的应用才会补齐通用镜像；`.apks` / `.xapk` 拆分包自动用 `install-multiple` 安装。
-- **可回收**：构建时裁掉非 x86_64 的 QEMU 目标（约 400 MB）；设置页可清理旧镜像、旧快照、锁文件和遗留 AVD。
-
-## 目录结构
-
-```
-apkstart/
-├─ src/
-│  ├─ main.js              主进程：窗口/托盘/单实例/命令行分发/IPC
-│  ├─ preload.js           安全桥接
-│  ├─ ui/                  渲染层（原生 HTML/CSS/JS，无框架）
-│  └─ core/
-│     ├─ zip.js            极简 ZIP 读取器（按需解压）
-│     ├─ axml.js           Android 二进制 XML 解析
-│     ├─ arsc.js           resources.arsc 资源表解析（应用名/图标路径还原）
-│     ├─ apk.js            APK 元信息：包名/版本/启动 Activity/图标/ABI
-│     ├─ png.js            零依赖 PNG 编码器 + 程序图标绘制
-│     ├─ shortcut.js       多尺寸 ICO 生成 + .lnk 快捷方式
-│     ├─ assoc.js          .apk 文件关联（HKCU，免管理员）
-│     ├─ adb.js            adb 客户端（安装/启动/同步/截图/…）
-│     ├─ engine.js         运行时管理：探测/模拟器托管/空闲回收
-│     ├─ sharer.js         本机 ↔ 安卓共享目录双向同步（三方哈希合并）
-│     ├─ installer.js      安装流水线编排
-│     ├─ compat.js         安装前兼容性分析（SDK/ABI/GMS/硬件/拆分）
-│     ├─ backup.js         应用备份与恢复（APK 必得，数据看 run-as）
-│     ├─ ipcguard.js       IPC 调用来源校验（页面边界 + 主框架）
-│     ├─ updater.js        在线更新：校验/解压/替换/回滚
-│     └─ store.js          应用清单与设置持久化
-├─ engine/                 运行时组件下载缓存（emulator / system-images / platform-tools）
-├─ tools/platform-tools/   便携 adb 放置处
-├─ test/                   单元测试 + Electron 集成测试 + 冒烟截图
-├─ build/pack.js           便携版打包
-└─ scripts/assoc.js        .apk 关联命令行开关
-```
-
-## 命令行
-
-```
-ApkStart.exe                      打开主界面
-ApkStart.exe <路径\to.apk>        安装 APK
-ApkStart.exe --launch <包名>      直接启动应用（桌面快捷方式使用此参数）
-```
-
-## 测试
+## 测试与自检
 
 ```powershell
-npm test                                   # 全部纯 Node 测试（不需要网络、不需要设备）
-npm run test:sync                          # 也可以单独跑：test:sync / test:updater /
-                                           # test:security / test:compat / test:backup
-npm run test:electron                      # 真实 Electron 冒烟：preload/沙箱/首屏渲染
-npm run test:app                           # 主进程自检：真实 IPC 通道 + 页面渲染
-npm run test:boot                          # 真实引导测试：用 61MB Alpine guest 验证 QEMU 参数/建盘/优雅关机
-npm run selftest                           # 运行时自检：装好 Android 后一键验证 安装→启动→截图→共享目录
-electron test/electron-integration.js      # ICO / 快捷方式集成测试
-electron . --smoke test\shot.png           # 启动应用并截图（界面冒烟）
+# 纯 Node 测试，不需要网络和设备
+npm test
+
+# Electron 首屏、沙箱和 preload 冒烟测试
+npm run test:electron
+
+# 主进程 IPC 与页面自检
+npm run test:app
+
+# 已部署 Android 后，执行安装、启动、截图和共享目录验收
+npm run selftest
 ```
 
-当前共 280 个自动化用例，覆盖：ZIP/AXML/ARSC/APK 解析、下载器分块与换源、更新器恶意包、
-共享目录双向同步与冲突、IPC 来源校验、兼容性判定、备份与恢复、日志滚动、快照指纹等。
-更新器里最难测的那部分（安装版「备份 → 安装 → 核对 → 回滚」）不是字符串断言：
-测试会用真机脚本执行一遍，并把安装器换成「删空安装目录」来复现事故。
+测试覆盖 APK/AXML/资源解析、下载器和换源、更新器安全、共享目录同步、兼容性判定、备份恢复、IPC 来源校验、卸载清理和发布说明生成等模块。
 
-`npm run selftest` 是装好系统后的「验收命令」——它会对当前设备依次检查 adb 连接、
-Android 版本、freeform 支持、共享目录双向同步，加 `--apk 某应用.apk` 还会完整走一遍
-安装 → 独立窗口启动 → 前台确认 → 截图。
+## 项目结构
 
-## 设计取舍（诚实说明）
+```text
+src/main.js          Electron 主进程、窗口、托盘和 IPC
+src/preload.js       安全桥接
+src/ui/              主界面、首次运行向导和设置页
+src/core/            APK 解析、安装、运行时、同步、备份和更新
+engine/              本地运行时缓存与构建输入
+build/               便携版和安装版构建脚本
+scripts/              文件关联与自检脚本
+test/                单元测试、Electron 测试和运行时验收工具
+docs/                架构、兼容性、测试和发布文档
+```
 
-- **不是从零实现的 hypervisor**：安卓内核、GPU 转译、ART 运行时是数年级别的工程，本项目选择站在 AOSP/QEMU/adb 的肩膀上，把工程量集中在「原生应用级体验」上——这正是应用宝电脑版、Google Play Games PC 版等产品共同的架构思路。
-- **共享目录是同步而非挂载**：Windows 无 root 时无法在安卓侧挂载 NTFS 目录，采用秒级双向同步达到同等体验。
-- **ARM-only 应用 / 字节系应用**：设置里开启「ARM 兼容模式」即可切换到 **Android 14（API 34）Google Play 镜像**（内置新版 ndk_translation 翻译层），仅含 ARM 原生库的应用可以安装运行。**实测红果免费短剧（com.phoenix.read，arm64-v8a-only）可正常安装、进入推荐流并播放视频**——旧版 API 30 镜像上会因字节系自带非标准 signal handler 触发翻译层保护性断言（`DoBadTrampoline` SIGABRT），Android 14 镜像的新版翻译层已修复。个别应用自带更深的反模拟检测（如强制校验真实传感器/基带），仍可能受限；安装失败或启动崩溃时 ApkStart 会给出中文说明。
+## 设计边界
 
-| 兼容模式下运行红果免费短剧（Android 14 · AEHD 硬件加速） |
-|:---:|
-| ![红果短剧在 ApkStart 兼容模式运行](docs/images/compat-hongguo-playing.png) |
+ApkStart 使用 Android Emulator、QEMU、adb 和 Android 系统镜像作为运行基础，项目自身主要负责安装、窗口承载、运行时管理、文件同步、备份和更新体验。运行时下载和系统镜像遵循各自的上游许可协议，项目代码本身使用 MIT 许可证。
+
+这是一个 Windows x64 应用，不提供 Linux 或 macOS 构建。安卓应用是否可用仍取决于 ABI、Google Play 服务、硬件依赖和应用自身的反模拟策略；安装前检查会尽量给出可操作的判断，但不能保证所有应用都能运行。
 
 ## 关于本仓库
 
-本仓库是 ApkStart 的**独立增强分支**，由 [@yuchen0x1](https://github.com/yuchen0x1) 维护：
+本仓库是 [RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart) 的独立增强分支，由 [@yuchen0x1](https://github.com/yuchen0x1) 维护。欢迎提交 [Issue](https://github.com/yuchen0x1/apkstart/issues) 或 Pull Request。
 
-- 原项目：[RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart)（感谢原作者的出色工作）
-- 本分支新增/修复内容见 [CHANGELOG.md](CHANGELOG.md)；应用内「设置 → 更新日志」也会展示
-- 安全边界与威胁模型见 [SECURITY.md](SECURITY.md)，测试怎么跑见 [docs/TESTING.md](docs/TESTING.md)，
-  本次升级的完整验收记录见 [docs/UPGRADE-REPORT.md](docs/UPGRADE-REPORT.md)
-- **问题与建议请提 [Issue](https://github.com/yuchen0x1/apkstart/issues)**，会尽快跟进
-
-## 参与贡献
-
-欢迎 Issue / PR。壳层保持零第三方依赖，提交前请跑 `npm test`；细节见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+- [贡献指南](CONTRIBUTING.md)
+- [安全边界](SECURITY.md)
+- [架构说明](docs/ARCHITECTURE.md)
+- [测试说明](docs/TESTING.md)
+- [升级交付报告](docs/UPGRADE-REPORT.md)
 
 ## 许可证
 
-[MIT](LICENSE)。发行包只含 ApkStart 自身代码与 Electron 运行时，不分发安卓系统镜像、QEMU 二进制或 Google 组件；这些由用户本机首次启动时从官方源按需下载，遵循各自的许可协议。
+[MIT](LICENSE)
