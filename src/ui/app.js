@@ -1464,14 +1464,14 @@ function bindSettings() {
     }
   });
 
-  // 一键卸载 ApkStart 本体（取消 .apk 关联 + 启动卸载程序；便携版手动删除）
+  // 一键卸载 ApkStart 本体（取消 .apk 关联 + 清理程序及其数据）
   $('btnUninstall').addEventListener('click', async () => {
-    const ok = window.confirm('确定卸载 ApkStart？\n\n将取消 .apk 文件关联并移除程序。此操作不可撤销。');
+    const ok = window.confirm('确定卸载 ApkStart？\n\n将取消 .apk 文件关联，并删除已下载应用、运行时镜像、快照、日志、设置、共享目录内容和程序文件。此操作不可撤销。');
     if (!ok) return;
     const btn = $('btnUninstall');
     btn.disabled = true;
     const r = await api.removeSelf().catch(() => ({ ok: false }));
-    if (r.ok && r.portable) {
+    if (r.ok && r.portable && !r.automatic) {
       btn.disabled = false;
       toast({
         title: '便携版无法自动卸载',
@@ -1485,7 +1485,7 @@ function bindSettings() {
       toast({ title: '卸载失败', body: r.error, type: 'error' });
       return;
     }
-    toast({ title: '正在卸载…', body: '卸载程序已启动，ApkStart 即将退出', type: 'ok', sticky: true });
+    toast({ title: '正在卸载…', body: '正在停止运行时并清理应用、镜像、快照和设置，ApkStart 即将退出', type: 'ok', sticky: true });
   });
 
   // ARM 兼容镜像下载（带进度 toast）

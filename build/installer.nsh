@@ -37,4 +37,11 @@
   nsExec::Exec 'taskkill.exe /F /T /IM netsimd.exe'
   ; 给一点时间让进程真正退出、释放文件句柄
   Sleep 1500
+
+  ; 删除 ApkStart 自己产生的数据：应用 APK、运行时镜像、AVD、快照、日志、
+  ; 更新缓存、默认共享目录和用户在设置中指定的其它目录。脚本先读取 settings.json，
+  ; 再删数据目录，因此从 Windows「应用和功能」卸载也不会留下几 GB 残留。
+  IfFileExists "$INSTDIR\resources\app\build\uninstall-data.ps1" 0 +3
+    DetailPrint "正在清理 ApkStart 数据、应用和运行时…"
+    nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\app\build\uninstall-data.ps1" -DataDir "$APPDATA\apkstart"'
 !macroend

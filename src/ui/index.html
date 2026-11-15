@@ -159,10 +159,13 @@
 </div>
 
 <!-- 设置 -->
-<div class="modal-mask" id="settingsMask">
-  <div class="modal">
+<div class="settings-page" id="settingsMask">
+  <div class="settings-page-shell">
     <header class="modal-head">
-      <h2>设置</h2>
+      <div>
+        <h2>设置</h2>
+        <span class="settings-head-sub">运行时、应用窗口、文件互通与软件更新</span>
+      </div>
       <button class="icon-btn" id="btnCloseSettings">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6 6 18"/></svg>
       </button>
@@ -667,7 +670,7 @@
           <label>卸载 ApkStart</label>
           <div class="row">
             <button class="btn ghost sm" id="btnUninstall">一键卸载</button>
-            <span class="inline-note">卸载会取消 .apk 关联并移除程序；便携版请按提示手动删除目录。</span>
+            <span class="inline-note">卸载会取消 .apk 关联，并删除程序、已下载应用、运行时镜像、快照、日志、设置和共享目录内容。</span>
           </div>
         </div>
       </div>

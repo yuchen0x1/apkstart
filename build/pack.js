@@ -80,6 +80,12 @@ for (const item of ['package.json', 'src', 'LICENSE']) {
   const src = path.join(ROOT, item);
   if (fs.existsSync(src)) copy(src, path.join(appDir, item));
 }
+// 便携版也必须带上卸载清理脚本；app:removeSelf 会从 resources/app/build 复制它到 TEMP。
+const uninstallScript = path.join(ROOT, 'build', 'uninstall-data.ps1');
+if (fs.existsSync(uninstallScript)) {
+  fs.mkdirSync(path.join(appDir, 'build'), { recursive: true });
+  copy(uninstallScript, path.join(appDir, 'build', 'uninstall-data.ps1'));
+}
 // 轻量版首次从官方源下载 emulator 时也需要这份 Qt 软件 OpenGL 插件。
 // 与完整版 build/runtime 使用同一来源，随应用本体分发而不是依赖开发机路径。
 const vendorDir = path.join(ROOT, 'build', 'vendor');

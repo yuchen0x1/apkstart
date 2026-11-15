@@ -5,6 +5,20 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.6] — 2026-11-16
+
+> 完善卸载清理和全屏设置页面，避免卸载后留下白板快捷方式。
+
+### 修复
+- **卸载残留应用数据**：卸载会清理 ApkStart 生成的下载应用、运行时、模拟器、系统镜像、快照、日志、设置、共享目录和临时文件。
+- **旧版卸载留下白板快捷方式**：即使旧版没有 `apps.json`，也能识别并删除 ApkStart 自己创建的桌面和开始菜单快捷方式；电脑原生软件快捷方式不会被误删。
+
+### 新增
+- **独立全屏设置页**：点击设置后进入完整页面，设置内容不再挤在小弹窗里。
+
+### 验证
+- `npm test`、Electron 冒烟测试和卸载清理回归测试全部通过。
+
 ## [0.6.5] — 2026-11-16
 
 > 针对原仓库仍能复现的运行时部署、启动和卸载问题做了一轮收口。
@@ -469,6 +483,8 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
+[0.6.6]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.6
+[0.6.5]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.5
 [0.6.4]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.4
 [0.6.3]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.3
 [0.6.2]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.2

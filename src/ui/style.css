@@ -374,7 +374,49 @@ body {
 .ctxmenu .item .k { margin-left: auto; color: var(--faint); font-size: 11px; }
 .ctxmenu .divider { height: 1px; background: var(--line); margin: 5px 6px; }
 
-/* ---------------- 设置弹窗 ---------------- */
+/* ---------------- 设置页 ---------------- */
+
+/* 设置是主界面里的独立全屏页面，不再使用居中的小弹窗。保留旧类名的基础样式，
+   让引导等其它遮罩继续按原来的行为工作。 */
+.settings-page {
+  position: fixed; inset: 0;
+  display: none;
+  z-index: 100;
+  background: var(--bg);
+}
+.settings-page.on { display: block; }
+.settings-page-shell {
+  width: 100%; height: 100%;
+  display: flex; flex-direction: column;
+  background: var(--bg);
+  overflow: hidden;
+}
+.settings-page .modal-head {
+  min-height: 68px;
+  padding: 15px clamp(20px, 4vw, 64px);
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.settings-page .modal-head h2 { font-size: 18px; letter-spacing: .1px; }
+.settings-head-sub {
+  display: block; margin-top: 3px;
+  color: var(--muted); font-size: 11.5px;
+}
+.settings-page .modal-body {
+  width: 100%;
+  padding: 8px clamp(20px, 4vw, 64px) 48px;
+  background: var(--bg);
+}
+.settings-page .modal-body > .group,
+.settings-page .modal-body > .advanced-group {
+  width: min(1120px, 100%);
+  margin-left: auto; margin-right: auto;
+}
+.settings-page .group { padding-top: 20px; padding-bottom: 12px; }
+.settings-page .group-title { font-size: 12px; margin-bottom: 13px; }
+.settings-page .field { margin-bottom: 15px; }
+.settings-page .field.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.settings-page .modal-body::-webkit-scrollbar-thumb { border-color: var(--bg); }
 
 .modal-mask {
   position: fixed; inset: 0;

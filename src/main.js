@@ -2313,7 +2313,7 @@ function registerIpc() {
    * 一键卸载 ApkStart 本体：
    * 1) 先取消 .apk 文件关联（避免卸载后双击 APK 指向已删除的程序）
    * 2) 安装版：启动 NSIS 卸载程序（它会自行请求管理员/确认），随后退出本程序
-   * 3) 便携版（旁加载 / 免安装）：没有 uninstaller.exe，返回提示让用户手动删除程序与数据目录
+   * 3) 便携版（旁加载 / 免安装）：没有卸载器时复制清理脚本到 TEMP，退出后自动删除程序与数据目录
    */
   ipcMain.handle('app:removeSelf', async () => {
     try {
@@ -2323,13 +2323,40 @@ function registerIpc() {
       // uninstaller.exe，导致安装版被误判成便携版、卸载按钮实际什么也没做（#51）。
       const uninstallerName = fs.readdirSync(exeDir).find((name) => /^Uninstall .*\.exe$/i.test(name));
       const uninstaller = uninstallerName ? path.join(exeDir, uninstallerName) : '';
-      if (!fs.existsSync(uninstaller)) {
-        return { ok: true, portable: true, dataDir: store.DATA_DIR, exeDir };
-      }
       const { spawn } = require('child_process');
+      const os = require('os');
+      const settings = store.getSettings();
+      const paths = runtime.provisioner.paths();
+      const cleanupSource = path.join(APP_ROOT, 'build', 'uninstall-data.ps1');
+      if (!fs.existsSync(cleanupSource)) throw new Error('缺少卸载清理脚本');
+      // 脚本复制到 TEMP，避免便携版删除程序目录时把正在执行的脚本一起锁住；
+      // 安装版也复制一份，避免 NSIS 与清理脚本同时删除 resources/app。
+      const cleanupScript = path.join(os.tmpdir(), `apkstart-uninstall-${process.pid}-${Date.now()}.ps1`);
+      fs.copyFileSync(cleanupSource, cleanupScript);
+      const cleanupArgs = [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', cleanupScript,
+        '-DataDir', store.DATA_DIR,
+        '-RuntimeDir', paths.root,
+        '-AvdDir', paths.avdHome,
+        '-SharedDir', settings.sharedDir || '',
+        '-TempDir', os.tmpdir(),
+        '-WaitPid', String(process.pid),
+      ];
       // 卸载前先收掉常驻的模拟器：qemu 会锁住 resources\runtime 里的 exe/dll，
       // NSIS 删不掉就会留下半个安装目录。这里只针对「真的在卸载」，不影响日常退出。
       try { await runtime?.emulator?.killOrphanProcesses(); } catch (_) { /* ignore */ }
+      const portable = !fs.existsSync(uninstaller);
+      if (portable && app.isPackaged) {
+        cleanupArgs.push('-RemoveInstallDir', '-InstallDir', exeDir);
+      }
+      spawn('powershell.exe', cleanupArgs, {
+        cwd: os.tmpdir(), detached: true, stdio: 'ignore', windowsHide: true,
+      }).unref();
+      if (portable) {
+        setTimeout(() => app.quit(), 300);
+        return { ok: true, portable: true, automatic: true, dataDir: store.DATA_DIR, exeDir };
+      }
       // 先让本程序退出，再由一个独立进程延迟 2 秒拉起卸载器：
       // 运行中的 exe 会锁住安装目录里的文件，直接拉起卸载器容易删不干净。
       const cmd = `ping 127.0.0.1 -n 3 >nul & start "" "${uninstaller}"`;

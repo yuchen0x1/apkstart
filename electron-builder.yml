@@ -12,6 +12,7 @@ files:
   - src/**/*
   - package.json
   - LICENSE
+  - build/uninstall-data.ps1
   - "build/vendor/**"
   - "!**/*.map"
   - "!**/node_modules/**"
