@@ -3,8 +3,9 @@
  * ApkStart 主进程
  * 职责：窗口 / 托盘 / 单实例 / 命令行分发（双击 apk、桌面快捷方式启动）/ IPC
  */
-const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, shell, nativeImage, screen, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, shell, nativeImage, screen, globalShortcut, clipboard } = require('electron');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const ipcguard = require('./core/ipcguard');
 
@@ -15,6 +16,8 @@ const { Sharer } = require('./core/sharer');
 const { parseApk } = require('./core/apk');
 const compat = require('./core/compat');
 const backup = require('./core/backup');
+const repair = require('./core/repair');
+const feedback = require('./core/report');
 const { drawAppIcon } = require('./core/png');
 
 // 品牌 Logo（build/render-logo.js 生成）；缺失时回退到程序化绘制的旧版图标
@@ -241,12 +244,18 @@ async function decodeIcon(raw) {
     decodeWindow = new BrowserWindow({ show: false, width: 2, height: 2, skipTaskbar: true });
     await decodeWindow.loadURL('about:blank');
   }
-  const mime = /^RIFF/.test(raw.toString('ascii', 0, 4)) ? 'image/webp' : 'image/png';
+  const isSvg = raw.slice(0, 256).toString('utf8').includes('<svg');
+  const mime = isSvg ? 'image/svg+xml'
+    : /^RIFF/.test(raw.toString('ascii', 0, 4)) ? 'image/webp' : 'image/png';
+  // SVG 没有位图尺寸，统一光栅化到 256 保证 .ico 清晰；位图保持原尺寸上限
+  const target = isSvg ? 256 : 'auto';
   const js = `(async () => {
     const img = new Image();
     img.src = 'data:${mime};base64,${raw.toString('base64')}';
     await img.decode();
-    const s = Math.min(256, Math.max(img.naturalWidth, img.naturalHeight));
+    const s = ${target === 'auto'
+    ? 'Math.min(256, Math.max(img.naturalWidth, img.naturalHeight))'
+    : String(target)};
     const c = document.createElement('canvas'); c.width = s; c.height = s;
     c.getContext('2d').drawImage(img, 0, 0, s, s);
     return c.toDataURL('image/png');
@@ -778,7 +787,29 @@ async function runUpdate() {
   }
 }
 
+// 并发启动防护：一次只允许一个 runLaunch 在跑。两个并发（用户手点 + 托盘菜单 /
+// 快捷方式 / CDP 驱动等入口同时触发）会互相杀掉对方正在开机的运行时、把未写完的
+// 快照标成损坏、触发 4 连重试甚至渲染后端崩溃（实测 0xC0000005），网络也会丢。
+let launchBusy = false;
+
 async function runLaunch(pkg) {
+  if (launchBusy) {
+    appLog(`launch ${pkg} rejected: another launch in progress`);
+    send('toast', { type: 'info', message: '正在启动另一个应用，请等它完成后再试。' });
+    if (appWin && appWin.isOpen) {
+      try { appWin.win.show(); appWin.win.focus(); } catch (_) { /* 已关 */ }
+    }
+    return { ok: false, error: 'busy' };
+  }
+  launchBusy = true;
+  try {
+    return await runLaunchInner(pkg);
+  } finally {
+    launchBusy = false;
+  }
+}
+
+async function runLaunchInner(pkg) {
   const t0 = Date.now();
   const mark = (s) => appLog(`launch ${pkg} ${s} +${Date.now() - t0}ms`);
   appLog(`launch start ${pkg}`);
@@ -795,6 +826,39 @@ async function runLaunch(pkg) {
     // 这里必须 await：不等压制生效就往下走，黑窗会在启动瞬间露出来。
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
     if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
+
+    // 「无头运行时」自愈（上游 issue #42）：宿主窗口被任务管理器结束进程、
+    // 崩溃强杀等方式直接销毁时，Windows 会连带销毁嵌在里面的模拟器 Qt 子窗口
+    // （qemu 本身还在跑，成了没有画面的“无头”进程）。之后每次启动应用都是
+    // embed 找不到窗口 + 永久黑窗，补嵌重试救不回来。
+    // 关键前提：必须等 guest **开机完成**才判定。开机过程中窗口可能还没创建，
+    // 这时候杀掉运行时会把正在写的快照截断（正是「每次打开都要等两分钟」的
+    // 成因），比黑屏更糟。所以先问 sys.boot_completed，只有 =1 且窗口不存在
+    // 才认定是无头运行时。
+    if (winAgent && runtime.vmRunning) {
+      const booted = await runtime.client().shell('getprop sys.boot_completed', { timeout: 6000 })
+        .then((s) => String(s || '').trim() === '1').catch(() => false);
+      if (booted) {
+        // 判据只看「模拟器的画面窗口句柄是否还存在」，两次采样都确认才算数。
+        // 上一版用 windows() 里有没有 QWindowIcon 来判：那是「可见窗口」列表，
+        // 而 armAgent 刚把未嵌入的模拟器主窗藏起来，于是每次都误判成无头，
+        // 在开机中途杀掉运行时 —— 用户看到的就是「一直转圈 / 然后 adb device not found」。
+        // 代理连不上（.catch → null）同样不下结论：不知道 ≠ 没有。
+        const probe = () => winAgent.emuAlive().catch(() => null);
+        const a1 = await probe();
+        if (a1 && a1.ok === true && a1.alive === false) {
+          await new Promise((r) => setTimeout(r, 1200));
+          const a2 = await probe();
+          if (a2 && a2.ok === true && a2.alive === false) {
+            mark('headless runtime detected (qemu alive, emu window gone) -> restart');
+            appWin.setState({ tip: '检测到安卓显示通道异常，正在重启安卓运行时…', ready: false });
+            await runtime.stop().catch(() => {});
+          }
+        } else if (!a1) {
+          mark('headless probe skipped (native agent unavailable)');
+        }
+      }
+    }
 
     // 运行时已经在跑、但 LCD 方向和应用对不上：只有重启运行时才能真的铺满。
     // 不静默重启 —— 那是 1 分钟的等待，用户有权知道并拒绝（拒绝就按现在的
@@ -833,7 +897,7 @@ async function runLaunch(pkg) {
     // 2) 应用真的活下来了，才把画面嵌进窗口（否则用户会看到闪一下的桌面/崩溃页）
     const embedded = await appWin.embed();
     if (!embedded) appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
-    mark(`embedded=${embedded}`);
+    mark(`embedded=${embedded} mean=${appWin.lastEmbedMean}`);
     // 嵌入完成后把窗口从别的窗口底下抬出来。否则上层窗口（浏览器等）会盖住安卓画面，
     // 用户看到的是「黑屏 / 画面没填满」，鼠标也点不到应用（全被上层窗口吃掉）。
     // 短暂 topmost 再立刻撤销，只借用一次置顶把 Z 序抬到最前，不会长期霸占顶层。
@@ -856,13 +920,20 @@ async function runLaunch(pkg) {
       ? { ready: false, tip: platform.supportNote() }
       : { ready: true, tip: '' });
     if (appWin.external) appLog(`embed unsupported on ${platform.platform}: external window mode`);
-    // DPI 上下文不一致导致 SetParent 被拒时，代理降级为「窗口跟随」模式：
-    // 画面照常显示，但告知用户原因（旧版完全静默，用户只能对着黑窗口猜）。
+    // 画面已经显示出来了，但有两类降级需要告知用户：
+    //  - dpi：SetParent 被拒（显示器缩放与模拟器不一致），只能让窗口跟着走
+    //  - black：嵌入成功但渲染表面失效（emulator 37.x + Win11 26xxx），像素自检抓到全黑
+    // 旧版这两种情况都是完全静默的，用户只能对着黑窗口自己猜。
     if (embedded && appWin.lastEmbedFollow) {
-      appLog(`embed degraded to follow mode (DPI awareness mismatch): ${pkg}`);
+      const black = appWin.lastEmbedFollowReason === 'black';
+      appLog(black
+        ? `embed black (mean=${appWin.lastBlackMean}) -> follow mode: ${pkg}`
+        : `embed degraded to follow mode (DPI awareness mismatch): ${pkg}`);
       send('toast', {
         type: 'info',
-        message: '当前显示器的 DPI 设置与模拟器不一致，窗口以「跟随模式」显示。若画面有黑边或错位，请把显示器缩放调成 100% 后重试。',
+        message: black
+          ? '当前显卡驱动下安卓画面无法嵌入窗口，已自动切换为「跟随模式」显示（画面正常，可正常使用）。'
+          : '当前显示器的 DPI 设置与模拟器不一致，窗口以「跟随模式」显示。若画面有黑边或错位，请把显示器缩放调成 100% 后重试。',
       });
     }
     // 嵌入失败（模拟器窗口还没建好）时再补两次：用户看到的是黑窗口，
@@ -1118,7 +1189,7 @@ function registerIpc() {
     const info = parseApk(filePath);
     const result = compat.analyze(info, await compatEnv());
     // 图标是 Buffer，跨 IPC 传一次就是几百 KB，这里没必要带出去
-    const { iconPng, ...rest } = info;
+    const { iconPng, iconSvg, ...rest } = info;
     return { info: rest, compat: result };
   });
 
@@ -1320,9 +1391,396 @@ function registerIpc() {
 
   ipcMain.handle('runtime:status', async () => runtime.status());
   ipcMain.handle('runtime:probe', async () => runtime.probe());
-  ipcMain.handle('runtime:start', async () => {
-    const r = await runtime.ensure({ onLog: (m) => send('runtime:log', m) });
-    return r.ok ? { ok: true, engine: r.engine } : { ok: false, error: r.error, needsSetup: r.needsSetup };
+  /**
+   * 启动运行时。
+   * opts.lowspec / opts.timeoutMs 只由「一键修复」传入，且只对本次启动生效 ——
+   * 用户点一次修复，不该被永久改掉画质与性能配置。
+   * 失败时把诊断结论、每轮尝试、退出码、报告路径一并交回渲染层，
+   * 以前这里只回一句 error，UI 只能显示一大段文字，没法给出「点哪个按钮」。
+   */
+  ipcMain.handle('runtime:start', async (_e, opts = {}) => {
+    const r = await runtime.ensure({
+      onLog: (m) => send('runtime:log', m),
+      lowspec: !!(opts && opts.lowspec),
+      timeoutMs: Number(opts && opts.timeoutMs) || 0,
+    });
+    if (r.ok) return { ok: true, engine: r.engine, lowspec: !!(opts && opts.lowspec) };
+    const out = {
+      ok: false,
+      error: r.error,
+      needsSetup: r.needsSetup,
+      diagnosis: r.diagnosis || null,
+      attempts: r.attempts || [],
+      exitCode: r.exitCode == null ? null : r.exitCode,
+      report: r.report || '',
+    };
+    // 失败即自动落一份脱敏报告：用户不用再翻 %APPDATA% 找文件，
+    // 作者也能在用户点「上报」时拿到完整上下文。重复签名 24 小时内不重复写。
+    try {
+      const rep = await prepareFailureReport();
+      if (rep) {
+        out.reportDraft = { file: rep.draft, sent: !!rep.sent, skipped: rep.skipped || '' };
+      }
+    } catch (_) { /* 生成失败不影响开机错误本身 */ }
+    return out;
+  });
+
+  // ---------------- 一键修复 ----------------
+
+  /** 修复窗口要的事实表：机器、加速、镜像、磁盘、上次退出码 */
+  async function repairFacts() {
+    const doctor = require('./core/doctor');
+    const host = doctor.hostInfo();
+    const p = runtime.provisioner.paths();
+    const env = await runtime.provisioner.checkEnv().catch(() => ({}));
+    let image = null;
+    try { image = runtime.emulator.imageChoice(); } catch (_) { image = null; }
+    // BIOS 厂商只在「要判断这是不是云电脑」时读一次：它比 CPU 型号更能识破被遮蔽的虚拟机
+    const vendor = doctor.systemVendor();
+    return repair.buildFacts({
+      ...host,
+      vendor,
+      vm: host.vm || doctor.looksVirtual(vendor),
+      osRelease: os.release(),
+      accel: (env && env.accel) || { ok: false },
+      emulatorVersion: env && env.emulator && env.emulator.version,
+      image: image && { api: image.api, tag: image.tag, compat: image.compat },
+      freeDiskMB: doctor.freeDiskMB(p.avdHome),
+      exitCode: runtime.emulator.lastExitCode,
+      runtimeDir: p.root,
+      appVersion: app.getVersion(),
+    });
+  }
+
+  /** 上次失败记录：内存里的优先，进程重启过就翻 last-failure.json */
+  function lastDiagnosis() {
+    if (runtime.emulator.lastDiagnosis) return runtime.emulator.lastDiagnosis;
+    const lf = runtime.emulator.lastFailure ? runtime.emulator.lastFailure() : null;
+    return (lf && lf.diagnosis) || null;
+  }
+
+  async function buildRepairPlan() {
+    const lf = runtime.emulator.lastFailure ? runtime.emulator.lastFailure() : null;
+    const attempts = (runtime.emulator.attempts && runtime.emulator.attempts.length
+      ? runtime.emulator.attempts
+      : ((lf && lf.attempts) || [])) || [];
+    return repair.buildPlan({ diagnosis: lastDiagnosis(), facts: await repairFacts(), attempts });
+  }
+
+  /**
+   * 执行一条修复动作。原则：能自动做的直接做，会动数据的必须弹原生确认框，
+   * 只能人工处理的如实返回「需要在设置里改」，不假装修好了。
+   */
+  async function runRepairAction(id) {
+    switch (id) {
+      case 'clear-locks': {
+        const avdHome = runtime.provisioner.paths().avdHome;
+        let removed = 0;
+        try {
+          for (const f of fs.readdirSync(avdHome)) {
+            if (!/\.lock$/i.test(f)) continue;
+            try { fs.rmSync(path.join(avdHome, f), { recursive: true, force: true }); removed += 1; } catch (_) { /* 被占用，交给下面的杀进程 */ }
+          }
+        } catch (_) { /* AVD 还没建过 */ }
+        await runtime.emulator.killOrphanProcesses().catch(() => {});
+        return { ok: true, detail: removed ? `清掉 ${removed} 个残留锁文件` : '没有发现残留锁文件' };
+      }
+      case 'gpu-software': {
+        store.saveSettings({ engine: { gpuMode: 'swiftshader' } });
+        return { ok: true, detail: '渲染后端已切换为 swiftshader（软件渲染）' };
+      }
+      case 'accel': {
+        const r = await enableVirtualizationImpl();
+        return {
+          ok: !!r.ok,
+          detail: r.ok
+            ? (r.restartNeeded ? '已开启，需重启电脑后生效' : (r.note || '硬件加速已可用'))
+            : (r.error || r.note || '这台机器无法开启硬件加速'),
+        };
+      }
+      case 'vc-redist': {
+        const r = await installVcRedistImpl();
+        return { ok: !!r.ok, detail: r.ok ? 'VC++ 运行库已安装' : '安装未完成（可能取消了管理员授权）' };
+      }
+      case 'cleanup-disk': {
+        const pass = { apply: false, aggressive: false, includeSnapshots: false };
+        const preview = await runtime.cleanup(pass).catch(() => null);
+        if (!preview || !preview.candidates || !preview.candidates.length) {
+          return { ok: false, detail: '没有可回收的缓存了，请把数据目录换到空间更大的盘' };
+        }
+        const size = preview.candidates.reduce((n, c) => n + (c.size || 0), 0);
+        const { response } = await dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          buttons: ['取消', '清理'],
+          defaultId: 0,
+          cancelId: 0,
+          title: '清理运行时缓存',
+          message: `将释放约 ${(size / 1048576).toFixed(0)} MB`,
+          detail: '只删旧镜像、旧快照、锁文件与非活动 AVD 的缓存，已安装的应用会保留。此操作不可撤销。',
+        });
+        if (response !== 1) return { ok: false, cancelled: true, detail: '已取消清理' };
+        const r = await runtime.cleanup({ apply: true, aggressive: false, includeSnapshots: false });
+        return { ok: true, detail: `释放约 ${Math.round(((r && r.saved) || 0) / 1048576)} MB` };
+      }
+      case 'wipe-data': {
+        const { response } = await dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          buttons: ['取消', '重建'],
+          defaultId: 0,
+          cancelId: 0,
+          title: '用干净数据重建',
+          message: '会清空安卓里的用户数据（已装应用、登录状态、存档）',
+          detail: '应用清单会保留，点开时会自动重装。此操作不可撤销，建议先导出诊断报告。',
+        });
+        if (response !== 1) return { ok: false, cancelled: true, detail: '已取消' };
+        const r = await runtime.resetAndroidData();
+        return {
+          ok: !!r.ok,
+          detail: r.ok ? `已重建，回收 ${Math.round(((r.reclaimed || 0)) / 1048576)} MB` : (r.error || '重建失败'),
+        };
+      }
+      case 'reinstall-image': {
+        const r = await runtime.provisioner.installPlayImage(
+          (x) => send('provision:progress', { ...x, component: 'play' }),
+        );
+        runtime.provisioner.invalidateEnvCache();
+        return { ok: !!(r && r.ok !== false), detail: '系统镜像已重新下载' };
+      }
+      case 'redeploy': {
+        const r = await autoDeploy({ force: false }).catch((e) => ({ ok: false, error: e.message }));
+        return { ok: !!(r && r.ok), detail: (r && r.error) || '运行时组件已校验补齐' };
+      }
+      case 'low-spec':
+        return { ok: true, detail: '低配参数已就绪，马上重新开机' };
+      default:
+        return { ok: false, detail: '这个动作需要在设置里手动处理' };
+    }
+  }
+
+  // ---------------- 失败报告 ----------------
+
+  const REPORTS_DIR = path.join(store.DATA_DIR, 'logs', 'reports');
+
+  /** 收集接口：用户设置优先，其次发行版内置（package.json → feedback.endpoint） */
+  function resolveReportEndpoint() {
+    const s = store.getSettings();
+    return String((s.report && s.report.endpoint) || feedback.contact().endpoint || '').trim();
+  }
+
+  /** 组装当前失败的报告包：内存里的诊断优先，进程重启过就翻 last-failure.json */
+  async function buildFailureBundle() {
+    const lf = runtime.emulator.lastFailure ? runtime.emulator.lastFailure() : null;
+    const attempts = (runtime.emulator.attempts && runtime.emulator.attempts.length
+      ? runtime.emulator.attempts
+      : ((lf && lf.attempts) || [])) || [];
+    let logLines = [];
+    try { logLines = runtime.emulator.recentLog(160) || []; } catch (_) { /* 没有日志也能出摘要 */ }
+    return feedback.buildBundle({
+      facts: await repairFacts(),
+      diagnosis: lastDiagnosis() || (lf && lf.diagnosis) || null,
+      attempts,
+      exitCode: runtime.emulator.lastExitCode != null ? runtime.emulator.lastExitCode : (lf && lf.exitCode),
+      logLines,
+      reportFile: (lf && lf.report) || '',
+      extra: { appVersion: app.getVersion() },
+    });
+  }
+
+  /** 落盘：摘要 .md + 复制一份完整诊断 .txt（都在 logs/reports 下） */
+  function saveFailureDraft(bundle) {
+    fs.mkdirSync(REPORTS_DIR, { recursive: true });
+    const md = path.join(REPORTS_DIR, `${bundle.id}.md`);
+    fs.writeFileSync(md, bundle.summary, 'utf8');
+    let txt = '';
+    try {
+      if (bundle.reportFile && fs.existsSync(bundle.reportFile)) {
+        txt = path.join(REPORTS_DIR, `${bundle.id}.txt`);
+        fs.copyFileSync(bundle.reportFile, txt);
+      }
+    } catch (_) { /* 完整报告复制失败不影响摘要 */ }
+    try {
+      fs.writeFileSync(path.join(REPORTS_DIR, '.last.json'),
+        JSON.stringify({ at: bundle.at, signature: bundle.signature, file: md }), 'utf8');
+    } catch (_) { /* ignore */ }
+    return { md, txt };
+  }
+
+  /** 同一签名 24 小时内只自动生成一次，避免反复失败把磁盘刷满、把用户烦到 */
+  function recentlyReported(sig, hours = 24) {
+    try {
+      const last = JSON.parse(fs.readFileSync(path.join(REPORTS_DIR, '.last.json'), 'utf8'));
+      if (last && last.signature === sig) {
+        return Date.now() - new Date(last.at).getTime() < hours * 3600e3;
+      }
+    } catch (_) { /* 没有历史记录 */ }
+    return false;
+  }
+
+  async function prepareFailureReport({ force = false } = {}) {
+    const bundle = await buildFailureBundle();
+    const settings = store.getSettings();
+    if (!force && !(settings.report && settings.report.auto)) return null;
+    if (!force && recentlyReported(bundle.signature)) {
+      let file = '';
+      try { file = JSON.parse(fs.readFileSync(path.join(REPORTS_DIR, '.last.json'), 'utf8')).file; } catch (_) { /* ignore */ }
+      return { bundle, draft: file, skipped: 'recent' };
+    }
+    const saved = saveFailureDraft(bundle);
+    // 配了收集接口 + 允许自动发送 → 直接 POST（已经脱敏）。失败不抛，回落到手动上报。
+    let sent = false;
+    let sendError = '';
+    const endpoint = resolveReportEndpoint();
+    if (endpoint && settings.report && settings.report.autoSend !== false) {
+      // 自动发送用较短超时：不能让「开机失败」的提示卡在上报网络上
+      const r = await postJson(endpoint, bundle.payload, 6000).catch((e) => ({ ok: false, error: e.message }));
+      sent = !!r.ok;
+      sendError = sent ? '' : (r.error || `HTTP ${r.status || '?'}`);
+      try {
+        const lastFile = path.join(REPORTS_DIR, '.last.json');
+        const last = JSON.parse(fs.readFileSync(lastFile, 'utf8'));
+        fs.writeFileSync(lastFile, JSON.stringify({ ...last, sent, sendError }), 'utf8');
+      } catch (_) { /* 记录失败不影响结果 */ }
+    }
+    return { bundle, draft: saved.md, full: saved.txt, sent, sendError };
+  }
+
+  /** 直传收集接口（配置了 report.endpoint 才会走） */
+  function postJson(url, body, timeout = 12000) {
+    return new Promise((resolve) => {
+      let u;
+      try { u = new URL(url); } catch (_) { resolve({ ok: false, error: '上报地址不合法' }); return; }
+      if (!/^https?:$/.test(u.protocol)) { resolve({ ok: false, error: '上报地址只支持 http(s)' }); return; }
+      const mod = u.protocol === 'http:' ? require('http') : require('https');
+      const data = Buffer.from(JSON.stringify(body));
+      const req = mod.request({
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'http:' ? 80 : 443),
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': data.length,
+          'user-agent': 'ApkStart-Report/1',
+        },
+        timeout,
+      }, (res) => {
+        res.resume();
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode });
+      });
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: '上报超时' }); });
+      req.on('error', (e) => resolve({ ok: false, error: e.message }));
+      req.write(data);
+      req.end();
+    });
+  }
+
+  ipcMain.handle('report:prepare', async () => {
+    const rep = await prepareFailureReport({ force: true }).catch(() => null);
+    if (!rep) return { ok: false, error: '还没有可上报的失败记录' };
+    return {
+      ok: true,
+      id: rep.bundle.id,
+      summary: rep.bundle.summary,
+      issueUrl: rep.bundle.issueUrl,
+      mailtoUrl: rep.bundle.mailtoUrl,
+      file: rep.draft,
+      full: rep.full || '',
+      dir: REPORTS_DIR,
+    };
+  });
+
+  /**
+   * 上报：配了收集接口就直接 POST（全自动）；没配就把摘要摆给用户看，
+   * 确认后才打开 GitHub 提交页 —— 客户端里不能塞 token，这是没有服务端时唯一的正路。
+   */
+  ipcMain.handle('report:submit', async () => {
+    const rep = await prepareFailureReport({ force: true }).catch(() => null);
+    if (!rep) return { ok: false, error: '还没有可上报的失败记录' };
+    const b = rep.bundle;
+    const endpoint = resolveReportEndpoint();
+    if (endpoint) {
+      const r = await postJson(endpoint, b.payload);
+      if (r.ok) return { ok: true, channel: 'endpoint', file: rep.draft };
+    }
+
+    const buttons = ['取消', '打开提交页'];
+    if (b.mailtoUrl) buttons.push('用邮件发送');
+    buttons.push('先导出到本地');
+    const localIdx = buttons.length - 1;
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      title: '上报失败报告',
+      message: '会把下面这份摘要提交给作者',
+      detail: `${b.summary.slice(0, 1500)}${b.summary.length > 1500 ? '\n…' : ''}\n\n`
+        + '摘要里的用户名路径已替换为 %USERPROFILE%；完整报告只保存在你本机。',
+      buttons,
+      defaultId: 1,
+      cancelId: 0,
+      noLink: true,
+    });
+    if (response === 0) return { ok: false, cancelled: true };
+    if (response === localIdx) {
+      shell.showItemInFolder(rep.draft);
+      return { ok: true, channel: 'local', file: rep.draft };
+    }
+    // 打开网页前把摘要放进剪贴板：浏览器没带上预填内容时还能直接粘贴
+    try { clipboard.writeText(b.summary); } catch (_) { /* ignore */ }
+    const url = response === 1 ? (b.issueUrl || b.mailtoUrl) : b.mailtoUrl;
+    if (!url) return { ok: false, error: '没有可用的上报渠道（仓库地址或邮箱未配置）' };
+    await shell.openExternal(url);
+    return { ok: true, channel: response === 1 ? 'github' : 'email', file: rep.draft, copied: true };
+  });
+
+  ipcMain.handle('report:folder', async () => {
+    fs.mkdirSync(REPORTS_DIR, { recursive: true });
+    await shell.openPath(REPORTS_DIR);
+    return { ok: true, dir: REPORTS_DIR };
+  });
+
+  ipcMain.handle('runtime:repairPlan', async () => {
+    const plan = await buildRepairPlan();
+    // 弹窗打开时顺手把报告备好（同签名 24h 只写一次），用户点「上报」不用再等
+    try {
+      const rep = await prepareFailureReport();
+      if (rep && rep.draft) plan.reportDraft = { file: rep.draft, skipped: rep.skipped || '' };
+    } catch (_) { /* 报告生成失败不影响修复方案 */ }
+    return plan;
+  });
+
+  /**
+   * 一键修复：默认只跑「自动」动作（不动用户数据），全部做完后由渲染层带着
+   * 低配参数 + 更长超时重新开机。指定 action 时只跑那一条。
+   */
+  ipcMain.handle('runtime:repairRun', async (_e, opts = {}) => {
+    const plan = await buildRepairPlan();
+    const only = opts && opts.action && opts.action !== 'auto' ? opts.action : '';
+    const wanted = only
+      ? plan.actions.filter((a) => a.id === only)
+      : plan.actions.filter((a) => a.kind === 'auto');
+    if (!wanted.length) return { ok: true, steps: [], retry: plan.retry, level: plan.level, empty: true };
+
+    // 装驱动、清数据、清锁都要求模拟器先退出；只是切渲染参数则不必打断
+    if (wanted.some((a) => ['accel', 'wipe-data', 'clear-locks', 'reinstall-image'].includes(a.id))) {
+      if (runtime.emulator.running && runtime.emulator.running()) {
+        await runtime.stop().catch(() => {});
+      }
+    }
+
+    const steps = [];
+    for (const a of wanted) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await runRepairAction(a.id).catch((e) => ({ ok: false, detail: e.message }));
+      steps.push({ id: a.id, label: a.label, ok: r.ok !== false, cancelled: !!r.cancelled, detail: r.detail || '' });
+      if (r.ok === false && !r.cancelled) break;
+      if (r.cancelled) break;
+    }
+    return {
+      ok: steps.every((s) => s.ok),
+      steps,
+      retry: plan.retry,
+      level: plan.level,
+      diagnosis: plan.title,
+    };
   });
   ipcMain.handle('runtime:stop', async () => {
     await runtime.stop();
@@ -1428,7 +1886,7 @@ function registerIpc() {
     const doctor = require('./core/doctor');
     return { ok: doctor.vcRedistOk(), path: vcRedistInstaller() };
   });
-  ipcMain.handle('runtime:installVcRedist', async () => {
+  async function installVcRedistImpl() {
     const file = vcRedistInstaller();
     if (!file) return { ok: false, reason: 'no-installer' };
     const { spawn } = require('child_process');
@@ -1442,7 +1900,8 @@ function registerIpc() {
     });
     const doctor = require('./core/doctor');
     return { ok: doctor.vcRedistOk() };
-  });
+  }
+  ipcMain.handle('runtime:installVcRedist', () => installVcRedistImpl());
 
   ipcMain.handle('runtime:usage', () => runtime.usage());
 
@@ -1646,7 +2105,7 @@ function registerIpc() {
    * 优先启用系统自带的「虚拟机平台」（WHPX）功能；若该 DLL 都不存在（老系统），
    * 退而安装并启用 Google 的 AEHD 驱动。两种方式都需要管理员提权。
    */
-  ipcMain.handle('provision:enableVirtualization', async () => {
+  async function enableVirtualizationImpl() {
     try {
       const accel = await runtime.provisioner.emulatorAccel();
       if (accel.ok) return { ok: true, already: true, accel, note: '硬件加速已可用，无需额外操作' };
@@ -1689,7 +2148,8 @@ function registerIpc() {
     } catch (e) {
       return { ok: false, error: e.message };
     }
-  });
+  }
+  ipcMain.handle('provision:enableVirtualization', () => enableVirtualizationImpl());
 
   ipcMain.handle('provision:installAdb', async () => {
     try {

@@ -234,7 +234,7 @@ class Runtime {
     return args;
   }
 
-  async boot({ install = false, onLog = () => {}, lcdOrientation = '' } = {}) {
+  async boot({ install = false, onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
     // 内置运行时（emulator 包 + AEHD 驱动 + Windows 版镜像下载）只有 Windows 一套。
     // 别的系统上如果还走这条路，会在下载/解压/装驱动里各失败一次，报错还各不相同。
     // 这里提前说清楚，并指向唯一的可行路径：「连接已有运行时」（upstream #24）。
@@ -246,7 +246,7 @@ class Runtime {
 
     // 首选：官方 emulator（自带设备模型与 GPU 转译，体验最好）
     if (env.emulator.ok && env.sysimg.ok) {
-      return this.bootEmulator({ env, onLog, lcdOrientation });
+      return this.bootEmulator({ env, onLog, lcdOrientation, lowspec, timeoutMs });
     }
 
     return this.bootQemu({ install, env, onLog });
@@ -256,7 +256,7 @@ class Runtime {
    * 用官方 emulator 启动 Android。
    * 与 QEMU+ISO 不同，这里没有"安装系统"这一步：镜像本身就是系统，首次启动即开机。
    */
-  async bootEmulator({ env, onLog = () => {}, lcdOrientation = '' } = {}) {
+  async bootEmulator({ env, onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
     if (this.vmStarting) {
       const started = Date.now();
       while (this.vmStarting && Date.now() - started < 300000) {
@@ -318,6 +318,8 @@ class Runtime {
         onLog,
         probe,
         lcdOrientation,
+        lowspec,
+        timeoutMs,
       });
       // start() 失败时是「返回 {ok:false}」而不是抛异常（磁盘不足、多次重试仍失败等）。
       // 老实现不看这个字段，直接把 ok:true 往上返回 —— 上层于是认为「已经就绪」，
@@ -815,16 +817,16 @@ class Runtime {
    * 幂等入口：预热与用户点击可能同时发生，共用一个 Promise，
    * 避免两边各判断一次「没在线」后各自拉起一台模拟器（AVD 锁冲突 + 双倍内存）。
    */
-  async ensure({ onLog = () => {}, lcdOrientation = '' } = {}) {
+  async ensure({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
     if (this._ensurePromise) return this._ensurePromise;
-    const p = this._ensureInner({ onLog, lcdOrientation });
+    const p = this._ensureInner({ onLog, lcdOrientation, lowspec, timeoutMs });
     this._ensurePromise = p;
     const clear = () => { if (this._ensurePromise === p) this._ensurePromise = null; };
     p.then(clear, clear);
     return p;
   }
 
-  async _ensureInner({ onLog = () => {}, lcdOrientation = '' } = {}) {
+  async _ensureInner({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
     const client = this.client();
     if (await client.isOnline()) {
       await this.prepare(client);
@@ -891,7 +893,7 @@ class Runtime {
       // 接管失败时先把这些孤儿清掉，再冷启，保证「关掉再开」一定能起来。
       await this.killOrphanEmulators({ onLog }).catch(() => {});
       try {
-        const r = await this.boot({ onLog, lcdOrientation });
+        const r = await this.boot({ onLog, lcdOrientation, lowspec, timeoutMs });
         if (r.ok) return { ok: true, client: r.client, engine: 'emulator', profile: r.profile, network: r.network || null };
         return {
           ok: false, error: r.error, env,
@@ -1161,6 +1163,7 @@ class Runtime {
     const t0 = Date.now();
     let last = null;
     let lastNotice = 0;
+    let repairTried = false;
     // 刚重启的虚拟机会有一段时间连 adb 都还没上线，不能一看到 offline 就放弃
     // （之前就是这样：重置数据后立刻返回 device-offline，被误判成「修复失败」）。
     let offlineSince = 0;
@@ -1175,6 +1178,16 @@ class Runtime {
         // eslint-disable-next-line no-await-in-loop
         last = await this.emulator.checkNetwork(adbPath || this.adbPath()).catch(() => null);
         if (last && last.ok) return last;
+        // 等了一会儿还是没网：多半是 WifiConfigStore 里保存网络撞车（异常退出写坏）。
+        // 修一次通常 10 秒内恢复；修不好继续等，不阻塞启动。
+        if (!repairTried && Date.now() - t0 > 12000) {
+          repairTried = true;
+          onLog('检测到虚拟机网络异常，正在自动修复 Wi-Fi 关联…');
+          // eslint-disable-next-line no-await-in-loop
+          const rep = await this.emulator.repairWifi(adbPath || this.adbPath(), onLog).catch(() => null);
+          if (rep && rep.ok) onLog('虚拟机网络已恢复');
+          else if (rep) onLog(`Wi-Fi 自动修复未成功（${rep.reason || 'unknown'}）`);
+        }
       }
       if (Date.now() - lastNotice > 10000) {
         lastNotice = Date.now();
@@ -1198,6 +1211,16 @@ class Runtime {
    */
   async repairNetwork({ onLog = () => {} } = {}) {
     try {
+      // 先走轻量修复：绝大多数「没网」只是 WifiConfigStore 里保存网络撞车
+      // （同一个 AndroidWifi 两条记录、network id 都是 0），清掉重连即可，
+      // 完全不用抹数据 —— 抹数据会丢已装应用，是最重的一步。
+      if (this.vmRunning) {
+        const quick = await this.emulator.repairWifi(this.adbPath(), onLog).catch(() => null);
+        if (quick && quick.ok) {
+          onLog('网络已恢复（Wi-Fi 关联已重新建立，未重置安卓数据）。');
+          return { ok: true, network: { ok: true }, wiped: false };
+        }
+      }
       onLog('正在修复虚拟机网络：重置安卓数据并重新开机（应用清单会保留，点开时自动重装）…');
       if (this.vmRunning) await this.stop({ graceful: false }).catch(() => {});
       // 给上一次的 qemu / netsimd 一点时间退干净，否则 -wipe-data 会撞 AVD 锁

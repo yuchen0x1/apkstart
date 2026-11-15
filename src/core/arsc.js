@@ -16,9 +16,27 @@ const RES_TABLE_TYPE_SPEC_TYPE = 0x0202;
 
 const TYPE_REFERENCE = 0x01;
 const TYPE_STRING = 0x03;
+const TYPE_FLOAT = 0x04;
+const TYPE_DIMENSION = 0x05;
+const TYPE_FRACTION = 0x06;
 const TYPE_INT_DEC = 0x10;
 const TYPE_INT_HEX = 0x11;
 const TYPE_INT_BOOLEAN = 0x12;
+const TYPE_COLOR_INT8 = 0x1c;
+const TYPE_COLOR_RGB8 = 0x1d;
+const TYPE_COLOR_INT4 = 0x1e;
+const TYPE_COLOR_RGB4 = 0x1f;
+
+/** 32 位整数的两种解读：浮点位模式 / 复数（dimension/fraction） */
+function uint32AsFloat(data) {
+  const b = Buffer.alloc(4);
+  b.writeUInt32LE(data >>> 0, 0);
+  return b.readFloatLE(0);
+}
+function complexToFloat(data) {
+  const RADIX = [1 / 256, 1 / 32768, 1 / 8388608, 1 / 2147483648];
+  return ((data & 0xffffff00) * RADIX[(data >>> 4) & 3]) || 0;
+}
 
 function readStringPool(buf, start) {
   const headerSize = buf.readUInt16LE(start + 2);
@@ -226,6 +244,9 @@ class ResTable {
     }
     if (best.dataType === TYPE_INT_BOOLEAN) return best.data !== 0;
     if (best.dataType === TYPE_INT_DEC || best.dataType === TYPE_INT_HEX) return best.data | 0;
+    if (best.dataType === TYPE_FLOAT) return uint32AsFloat(best.data);
+    if (best.dataType === TYPE_DIMENSION || best.dataType === TYPE_FRACTION) return complexToFloat(best.data);
+    if (best.dataType >= TYPE_COLOR_INT8 && best.dataType <= TYPE_COLOR_RGB4) return best.data >>> 0;
     return null;
   }
 }

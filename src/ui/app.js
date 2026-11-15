@@ -414,9 +414,12 @@ async function deployAll() {
     toast({ title: '组件已就绪，正在自动开机…', body: '首次约 1-3 分钟，之后几秒即可。', type: 'info' });
     const started = await api.runtimeStart();
     await refreshStatus();
-    toast(started && started.ok
-      ? { title: '运行时已就绪', body: '现在把 APK 拖进窗口，或双击桌面图标即可。', type: 'ok' }
-      : { title: '开机未完成', body: (started && started.error) || '请导出诊断报告查看原因', type: 'error', sticky: true });
+    if (started && started.ok) {
+      toast({ title: '运行时已就绪', body: '现在把 APK 拖进窗口，或双击桌面图标即可。', type: 'ok' });
+    } else {
+      // 不再丢一大段错误文本：直接给「一键修复」窗口
+      openRepair(started);
+    }
   } catch (e) {
     toast({ title: '准备失败', body: e.message, type: 'error', sticky: true });
   } finally {
@@ -1020,6 +1023,26 @@ function bindUpdate() {
     }
   });
 
+  // 失败报告开关：默认开（只落本机），关掉后连摘要也不生成
+  const ra = $('setReportAuto');
+  if (ra) {
+    ra.addEventListener('change', async () => {
+      const s = await api.setSettings({ report: { auto: ra.checked } }).catch(() => null);
+      if (s) state.settings = s;
+      toast({
+        title: ra.checked ? '已开启失败报告' : '已关闭失败报告',
+        body: ra.checked ? '开机失败时会自动生成脱敏摘要，等你决定是否上报' : '不再自动生成摘要（仍可手动导出诊断报告）',
+        type: 'ok',
+      });
+    });
+  }
+  const rf = $('btnReportFolder');
+  if (rf) {
+    rf.addEventListener('click', () => {
+      api.reportFolder().catch(() => toast({ title: '打开失败', body: '请稍后重试', type: 'error' }));
+    });
+  }
+
   // 自动更新开关：状态在 init() 里按设置回填；这里只负责把改动写回去
   const au = $('setAutoUpdate');
   if (au) {
@@ -1503,8 +1526,9 @@ function bindSettings() {
     const el = $('probeResult');
     el.textContent = '正在启动…';
     const r = await api.runtimeStart();
-    el.textContent = r.ok ? `已就绪：${r.engine}` : `启动失败：${r.error}`;
+    el.textContent = r.ok ? `已就绪：${r.engine}` : '启动失败，已打开修复窗口';
     refreshStatus();
+    if (!r.ok) openRepair(r);
   });
 
   $('btnRuntimeStop').addEventListener('click', async () => {
@@ -1599,7 +1623,7 @@ function bindEvents() {
       const t = toast({ title: '正在启动运行时…', body: '首次启动需要引导 Android 系统', sticky: true, spinner: true });
       const r = await api.runtimeStart();
       if (r.ok) { t.update({ title: '运行时已就绪', type: 'ok' }); setTimeout(t.dismiss, 2200); }
-      else t.update({ title: '启动失败', body: r.error, type: 'error' });
+      else { t.dismiss(); openRepair(r); }
       refreshStatus();
       return;
     }
@@ -1702,11 +1726,14 @@ function bindEvents() {
     // 报错了就别再让「正在安装…」那条一直转圈（可能来自双击 APK 的另一条链路）
     if (installToast) { try { installToast.dismiss(); } catch (_) { /* ignore */ } installToast = null; }
     const name = p && p.file ? String(p.file).split(/[\\/]/).pop() : '';
+    const body = friendlyInstallErrorText((p && p.message) || '未知错误');
     toast({
       title: name ? `安装失败：${name}` : '安装失败',
-      body: friendlyInstallErrorText((p && p.message) || '未知错误'),
+      body,
       type: 'error',
     });
+    // 装不上常常只是「安卓还没起来」的下游症状：给修复入口，别让人对着安装失败发愣
+    maybeOpenRepair(body);
   });
   api.on('toast', (p) => toast({ title: p.message, type: p.type === 'error' ? 'error' : 'info' }));
   api.on('app:launched', () => setTimeout(refreshApps, 800));
@@ -1916,6 +1943,8 @@ async function init() {
   // 自动更新开关按设置回填（bindUpdate 在 settings 加载前绑定，只能在这里回填）
   const au = $('setAutoUpdate');
   if (au) au.checked = !!(state.settings && state.settings.update && state.settings.update.autoUpdate !== false);
+  const ra = $('setReportAuto');
+  if (ra) ra.checked = !!(state.settings && state.settings.report && state.settings.report.auto !== false);
   await refreshStatus();
   await refreshApps();
   refreshAndroid();
@@ -2070,6 +2099,223 @@ async function fixAllIssues(issues) {
     // eslint-disable-next-line no-await-in-loop
     await new Promise((res) => setTimeout(res, 500));
   }
+}
+
+/* ---------------- 一键修复 ---------------- */
+
+/**
+ * 开机失败时弹这个窗：一句结论 + 体检表 + 能点的按钮。
+ * 修不了的时候（CPU 太老、Windows 7、内存太小）就把「为什么」摊开讲清楚，
+ * 而不是丢一句「CPU 缺少指令集」让用户去换系统镜像 —— 那条路永远走不通。
+ */
+let repairPlan = null;
+
+const REPAIR_BADGE = {
+  blocked: { text: '这台机器跑不了', cls: 'bad' },
+  slow: { text: '能修，但会慢', cls: 'warn' },
+  auto: { text: '可以自动修复', cls: 'ok' },
+};
+
+async function openRepair(started) {
+  // 组件还没装（首次部署没走完）不是「开机失败」，别用修复窗口盖住部署引导
+  if (started && started.needsSetup) {
+    toast({ title: '还差运行时组件', body: '请在「设置 → 运行时」里点「一键完成」把组件补齐。', type: 'info', sticky: true });
+    return;
+  }
+  const plan = await api.repairPlan().catch(() => null);
+  if (!plan) {
+    if (started && started.error) toast({ title: '开机未完成', body: started.error, type: 'error', sticky: true });
+    return;
+  }
+  renderRepairPlan(plan);
+  $('repairMask').classList.add('on');
+}
+
+/** 把方案画出来（也用于「单独执行一条」之后刷新状态） */
+function renderRepairPlan(plan) {
+  repairPlan = plan;
+  const badge = REPAIR_BADGE[plan.level] || REPAIR_BADGE.auto;
+  const badgeEl = $('repairBadge');
+  badgeEl.textContent = badge.text;
+  badgeEl.className = `repair-badge ${badge.cls}`;
+  $('repairTitle').textContent = plan.level === 'blocked' ? '为什么这台电脑跑不了' : '运行不起来的解决办法';
+  $('repairHeadline').textContent = plan.headline || plan.title || '';
+  $('repairChecks').innerHTML = (plan.checks || []).map((c) => `
+    <div class="repair-check ${esc(c.state || '')}">
+      <span class="rc-label">${esc(c.label)}</span>
+      <span class="rc-value">${esc(c.value)}</span>
+    </div>`).join('');
+  renderRepairActions(plan);
+  // 报告是自动生成的（脱敏、只落本机）：说清楚它已经在哪、什么时候发出去由用户决定
+  const draft = $('repairDraft');
+  if (draft) {
+    const has = !!(plan.reportDraft && plan.reportDraft.file);
+    draft.hidden = !has;
+    draft.textContent = !has ? ''
+      : (plan.reportDraft.sent
+        ? '失败报告已自动上报（已脱敏）：作者会收到这次的机器信息、尝试记录与日志末尾。'
+        : '失败报告已自动生成并保存在本机（路径里的用户名已替换为 %USERPROFILE%）。点「上报给作者」才会发送。');
+  }
+  $('repairWhy').innerHTML = (plan.why || []).map((t) => `<p>${esc(t)}</p>`).join('');
+  // 跑不了的情况，默认就把原因摊开；能修的先收起，别让人一上来读六百字
+  $('repairWhy').hidden = plan.level !== 'blocked';
+  $('repairWhyBtn').textContent = $('repairWhy').hidden ? '为什么跑不了' : '收起说明';
+  const steps = $('repairSteps');
+  steps.hidden = true;
+  steps.innerHTML = '';
+  const btn = $('repairRunBtn');
+  btn.disabled = false;
+  btn.textContent = plan.canAutoFix ? '一键修复并重试' : '仍然尝试一次';
+  $('repairLaterBtn').disabled = false;
+}
+
+/**
+ * 逐条列出修复动作。
+ * 「一键修复」只会自动跑 kind=auto 的那几条；开 Hyper-V、重下镜像这种
+ * 需要 UAC 或动数据的事，用户想单独做时点右边的按钮，不会被一键流程替做决定。
+ */
+function renderRepairActions(plan) {
+  const box = $('repairActions');
+  if (!box) return;
+  const acts = plan.actions || [];
+  if (!acts.length) { box.hidden = true; box.innerHTML = ''; return; }
+  box.hidden = false;
+  box.innerHTML = acts.map((a) => `
+    <div class="repair-action ${esc(a.kind || '')}">
+      <div class="ra-body">
+        <div class="ra-label">${esc(a.label)}${a.kind === 'auto' ? '<span class="ra-tag">随一键修复执行</span>' : ''}</div>
+        ${a.hint ? `<div class="ra-hint">${esc(a.hint)}</div>` : ''}
+      </div>
+      <button class="btn ghost sm ra-run" data-id="${esc(a.id)}">执行</button>
+    </div>`).join('');
+  box.querySelectorAll('.ra-run').forEach((b) => {
+    b.addEventListener('click', () => runSingleRepair(b.dataset.id));
+  });
+}
+
+/** 单独执行一条修复动作（会动数据的仍由主进程弹原生确认框） */
+async function runSingleRepair(id) {
+  const act = (repairPlan && repairPlan.actions || []).find((a) => a.id === id);
+  const label = act ? act.label : '修复动作';
+  const t = toast({ title: `正在执行：${label}`, sticky: true, spinner: true });
+  const r = await api.repairRun({ action: id }).catch((e) => ({ ok: false, error: e.message }));
+  const step = (r.steps || [])[0] || {};
+  const ok = step.ok !== false && r.ok !== false;
+  t.update({
+    title: ok ? '已完成' : '未完成',
+    body: step.detail || r.error || (ok ? '' : '可以导出诊断报告发给我'),
+    type: ok ? 'ok' : 'error',
+    sticky: !ok,
+  });
+  if (ok && id !== 'report') setTimeout(t.dismiss, 3200);
+  const fresh = await api.repairPlan().catch(() => null);
+  if (fresh) renderRepairPlan(fresh);
+}
+
+function closeRepair() {
+  $('repairMask').classList.remove('on');
+}
+
+/** 一键修复：跑自动动作 → 关窗 → 用低配参数重新开机 → 失败就再弹回来 */
+async function runRepair() {
+  const plan = repairPlan;
+  if (!plan) return;
+  const btn = $('repairRunBtn');
+  const later = $('repairLaterBtn');
+  btn.disabled = true;
+  later.disabled = true;
+  btn.textContent = '正在修复…';
+  const box = $('repairSteps');
+  box.hidden = false;
+  box.innerHTML = '';
+  const line = (text, cls) => {
+    const d = document.createElement('div');
+    d.className = `rs-line${cls ? ` ${cls}` : ''}`;
+    d.textContent = text;
+    box.appendChild(d);
+    box.scrollTop = box.scrollHeight;
+  };
+  line('正在执行修复动作…', 'run');
+  const r = await api.repairRun({ action: 'auto' }).catch((e) => ({ ok: false, steps: [], error: e.message }));
+  box.innerHTML = '';
+  (r.steps || []).forEach((st) => line(`${st.ok ? '✓' : '✕'} ${st.label}${st.detail ? ` — ${st.detail}` : ''}`, st.ok ? 'ok' : 'bad'));
+  if (r.empty) line('这套问题没有可自动执行的动作，直接换低配参数再试一次。', 'run');
+
+  const retry = r.retry || plan.retry || {};
+  closeRepair();
+  const t = toast({
+    title: retry.lowspec ? '正在以低配模式重新开机…' : '正在重新开机…',
+    body: '这台机器可能比较慢，最多需要 15 分钟；期间可以先做别的事，不用等在这里。',
+    sticky: true,
+    spinner: true,
+  });
+  const started = await api.runtimeStart({
+    lowspec: !!retry.lowspec,
+    timeoutMs: Number(retry.timeoutMs) || 0,
+  }).catch((e) => ({ ok: false, error: e.message }));
+  await refreshStatus();
+  if (started && started.ok) {
+    t.update({ title: '已经开起来了', body: '现在可以把 APK 拖进窗口，或双击桌面图标。', type: 'ok' });
+    setTimeout(t.dismiss, 4000);
+    return;
+  }
+  t.update({ title: '还是没起来', body: '这次的结果已记进诊断报告，可以点「查看原因」换个办法。', type: 'error', sticky: true });
+  setTimeout(() => openRepair(started), 400);
+}
+
+function bindRepairUI() {
+  const run = $('repairRunBtn');
+  if (!run) return;
+  run.addEventListener('click', runRepair);
+  $('repairCloseBtn').addEventListener('click', closeRepair);
+  $('repairLaterBtn').addEventListener('click', closeRepair);
+  $('repairMask').addEventListener('click', (e) => { if (e.target === $('repairMask')) closeRepair(); });
+  $('repairWhyBtn').addEventListener('click', () => {
+    const why = $('repairWhy');
+    why.hidden = !why.hidden;
+    $('repairWhyBtn').textContent = why.hidden ? '为什么跑不了' : '收起说明';
+  });
+  const exportBtn = $('repairExportBtn');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      api.doctorReport().catch(() => toast({ title: '导出失败', body: '请稍后再试', type: 'error' }));
+    });
+  }
+  const sendBtn = $('repairSendBtn');
+  if (sendBtn) sendBtn.addEventListener('click', sendFailureReport);
+}
+
+/**
+ * 上报失败报告。
+ * 配了收集接口 → 直接 POST；没配 → 弹出摘要让用户看一眼，再打开 GitHub 提交页
+ * （客户端里不能塞 token，所以最后一下必须由用户点）。
+ */
+async function sendFailureReport() {
+  const t = toast({ title: '正在准备失败报告…', sticky: true, spinner: true });
+  const r = await api.reportSubmit().catch((e) => ({ ok: false, error: e.message }));
+  if (!r || r.ok === false) {
+    if (r && r.cancelled) { t.dismiss(); return; }
+    t.update({ title: '上报未完成', body: (r && r.error) || '请稍后重试', type: 'error', sticky: true });
+    return;
+  }
+  if (r.channel === 'endpoint') {
+    t.update({ title: '已自动上报', body: '报告已发送给作者，感谢反馈。', type: 'ok' });
+  } else if (r.channel === 'local') {
+    t.update({ title: '已导出报告', body: '文件已在资源管理器中打开，可手动发给我。', type: 'ok' });
+  } else {
+    t.update({ title: '已打开提交页', body: '摘要已复制到剪贴板，点页面上的「Submit new issue」即可。', type: 'ok' });
+  }
+  setTimeout(() => t.dismiss(), 4200);
+}
+
+bindRepairUI();
+
+/** 安装/开机失败时，判断要不要给修复入口 */
+function maybeOpenRepair(message) {
+  const msg = String(message || '');
+  if (!/运行时.*(未能启动|开不完|启动失败)|CPU 缺少|开机未完成|device offline|no devices\/emulators/i.test(msg)) return false;
+  setTimeout(() => openRepair(null), 500);
+  return true;
 }
 
 /**

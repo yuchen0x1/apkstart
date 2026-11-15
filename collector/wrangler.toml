@@ -1,0 +1,16 @@
+# ApkStart 失败报告收集端（Cloudflare Worker）
+# 部署：见同目录 README.md
+name = "apkstart-reports"
+main = "worker.mjs"
+compatibility_date = "2026-01-01"
+
+# KV：存上报（90 天自动过期）
+# 先 `wrangler kv namespace create REPORTS`，把返回的 id 填到下面
+[[kv_namespaces]]
+binding = "REPORTS"
+id = "在这里填 KV namespace id"
+
+# 管理口令：`wrangler secret put ADMIN_TOKEN`（不设则 /reports 与 /r/<id> 一律 403）
+# 邮件转发（可选）：RESEND_API_KEY / MAIL_TO / MAIL_FROM
+#   wrangler secret put RESEND_API_KEY
+#   wrangler secret put MAIL_TO

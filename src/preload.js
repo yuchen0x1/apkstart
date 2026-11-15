@@ -31,7 +31,12 @@ contextBridge.exposeInMainWorld('apkstart', {
 
   runtimeStatus: () => invoke('runtime:status'),
   runtimeProbe: () => invoke('runtime:probe'),
-  runtimeStart: () => invoke('runtime:start'),
+  runtimeStart: (opts) => invoke('runtime:start', opts || {}),
+  repairPlan: () => invoke('runtime:repairPlan'),
+  repairRun: (opts) => invoke('runtime:repairRun', opts || {}),
+  reportPrepare: () => invoke('report:prepare'),
+  reportSubmit: () => invoke('report:submit'),
+  reportFolder: () => invoke('report:folder'),
   runtimeStop: () => invoke('runtime:stop'),
   runtimeLog: () => invoke('runtime:log'),
   doctorProfile: () => invoke('doctor:profile'),

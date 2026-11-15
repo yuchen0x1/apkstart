@@ -37,6 +37,9 @@ function describeExitCode(code) {
     case 1: return '启动参数或环境错误';
     case 3221225477: return '0xC0000005 访问冲突，渲染后端崩溃';
     case 3221225725: return '0xC00000FD 栈溢出';
+    // 0xC000001D：CPU 执行到它不认识的指令。这才是「真·缺指令集」的唯一硬证据，
+    // 以前没映射，报告里是一片空白，只能靠日志里那句无害的 CPUID 警告去猜。
+    case 3221225501: return '0xC000001D 非法指令（CPU 缺少模拟器要求的指令集）';
     case 3221225781: return '0xC0000135 缺少 DLL（VC++ 运行库 / 运行时组件被杀毒删除）';
     case 3221225506: return '0xC0000022 拒绝访问（驱动或权限问题）';
     case 3221225595: return '0xC000007B 镜像位数不匹配或 DLL 损坏';
@@ -864,10 +867,137 @@ class EmulatorEngine {
   }
 
   /**
+   * 轻量修复虚拟机的 Wi-Fi 关联 —— 不抹数据、不重装应用。
+   *
+   * 病根（实测）：模拟器被强杀 / 异常退出后，`/data` 里的 WifiConfigStore 会被写坏
+   * （典型样本：同一个 AndroidWifi 存了两份、network id 撞车）。此时扫描明明能看到
+   * AP（RSSI -50），wpa_supplicant 却永远停在 disconnected——wlan0 一直 NO-CARRIER、
+   * 拿不到 IP，联网应用打开就是一块黑屏。
+   *
+   * 修法（由轻到重）：
+   *   1. 关/开 wifi 电台，逼系统重扫重连（够用就到此为止）；
+   *   2. 清掉保存网络（forget 掉撞车的 id），在 WLAN 设置页点一下该 AP 重新保存关联。
+   *      uiautomator dump 拿列表项的精确 bounds 再点，不靠猜坐标。
+   *
+   * @returns {Promise<{ok:boolean, fixed:boolean, reason?:string}>}
+   */
+  async repairWifi(adbPath = '', onLog = () => {}) {
+    let adb = adbPath || '';
+    if (!adb) {
+      try { adb = path.join(this.locate().root, 'platform-tools', 'adb.exe'); } catch (_) { adb = ''; }
+    }
+    if (!adb || !fs.existsSync(adb)) adb = 'adb';
+    const port = Number(process.env.ANDROID_ADB_SERVER_PORT) || this.adbPort || 5044;
+    const env = { ...process.env, ANDROID_ADB_SERVER_PORT: String(port) };
+    const sh = (cmd, timeout = 10000) => new Promise((resolve) => {
+      try {
+        execFile(adb, ['-s', this.serial, 'shell', cmd], { timeout, windowsHide: true, env }, (e, out, err) => {
+          // 注意：命令失败（非 0 退出）时也要把 stdout/stderr 带出来。
+          // 之前这里失败就返回空串，导致 `connect-network` 的 SecurityException
+          // 被吞掉、UI 兜底分支永远进不去（实测踩过这个坑）。
+          resolve(String(out || '') + String(err || ''));
+        });
+      } catch (_) { resolve(''); }
+    });
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // 0) 已经连着就不用修
+    const before = await sh('cmd wifi status');
+    if (/Wifi is connected/i.test(before)) {
+      const ip = await this.checkNetwork(adbPath).catch(() => null);
+      if (ip && ip.ok) return { ok: true, fixed: false, reason: 'already-connected' };
+    }
+
+    // 1) 先试最便宜的一招：关掉再打开 wifi 电台，逼系统重扫重连。
+    //    多数「只是没关联上」的情况这一步就够（不用动车上的保存网络）。
+    await sh('cmd wifi set-wifi-enabled disabled');
+    await sleep(1500);
+    await sh('cmd wifi set-wifi-enabled enabled');
+    for (let i = 0; i < 5; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(1500);
+      // eslint-disable-next-line no-await-in-loop
+      const st = await this.checkNetwork(adbPath).catch(() => null);
+      if (st && st.ok) return { ok: true, fixed: true, reason: 'radio-cycle' };
+    }
+
+    // 2) 还是不行：清掉保存网络重新关联。
+    //    实测病态样本：list-networks 里同一条 AndroidWifi 存了两份、network id 撞车，
+    //    系统会一直停在 disconnected。forget 掉那个 id 会把同 id 的记录一起清掉，
+    //    然后走设置页点一下重新保存（开放网络无需密码）。
+    const list = await sh('cmd wifi list-networks');
+    const ids = new Set();
+    for (const line of String(list).split(/\r?\n/)) {
+      const m = /^\s*(\d+)\s+\S/.exec(line);
+      if (m) ids.add(m[1]);
+    }
+    for (const id of ids) {
+      // eslint-disable-next-line no-await-in-loop
+      await sh(`cmd wifi forget-network ${id}`);
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(400);
+    }
+
+    // 3) 重新保存并关联：优先用 shell 命令（部分镜像开放权限）
+    const conn = await sh('cmd wifi connect-network AndroidWifi open', 8000);
+    if (/SecurityException|Exception|doesn't exist/i.test(conn)) {
+      // 4) 回退到 UI：打开 WLAN 设置 → 等扫描出 AndroidWifi → 按节点 bounds 点它。
+      //    实测坑：刚 forget 完、设置页刚打开时列表还是空的（等扫描 3~8 秒），
+      //    所以这里必须轮询重试，dump 太早会拿不到节点。
+      await sh('am start -a android.settings.WIFI_SETTINGS');
+      await sleep(3000);
+      let tapped = false;
+      for (let attempt = 0; attempt < 10 && !tapped; attempt++) {
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(2500);
+        // eslint-disable-next-line no-await-in-loop
+        const dump = await sh('rm -f /sdcard/wifi_ui.xml; uiautomator dump /sdcard/wifi_ui.xml >/dev/null 2>&1; cat /sdcard/wifi_ui.xml', 15000);
+        const m = /text="AndroidWifi"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/.exec(dump)
+          || /bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"[^>]*text="AndroidWifi"/.exec(dump);
+        onLog(`Wi-Fi 修复：第 ${attempt + 1} 次查找${m ? '命中' : '未命中'}（界面 ${dump.length} 字节）`);
+        if (!m) continue;
+        const cx = Math.round((Number(m[1]) + Number(m[3])) / 2);
+        const cy = Math.round((Number(m[2]) + Number(m[4])) / 2);
+        // eslint-disable-next-line no-await-in-loop
+        await sh(`input tap ${cx} ${cy}`);
+        onLog(`Wi-Fi 修复：已点击 AndroidWifi（${cx},${cy}）`);
+        tapped = true;
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(1500);
+        // 开放网络通常直接连；个别镜像会弹确认框，有就点掉
+        // eslint-disable-next-line no-await-in-loop
+        const dump2 = await sh('uiautomator dump /sdcard/wifi_ui2.xml >/dev/null 2>&1; cat /sdcard/wifi_ui2.xml', 12000);
+        const btn = /text="Connect"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/.exec(dump2);
+        if (btn) {
+          // eslint-disable-next-line no-await-in-loop
+          await sh(`input tap ${Math.round((Number(btn[1]) + Number(btn[3])) / 2)} ${Math.round((Number(btn[2]) + Number(btn[4])) / 2)}`);
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(1200);
+        }
+      }
+    }
+
+    // 4) 等 DHCP 完成再判定（association + DHCP 通常 2~8 秒，慢的时候 20 秒）
+    for (let i = 0; i < 14; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(1500);
+      // eslint-disable-next-line no-await-in-loop
+      const st = await this.checkNetwork(adbPath).catch(() => null);
+      if (st && st.ok) {
+        // 回到桌面 / 关掉设置页，别把用户停在设置里
+        await sh('input keyevent KEYCODE_HOME');
+        return { ok: true, fixed: true };
+      }
+    }
+    await sh('input keyevent KEYCODE_HOME');
+    return { ok: false, fixed: true, reason: 'still-no-ip' };
+  }
+
+  /**
    * 启动 + 自动重试。
    * @param {Function} probe 异步回调，返回 'ok' | 'pending' | 'fatal'
    */
-  async start({ headless = false, onLog = () => {}, probe = null, maxAttempts = 4, lcdOrientation = '' } = {}) {
+  async start({ headless = false, onLog = () => {}, probe = null, maxAttempts = 4, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
     if (this.proc && !this.proc.killed) {
       return { ok: true, reused: true, serial: this.serial, port: this.port };
     }
@@ -926,6 +1056,20 @@ class EmulatorEngine {
       settings: s, accel: accelInfo, emulatorVersion: emuVersion, diskMB,
       port: startPort, adbPort,
     });
+    // 「低配模式」：一键修复里由用户点一下才启用，只对本次启动生效，不写进设置。
+    // 目的不是让机器变快，而是让「本来就慢但能跑」的机器有机会开完机：
+    // 降分辨率/减 vCPU 少抢资源，关快照避免加载失败后白等，并给足超时。
+    if (lowspec) {
+      profile.memoryMB = Math.min(profile.memoryMB, 2048);
+      profile.cores = Math.min(profile.cores, 2);
+      profile.lcd = doctor.lcdFor({ accelOk: false });
+      profile.snapshot = false;
+      profile.lowspec = true;
+      onLog(`已切到低配模式：${profile.lcd.w}x${profile.lcd.h} · ${profile.cores} 核 · ${profile.memoryMB}MB · 不存快照`);
+    }
+    if (Number(timeoutMs) > 0) {
+      profile.bootTimeoutMs = Math.max(profile.bootTimeoutMs || 0, Number(timeoutMs));
+    }
     this.profile = profile;
     // 嵌入 Electron 的可见窗口会经历跨进程 SetParent、失焦和 DWM 重绘；
     // 这类场景下 host 的交换链可能在失焦后丢失，表现为「安卓仍在跑，窗口全黑」。
@@ -1095,8 +1239,21 @@ class EmulatorEngine {
         // 用户只会说「这个应用黑屏」，很难联想到是网络。这里主动查一次并说清楚。
         let network = null;
         try { network = await this.checkNetwork(); } catch (_) { /* 体检失败不算启动失败 */ }
+        // 没网时先自动修一次 Wi-Fi 关联（清撞车的保存网络 + 点一下重新关联），
+        // 修好了用户就完全无感；修不好才提示，且不再劝用户「重置数据」——
+        // 那会白丢已装应用，而真正的病根只是一份写坏的 wifi 配置。
         if (network && !network.ok) {
-          onLog('⚠ 安卓虚拟机当前没有网络：需要联网的应用（如短剧类）打开后会一直黑屏。'
+          onLog('检测到虚拟机网络异常，正在自动修复 Wi-Fi 关联…');
+          const rep = await this.repairWifi('', onLog).catch(() => null);
+          if (rep && rep.ok) {
+            onLog('虚拟机网络已恢复');
+            network = await this.checkNetwork().catch(() => network);
+          } else if (rep) {
+            onLog(`Wi-Fi 自动修复未成功（${rep.reason || 'unknown'}）`);
+          }
+        }
+        if (network && !network.ok) {
+          onLog('⚠ 安卓虚拟机当前没有网络：需要联网的应用打开后会一直黑屏。'
             + '可在「设置 → 修复网络」重置安卓数据来修（应用清单会保留，点开时会自动重装）。');
         }
         return {
@@ -1106,10 +1263,18 @@ class EmulatorEngine {
       }
 
       const attemptLines = this._attemptLines(logStart, 80);
-      const d = fatal ? (this.lastDiagnosis || doctor.diagnose(attemptLines)) : doctor.diagnose(attemptLines);
+      let d = fatal ? (this.lastDiagnosis || doctor.diagnose(attemptLines)) : doctor.diagnose(attemptLines);
+      // 进程没崩、只是等到超时：结论就该是「太慢」，不能被日志里的 CPUID 警告
+      // 或 UNKNOWN 抢走。否则用户拿着「CPU 缺少指令集」去换镜像，永远修不好。
+      if (!fatal && ['UNKNOWN', 'CPU_FEATURE'].includes(d.code)) {
+        d = doctor.timeoutDiagnosis({
+          accelOk: !!(accelInfo && accelInfo.ok),
+          seconds: Math.round((Date.now() - started) / 1000),
+        });
+      }
       this.attempts.push({ plan: plan.label, diagnosis: d.code, timeout: !fatal, exitCode: this.lastExitCode });
       this.lastDiagnosis = d;
-      lastError = fatal ? `${d.title}：${d.hint}` : '开机超时（可能是首次引导较慢或硬件加速未生效）';
+      lastError = `${d.title}：${d.hint}`;
       onLog(`${lastError}，自动换一组参数重试…`);
       this._noteGpuFailure(plan);
       // eslint-disable-next-line no-await-in-loop
@@ -1126,7 +1291,11 @@ class EmulatorEngine {
       extra: {
         attempts: this.attempts,
         diagnosis: d,
+        // 日志里那些「看着像错误、其实无害」的行，报告里主动解释一句，
+        // 省得用户拿 "host doesn't support requested feature" 去查错方向。
+        notes: doctor.notes(this.recentLog(300)),
         image: choice,
+        lowspec: !!profile.lowspec,
         exitCode: this.lastExitCode,
         exitMeaning: describeExitCode(this.lastExitCode),
         sessionLog: this.tailAppLog(200),

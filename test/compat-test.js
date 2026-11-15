@@ -195,6 +195,13 @@ const hasCode = (r, code) => r.reasons.some((x) => x.code === code);
     eq(r.level, 'ok', '应判为可用');
   });
 
+  await test('微信 arm64 包同样命中转译黑名单（libowl 安全组件）', () => {
+    const r = compat.analyze(mkApk({ packageName: 'com.tencent.mm', abis: ['arm64-v8a'] }),
+      { abis: ['x86_64'], armTranslation: true, sdk: 34 });
+    eq(r.level, 'unsupported', '应判为暂不支持');
+    assert(hasCode(r, 'known-translation-crash'), '应给出已知崩溃理由');
+  });
+
   await test('未知包名的 arm64 应用不会被误判', () => {
     const r = compat.analyze(mkApk({ packageName: 'com.example.other', abis: ['arm64-v8a'] }),
       { abis: ['x86_64'], armTranslation: true, sdk: 35 });

@@ -19,7 +19,17 @@ const TITLEBAR_H = 38;
  * 这圈灰边就正好被推到客户区外面，画面干净地贴满四周。
  */
 const EMU_PAD = 8;
+/**
+ * 「嵌入成功但全黑」的判定阈值。实测（只统计画面中间 76% 区域，避开模拟器自带的
+ * 灰色内边距）：正常画面平均亮度 84~130，被 SetParent 弄坏的窗口稳定在 8~20。
+ * 取 40：留出足够余量，又远低于任何真实界面（深色主题的安卓桌面也在 60 以上）。
+ */
+const BLACK_MEAN = Number(process.env.APKSTART_BLACK_MEAN || 40);
+/** 关掉「像素自检 → 跟随模式」降级（排查问题时用，避免自动切换干扰观察） */
+const NO_FOLLOW = process.env.APKSTART_NO_FOLLOW === '1';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** 跟随模式的排查开关：APKSTART_FOLLOW_DEBUG=1 时把每次校准的回包打到 stdout */
+const dbg = (...a) => { if (process.env.APKSTART_FOLLOW_DEBUG === '1') console.error('[follow]', ...a); };
 
 function iconUrl(p) {
   if (!p || !fs.existsSync(p)) return '';
@@ -39,6 +49,16 @@ class AppWindow {
     this.state = { label: '', tip: '', ready: false, landscape: false };
     this._fitTimer = null;
     this._closedCb = null;
+    // 模拟器窗口已成功嵌入本窗口。显示类事件（show/restore）靠它决定
+    // 是否要顺带把被 minimize→agent.hide() 藏掉的模拟器窗口重新亮出来。
+    this._embedded = false;
+    // 嵌入后是否降级成了「窗口跟随」，以及原因（dpi = SetParent 被拒，black = 画面全黑）
+    this.lastEmbedFollow = false;
+    this.lastEmbedFollowReason = '';
+    // 触发降级时的实测亮度，写进日志便于回看
+    this.lastBlackMean = 0;
+    // 嵌入后第一次采到的画面平均亮度（诊断「黑屏但嵌入成功」用）
+    this.lastEmbedMean = -1;
   }
 
   get isOpen() { return !!(this.win && !this.win.isDestroyed()); }
@@ -125,6 +145,7 @@ class AppWindow {
     if (this.isOpen && this.pkg === pkg) {
       this.win.show();
       this.win.focus();
+      this._revealEmbedded();
       return this.win;
     }
     this.close({ keepApp: true });
@@ -204,6 +225,11 @@ class AppWindow {
       this.scheduleFit();
     });
     this.win.on('minimize', () => { this.agent.hide().catch(() => {}); });
+    // 程序化 show()（从主界面把已运行的应用调回前台、embed 后抬 Z 序等路径）
+    // 不触发 restore 事件：这里统一兜底，否则模拟器窗口还停在
+    // minimize 时被 agent.hide() 藏起来的状态 —— 宿主有窗口但画面全黑
+    // （实测表现：窗口在、进程活着、安卓侧正常，只有嵌入画面消失）。
+    this.win.on('show', () => this._revealEmbedded());
     // 关闭统一收口到 close()：它先 agent.park() 把模拟器窗口从宿主上摘下来藏好，
     // 再销毁宿主。少了这一步，Windows 会连带销毁嵌入的 Qt 子窗口（qemu 还在跑），
     // 之后任何应用再打开都拿不到句柄 —— 日志是 `embed failed: emu=0`、窗口全黑，
@@ -218,6 +244,7 @@ class AppWindow {
     });
     this.win.on('closed', () => {
       if (this._selfClose) return;   // close() 自己在 park 完成后收尾
+      this._stopFollowSync();
       this.win = null;
       const pkg = this.pkg;
       this.pkg = null;
@@ -235,6 +262,9 @@ class AppWindow {
       // Electron 窗口重新获得焦点时，Qt 子窗口可能还停留在被遮挡后的黑帧；
       // 只做无激活重排/重绘，不抢回焦点，也不把鼠标事件发给模拟器。
       this.agent.refresh?.().catch(() => {});
+      // 焦点回来兜底再亮一次：覆盖「minimize 藏窗后从任务栏/主界面点回来」
+      // 走不到 restore/show 事件的路径。已可见时 ShowWindow 是无害空操作。
+      this._revealEmbedded();
     });
     this.win.on('blur', () => {
       this._syncHook(false);
@@ -299,6 +329,13 @@ class AppWindow {
    * netsimd 的控制台黑窗）继续压住 —— 关了反而会给它们再露一次脸的机会。
    * 模拟器窗口偶尔还没创建好（快照恢复太快的机器上），这里重试两次。
    */
+  /** 窗口重新可见时，把被藏起来的模拟器窗口重新亮出来（只对已嵌入状态生效） */
+  _revealEmbedded() {
+    if (!this._embedded || !this.isOpen) return;
+    this.agent.show().catch(() => {});
+    this.scheduleFit();
+  }
+
   async embed() {
     if (!this.isOpen) return false;
     // 非 Windows / 没有原生代理：嵌入这条路根本不存在。
@@ -322,6 +359,26 @@ class AppWindow {
       if (r && r.ok) {
         // SetParent 被 DPI 不一致拒绝时代理会降级为「窗口跟随」并置 follow=true
         this.lastEmbedFollow = !!r.follow;
+        this.lastEmbedFollowReason = r.follow ? 'dpi' : '';
+        this._embedded = true;
+        // 嵌入成功 ≠ 有画面。某些 emulator（实测 37.x + Win11 26xxx）被 SetParent
+        // 之后句柄 / 尺寸 / 可见性全都正常，渲染表面却直接失效，整块永远是黑的 ——
+        // 枚举窗口、看日志都发现不了，用户的观感就是「打开就黑屏，什么也没有」。
+        // 这里抓一次真实像素，连续全黑就降级成「跟随模式」（不 reparent）。
+        if (!this.lastEmbedFollow && !NO_FOLLOW) {
+          const black = await this._looksBlack();
+          if (black) {
+            const f = await this.agent.follow(this._rect()).catch(() => ({ ok: false }));
+            if (f && f.ok) {
+              this.lastEmbedFollow = true;
+              this.lastEmbedFollowReason = 'black';
+              dbg('follow switched', JSON.stringify(f));
+            }
+          }
+        }
+        // 两种降级（DPI 被拒 / 全黑）都要开「持续校准」：跟随模式下模拟器会
+        // 重建自己的顶层窗口并默认出现在屏幕左上角，不持续摆正就飘着不贴合。
+        if (this.lastEmbedFollow) this._startFollowSync();
         return true;
       }
       // eslint-disable-next-line no-await-in-loop
@@ -331,7 +388,62 @@ class AppWindow {
     // 还是「SetParent 失败」，不用再靠猜。
     this.lastEmbedError = last ? (last.error || `emu=${last.emu}`) : 'no-response';
     this.lastEmbedFollow = false;
+    this._embedded = false;
     return false;
+  }
+
+  /**
+   * 连续采样模拟器窗口的像素，判断「窗口在但画面全黑」。
+   * 只采到一次有画面就立刻返回 false（正常情况第一次就返回，几乎没有开销）；
+   * 采样失败（代理没响应 / 窗口还没建好）一律当作「不是黑屏」，绝不凭猜测降级。
+   * 阈值可用 APKSTART_BLACK_MEAN 覆盖，APKSTART_NO_FOLLOW=1 可整体关掉降级。
+   */
+  async _looksBlack() {
+    let last = 0;
+    // 采样 5 次、跨越约 3.5 秒才下结论：应用刚启动时常常挂在一张全黑的启动图上，
+    // 只看一眼就降级会把好机器也切成跟随模式。只要有一次测到画面就立刻收工。
+    for (let i = 0; i < 5; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const p = await this.agent.pixmean().catch(() => null);
+      if (!p || !p.ok || typeof p.mean !== 'number' || p.mean < 0) return false;
+      last = p.mean;
+      this.lastEmbedMean = p.mean;
+      if (p.mean >= BLACK_MEAN) return false;
+      if (i < 4) {
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(700);
+      }
+    }
+    this.lastBlackMean = last;
+    return true;
+  }
+
+  /**
+   * 跟随模式的「持续校准」。
+   *
+   * 跟随模式下模拟器是独立顶层窗口，位置只能由我们摆 —— 但它自己也会抢：
+   * 摘掉父窗口时模拟器会重建一个新窗口（默认出现在屏幕左上角），拖窗口、切 DPI、
+   * 模拟器内部改尺寸都可能让它飘走。只靠 resize/move 事件校准不够，
+   * 所以这里低频（500ms）反复把矩形按回去；最小化/不可见时跳过，避免把
+   * 「隐藏起来省资源」的窗口又亮出来。
+   */
+  _startFollowSync() {
+    this._stopFollowSync();
+    this._followTimer = setInterval(() => {
+      if (!this.isOpen || !this.lastEmbedFollow) return;
+      try {
+        if (this.win.isMinimized() || !this.win.isVisible()) return;
+      } catch (_) { return; }
+      this.agent.fit(this._rect()).then((r) => dbg('tick', JSON.stringify(r))).catch((e) => dbg('tick fail', e.message));
+    }, 500);
+    this._followTimer.unref?.();
+  }
+
+  _stopFollowSync() {
+    if (this._followTimer) {
+      clearInterval(this._followTimer);
+      this._followTimer = null;
+    }
   }
 
   async fitNow() {
@@ -345,11 +457,15 @@ class AppWindow {
   _rect() {
     const sf = this._scale();
     const b = this.win.getContentBounds();
+    // 跟随模式下模拟器是独立顶层窗口，没有宿主裁剪：再外扩 8px 就会盖住宿主
+    // 自己的边框和阴影，看起来像「窗口边缘缺了一块」。这里退回 0 内边距，
+    // 让模拟器自带的那圈灰边留在我们自己窗口里面（视觉上是 LCD 周围的一圈留白）。
+    const pad = this.lastEmbedFollow ? 0 : EMU_PAD;
     return {
-      x: -EMU_PAD,
-      y: Math.round(TITLEBAR_H * sf) - EMU_PAD,
-      w: Math.round(b.width * sf) + EMU_PAD * 2,
-      h: Math.round((b.height - TITLEBAR_H) * sf) + EMU_PAD * 2,
+      x: -pad,
+      y: Math.round(TITLEBAR_H * sf) - pad,
+      w: Math.round(b.width * sf) + pad * 2,
+      h: Math.round((b.height - TITLEBAR_H) * sf) + pad * 2,
     };
   }
 
@@ -451,6 +567,8 @@ class AppWindow {
     if (!this.isOpen) return;
     const win = this.win;
     const pkg = this.pkg;
+    this._embedded = false;
+    this._stopFollowSync();
     this._syncHook(false);
     if (!keepApp && pkg && this._onCloseApp) this._onCloseApp(pkg);
     this._selfClose = true;

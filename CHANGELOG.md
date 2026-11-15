@@ -5,6 +5,76 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.1] — 2026-11-16
+
+### 新增
+- **失败自动上报（脱敏 + 一键提交）**：开机失败时自动生成一份诊断摘要与完整报告，
+  存在 `%APPDATA%\apkstart\logs\reports\`（同一签名 24 小时内不重复写）。
+  摘要里的家目录、用户名、临时目录会替换成 `%USERPROFILE%` / `%TEMP%`；
+  修复窗口里的「上报给作者」会先把摘要摆给用户确认，再打开仓库的 GitHub 提交页
+  （摘要同时进剪贴板，浏览器丢了预填内容也能粘）。
+  - 客户端不携带任何 token；要「全自动直传」，把 `settings.report.endpoint` 指向自己的
+    收集接口即可（先脱敏再 POST，失败自动回落到 GitHub 页面）。
+  - `package.json` 的 `feedback.email` 填上以后，弹窗里会多一个「用邮件发送」的渠道。
+  - 设置 → 问题反馈里可关闭「失败时自动生成诊断报告」；关掉后不写任何摘要。
+  - **自带一个可部署的收集端**（`collector/`，Cloudflare Worker，免费额度够用）：
+    收报告 → 限流 → KV 存 90 天 → 可选转发到你邮箱。部署后把地址填进
+    `package.json` 的 `feedback.endpoint`，所有用户装完即「失败自动上报」，不用逐个配置。
+    接口约定见 `collector/README.md`（换成自建服务端照那个实现即可）。
+- **一键修复窗口**：开机失败不再只丢一段错误文本，而是弹出「结论 + 本机体检表 + 可点的按钮」。
+  能自动做的（清残留锁、换渲染后端、校验组件、清理磁盘、装 VC++、开硬件加速）点一下就跑；
+  会动数据/系统的（重建数据、重下镜像）先弹原生确认；跑不了的情况直接把原因摊开讲清楚。
+- **低配模式（只对本次启动生效）**：540×960 / 2 vCPU / 2 GB / 不加载快照，超时放宽到 15 分钟。
+  不写进设置 —— 用户点一次修复，不该被永久改掉画质与性能配置。
+
+### 修复
+- **宿主窗口被强杀后，之后每次打开应用都是永久黑窗**：qemu 进程被任务管理器
+  结束（或 ApkStart 崩溃）时，Windows 会连带销毁嵌在宿主窗口里的模拟器 Qt 子窗口，
+  而 qemu 本身还在跑，成了没有画面的「无头」进程——之后 embed 再也找不到窗口，
+  补嵌重试也救不回来。现在启动前先探测「进程活着但 QWindowIcon 主窗不存在」，
+  命中就把无头运行时停掉重开，用户看到的是正常的启动动画而不是黑窗。
+- **并发启动互相打断**：用户手点 + 托盘/快捷方式/CDP 同时触发两次启动时，会互相
+  杀掉对方正在开机的运行时、把未写完的快照标成损坏，进而触发 4 连重试、渲染后端
+  崩溃（0xC0000005）和网络丢失。现在 `runLaunch` 串行化，第二次请求直接提示
+  「正在启动另一个应用」并把已有窗口带到前台。
+- **虚拟机没有网络（联网应用打开就黑屏）**：根因是模拟器异常退出后 `/data` 里的
+  WifiConfigStore 被写坏（同一个 AndroidWifi 存了两份、network id 撞车），
+  wpa_supplicant 永远停在 disconnected，wlan0 NO-CARRIER 拿不到 IP。
+  新增轻量修复 `repairWifi()`：先关/开 wifi 电台逼系统重连，不行再清掉保存网络
+  并在 WLAN 设置页按 uiautomator 节点坐标点一下该 AP 重新保存（开放网络无需密码）。
+  启动体检与「等待联网」流程都会自动调用，实测 23 秒从零网络恢复，**不再需要
+  重置安卓数据**；「设置 → 修复网络」也改为先试轻量修复，失败才抹数据。
+- **应用图标显示为模糊色块（抖音等全矢量图标）**：现代应用的 launcher 图标常是
+  adaptive-icon 且前景/背景全为 `<vector>`，APK 里没有任何位图可捡，兜底逻辑只能
+  捡到品牌占位图（如抖音的 `yw_1222.jpg`）。现在把 vector drawable 转成 SVG
+  （支持 path / group 变换 / clip-path / 填充描边透明度），自适应图标双层合成后
+  存为 `.svg`，UI 的 `<img>` 由 Chromium 原生渲染；`.ico` 通过渲染进程光栅化到
+  256px。axml/arsc 同步补齐 FLOAT / DIMENSION / FRACTION / COLOR 属性类型解码。
+  实测：抖音卡片显示真实图标（黑底彩色音符）。
+- **应用窗口「切换到前台」后画面全黑**：最小化会把模拟器窗口 `agent.hide()` 藏掉，
+  但从主界面点开已运行的应用 / `app:foreground` 只调 `win.show()`，不触发
+  `restore` 事件，模拟器窗口停留在隐藏状态——宿主窗口在、进程活着、安卓侧画面
+  正常，唯独嵌入画面消失。现在以 `_embedded` 状态跟踪嵌入，`show`/`focus` 事件
+  统一兜底 `_revealEmbedded()`。实测：最小化 → 切回前台画面即时恢复。
+
+### 变更
+- 网络异常提示不再劝用户重置数据（那会白丢已装应用），自动修复失败才提示。
+- **微信 8.0.80 加入转译黑名单**：`libowl.so`（自研安全组件）在 `System.load`
+  阶段经 `JNIEnv::GetMethodID` 转译 trampoline 触发信号探测，
+  `libndk_translation` 无法处理预期内信号 → 启动即 SIGSEGV（实测复现，
+  tombstone_04）。与快手 weapon SDK 同类，属底层不兼容，安装前明确提示。
+- **「CPU 缺少运行时要求的指令集」被误判（上游 #15 的根因）**：`CPU_FEATURE` 以前匹配
+  `host doesn't support requested feature`，而 QEMU 在绝大多数正常机器上都会打印这句
+  CPUID 警告（`warning` 级，模拟器自己会降级）。于是「开机超时」被翻译成「CPU 缺指令集」，
+  用户拿这句话去换系统镜像，永远修不好。现在只认硬证据（`Illegal instruction` /
+  退出码 `0xC000001D`），无害警告单独摘进「日志里这些行其实无害」。
+- **超时不再落到 UNKNOWN**：进程没崩、只是等到超时，结论改为 `TIMEOUT`（区分有无硬件加速），
+  并说明「之前连试 4 组参数、每组都从零冷启动，所以永远等不到开完」。
+- **关加速的兜底档只给 4 分钟（等于没兜底）**：`planVariants()` 里 `accel:'off'` 的两档
+  沿用了「有加速」算出的 240s 超时，而 TCG 冷启动 Android 14 常要 8~15 分钟；现改为 10 / 15 分钟。
+- **诊断报告自带解释**：补 `cpuModel` / BIOS 厂商（识别云电脑）/ 是否虚拟机 / 低配标记，
+  并逐条说明无害日志；报告的「诊断」段与界面结论统一（不再各算一遍正则）。
+
 ## [0.6.0] — 2026-11-15
 
 上游 38 条 issue 里剩下的四条能落地的，这一版全部处理完（结论见
@@ -272,7 +342,7 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
-[Unreleased]: https://github.com/yuchen0x1/apkstart/compare/v0.5.0...HEAD
+[0.6.1]: https://github.com/yuchen0x1/apkstart/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/yuchen0x1/apkstart/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/yuchen0x1/apkstart/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.4.0

@@ -221,8 +221,17 @@ class Installer {
         iconPath = store.iconPath(meta.package);
         fs.writeFileSync(iconPath, meta.iconPng);
       } catch (_) { /* ignore */ }
+    } else if (meta.iconSvg) {
+      // 矢量图标（adaptive-icon 全矢量，如抖音）：存成 .svg，UI 的 <img>
+      // 走 Chromium 原生渲染。.ico 这边交给 decode 回调光栅化，失败落到品牌占位图。
       try {
-        const ico = await iconToIco(meta.iconPng, {
+        iconPath = store.svgIconPath(meta.package);
+        fs.writeFileSync(iconPath, meta.iconSvg);
+      } catch (_) { /* ignore */ }
+    }
+    if (meta.iconPng || meta.iconSvg) {
+      try {
+        const ico = await iconToIco(meta.iconPng || Buffer.from(meta.iconSvg), {
           decode: this.ctx.decodeIcon,
           onFallback: (why) => { iconFallback = why; },
         });

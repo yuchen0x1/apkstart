@@ -136,6 +136,35 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(doctor.diagnose(mixed).code === 'ACCESS_VIOLATION', '崩溃应优先于普通渲染日志');
   });
 
+  await test('CPU 指令集：QEMU 的无害警告不许当成结论（#15 误诊回归）', () => {
+    const warn = ["WARNING: host doesn't support requested feature: CPUID.01H:ECX.avx [bit 28]"];
+    assert(doctor.diagnose(warn).code !== 'CPU_FEATURE',
+      'CPUID 警告在绝大多数机器上都会出现，判成「缺指令集」会把用户引向换镜像');
+    assert(doctor.diagnose(['Illegal instruction']).code === 'CPU_FEATURE');
+    assert(doctor.diagnose(['emulator exit 3221225501']).code === 'CPU_FEATURE');
+    assert(doctor.notes(warn).length === 1, '无害警告要被单独摘出来解释');
+  });
+
+  await test('超时结论：没有加速时说「慢」并给出可执行动作', () => {
+    const slow = doctor.timeoutDiagnosis({ accelOk: false, seconds: 240 });
+    assert(slow.code === 'TIMEOUT');
+    assert(/15 分钟/.test(slow.hint), `应说明放宽到多久：${slow.hint}`);
+    const gpu = doctor.timeoutDiagnosis({ accelOk: true, seconds: 240 });
+    assert(/渲染/.test(gpu.hint), `有加速时应指向渲染：${gpu.hint}`);
+  });
+
+  await test('关加速的兜底档自带更长超时（否则兜底等于没兜底）', () => {
+    const p = doctor.chooseProfile({
+      host: doctor.hostInfo(), accel: { ok: true }, emulatorVersion: '37.3.8.0',
+      diskMB: 50000, port: 5554, adbPort: 5044,
+    });
+    const off = doctor.planVariants(p).filter((v) => v.accel === 'off');
+    assert(off.length >= 1, '缺少关加速的兜底档');
+    for (const v of off) {
+      assert(v.bootTimeoutMs >= 600000, `TCG 冷启动常要 8~15 分钟，超时却只有 ${v.bootTimeoutMs}ms`);
+    }
+  });
+
   await test('空闲端口探测返回偶数端口对', async () => {
     const p = await doctor.freePortPair(5560);
     assert(p % 2 === 0 && p >= 5560, `端口异常：${p}`);

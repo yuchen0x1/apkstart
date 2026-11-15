@@ -697,6 +697,22 @@
         </div>
       </div>
 
+      <div class="group" id="reportGroup">
+        <div class="group-title">问题反馈</div>
+        <div class="field">
+          <label>失败时自动生成诊断报告</label>
+          <div class="row">
+            <input type="checkbox" id="setReportAuto" class="switch" />
+            <span class="inline-note" style="margin-left:8px;">未配置收集接口时只保存在本机</span>
+          </div>
+          <span class="sub">开机失败时自动整理一份摘要（CPU、加速状态、每轮尝试、日志末尾），路径里的用户名会替换成 %USERPROFILE%。配置了收集接口（发行版内置或 settings.json 的 report.endpoint）会直接发给作者；否则在修复窗口点「上报给作者」提交到 GitHub Issues。</span>
+          <div class="row" style="margin-top:6px;">
+            <button class="btn ghost sm" id="btnReportFolder">打开报告目录</button>
+            <span class="inline-note">logs\reports</span>
+          </div>
+        </div>
+      </div>
+
       <div class="group" id="aboutGroup">
         <div class="group-title">更新日志</div>
         <div class="about-box">
@@ -715,6 +731,38 @@
     <footer class="modal-foot">
       <span class="inline-note">设置修改后立即生效</span>
       <button class="btn primary" id="btnDoneSettings">完成</button>
+    </footer>
+  </div>
+</div>
+
+
+<!-- 一键修复：开机失败时弹出（结论 + 体检表 + 一键修复 / 为什么跑不了） -->
+<div class="modal-mask" id="repairMask">
+  <div class="modal repair-modal">
+    <header class="modal-head">
+      <h2 id="repairTitle">运行不起来的解决办法</h2>
+      <button class="icon-btn" id="repairCloseBtn" aria-label="关闭">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </header>
+    <div class="modal-body">
+      <div class="repair-head">
+        <span class="repair-badge ok" id="repairBadge">可以自动修复</span>
+        <p class="repair-headline" id="repairHeadline"></p>
+      </div>
+      <div class="repair-checks" id="repairChecks"></div>
+      <div class="repair-actions" id="repairActions" hidden></div>
+      <div class="repair-why" id="repairWhy" hidden></div>
+      <div class="repair-draft" id="repairDraft" hidden></div>
+      <div class="repair-steps" id="repairSteps" hidden></div>
+    </div>
+    <footer class="modal-foot">
+      <button class="btn ghost" id="repairExportBtn">导出报告</button>
+      <button class="btn ghost" id="repairSendBtn">上报给作者</button>
+      <span class="repair-spacer"></span>
+      <button class="btn ghost" id="repairWhyBtn">为什么跑不了</button>
+      <button class="btn ghost" id="repairLaterBtn">稍后再说</button>
+      <button class="btn primary" id="repairRunBtn">一键修复并重试</button>
     </footer>
   </div>
 </div>

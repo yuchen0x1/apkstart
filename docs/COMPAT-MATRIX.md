@@ -141,3 +141,31 @@ F .smile.gifmaker: runtime.cc:708] Runtime aborting...
    （当前：`com.smile.gifmaker`、`com.kuaishou.nebula`）。只有在「APK 无本机原生库 + 必须走转译」
    时才命中，判为「暂不支持」并给出崩溃原因；将来出了 x86_64 原生库会自动失效。
    测试见 `test/compat-test.js` 的三条用例。
+
+
+---
+
+## 7. ApkStart 自带运行时端到端实测（2026-11-15 第二轮）
+
+环境：ApkStart 开发版（Electron 45.3.2 + 窗口嵌入）+ 自带 runtime
+（emulator 37.x / AVD `apkstart` / API 34 google_apis_playstore x86_64，
+libndk_translation，720x1280，`-gpu swangle`）。经 `runtime:repairNetwork`
+wipe 后首次开机联网正常（wlan0 10.0.2.16），快照已存。
+
+| 应用 | 版本 | ABI | 安装 | 启动 | 结论 |
+|---|---|---|---|---|---|
+| 抖音 | 41.1.0 | arm64-v8a | ✅ | ✅ 隐私弹窗→同意→推荐流播放，帧间像素变化 20.1% | **可用** |
+| 哔哩哔哩 | 9.19.0 | arm64-v8a | ✅ | ✅ 访客模式→For You 推荐流封面/播放量/UP 主全加载 | **可用** |
+| 微信 | 8.0.80 | arm64-v8a | ✅ | ❌ `libowl.so` SIGSEGV（System.load 阶段，tombstone_04） | **不兼容**（已入黑名单） |
+| 快手 | 14.10.20 | arm64-v8a | ✅ | ❌ 安全 SDK + 自定义链接器崩溃（上轮实测） | **不兼容**（已入黑名单） |
+
+本轮同时修复并验证：
+
+1. **图标不显示**：抖音/微信/B 站的 launcher 图标全为矢量（adaptive-icon + vector），
+   新增 vector→SVG 转换 + 双层合成，卡片显示真实图标（抖音黑底音符实测截图确认）。
+2. **切前台黑屏**：最小化再切回，模拟器窗口停在 `agent.hide()` 状态；
+   加 `_embedded` 跟踪 + show/focus 兜底 `agent.show()`，实测画面恢复。
+3. **虚拟机网络失联**：wlan0 NO-CARRIER 不关联（快照/异常退出后常见），
+   走内置 `repairNetwork`（wipe + 冷启动）恢复，与引擎注释的已知结论一致。
+
+安装方式：ApkStart UI 全流程（CDP 驱动 `apk:install` / `app:launch`）。

@@ -32,6 +32,17 @@ public class ApkAgent
     [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr Hwnd; public uint Message; public IntPtr WParam; public IntPtr LParam; public uint Time; public int X; public int Y; }
     // Minimal PROCESS_BASIC_INFORMATION: enough to read InheritedFromUniqueProcessId.
     [StructLayout(LayoutKind.Sequential)] public struct PBI { public IntPtr R1; public IntPtr Peb; public IntPtr R2a; public IntPtr R2b; public IntPtr Pid; public IntPtr ParentPid; }
+    [StructLayout(LayoutKind.Sequential)] public struct BITMAPINFOHEADER
+    {
+        public int biSize; public int biWidth; public int biHeight;
+        public short biPlanes; public short biBitCount; public int biCompression;
+        public int biSizeImage; public int biXPelsPerMeter; public int biYPelsPerMeter;
+        public int biClrUsed; public int biClrImportant;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct BITMAPINFO
+    {
+        public BITMAPINFOHEADER bmiHeader; public int bmiColors;
+    }
 
     public delegate bool EnumProc(IntPtr h, IntPtr p);
     public delegate IntPtr HookProc(int code, IntPtr wp, IntPtr lp);
@@ -66,6 +77,19 @@ public class ApkAgent
     [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, HookProc p, IntPtr mod, uint thread);
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
+    // 像素自检（pixmean）与跟随模式（follow）用到的 GDI 调用。
+    // 背景见 ForceFollow 的注释：某些 emulator 版本被 SetParent 之后渲染表面直接死掉，
+    // 窗口仍在、尺寸也对，就是一片黑 —— 只有抓像素才能发现。
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleBitmap(IntPtr dc, int w, int hh);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+    [DllImport("gdi32.dll")] static extern int GetDIBits(IntPtr dc, IntPtr bmp, uint start, uint lines, byte[] bits, ref BITMAPINFO bi, uint usage);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h, int code, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] static extern bool PeekMessage(out MSG m, IntPtr h, uint min, uint max, uint remove);
     [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr h, uint min, uint max);
@@ -613,6 +637,24 @@ public class ApkAgent
         return "\"host\":" + h.ToInt64() + ",\"list\":[" + sb + "]";
     }
 
+    // 模拟器的画面窗口**是否还存在**（不管可见、不管有没有被嵌进宿主）。
+    // 这就是「无头运行时」的唯一判据：qemu 活着但窗口没了，之后每次 embed 都会失败，
+    // 用户看到的永远是黑窗。
+    //
+    // 为什么不用 ListWindows：它默认只看可见窗口，而我们自己的 QuietSweep 会把
+    // 未嵌入的模拟器主窗藏起来 —— 于是「刚藏好」会被误判成「窗口没了」，
+    // 上一版就是这样在开机过程中把运行时杀掉的（后果是 adb device not found）。
+    // 这里换成 Handle + FindEmulator（它认得隐藏窗口、也做了进程归属校验）。
+    static bool EmuAlive()
+    {
+        // 作用域还没建立（armAgent 没跑完）时 IsOurs 恒为 false，查不出任何东西，
+        // 这时候下结论一定是错的 —— 直接当作「活着」。
+        if (_scopeDirs.Count == 0) return true;
+        if (_emu != IntPtr.Zero && IsWindow(_emu)) return true;
+        if (FindEmulator() != IntPtr.Zero) return true;
+        return false;
+    }
+
     static bool Embed(IntPtr host, IntPtr emu)
     {
         if (host == IntPtr.Zero || emu == IntPtr.Zero) return false;
@@ -666,6 +708,21 @@ public class ApkAgent
     static readonly IntPtr HWND_TOP = new IntPtr(0);
     static void Fit(int x, int y, int w, int h, bool frame)
     {
+        // 跟随模式下 `SetParent(0)` 会让模拟器把窗口当成「被摘出去了」而另外建一个
+        // 顶层窗口：新窗口出现在它自己的默认位置（实测 (0,38)），尺寸也是它自己的，
+        // 而旧句柄**依然有效但不可见** —— 只靠 IsWindow 判断永远发现不了，
+        // SetWindowPos 全都打在那个看不见的旧窗口上，用户看到的就是「画面飘在
+        // 屏幕左上角、怎么拉都不动」。所以每次 Fit 都用 FindEmulator 认一次真窗口，
+        // 句柄对不上就改认它，并补回无边框 + owner 归属。
+        if (_follow)
+        {
+            IntPtr re = FindEmulator();
+            if (re != IntPtr.Zero && (re != _emu || !IsWindow(_emu)))
+            {
+                _emu = re;
+                ApplyFollowStyle(_emu);
+            }
+        }
         if (_emu == IntPtr.Zero) return;
         // Fit 是 JS 侧每次 resize 都会调的，此时网页层一定已经建好了。
         // 确保模拟器挂在网页层之下（兄弟关系会被网页层盖住并吃掉鼠标）。
@@ -745,6 +802,97 @@ public class ApkAgent
         SetWindowLong(_emu, GWL_EXSTYLE, ex);
         SetWindowPos(_emu, IntPtr.Zero, 60, 40, 480, 853, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         _emu = IntPtr.Zero;
+    }
+
+    /**
+     * 抓一次模拟器窗口自己的画面，返回平均亮度（0~255）。失败返回 -1。
+     *
+     * 为什么要抓像素：某些 emulator 版本（实测 37.x + Windows 11 26xxx）被 SetParent
+     * 之后，窗口句柄、尺寸、可见性全都正常，但渲染表面直接失效 —— 整块永远是黑的。
+     * 从日志和窗口枚举上完全看不出来（embed 返回成功、Qt 子窗口 vis:true），
+     * 只有把窗口画到内存里看像素才能确诊，进而降级到跟随模式。
+     */
+    static int MeanBrightness(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return -1;
+        RECT r;
+        if (!GetWindowRect(hwnd, out r)) return -1;
+        int w = r.R - r.L, h = r.B - r.T;
+        if (w <= 8 || h <= 8) return -1;
+        IntPtr screen = GetDC(IntPtr.Zero);
+        IntPtr mem = CreateCompatibleDC(screen);
+        IntPtr bmp = CreateCompatibleBitmap(screen, w, h);
+        IntPtr old = SelectObject(mem, bmp);
+        bool ok = PrintWindow(hwnd, mem, 2);
+        int mean = -1;
+        if (ok)
+        {
+            BITMAPINFO bi = new BITMAPINFO();
+            bi.bmiHeader.biSize = 40;
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = -h;   // 负数 = 自上而下，省一次翻转
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = 0;
+            byte[] bits = new byte[w * h * 4];
+            int lines = GetDIBits(mem, bmp, 0, (uint)h, bits, ref bi, 0);
+            if (lines > 0)
+            {
+                // 只统计中间 76% 的区域：四周是模拟器自己的灰色内边距（亮度约 60），
+                // 把整块都算进去的话，纯黑画面也能测出 27 —— 上一版就是因此被误判成
+                // 「有画面」而没触发降级（实测黑屏窗口 mean=27，真实画面 mean=84~130）。
+                long sum = 0; int n = 0;
+                int y0 = (int)(h * 0.12), y1 = (int)(h * 0.88);
+                int x0 = (int)(w * 0.12) * 4, x1 = (int)(w * 0.88) * 4;
+                int stride = w * 4;
+                // 步长抽样：兼顾速度与代表性（一整块黑 vs 有画面差别极明显）
+                for (int yy = y0; yy < y1; yy += 2)
+                {
+                    int baseOff = yy * stride;
+                    for (int xx = x0; xx < x1; xx += 512) { sum += bits[baseOff + xx]; n++; }
+                }
+                if (n > 0) mean = (int)(sum / n);
+            }
+        }
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(IntPtr.Zero, screen);
+        return mean;
+    }
+
+    /**
+     * 强制切到「跟随模式」：把模拟器窗口从宿主上摘下来，恢复成无边框顶层窗口，
+     * 位置/尺寸由 JS 侧的 Fit 持续同步，并且设为宿主的被拥有窗口（owner）——
+     * 宿主在前它就在前，宿主最小化它跟着收，别的应用切前台也不会被它压住。
+     * 用于「SetParent 成功但画面全黑」的机型（见 MeanBrightness 说明）。
+     */
+    static void ApplyFollowStyle(IntPtr e)
+    {
+        if (e == IntPtr.Zero) return;
+        uint st = (uint)GetWindowLong(e, GWL_STYLE);
+        st &= ~WS_CHILD;
+        st |= 0x80000000u;   // WS_POPUP
+        st |= 0x10000000u;   // WS_VISIBLE
+        st &= ~(uint)(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_BORDER);
+        SetWindowLong(e, GWL_STYLE, (int)st);
+        int ex = GetWindowLong(e, GWL_EXSTYLE);
+        ex &= ~WS_EX_APPWINDOW;
+        ex |= WS_EX_TOOLWINDOW;
+        SetWindowLong(e, GWL_EXSTYLE, ex);
+        if (_host != IntPtr.Zero)
+        {
+            try { SetWindowLongPtr(e, -8 /* GWLP_HWNDPARENT */, _host); } catch { }
+        }
+    }
+
+    static void ForceFollow()
+    {
+        if (_emu == IntPtr.Zero) return;
+        SetParent(_emu, IntPtr.Zero);
+        ApplyFollowStyle(_emu);
+        _chromeRender = IntPtr.Zero;
+        _follow = true;
     }
 
     // 与 Detach 相同，但**不显示**窗口：宿主窗口即将销毁时调用。
@@ -1181,7 +1329,11 @@ public class ApkAgent
                     {
                         if (_emu == IntPtr.Zero) _emu = FindEmulator();
                         Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), false);
-                        Reply(sock, "{\"ok\":true}");
+                        // 回包里带上句柄/模式，排查「跟随模式飘在屏幕左上角」时一眼看出
+                        // 到底是在挪哪个窗口（debug 用，正常流程不看这些字段）
+                        Reply(sock, "{\"ok\":true,\"emu\":" + _emu.ToInt64()
+                            + ",\"host\":" + _host.ToInt64()
+                            + ",\"follow\":" + (_follow ? "true" : "false") + "}");
                     }
                     else if (cmd == "refresh")
                     {
@@ -1209,6 +1361,19 @@ public class ApkAgent
                         Detach();
                         Reply(sock, "{\"ok\":true}");
                     }
+                    else if (cmd == "pixmean")
+                    {
+                        // 采样模拟器窗口当前画面的平均亮度，用于判定「嵌入成功但全黑」
+                        Reply(sock, "{\"ok\":true,\"mean\":" + MeanBrightness(_emu) + "}");
+                    }
+                    else if (cmd == "follow")
+                    {
+                        // 嵌入后画面全黑的机型：切成跟随模式并立刻按给定矩形摆好
+                        ForceFollow();
+                        Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), false);
+                        Reply(sock, "{\"ok\":true,\"follow\":true,\"emu\":" + _emu.ToInt64()
+                            + ",\"host\":" + _host.ToInt64() + "}");
+                    }
                     else if (cmd == "hook")
                     {
                         // Options are re-sent on every enable, so changing settings
@@ -1229,6 +1394,10 @@ public class ApkAgent
                     else if (cmd == "consoles")
                     {
                         Reply(sock, "{\"ok\":true,\"list\":[" + ListConsoles() + "]}");
+                    }
+                    else if (cmd == "emuok")
+                    {
+                        Reply(sock, "{\"ok\":true,\"alive\":" + (EmuAlive() ? "true" : "false") + "}");
                     }
                     else if (cmd == "windows")
                     {

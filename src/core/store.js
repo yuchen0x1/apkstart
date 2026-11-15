@@ -122,6 +122,17 @@ const DEFAULT_SETTINGS = {
     // 有应用窗口则等窗口关闭再装（不打断正在玩的应用）。关掉则只通知、手动更新。
     autoUpdate: true,
   },
+  report: {
+    // 开机失败时在本机自动生成一份「脱敏诊断报告」，供用户一键上报。
+    // 只落到本地，不会自己发出去 —— 报告里有用户名路径和机器信息，得让用户看一眼再决定。
+    auto: true,
+    // 配了收集接口时是否直接发出去（仍然先脱敏）。默认开：
+    // 发行版一旦内置了 feedback.endpoint，就等于「失败自动上报」，用户可在设置里关。
+    autoSend: true,
+    // 有自己的收集接口时填这里；填了以后失败会直接 POST（仍然先脱敏），
+    // 没填就走 GitHub issue 预填页（不需要 token）。
+    endpoint: '',
+  },
   display: {
     mode: 'window',          // window（竖屏窗口，可自由拉伸） | fullscreen（自动适配屏幕）
     portrait: '900x1600',    // 窗口模式的竖屏分辨率，可在设置里调大小
@@ -275,6 +286,11 @@ const store = {
     // 包名来自 APK 清单（不受信任输入）。apk.js 已做白名单校验，这里再做一层
     // 路径净化兜底：`..\..\` 这类构造最多变成一个奇怪的文件名，写不出目录外。
     return path.join(ICON_DIR, `${safePathName(pkg)}.png`);
+  },
+
+  /** 矢量图标（apk.js 转出的 SVG）落盘路径；UI 的 <img> 直接能显示 */
+  svgIconPath(pkg) {
+    return path.join(ICON_DIR, `${safePathName(pkg)}.svg`);
   },
 
   apkPath(pkg, version = 'cur') {

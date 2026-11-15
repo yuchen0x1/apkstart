@@ -886,3 +886,57 @@ kbd {
 .deploy-log .dl-t { color: #5f7080; margin-right: 6px; }
 .deploy-log .dl-line.ok { color: #7ddc9a; }
 .deploy-log .dl-line.err { color: #ff9d9d; }
+
+/* ---------------- 一键修复弹窗 ---------------- */
+
+.repair-modal { width: 640px; }
+/* 修复窗口必须压在向导/设置之上：它通常在用户已经操作过界面之后才出现 */
+#repairMask { z-index: 120; }
+.repair-head { display: flex; gap: 10px; align-items: flex-start; padding: 14px 0 12px; }
+.repair-badge {
+  flex: 0 0 auto; font-size: 11.5px; font-weight: 600;
+  padding: 3px 9px; border-radius: 999px; border: 1px solid transparent;
+  white-space: nowrap;   /* 「能修，但会慢」被挤成两行会变成一个奇怪的竖胶囊 */
+}
+.repair-badge.ok { color: #0f6e56; border-color: #9fe1cb; background: #e1f5ee; }
+.repair-badge.warn { color: #854f0b; border-color: #fac775; background: #faeeda; }
+.repair-badge.bad { color: #a32d2d; border-color: #f7c1c1; background: #fcebeb; }
+.repair-headline { margin: 0; font-size: 13px; line-height: 1.65; color: var(--text); }
+.repair-checks { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
+.repair-check {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: 10px;
+  background: #fafbfc; min-width: 0;
+}
+.repair-check .rc-label { flex: 0 0 auto; font-size: 11.5px; color: var(--muted); }
+.repair-check .rc-value { font-size: 12px; min-width: 0; word-break: break-word; }
+.repair-check.bad { border-color: #f7c1c1; background: #fdf4f4; }
+.repair-check.warn { border-color: #f2dfb6; background: #fdf9f0; }
+.repair-actions { margin-top: 12px; display: grid; gap: 6px; }
+.repair-action {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px 8px 12px; border: 1px solid var(--line); border-radius: 10px;
+  background: #fafbfc;
+}
+.repair-action .ra-body { flex: 1; min-width: 0; }
+.repair-action .ra-label { font-size: 12.5px; font-weight: 500; }
+.repair-action .ra-hint { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.repair-action .ra-tag {
+  margin-left: 6px; font-size: 10.5px; font-weight: 400;
+  color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px;
+}
+.repair-action .ra-run { flex: 0 0 auto; }
+.repair-why { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.repair-why p { margin: 0 0 9px; font-size: 12.5px; line-height: 1.78; color: #37414c; }
+.repair-why p:last-child { margin-bottom: 0; }
+.repair-draft {
+  margin-top: 10px; padding: 7px 10px; border-radius: 8px;
+  background: #f4f7f9; border: 1px solid var(--line);
+  font-size: 11.5px; color: var(--muted); line-height: 1.6;
+}
+.repair-steps { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; font-size: 12px; }
+.rs-line { padding: 3px 0; color: var(--muted); line-height: 1.6; }
+.rs-line.ok { color: #0f6e56; }
+.rs-line.bad { color: #a32d2d; }
+.rs-line.run { color: var(--brand); }
+.repair-spacer { flex: 1; }

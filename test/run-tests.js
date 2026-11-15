@@ -180,6 +180,69 @@ console.log('\n[合成 APK：axml + apk 全链路]');
   }
 }
 
+/* ---------------- 矢量图标（vector drawable → SVG） ---------------- */
+console.log('\n[apk.js 矢量图标转 SVG]');
+{
+  const { vectorToSvg, composeAdaptiveIcon } = require('../src/core/apk');
+  const AN = 'http://schemas.android.com/apk/res/android';
+  const n = (name, attrs, children = []) => ({
+    name,
+    attrs: attrs.map(([k, typed]) => ({ ns: AN, name: k, typed, dataType: 4 })),
+    children,
+  });
+
+  test('vector：viewport + path 颜色/描边转成合法 SVG', () => {
+    const root = n('vector', [['viewportWidth', 108], ['viewportHeight', 108]], [
+      n('path', [['fillColor', 0xff0b0b16], ['pathData', 'M0,0h108v108h-108z']]),
+      n('path', [['fillColor', 0x80ff0000], ['fillAlpha', 0.5], ['pathData', 'M10,10 L50,50 Z']]),
+    ]);
+    const svg = vectorToSvg(root, null);
+    assert(svg && svg.startsWith('<svg xmlns="http://www.w3.org/2000/svg"'), '应有 SVG 根');
+    assert(svg.includes('viewBox="0 0 108 108"'), '应有 viewBox');
+    assert(svg.includes('fill="#0b0b16"'), '不透明色直接输出');
+    assert(svg.includes('fill-opacity="0.251"'), 'fillAlpha 与 alpha 相乘');
+    assert(svg.includes('fill="#ff0000"'), '红色填充');
+  });
+
+  test('vector：group 变换与 clip-path 语义', () => {
+    const root = n('vector', [['viewportWidth', 24], ['viewportHeight', 24]], [
+      n('group', [['pivotX', 12], ['pivotY', 12], ['scaleX', 2], ['rotation', 45]], [
+        n('clip-path', [['pathData', 'M2,2h20v20h-20z']]),
+        n('path', [['fillColor', 0xff00ff00], ['pathData', 'M4,4h8v8h-8z']]),
+      ]),
+    ]);
+    const svg = vectorToSvg(root, null);
+    assert(svg && svg.includes('<clipPath id='), 'clip-path 应进 defs');
+    assert(svg.includes('clip-path="url(#'), '后续兄弟节点应被裁剪');
+    assert(svg.includes('translate(12 12) rotate(45) scale(2 1) translate(-12 -12)'), 'group 变换序列');
+    assert(svg.includes('fill="#00ff00"'), '绿色填充');
+  });
+
+  test('vector：viewport 缺失 / 无内容时返回 null', () => {
+    assert(vectorToSvg(n('vector', []), null) === null, '缺 viewport 应为 null');
+    assert(vectorToSvg(n('vector', [['viewportWidth', 24], ['viewportHeight', 24]]), null) === null,
+      '无子节点应为 null');
+  });
+
+  test('adaptive-icon 两层合成：svg 在下、位图 image data-uri 在上反之亦可', () => {
+    const bg = { svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108"><path d="M0,0h108v108h-108z" fill="#123456"/></svg>' };
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0, 0, 0, 0, 1, 2, 3, 4]);
+    const svg = composeAdaptiveIcon([bg, { data: png }]);
+    assert(svg && svg.startsWith('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108"'), '根元素 108 视口');
+    assert(svg.includes('fill="#123456"'), '背景层内容被内联');
+    assert(svg.includes('data:image/png;base64,'), '位图层转 data-uri');
+    assert(svg.indexOf('<svg') === 0 && svg.lastIndexOf('<svg') === 0, '内层 svg 标签应被剥离，只留根');
+  });
+
+  test('adaptive-icon：两层都无效时返回 null，单层位图直接可用', () => {
+    assert(composeAdaptiveIcon([null, null]) === null, '全空应为 null');
+    const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 1, 2, 3]);
+    const only = composeAdaptiveIcon([null, { data: jpg }]);
+    assert(only && only.includes('data:image/jpeg;base64,'), '仅位图也能合成');
+  });
+}
+
 /* ---------------- 自动更新设置与更新日志 ---------------- */
 console.log('[update]');
 test('update.autoUpdate 默认开启（发现新版本自动下载并重启安装）', () => {

@@ -38,6 +38,10 @@ const ABI_LABEL = {
 const KNOWN_TRANSLATION_BROKEN = {
   'com.smile.gifmaker': '快手',
   'com.kuaishou.nebula': '快手极速版',
+  // 微信 8.0.80：libowl.so（自研安全组件）在 System.load 阶段走 JNI_GetMethodID
+  // 转译 trampoline 时触发信号探测，libndk_translation 处理不了预期内信号 →
+  // 启动即 SIGSEGV（2026-11-15 实测，tombstone_04）。与快手 weapon SDK 同类。
+  'com.tencent.mm': '微信',
 };
 
 /** 这些硬件特性在桌面运行时里没有真实对应设备 */

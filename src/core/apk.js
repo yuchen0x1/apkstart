@@ -95,12 +95,32 @@ function iconFromNode(zip, node, res, depth = 0) {
   return null;
 }
 
-/** 从自适应图标 / layer-list 的 XML 里找出可用的前景/背景位图 */
+/** 从自适应图标 / layer-list / vector 的 XML 里找出可用的图标 */
 function iconFromXml(zip, xmlBuffer, res, depth = 0) {
   let root;
   try {
     root = parseAxml(xmlBuffer);
   } catch (_) {
+    return null;
+  }
+  // 前景/背景都是矢量图的应用（抖音等）：整条链上没有任何位图可捡，
+  // 转成 SVG 让渲染层显示（主进程无法栅格化矢量图，Chromium 可以）。
+  if (root.name === 'vector') {
+    const svg = vectorToSvg(root, res);
+    if (svg) return { svg, file: null };
+  }
+  if (root.name === 'adaptive-icon') {
+    const layers = [];
+    for (const key of ['background', 'foreground']) {
+      const node = root.children.find((c) => c.name === key);
+      layers.push(node ? iconFromNode(zip, node, res, depth) : null);
+    }
+    if (layers.some(Boolean)) {
+      const composed = composeAdaptiveIcon(layers);
+      if (composed) return { svg: composed, file: null };
+      const bmp = layers.find((l) => l && l.data);
+      if (bmp) return bmp;
+    }
     return null;
   }
   // 先按规范顺序找 foreground → background → monochrome
@@ -112,6 +132,166 @@ function iconFromXml(zip, xmlBuffer, res, depth = 0) {
   }
   // 再整棵树扫一遍（layer-list / bitmap / inset 这类没有固定子节点名的）
   return iconFromNode(zip, root, res, depth);
+}
+
+// ---- 矢量图（vector drawable）→ SVG ----
+// 主进程没有栅格化能力，但 UI 跑在 Chromium 里，<img> 原生支持 SVG。
+// 这里只转图标级别的常见子集：path / group(平移缩放旋转) / clip-path。
+
+function escXml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function numAttrOf(node, name) {
+  const a = attr(node, name);
+  return a && typeof a.typed === 'number' ? a.typed : null;
+}
+
+/** 颜色属性（直接值 / arsc 引用）统一成 ARGB 整数 */
+function colorAttrOf(node, res, name) {
+  const a = attr(node, name);
+  if (!a) return null;
+  let v = null;
+  if (a.refId && res) v = res.resolve(a.refId, 'any');
+  else if (a.typed !== null && a.typed !== undefined) v = a.typed;
+  if (typeof v === 'string') {
+    const m = /^#([0-9a-fA-F]{3,8})$/.exec(v.trim());
+    if (!m) return null;
+    const h = m[1];
+    if (h.length === 3) return (parseInt(h[0] + h[0] + h[1] + h[1] + h[2] + h[2], 16) | 0xff000000) >>> 0;
+    if (h.length === 6) return (parseInt(h, 16) | 0xff000000) >>> 0;
+    return parseInt(h, 16) >>> 0;
+  }
+  if (typeof v === 'number') return v >>> 0;
+  return null;
+}
+
+function hexOf(argb) {
+  return '#' + (argb & 0xffffff).toString(16).padStart(6, '0');
+}
+
+function svgPathEl(node, res) {
+  const d = attrValue(node, 'pathData');
+  if (!d) return '';
+  const parts = [`d="${escXml(d)}"`];
+  const fill = colorAttrOf(node, res, 'fillColor');
+  if (fill !== null) {
+    parts.push(`fill="${hexOf(fill)}"`);
+    const alpha = ((fill >>> 24) & 0xff) / 255;
+    const fillAlpha = numAttrOf(node, 'fillAlpha');
+    const op = Math.min(1, (fillAlpha === null ? 1 : fillAlpha) * alpha);
+    if (op < 0.999) parts.push(`fill-opacity="${op.toFixed(3)}"`);
+  } else {
+    parts.push('fill="none"');
+  }
+  const stroke = colorAttrOf(node, res, 'strokeColor');
+  if (stroke !== null) {
+    parts.push(`stroke="${hexOf(stroke)}"`);
+    const strokeAlpha = numAttrOf(node, 'strokeAlpha');
+    const sa = Math.min(1, (strokeAlpha === null ? 1 : strokeAlpha) * ((stroke >>> 24) & 0xff) / 255);
+    if (sa < 0.999) parts.push(`stroke-opacity="${sa.toFixed(3)}"`);
+    const sw = numAttrOf(node, 'strokeWidth');
+    if (sw !== null) parts.push(`stroke-width="${sw}"`);
+  }
+  return `<path ${parts.join(' ')}/>`;
+}
+
+function svgGroupTransform(node) {
+  const tx = numAttrOf(node, 'translateX') || 0;
+  const ty = numAttrOf(node, 'translateY') || 0;
+  const rot = numAttrOf(node, 'rotation') || 0;
+  const px = numAttrOf(node, 'pivotX') || 0;
+  const py = numAttrOf(node, 'pivotY') || 0;
+  const sx = numAttrOf(node, 'scaleX');
+  const sy = numAttrOf(node, 'scaleY');
+  if (!tx && !ty && !rot && !px && !py && (sx === null || sx === 1) && (sy === null || sy === 1)) return '';
+  const r = (n) => Number(n.toFixed(3));
+  const parts = [`translate(${r(px + tx)} ${r(py + ty)})`];
+  if (rot) parts.push(`rotate(${r(rot)})`);
+  if ((sx !== null && sx !== 1) || (sy !== null && sy !== 1)) {
+    parts.push(`scale(${r(sx === null ? 1 : sx)} ${r(sy === null ? 1 : sy)})`);
+  }
+  if (px || py) parts.push(`translate(${r(-px)} ${r(-py)})`);
+  return ` transform="${parts.join(' ')}"`;
+}
+
+let clipSeq = 0;
+
+/** 走一遍子节点；clip-path 生效于其后兄弟节点（与 Android 语义一致） */
+function vectorChildrenToSvgEls(list, res, depth, defs) {
+  const out = [];
+  let clipId = null;
+  let bucket = null;
+  for (const c of list || []) {
+    if (c.name === 'clip-path') {
+      const d = attrValue(c, 'pathData');
+      if (d && depth < 12) {
+        const id = `apkclip${++clipSeq}`;
+        defs.push(`<clipPath id="${id}"><path d="${escXml(d)}"/></clipPath>`);
+        clipId = id;
+        bucket = [];
+      }
+      continue;
+    }
+    const el = vectorNodeToSvgEl(c, res, depth + 1, defs);
+    if (!el) continue;
+    if (clipId && bucket) bucket.push(el);
+    else out.push(el);
+  }
+  if (clipId && bucket && bucket.length) out.push(`<g clip-path="url(#${clipId})">${bucket.join('')}</g>`);
+  return out.join('');
+}
+
+function vectorNodeToSvgEl(node, res, depth, defs) {
+  if (!node || depth > 12) return '';
+  if (node.name === 'path') return svgPathEl(node, res);
+  if (node.name === 'group') {
+    return `<g${svgGroupTransform(node)}>${vectorChildrenToSvgEls(node.children, res, depth, defs)}</g>`;
+  }
+  return '';
+}
+
+function vectorToSvg(root, res) {
+  try {
+    const vw = numAttrOf(root, 'viewportWidth');
+    const vh = numAttrOf(root, 'viewportHeight');
+    if (!vw || !vh || vw <= 0 || vh <= 0) return null;
+    const defs = [];
+    const inner = vectorChildrenToSvgEls(root.children, res, 0, defs);
+    if (!inner) return null;
+    const defStr = defs.length ? `<defs>${defs.join('')}</defs>` : '';
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${vw} ${vh}" width="${vw}" height="${vh}">${defStr}${inner}</svg>`;
+  } catch (_) {
+    return null;
+  }
+}
+
+function sniffImageMime(data) {
+  if (data.length > 4 && data[0] === 0x89 && data[1] === 0x50) return 'image/png';
+  if (data.length > 3 && data[0] === 0xff && data[1] === 0xd8) return 'image/jpeg';
+  if (data.length > 12 && data.toString('ascii', 0, 4) === 'RIFF' && data.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+/** 自适应图标两层合成：background 在下、foreground 在上，统一 108x108 视口 */
+function composeAdaptiveIcon(layers, viewport = 108) {
+  let inner = '';
+  let ok = false;
+  for (const hit of layers) {
+    if (!hit) continue;
+    if (hit.svg) {
+      inner += hit.svg.replace(/^<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '');
+      ok = true;
+    } else if (hit.data) {
+      const mime = sniffImageMime(hit.data);
+      if (!mime) continue;
+      inner += `<image href="data:${mime};base64,${hit.data.toString('base64')}" x="0" y="0" width="${viewport}" height="${viewport}" preserveAspectRatio="none"/>`;
+      ok = true;
+    }
+  }
+  if (!ok) return null;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${viewport} ${viewport}" width="${viewport}" height="${viewport}">${inner}</svg>`;
 }
 
 /**
@@ -291,8 +471,9 @@ function parseApkZip(zip, filePath, stat) {
     isSplit,
     splitName: typeof splitName === 'string' ? splitName : '',
     debuggable,
-    iconPng: icon ? icon.data : null,
-    iconFile: icon ? icon.file : null,
+    iconPng: icon && icon.data ? icon.data : null,
+    iconFile: icon && icon.file ? icon.file : null,
+    iconSvg: icon && icon.svg ? icon.svg : null,
   };
 }
 
@@ -309,4 +490,4 @@ function quickCheck(filePath) {
   }
 }
 
-module.exports = { parseApk, quickCheck };
+module.exports = { parseApk, quickCheck, vectorToSvg, composeAdaptiveIcon };

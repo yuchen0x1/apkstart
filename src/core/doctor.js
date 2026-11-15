@@ -22,6 +22,44 @@ const isAsciiPath = (p) => ASCII.test(String(p || ''));
 
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 
+/**
+ * 机型的虚拟化线索：只读 CPU 型号，**不起子进程**。
+ *
+ * 这份画像会在状态刷新、诊断报告里被反复取用，任何 spawn（哪怕是 reg.exe）
+ * 都可能被杀软拦下、也拖慢首屏；所以 BIOS 厂商单独放到 systemVendor()，
+ * 只在真的要判断「这是不是云电脑」时取一次。
+ */
+const VM_RE = /virtual|qemu|vmware|hyper-v|kvm|bochs|parallels|xen/i;
+function looksVirtual(text) { return VM_RE.test(String(text || '')); }
+
+let _branding = null;
+function hostBranding() {
+  if (_branding) return _branding;
+  const cpuModel = String(((os.cpus() || [])[0] || {}).model || '').trim();
+  _branding = { cpuModel, vendor: '', vm: looksVirtual(cpuModel) };
+  return _branding;
+}
+
+/**
+ * BIOS 厂商（Windows 注册表，只读一次）。
+ * VMware / innotek / QEMU / Microsoft Corporation（Hyper-V）是云电脑与虚拟机的强信号，
+ * CPU 型号被宿主遮蔽时只剩它还能看出问题 —— 但它是「可选增强」，
+ * 读不到（被杀软拦、注册表权限）就返回空串，绝不阻塞主流程。
+ */
+let _vendor = null;
+function systemVendor() {
+  if (_vendor !== null) return _vendor;
+  _vendor = '';
+  if (process.platform !== 'win32') return _vendor;
+  try {
+    const out = execFileSync('reg', ['query', 'HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS', '/v', 'SystemManufacturer'],
+      { encoding: 'utf8', windowsHide: true, timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const m = /SystemManufacturer\s+REG_SZ\s+(.+)/i.exec(out);
+    if (m) _vendor = m[1].trim();
+  } catch (_) { /* 读不到就算了，CPU 型号已经够用 */ }
+  return _vendor;
+}
+
 /** 本机画像（毫秒级，只读） */
 function hostInfo() {
   const totalMB = Math.round(os.totalmem() / 1048576);
@@ -34,6 +72,7 @@ function hostInfo() {
     totalMB,
     freeMB,
     cores,
+    ...hostBranding(),
     home,
     homeAscii: isAsciiPath(home),
     tmp: os.tmpdir(),
@@ -80,7 +119,7 @@ function gpuCandidates(emulatorVersion) {
     //                  「带窗口就起不来、无窗口正常」的机器多半是宿主 Vulkan/GL 驱动初始化
     //                  失败；换一条完全不同的软件 Vulkan 实现有机会绕过，也让用户多一个
     //                  可手动指定的后端（设置 → 渲染后端）。
-    ? ['host', 'swangle', 'software', 'swiftshader', 'lavapipe']
+    ? ['host', 'swangle', 'software', 'swiftshader', 'lavapipe', 'guest']
     : ['host', 'swiftshader_indirect', 'swiftshader', 'lavapipe'];
 }
 
@@ -175,7 +214,8 @@ function chooseProfile({
   const dataMB = wantGB > 0 ? clamp(Math.round(wantGB * 1024), 2048, 65536) : autoDataMB;
 
   const gpus = gpuCandidates(emulatorVersion);
-  const gpu = overrides.gpuMode && gpus.includes(overrides.gpuMode) ? overrides.gpuMode : gpus[0];
+  const gpuPinned = !!(overrides.gpuMode && overrides.gpuMode !== 'auto' && gpus.includes(overrides.gpuMode));
+  const gpu = gpuPinned ? overrides.gpuMode : gpus[0];
 
   // 渲染分辨率：auto 时按加速状态选（软件模拟降到 540x960 保流畅）
   const wantLcd = String((settings && settings.engine && settings.engine.renderSize) || 'auto');
@@ -194,6 +234,7 @@ function chooseProfile({
     lcd,
     gpu,
     gpuCandidates: gpus,
+    gpuPinned,
     accel: accelOk ? 'auto' : 'off',
     accelOk,
     port,
@@ -245,7 +286,7 @@ function planVariants(profile, { preferSoftware = false } = {}) {
   const safeGpu = gpus.find((g) => /software|swiftshader/.test(g)) || firstGpu;
   const fallbackGpus = gpus.filter((g) => g !== firstGpu && /software|swiftshader|swangle|lavapipe/.test(g));
   const ordered = [firstGpu, ...fallbackGpus].slice(0, 2);
-  if (preferSoftware) {
+  if (preferSoftware && !profile.gpuPinned) {
     // 可见窗口优先「ANGLE + SwiftShader」(swangle)：它同样是软件渲染，不会出现 host
     // 后端失焦后交换链丢失导致的全黑，但合成路径对 WebView 友好得多。
     // 上游实测：裸 software 会让「点同意后进主界面」黑屏，swangle 不会。
@@ -265,6 +306,11 @@ function planVariants(profile, { preferSoftware = false } = {}) {
     ...profile,
     gpu: safeGpu,
     accel: 'off',
+    // 关掉加速就是 TCG 纯软件模拟：Android 14 冷启动 8~15 分钟是常态，
+    // 而 profile.bootTimeoutMs 是按「有加速」算出来的 4 分钟 —— 直接套用等于
+    // 让兜底方案必然超时（用户干等 16 分钟、四组参数全失败，最后还被误诊成 CPU 问题）。
+    // 这里给 TCG 单独放宽，兜底才真的兜得住。
+    bootTimeoutMs: Math.max(profile.bootTimeoutMs || 0, 600000),
     label: '关闭加速的软件模拟（慢，但兼容性最好）',
     wipe: false,
     snapshot: false,
@@ -276,6 +322,8 @@ function planVariants(profile, { preferSoftware = false } = {}) {
     memoryMB: 2048,
     cores: 2,
     dataMB: Math.min(profile.dataMB, 2048),
+    // 最小内存 + 清快照是最后一档，通常也最慢：多给 5 分钟，别让它在快要开完时被砍
+    bootTimeoutMs: Math.max(profile.bootTimeoutMs || 0, 900000),
     label: '保守冷启动（最小内存 + 清快照）',
     // 这里**绝对不能** wipe：以前写的是 wipe:true，而磁盘写满时每次尝试都会失败，
     // 于是连续重试把用户已装的应用和存档一起「清快照 + 清数据」了 ——
@@ -443,9 +491,17 @@ const RULES = [
   },
   {
     code: 'CPU_FEATURE',
-    re: /host doesn't support requested feature|CPUID.*not supported|unsupported CPU|missing.*(AVX|SSE4|xsave)/i,
+    // 只认「真的跑不下去」的信号：非法指令、明确说 CPU 不支持。
+    // 以前这里是 /host doesn't support requested feature|missing.*(AVX|SSE4|xsave)/，
+    // 而 QEMU 在绝大多数正常机器上都会打印一句
+    // "warning: host doesn't support requested feature: CPUID.01H:ECX.avx"，
+    // 于是「超时」被误诊成「CPU 缺指令集」，把用户引向换镜像这条死路（#15 类反馈）。
+    // 无害的 CPUID 警告改由 notes() 单独摘出来，只作说明、不参与结论。
+    re: /Illegal instruction|3221225501|0xC000001D|unsupported CPU|CPU (is )?not supported|requires (a )?CPU with (AVX|SSE4)|CPU lacks (AVX|SSE4)/i,
     title: 'CPU 缺少运行时要求的指令集',
-    hint: '这类提示在部分老 CPU 上只是警告、仍能开机；若确实起不来，请把「运行时」里的引擎更新到较旧兼容版本，或换一台支持 VT-x/AVX 的电脑。',
+    hint: '这台 CPU 太老，模拟器用到的指令（常见是 SSE4.2 / AVX）它没有。'
+      + '换 Android 12/14 镜像都解决不了 —— 执行指令的是宿主侧的 emulator，镜像只决定开机后有多重。'
+      + '只能换一台 CPU 较新的电脑，或用带嵌套虚拟化的云主机。',
   },
 
   {
@@ -466,6 +522,50 @@ function diagnose(lines) {
     code: 'UNKNOWN',
     title: '运行时未能完成开机',
     hint: '已自动按多种参数组合重试。可点「导出诊断报告」把日志发给作者定位。',
+  };
+}
+
+/**
+ * 日志里的「良性噪音」：只用于解释，不参与诊断结论。
+ * 用户最容易被这几句吓到（"host doesn't support requested feature" 尤甚），
+ * 修复窗口和诊断报告都该主动说明「这是警告，不是原因」。
+ */
+function notes(lines) {
+  const text = (Array.isArray(lines) ? lines.join('\n') : String(lines || '')).slice(-24000);
+  const out = [];
+  if (/host doesn't support requested feature/i.test(text)) {
+    out.push('日志里的 "host doesn\'t support requested feature" 是 QEMU 的警告：'
+      + '模拟器想启用某个 CPU 特性（例如 AVX）而宿主没提供，它会自己降级，不影响开机。');
+  }
+  if (/does not have the requested snapshot|Failed to load snapshot/i.test(text)) {
+    out.push('"Failed to load snapshot" 说明快速启动快照失效，程序会自动改为冷启动，不是故障。');
+  }
+  return out;
+}
+
+/**
+ * 「等到超时」的结论。
+ *
+ * 以前这种情况会掉进 UNKNOWN，或者被 CPUID 警告抢走结论，用户只看到一句
+ * 「CPU 缺少指令集」—— 而他真正需要知道的是「这台机器有多慢、还差多久」。
+ */
+function timeoutDiagnosis({ accelOk = true, seconds = 0 } = {}) {
+  const wait = seconds ? `${Math.round(seconds / 60)} 分钟` : '设定时间';
+  if (accelOk) {
+    return {
+      code: 'TIMEOUT',
+      title: `等了 ${wait} 也没开完机`,
+      hint: '这台机器有硬件加速，但安卓在这段时间内没起来：可能是显卡/驱动把渲染卡住了，'
+        + '也可能是第一次冷启动特别慢。点「一键修复」会换软件渲染 + 低配参数，并给足开机时间。',
+    };
+  }
+  return {
+    code: 'TIMEOUT',
+    title: `没有硬件加速，纯软件模拟在 ${wait} 内开不完机`,
+    hint: '这台机器没有可用的 WHPX/AEHD，安卓只能跑在纯软件模拟（QEMU TCG）上，'
+      + 'Android 14 冷启动常要 8~15 分钟，远超当前等待时间。'
+      + '「一键修复」会用低配参数（540x960 / 2 核 / 2G）并把等待延长到 15 分钟；'
+      + '想彻底变快，需要开启「虚拟机平台」或安装 AEHD 驱动。',
   };
 }
 
@@ -530,8 +630,11 @@ function writeReport({ dataDir, profile, logLines = [], extra = {} }) {
   const dir = path.join(dataDir, 'logs');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `diagnostic-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`);
-  const d = diagnose(logLines);
+  // 报告里的结论必须和界面上的结论一致：调用方已经给出诊断时直接采用，
+  // 否则重新跑一遍正则很容易得出另一个结论（比如把超时说成 UNKNOWN）。
+  const d = (extra && extra.diagnosis) || diagnose(logLines);
   const sessionLog = Array.isArray(extra.sessionLog) ? extra.sessionLog : [];
+  const benign = Array.isArray(extra.notes) ? extra.notes : notes(logLines);
   const body = [
     'ApkStart 诊断报告',
     `生成时间：${new Date().toLocaleString()}`,
@@ -547,6 +650,9 @@ function writeReport({ dataDir, profile, logLines = [], extra = {} }) {
     '== 诊断 ==',
     `${d.code}：${d.title}`,
     d.hint,
+    ...(benign.length
+      ? ['', '== 日志里这些「像错误」的行其实无害 ==', ...benign.map((t) => `- ${t}`)]
+      : []),
     ...emptyReportNote(extra),
     '',
     '== 附加信息 ==',
@@ -593,9 +699,9 @@ function vcRedistOk() {
 }
 
 module.exports = {
-  hostInfo, freeDiskMB, isAsciiPath, shortPath, lcdFor, orientLcd, liteProfile,
+  hostInfo, hostBranding, systemVendor, looksVirtual, freeDiskMB, isAsciiPath, shortPath, lcdFor, orientLcd, liteProfile,
   versionNumbers, gpuCandidates, chooseProfile, planVariants,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey, imageIdentity,
-  diagnose, noAccelDiagnosis, describeProfile, writeReport, vcRedistOk,
+  diagnose, notes, timeoutDiagnosis, noAccelDiagnosis, describeProfile, writeReport, vcRedistOk,
 };

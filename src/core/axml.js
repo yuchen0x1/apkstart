@@ -17,9 +17,30 @@ const RES_XML_RESOURCE_MAP = 0x0180;
 const TYPE_NULL = 0x00;
 const TYPE_REFERENCE = 0x01;
 const TYPE_STRING = 0x03;
+const TYPE_FLOAT = 0x04;
+const TYPE_DIMENSION = 0x05;
+const TYPE_FRACTION = 0x06;
 const TYPE_INT_DEC = 0x10;
 const TYPE_INT_HEX = 0x11;
 const TYPE_INT_BOOLEAN = 0x12;
+// 0x1c~0x1f 是四种颜色类型（ARGB/RGB，8bit/4bit），data 都是 32 位 ARGB 整数
+const TYPE_COLOR_INT8 = 0x1c;
+const TYPE_COLOR_RGB8 = 0x1d;
+const TYPE_COLOR_INT4 = 0x1e;
+const TYPE_COLOR_RGB4 = 0x1f;
+
+/**
+ * 复数（dimension/fraction）解码，与 TypedValue.complexToFloat 一致：
+ * 低 4 位单位、次 2 位 radix、高 26 位符号数 mantissa。
+ */
+const COMPLEX_RADIX = [1 / 256, 1 / 32768, 1 / 8388608, 1 / 2147483648];
+function complexToFloat(data) {
+  return ((data & 0xffffff00) * COMPLEX_RADIX[(data >>> 4) & 3]) || 0;
+}
+
+function isColorType(t) {
+  return t >= TYPE_COLOR_INT8 && t <= TYPE_COLOR_RGB4;
+}
 
 const ANDROID_NS = 'http://schemas.android.com/apk/res/android';
 
@@ -128,6 +149,12 @@ function parseAxml(buffer) {
           value = data !== 0;
         } else if (dataType === TYPE_INT_DEC || dataType === TYPE_INT_HEX) {
           value = data | 0;
+        } else if (dataType === TYPE_FLOAT) {
+          value = buf.readFloatLE(a + 16);
+        } else if (dataType === TYPE_DIMENSION || dataType === TYPE_FRACTION) {
+          value = complexToFloat(data);
+        } else if (isColorType(dataType)) {
+          value = data >>> 0;
         }
 
         node.attrs.push({
@@ -164,4 +191,7 @@ function children(node, name) {
   return node.children.filter((c) => c.name === name);
 }
 
-module.exports = { parseAxml, attr, attrValue, children, ANDROID_NS, TYPE_REFERENCE };
+module.exports = {
+  parseAxml, attr, attrValue, children, ANDROID_NS, TYPE_REFERENCE,
+  TYPE_FLOAT, TYPE_DIMENSION, TYPE_FRACTION, isColorType, complexToFloat,
+};
