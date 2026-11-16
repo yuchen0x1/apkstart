@@ -497,6 +497,21 @@ body {
 .field .row input { flex: 1; }
 .field.two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
+/* 安卓预装应用清单：每行一个可勾选分组（含被移除的数量提示） */
+.guest-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.guest-item {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--panel-2);
+}
+.guest-item input { width: auto; height: auto; margin: 3px 0 0; flex: none; }
+.guest-item .gt { font-size: 13px; color: var(--text); font-weight: 500; }
+.guest-item .gd { font-size: 12px; color: var(--faint); line-height: 1.55; margin-top: 3px; }
+.guest-item .gcount { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.guest-item.danger { border-color: #f6c9c9; background: #fff8f8; }
+.guest-item.gone { opacity: .62; }
+.guest-empty { font-size: 12px; color: var(--faint); }
+
 .switch-field { display: flex; align-items: center; gap: 14px; }
 .switch-field > div { flex: 1; }
 .switch {

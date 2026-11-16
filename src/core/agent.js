@@ -175,6 +175,13 @@ class WinAgent extends EventEmitter {
 
   async refresh() { return this.call({ cmd: 'refresh' }, 3000); }
 
+  /**
+   * 采样模拟器窗口当前画面的平均亮度（-1 = 抓不到）。
+   * 用来区分「SetParent 成功但宿主画黑帧」和「画面真的在显示」：
+   * 前者 main.js 会自动摘成独立窗口，而不是对用户谎报启动成功。
+   */
+  async pixmean() { return this.call({ cmd: 'pixmean' }, 4000); }
+
   /** 低延迟模式：让窗口代理降频扫描，避免全桌面 EnumWindows 抢走游戏的 CPU */
   async setPerformanceMode(on) { return this.call({ cmd: 'perf', on: on ? 1 : 0 }, 3000); }
 

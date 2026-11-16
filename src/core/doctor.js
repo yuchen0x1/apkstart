@@ -540,21 +540,25 @@ function imageIdentity(dir) {
 const RULES = [
   {
     code: 'ACCESS_VIOLATION',
-    // Windows 上 emulator/qemu 以 0xC0000005（十进制 3221225477）退出：
-    // 实测多见于「显卡驱动 / Vulkan 后端在 guest 刚要启动时崩掉」，
-    // 与 CPU、内存、镜像都无关（同机换 -gpu software 往往就能过）。
+    // Windows 上 emulator/qemu 以 0xC0000005（十进制 3221225477）退出。
+    // 只能说明「模拟器进程崩了」——常见诱因有显卡/Vulkan，也可能是 TCG、
+    // 运行时与系统不兼容。实测存在 swiftshader / swangle / software 三种
+    // 软件后端全部同一退出码的情况，那时换后端毫无意义（见 tcgCrashDiagnosis）。
     // 必须排在 GPU_INIT 前面：崩溃日志里通常也带着渲染初始化信息，先判崩溃更准。
     re: /emulator exit 3221225477|exit code 3221225477|0xC0000005|STATUS_ACCESS_VIOLATION/i,
-    title: '渲染后端崩溃（0xC0000005 访问冲突）',
-    hint: '已自动改用更保守的渲染后端重试，并记住这个后端下次不再先试。'
-      + '若反复出现，请更新显卡驱动；或在设置 → 性能与资源里把画质调低、关闭远程桌面/虚拟机显卡直通后再试。',
+    title: '模拟器进程崩溃（0xC0000005 访问冲突）',
+    hint: '访问冲突只说明模拟器进程崩了，不一定是显卡：已自动换用其他渲染后端重试。'
+      + '若多个软件后端都崩在同一退出码，说明问题在模拟器/TCG 层，'
+      + '请启用 WHPX/AEHD 硬件加速或更新运行时，而不是反复调画质。',
   },
   {
     code: 'GPU_INIT',
     // 只匹配「失败」语境：正常日志里也会出现 Vulkan/EGL/ANGLE 字样，不能误判为致命错误
-    re: /Failed to initialize GL emulation|Could not initialize (OpenGL|emulated framebuffer)|Failed to create .*GLES|EGL_(BAD|NOT_INITIALIZED|CONTEXT_LOST)|Failed to (load|initialize) .*vulkan|vulkan.*(failed|error)|ANGLE.*(fail|error)/i,
+    re: /Failed to initialize GL emulation|Could not initialize (OpenGL|emulated framebuffer)|Failed to create .*GLES|EGL_(BAD|NOT_INITIALIZED|CONTEXT_LOST)|Failed to (load|initialize) .*vulkan|Failed to create Vulkan instance|vulkan.*(failed|error)|Platform does not support Guest Angle|UpdateLayeredWindowIndirect failed|emuglConfig_init.*failed|initOpenglesEmulation.*failed|No OpenGL ES (driver|renderer)|ANGLE.*(fail|error)/i,
     title: '显卡渲染后端初始化失败',
-    hint: '已自动切换软件渲染重试。若仍失败，请更新显卡驱动，或关闭远程桌面/虚拟机显卡直通后再试。',
+    hint: '日志里出现了 GL / Vulkan / ANGLE 初始化失败（本机现场：VK_ERROR_INCOMPATIBLE_DRIVER、'
+      + 'Platform does not support Guest Angle）。已自动切换软件渲染重试；'
+      + '若仍黑屏，这是宿主渲染层的问题，安卓侧画面本身是好的。',
   },
   {
     code: 'GPU_MODE',
@@ -566,7 +570,9 @@ const RULES = [
     code: 'ACCEL',
     re: /x86_64 emulation currently requires hardware acceleration|acceleration.*not (installed|available|supported)|WHPX.*(not|failed)|AEHD.*(not|failed)|ERROR_ACCESS_DENIED|加速.*不可用/i,
     title: '硬件加速不可用',
-    hint: '已自动回退软件模拟（首次启动会明显变慢）。想要流畅可用，请在「Windows 功能」勾选「虚拟机平台」，或安装 AEHD 驱动后重启。',
+    hint: '已自动回退软件模拟（首次启动会明显变慢）。'
+      + '在「设置 → 性能与资源」点「一键开启硬件加速」即可自动开启 WHPX 或安装 AEHD；'
+      + '需要重启。',
   },
   {
     code: 'MEMORY',
@@ -695,7 +701,7 @@ function timeoutDiagnosis({ accelOk = true, seconds = 0 } = {}) {
     hint: '这台机器没有可用的 WHPX/AEHD，安卓只能跑在纯软件模拟（QEMU TCG）上，'
       + 'Android 14 冷启动常要 8~15 分钟，远超当前等待时间。'
       + '「一键修复」会用低配参数（540x960 / 2 核 / 2G）并把等待延长到 15 分钟；'
-      + '想彻底变快，需要开启「虚拟机平台」或安装 AEHD 驱动。',
+      + '想彻底变快，到「设置 → 性能与资源」点「一键开启硬件加速」，开启后重启电脑。',
   };
 }
 
@@ -711,8 +717,28 @@ function noAccelDiagnosis() {
     code: 'ACCEL',
     title: '本机没有可用的硬件加速，软件模拟没能起来',
     hint: 'x86_64 安卓镜像在多数 CPU 上必须有 WHPX 或 AEHD 才能开机。'
-      + '请在「Windows 功能」里勾选「虚拟机平台（Hyper-V）」后重启，'
-      + '或在「运行时」页安装 AEHD 驱动，装好后重新点「启动运行时」。',
+      + '打开「设置 → 性能与资源」点「一键开启硬件加速」，程序会自动申请管理员权限并开启对应功能；'
+      + '完成后重启电脑。BIOS 里的 SVM / VT-x 也需要是开启状态。',
+  };
+}
+
+/**
+ * 「换了多种软件渲染后端，仍然全部 0xC0000005」的专用结论。
+ *
+ * 这时继续换 -gpu 参数是无效的：崩溃发生在模拟器/TCG 层，而不是 GLES 后端。
+ * 典型现场：没有 WHPX/AEHD 的 Windows 机器被强制走 TCG，guest 内核命令行
+ * 已经打印出来（说明镜像和引导没问题），随后 qemu 进程直接访问冲突。
+ * 给出能真正改变结果的步骤：开硬件虚拟化、升级运行时、排查安全软件/RDP。
+ */
+function tcgCrashDiagnosis() {
+  return {
+    code: 'TCG_CRASH',
+    title: '纯软件模拟（TCG）崩溃，换渲染后端无效',
+    hint: 'swiftshader / swangle / software 等多个软件后端都以 0xC0000005 退出，'
+      + '说明崩溃发生在模拟器本身而不是显卡驱动。请到「设置 → 性能与资源」点「一键开启硬件加速」，'
+      + '程序会自动开启 WHPX 或安装 AEHD（会弹管理员授权，完成后重启电脑）；'
+      + '若提示 BIOS 虚拟化未开，需先重启进 BIOS 打开 AMD SVM / Intel VT-x。'
+      + '仍失败再更新运行时引擎并导出诊断报告。',
   };
 }
 
@@ -884,7 +910,7 @@ module.exports = {
   versionNumbers, gpuCandidates, machineTier, lowSpecProfile, chooseProfile, planVariants,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey, imageIdentity,
-  diagnose, notes, timeoutDiagnosis, noAccelDiagnosis,
+  diagnose, notes, timeoutDiagnosis, noAccelDiagnosis, tcgCrashDiagnosis,
   describeProfile, describeTuning, describeManual, describeAttempt,
   writeReport, vcRedistOk,
 };

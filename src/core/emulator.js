@@ -37,8 +37,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Windows 上把 emulator/qemu 的退出码翻译成人话。
- * 0xC0000005（3221225477）是崩溃里最常见的那个：访问冲突，实测多由
- * 显卡驱动 / Vulkan 后端在 guest 启动瞬间崩掉引起，换软件渲染即可绕过。
+ * 0xC0000005（3221225477）最常见：进程访问冲突。诱因可能是显卡/Vulkan，
+ * 也可能是 TCG 或运行时与系统不兼容——换渲染后端不总能绕过，别下死结论。
  */
 function describeExitCode(code) {
   // 被信号结束时 code 是 null（Windows 上走 taskkill / adb emu kill 都会这样），
@@ -47,7 +47,7 @@ function describeExitCode(code) {
   switch (Number(code)) {
     case 0: return '正常退出';
     case 1: return '启动参数或环境错误';
-    case 3221225477: return '0xC0000005 访问冲突，渲染后端崩溃';
+    case 3221225477: return '0xC0000005 访问冲突（模拟器进程崩溃）';
     case 3221225725: return '0xC00000FD 栈溢出';
     // 0xC000001D：CPU 执行到它不认识的指令。这才是「真·缺指令集」的唯一硬证据，
     // 以前没映射，报告里是一片空白，只能靠日志里那句无害的 CPUID 警告去猜。
@@ -722,6 +722,10 @@ class EmulatorEngine {
       args.push('-no-snapshot');
     }
     if (wipe) args.push('-wipe-data');
+    // 系统语言**不在这里**改：实测 emulator 37.x 的 -prop 只接受 qemu.* 属性
+    // （日志会写 `unexpected '-prop' value ... only 'qemu.*' properties are supported`），
+    // 传 persist.sys.locale 会被直接丢弃。安卓 13+ 的系统语言走
+    // `settings put system system_locales` + 重启，见 core/guest.js。
     // 对齐上游：只在明确关闭硬件加速时传 `-accel off`（配合 env 里的
     // ANDROID_I_WANT_MY_TCG）。绝不传 `-accel on` —— 上游实测 37.x 在部分
     // Windows/显卡组合下会因此以 0xC0000005 崩溃；不传参数走官方默认路径即可。
@@ -1297,12 +1301,13 @@ class EmulatorEngine {
       // eslint-disable-next-line no-await-in-loop
       const dead = await this._waitSpawnSettled(2200);
       if (dead || !this.proc) {
-        const d = doctor.diagnose(this._attemptLines(logStart, 60));
+        let d = doctor.diagnose(this._attemptLines(logStart, 60));
         this.attempts.push({
           plan: plan.label, diagnosis: d.code, exitCode: this.lastExitCode,
           // 实际参数：失败后用户/作者都要能看出「这一轮到底用了多保守的配置」，
           // 只看 label（gpu / 加速方式）是不够的。
           params: doctor.describeAttempt(plan),
+          gpu: plan.gpu, accel: plan.accel,
         });
         this.lastDiagnosis = d;
         lastError = `${d.title}：${d.hint}`;
@@ -1319,6 +1324,13 @@ class EmulatorEngine {
         // 加速/镜像类结论可能是缓存里的旧数据，作废掉，下次启动重新探测
         if (['ACCEL', 'GPU_INIT', 'GPU_MODE', 'IMAGE', 'DLL', 'ACCESS_VIOLATION'].includes(d.code)) {
           try { this.provisioner.invalidateEnvCache(); } catch (_) { /* ignore */ }
+        }
+        if (this._softwareTcgCrashed(plan, d)) {
+          d = doctor.tcgCrashDiagnosis();
+          this.lastDiagnosis = d;
+          lastError = `${d.title}：${d.hint}`;
+          onLog(`${d.title}，停止重试等价的软件后端。`);
+          break;
         }
         onLog(`${d.title}，自动换一组参数重试…`);
         this._noteGpuFailure(plan);
@@ -1430,13 +1442,23 @@ class EmulatorEngine {
       this.attempts.push({
         plan: plan.label, diagnosis: d.code, timeout: !fatal, exitCode: this.lastExitCode,
         params: doctor.describeAttempt(plan),
+        gpu: plan.gpu, accel: plan.accel,
       });
-      this.lastDiagnosis = d;
-      lastError = `${d.title}：${d.hint}`;
-      onLog(`${lastError}，自动换一组参数重试…`);
-      this._noteGpuFailure(plan);
+      const tcgCrash = this._softwareTcgCrashed(plan, d);
+      if (tcgCrash) {
+        d = doctor.tcgCrashDiagnosis();
+        this.lastDiagnosis = d;
+        lastError = `${d.title}：${d.hint}`;
+        onLog(`${d.title}，停止重试等价的软件后端。`);
+      } else {
+        this.lastDiagnosis = d;
+        lastError = `${d.title}：${d.hint}`;
+        onLog(`${lastError}，自动换一组参数重试…`);
+        this._noteGpuFailure(plan);
+      }
       // eslint-disable-next-line no-await-in-loop
       await this.killAttempt();
+      if (tcgCrash) break;
     }
 
     // 全部组合都失败、而且本机根本没有加速：给一句能照做的结论，
@@ -1466,7 +1488,7 @@ class EmulatorEngine {
     const visibleHint = headless ? '' : (
       '\n\n本次是带窗口模式（画面上要嵌进应用窗口）。如果同一台机器上「无窗口模式」能起来、'
       + '只有带窗口起不来，那是宿主 GPU/Vulkan 驱动与模拟器 Qt 窗口的冲突，不是安卓镜像的问题：'
-      + '在「设置 → 渲染后端」手动指定 swiftshader 或 lavapipe 再试一次。'
+      + '在「设置 → 渲染后端」手动指定 swangle 或 software 再试一次。'
     );
     const customHint = choice && choice.custom
       ? `\n当前使用的是自定义镜像「${choice.name}」（${choice.dir}）。`
@@ -1593,6 +1615,20 @@ class EmulatorEngine {
     }
     await this.killAttempt();
     return true;
+  }
+
+  /**
+   * 纯软件模拟下的重复访问冲突：换 GPU 后端已经救不了，别再耗完 4 轮。
+   *
+   * 判据用 attempts（每轮独立记录）而不是日志文本，避免上一轮的崩溃串味。
+   * 典型现场：机器没有 WHPX/AEHD，swiftshader / swangle / software 全部
+   * 以 0xC0000005 退出——病根在 TCG/模拟器本身，继续换后端只会白等十几分钟。
+   */
+  _softwareTcgCrashed(plan, d) {
+    if (!d || d.code !== 'ACCESS_VIOLATION') return false;
+    if (!plan || plan.accel !== 'off' || !/software|swiftshader|swangle/i.test(plan.gpu || '')) return false;
+    return this.attempts.filter((a) => a.diagnosis === 'ACCESS_VIOLATION'
+      && a.accel === 'off' && /software|swiftshader|swangle/i.test(a.gpu || '')).length >= 2;
   }
 
   /**

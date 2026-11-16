@@ -343,6 +343,30 @@
         </div>
       </div>
 
+      <div class="group" id="guestGroup">
+        <div class="group-title">安卓系统：中文界面与预装应用</div>
+        <div class="field">
+          <label>系统语言</label>
+          <div class="inline-note" id="guestLocaleText">正在读取系统语言…</div>
+          <span class="sub">安卓的系统语言存在系统设置里，而且只在开机那一刻读取；这台电脑上的 Google Play 镜像又不允许 root（直接用 adb 改语言属性会被系统拒绝）。所以点「切换为简体中文」会先把语言写进安卓设置，再让安卓自己重启一次（约半分钟，模拟器不退出，已装应用和存档都在）；起来之后桌面、设置、系统应用就全是中文了。</span>
+          <div class="row" style="margin-top:10px">
+            <button class="btn primary sm" id="btnGuestZh">切换为简体中文</button>
+            <button class="btn ghost sm" id="btnGuestLocaleSettings">在安卓里手动改语言</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>精简预装应用</label>
+          <span class="sub">勾选的整组会从安卓的当前用户里移除：桌面图标消失、后台不再运行；系统分区不动，随时能一键装回来，你自己装的应用完全不受影响。需要安卓正在运行才会真正执行。</span>
+          <div class="guest-list" id="guestTrimList">
+            <div class="guest-empty">正在读取预装应用…</div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="btn sm" id="btnGuestTrim">立即精简</button>
+            <button class="btn ghost sm" id="btnGuestRestore">恢复全部预装应用</button>
+          </div>
+        </div>
+      </div>
+
       <div class="group" id="perfGroup">
         <div class="group-title">性能与资源占用</div>
         <div class="field">
@@ -358,6 +382,24 @@
           <label>低配电脑自动优化</label>
           <div class="inline-note" id="autoTierText">正在检测…</div>
           <span class="sub">检测不到硬件虚拟化（WHPX / AEHD）、内存偏小或 CPU 核心较少的电脑，会自动把内存固定到 2 GB、vCPU 2 个、分辨率 540 × 960、改用软件渲染，并保留快速启动快照。下面手动填的内存、核心数、画质、渲染后端永远优先，自动降级不会覆盖你的设置。</span>
+        </div>
+        <div class="field" id="accelField">
+          <label>硬件加速（WHPX / AEHD）</label>
+          <div class="inline-note" id="accelStatusText">正在检测…</div>
+          <span class="sub">x86_64 安卓镜像要靠硬件加速才能正常开机。点「一键开启」会申请管理员权限，自动开启「虚拟机平台 / Windows 虚拟机监控程序平台」，或安装 AEHD 驱动，完成后按提示重启即可。若 BIOS 里没开虚拟化（AMD SVM / Intel VT-x），还需要先进 BIOS 打开。</span>
+          <div class="row" style="margin-top:10px">
+            <button class="btn primary sm" id="btnEnableAccel">一键开启硬件加速</button>
+            <button class="btn ghost sm" id="btnOpenFeatures">打开 Windows 功能</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>应用窗口显示方式</label>
+          <select id="setWindowMode">
+            <option value="auto">自动（推荐：嵌入失败就改用独立窗口）</option>
+            <option value="standalone">始终用独立窗口（Android Emulator 窗口）</option>
+            <option value="embedded">始终嵌进 ApkStart 窗口</option>
+          </select>
+          <span class="sub">「自动」会先尝试把安卓画面嵌进 ApkStart 的应用窗口；如果这台电脑嵌入后画面是黑的，程序会记住并改用模拟器自己的窗口，下次点应用直接把那个窗口显示出来 —— 不会再先给你一块黑屏。显卡驱动 / 软件渲染不兼容时，「始终用独立窗口」最省心。</span>
         </div>
         <div class="field two">
           <div>

@@ -18,6 +18,7 @@ const { Provisioner } = require('./provision');
 const { EmulatorEngine } = require('./emulator');
 const doctor = require('./doctor');
 const container = require('./container');
+const guest = require('./guest');
 const platform = require('./platform');
 
 const LOG_DIR = path.join(store.DATA_DIR, 'logs');
@@ -564,6 +565,9 @@ class Runtime {
     // 国产用户第一次进入运行时时，系统桌面默认可能是英文且媒体音量为 0。
     // 这里在 Android 真正可用后一次性设置中文环境与 50% 媒体音量，之后保留用户自己的调整。
     if (!this._guestDefaultsReady) {
+      // 全新（或刚重置）的 /data：音量初始化标记还没置过位。
+      // 这个值必须在音量初始化写盘**之前**取，后面「首次开机收尾」要靠它判断。
+      var freshGuestData = store.getSettings().androidVolumeInitialized !== true;
       let volumeReady = store.getSettings().androidVolumeInitialized === true;
       try {
         await client.shell(
@@ -605,6 +609,57 @@ class Runtime {
       if (this.emulator.lcdOrientation === 'landscape') {
         try { await client.shell('wm size reset; wm density reset', { timeout: 15000 }); } catch (_) { /* ignore */ }
       }
+    }
+    // 记录「中文到底有没有真的生效」：设置页据此显示状态，不让用户自己猜。
+    // 判据必须是 am get-config（真实界面语言）——Play 镜像上 persist.sys.locale
+    // 一直是 en-US，拿 getprop 判断会永远显示"没生效"。
+    // 注意：不要在这里顺手读一次客机语言（`am get-config`）来记录「汉化是否生效」。
+    // 实测在开机刚完成的那一刻插一条 adb 命令，会让这台机器上的模拟器在几秒内
+    // 莫名退出（emulator exit null，快照还被写坏过一次）。语言状态改为按需读取：
+    // 设置页打开时由 core/guest.js 的 readState/probeLocale 现场问一次，不占开机路径。
+    //
+    // ── 首次开机收尾（只针对 ApkStart 自管的内置 AVD、且 /data 全新/刚重置）──
+    // 上面写入的 system_locales 只在安卓启动那一刻被读取，所以必须让安卓自己重启
+    // 一次，界面语言才会真的变成中文；顺手把预装的冗余 Google/AOSP 应用按默认
+    // 分组精简掉（pm uninstall --user 0，可逆，不动系统分区）。
+    // 三道保险，保证不误动别人正在用的系统：
+    //   1. managedBuiltin —— 只对内置 apkstart AVD；attach 模式和自定义镜像不碰；
+    //   2. freshGuestData —— 只对全新 /data；老用户升级时音量标记早已置位，直接跳过；
+    //   3. localeRebootDone / autoTrimDone —— 每个 /data 生命周期里只做一次。
+    try {
+      const st = store.getSettings();
+      const g = st.guest || {};
+      const managedBuiltin = this.emulator && this.emulator.avdName === 'apkstart'
+        && (this.settings.engine.mode || 'builtin') !== 'attach';
+      if (managedBuiltin && freshGuestData && g.localeRebootDone !== true) {
+        store.saveSettings({ guest: { localeRebootDone: true } });
+        this.log('首次开机：重启一次安卓以应用中文界面…');
+        await client.shell('svc power reboot', { timeout: 8000 }).catch(() => '');
+        // 设备先掉线再回来；快速重启可能看不到 offline，掉线等待自带上限
+        for (let i = 0; i < 45; i += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((r) => setTimeout(r, 1000));
+          // eslint-disable-next-line no-await-in-loop
+          if (!(await client.isOnline().catch(() => false))) break;
+        }
+        await this.waitAdb(client, 240000);
+        await this.waitAndroidReady(client, 240000);
+        this.log('安卓重启完成，系统界面现在是中文');
+      }
+      if (managedBuiltin && freshGuestData && g.autoTrimDone !== true) {
+        const groups = guest.GROUPS.filter((x) => x.defaultOn).map((x) => x.id);
+        // eslint-disable-next-line no-await-in-loop
+        const r = await guest.trim(client, groups);
+        if (!r.failed.length) {
+          store.saveSettings({ guest: { autoTrimDone: true } });
+          this.log(`首次开机：已精简 ${r.removed.length} 个预装应用（设置页可随时恢复）`);
+        } else {
+          // 有失败就不置标记，下次开机接着补（已移除的会被自动跳过）
+          this.log(`首次开机：精简预装应用有 ${r.failed.length} 个失败，下次启动自动重试`);
+        }
+      }
+    } catch (e) {
+      this.log(`首次开机收尾失败（不影响使用）：${e.message}`);
     }
     this.startWatchdog();
   }
@@ -1257,7 +1312,12 @@ class Runtime {
       // /data 被删了，guest 里的语言与音量也一起回到出厂值：
       // 清掉这个一次性标记，下次开机重新设中文环境 + 50% 音量，
       // 否则重置过的机器会一直是英文界面 / 可能的静音状态。
-      try { store.saveSettings({ androidVolumeInitialized: false }); } catch (_) { /* ignore */ }
+      // /data 被删了，guest 里的语言与音量也一起回到出厂值：
+      // 清掉这个一次性标记，下次开机重新设中文环境 + 50% 音量，
+      // 否则重置过的机器会一直是英文界面 / 可能的静音状态。
+      // 首次开机收尾的两个标记也一起清：新 /data 要重新走一遍
+      // 「写中文 → 重启生效 → 精简预装」的流程。
+      try { store.saveSettings({ androidVolumeInitialized: false, guest: { localeRebootDone: false, autoTrimDone: false } }); } catch (_) { /* ignore */ }
       return { ok: true, reclaimed, avdDir };
     } catch (e) {
       return { ok: false, reclaimed: 0, avdDir: '', error: e.message };

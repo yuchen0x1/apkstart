@@ -46,6 +46,7 @@ const { AppWindow, TITLEBAR_H } = require('./core/appwin');
 const { NotifyBridge } = require('./core/notify');
 const { AndroidSettings } = require('./core/android');
 const { Updater } = require('./core/updater');
+const guest = require('./core/guest');
 
 // Windows 下窗口被遮挡时 capturePage 会拿到旧帧，自动化截图需要禁用遮挡计算
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
@@ -358,7 +359,7 @@ function refreshPointerMapping() {
  * 打开（或复用）那个「一个应用一个干净窗口」。
  * @param {object} [box] 模拟器 LCD 尺寸；横屏应用传 1920x1080，窗口按它定比例
  */
-function openAppWindow(pkg, tip, box = null) {
+function openAppWindow(pkg, tip, box = null, opts = {}) {
   const rec = store.getApp(pkg);
   appWin.open({
     pkg,
@@ -366,6 +367,8 @@ function openAppWindow(pkg, tip, box = null) {
     iconPath: rec && rec.icoPath,
     lcd: box || (runtime && runtime.emulator && runtime.emulator.lcd) || null,
     fullscreen: displaySettings().mode === 'fullscreen',
+    // 独立窗口模式下不显示宿主窗口：用户要看的画面在模拟器自己的窗口里
+    hidden: !!opts.hidden,
   });
   appWin.setIcon(rec && rec.icoPath);
   appWin.setState({ tip: tip || '正在启动安卓运行时…', ready: false, landscape: appWin.lcdLandscape });
@@ -521,9 +524,58 @@ function enableWindowsFeature(feature) {
     const { spawn } = require('child_process');
     const proc = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
       { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    proc.on('exit', (code) => resolve({ ok: code === 0, restart: true, code }));
+    let stderr = '';
+    if (proc.stderr) proc.stderr.on('data', (d) => { stderr += String(d); });
+    proc.on('exit', (code) => resolve({
+      ok: code === 0,
+      restart: true,
+      code,
+      error: code === 0 ? '' : (
+        /cancel|declined|取消|0x800704c7/i.test(stderr)
+          ? '已取消管理员授权：需要在弹窗点「是」'
+          : `启用「${feature}」失败（退出码 ${code}）`
+      ),
+    }));
     proc.on('error', () => resolve({ ok: false, error: '无法启动 PowerShell' }));
   });
+}
+
+/**
+ * BIOS 里的 CPU 虚拟化（AMD SVM / Intel VT-x）是否真的开了。
+ * WHPX/AEHD 都依赖它；Windows 功能打开得再全，BIOS 没开照样起不来。
+ * 只在用户点「一键开启」时查一次，不拖慢日常状态刷新。
+ */
+function virtualizationFirmwareEnabled() {
+  return new Promise((resolve) => {
+    const ps = '$v = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1; '
+      + 'if ($v -and $v.VirtualizationFirmwareEnabled) { "true" } else { "false" }';
+    const { execFile } = require('child_process');
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { windowsHide: true, timeout: 15000 }, (err, stdout) => {
+        const text = String(stdout || '');
+        if (err && !/\b(true|false)\b/i.test(text)) { resolve(null); return; }
+        resolve(/\btrue\b/i.test(text) ? true : (/\bfalse\b/i.test(text) ? false : null));
+      });
+  });
+}
+
+/** 打开 Windows 的「启用或关闭 Windows 功能」对话框（用户手动勾选 WHPX 的兜底入口） */
+function openWindowsFeatures() {
+  if (process.platform !== 'win32') return Promise.resolve({ ok: false, error: '仅支持 Windows' });
+  try {
+    const { spawn } = require('child_process');
+    const exe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'optionalfeatures.exe');
+    if (fs.existsSync(exe)) {
+      const p = spawn(exe, [], { detached: true, stdio: 'ignore' });
+      p.unref?.();
+      p.once('error', () => { shell.openExternal('ms-settings:optionalfeatures').catch(() => {}); });
+      return Promise.resolve({ ok: true, how: 'optionalfeatures' });
+    }
+    return shell.openExternal('ms-settings:optionalfeatures').then(() => ({ ok: true, how: 'ms-settings' }))
+      .catch((e) => ({ ok: false, error: e.message }));
+  } catch (e) {
+    return Promise.resolve({ ok: false, error: e.message });
+  }
 }
 
 // ---------------- 主窗口 ----------------
@@ -638,6 +690,18 @@ function buildTray() {
         ? apps.map((a) => ({ label: a.label, click: () => runLaunch(a.package) }))
         : [{ label: i18n.t('还没有安装应用'), enabled: false }]),
       { type: 'separator' },
+      {
+        // 独立窗口模式下宿主窗口是藏起来的，用户没有 × 可点：必须给一个明确的
+        // 「关掉现在这个应用」出口，否则只能靠退出整个 ApkStart。
+        label: i18n.t('关闭当前应用'),
+        click: () => {
+          if (!appWin || !appWin.isOpen) {
+            notify(i18n.t('当前没有运行中的应用'), '');
+            return;
+          }
+          try { appWin.close({ keepApp: false }); } catch (_) { /* 已关 */ }
+        },
+      },
       {
         label: displaySettings().mode === 'fullscreen' ? i18n.t('切回竖屏窗口') : i18n.t('全屏（自适应屏幕）'),
         click: () => { toggleDisplayMode(); },
@@ -858,6 +922,76 @@ async function runUpdate() {
 // 快照标成损坏、触发 4 连重试甚至渲染后端崩溃（实测 0xC0000005），网络也会丢。
 let launchBusy = false;
 
+/**
+ * 检测「Android 仍在线且已完成开机，但模拟器 Qt 画面窗口已消失」的无头运行时。
+ * 不依赖 runtime.vmRunning：跨 ApkStart 进程接管的 emulator 没有本地 child-process 句柄，
+ * vmRunning 会是 false；只要 ADB 已在线，就应该继续检查窗口句柄。
+ * Attach 模式不管理外部模拟器窗口，绝不自动关停用户自己的运行时。
+ */
+async function hasHeadlessRuntimeWindow() {
+  if (!runtime || !winAgent || runtime.settings.engine.mode === 'attach'
+      || runtime.settings.engine.headless || runtime.vmProc) return false;
+  const online = await runtime.client().isOnline().catch(() => false);
+  if (!online) return false;
+  const booted = await runtime.client().shell('getprop sys.boot_completed', { timeout: 6000 })
+    .then((s) => String(s || '').trim() === '1').catch(() => false);
+  if (!booted) return false;
+  const probe = () => winAgent.emuAlive().catch(() => null);
+  const first = await probe();
+  if (!first || first.ok !== true || first.alive !== false) return false;
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const second = await probe();
+  return !!(second && second.ok === true && second.alive === false);
+}
+
+/**
+ * 代理是否两次都确认「模拟器画面窗口不存在」。
+ * 单次采样可能是 Qt 窗口还没建好，必须间隔复测；代理连不上（null）不下结论。
+ */
+async function emuWindowGone() {
+  if (!winAgent) return false;
+  const probe = () => winAgent.emuAlive().catch(() => null);
+  const first = await probe();
+  if (!first || first.ok !== true || first.alive !== false) return false;
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const second = await probe();
+  return !!(second && second.ok === true && second.alive === false);
+}
+
+/** 停掉已确认无头的内置模拟器，并跳过一次可能损坏的 Quick Boot 快照。 */async function stopHeadlessRuntime() {
+  if (!runtime || runtime.settings.engine.mode === 'attach') return false;
+  if (runtime.emulator) {
+    // 重启无头实例时不要从故障状态保存 Quick Boot；下一次启动走完整冷启动。
+    runtime.emulator.snapshotWorthSaving = false;
+    if (runtime.emulator.forceColdBootOnNextStart) runtime.emulator.forceColdBootOnNextStart();
+  }
+  const stopped = await runtime.stop({ graceful: false });
+  if (!stopped) throw new Error('未能停止丢失画面窗口的模拟器，已取消自动重启以避免重复接管');
+  // Runtime.stop 对接管实例会按控制台端口强杀，但 Windows 进程退出与 ADB
+  // 设备列表更新有竞态。必须确认旧实例已经离线，才允许 installer.launch/ensure，
+  // 否则 ensure 可能把刚刚判为无头的同一台 guest 又接管回来。
+  for (let i = 0; i < 40; i += 1) {
+    // 不能只等 ADB 离线：taskkill 后 ADB 可能先断、QEMU 控制台端口还没释放，
+    // ensure() 会在这段竞态里把旧实例重新 adopt 回来。两个信号都确认消失才继续。
+    // eslint-disable-next-line no-await-in-loop
+    const [online, consoleAlive] = await Promise.all([
+      runtime.client().isOnline().catch(() => false),
+      runtime.emulator && runtime.emulator._consoleAlive
+        ? runtime.emulator._consoleAlive().catch(() => false)
+        : Promise.resolve(false),
+    ]);
+    if (!online && !consoleAlive) {
+      if (runtime._activeApps && typeof runtime._activeApps.clear === 'function') {
+        runtime._activeApps.clear();
+      }
+      return true;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error('旧模拟器仍在线，已取消自动重启以避免重复接管');
+}
+
 async function runLaunch(pkg) {
   if (launchBusy) {
     appLog(`launch ${pkg} rejected: another launch in progress`);
@@ -885,7 +1019,16 @@ async function runLaunchInner(pkg) {
     //    窗口本身也先按这个比例打开，别等模拟器起来再改（改一次要重排画面）。
     const rec = store.getApp(pkg);
     const want = lcd.desiredOrientation(rec);
-    openAppWindow(pkg, '正在启动安卓运行时…', want ? lcd.orientBox(portraitSize(), want) : windowBox());
+    // 显示方式（engine.windowMode）：
+    //   auto —— 先试嵌入；一旦这台机器被判定「嵌入必黑」（embeddedBlack），
+    //           以后直接走独立窗口，不再让用户每次都先对着一块黑屏等几秒。
+    //   standalone —— 始终用模拟器自己的窗口；embedded —— 始终嵌进应用窗口。
+    const engCfg = store.getSettings().engine || {};
+    const wantStandalone = engCfg.windowMode === 'standalone'
+      || (engCfg.windowMode !== 'embedded' && engCfg.embeddedBlack === true);
+    if (wantStandalone) appLog(`window mode: standalone (embeddedBlack=${!!engCfg.embeddedBlack})`);
+    openAppWindow(pkg, '正在启动安卓运行时…', want ? lcd.orientBox(portraitSize(), want) : windowBox(),
+      { hidden: wantStandalone });
     // 1) 先把「应用窗口」打开显示启动动画：整个过程看不到安卓桌面，也看不到模拟器窗口
     // 开机阶段把模拟器主窗 + qemu / netsimd 的控制台黑窗藏起来，避免任何闪现。
     // 压制是常驻的（embed 后它会自动跳过被嵌入的那一个窗口，见 appwin.embed）。
@@ -893,37 +1036,14 @@ async function runLaunchInner(pkg) {
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
     if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
 
-    // 「无头运行时」自愈（上游 issue #42）：宿主窗口被任务管理器结束进程、
-    // 崩溃强杀等方式直接销毁时，Windows 会连带销毁嵌在里面的模拟器 Qt 子窗口
-    // （qemu 本身还在跑，成了没有画面的“无头”进程）。之后每次启动应用都是
-    // embed 找不到窗口 + 永久黑窗，补嵌重试救不回来。
-    // 关键前提：必须等 guest **开机完成**才判定。开机过程中窗口可能还没创建，
-    // 这时候杀掉运行时会把正在写的快照截断（正是「每次打开都要等两分钟」的
-    // 成因），比黑屏更糟。所以先问 sys.boot_completed，只有 =1 且窗口不存在
-    // 才认定是无头运行时。
-    if (winAgent && runtime.vmRunning) {
-      const booted = await runtime.client().shell('getprop sys.boot_completed', { timeout: 6000 })
-        .then((s) => String(s || '').trim() === '1').catch(() => false);
-      if (booted) {
-        // 判据只看「模拟器的画面窗口句柄是否还存在」，两次采样都确认才算数。
-        // 上一版用 windows() 里有没有 QWindowIcon 来判：那是「可见窗口」列表，
-        // 而 armAgent 刚把未嵌入的模拟器主窗藏起来，于是每次都误判成无头，
-        // 在开机中途杀掉运行时 —— 用户看到的就是「一直转圈 / 然后 adb device not found」。
-        // 代理连不上（.catch → null）同样不下结论：不知道 ≠ 没有。
-        const probe = () => winAgent.emuAlive().catch(() => null);
-        const a1 = await probe();
-        if (a1 && a1.ok === true && a1.alive === false) {
-          await new Promise((r) => setTimeout(r, 1200));
-          const a2 = await probe();
-          if (a2 && a2.ok === true && a2.alive === false) {
-            mark('headless runtime detected (qemu alive, emu window gone) -> restart');
-            appWin.setState({ tip: '检测到安卓显示通道异常，正在重启安卓运行时…', ready: false });
-            await runtime.stop().catch(() => {});
-          }
-        } else if (!a1) {
-          mark('headless probe skipped (native agent unavailable)');
-        }
-      }
+    // 「无头运行时」自愈（上游 issue #42）：即使 qemu 是上一个 ApkStart 进程
+    // 接管过来的（没有当前进程的 emulator child handle），只要 ADB 已在线、guest
+    // 已启动且 Qt 画面窗口两次探测都不存在，就安全重启；开机中途不做破坏性操作。
+    if (await hasHeadlessRuntimeWindow()) {
+      mark('headless runtime detected (adb online, emu window gone) -> cold restart');
+      appWin.setState({ tip: '检测到安卓显示通道异常，正在重启安卓运行时…', ready: false });
+      // 停机未确认完成时必须中止，不能让 ensure() 又把旧的无头实例接管回来。
+      await stopHeadlessRuntime();
     }
 
     // 运行时已经在跑、但 LCD 方向和应用对不上：只有重启运行时才能真的铺满。
@@ -946,7 +1066,7 @@ async function runLaunchInner(pkg) {
       }
     }
 
-    const r = await installer.launch(pkg, {
+    const launchOptions = {
       lcdOrientation,
       onLog: (m) => {
         send('runtime:log', m);
@@ -965,7 +1085,8 @@ async function runLaunchInner(pkg) {
         await rt.client.prepareForeground().catch(() => {});
         mark('foreground ready');
       },
-    });
+    };
+    let r = await installer.launch(pkg, launchOptions);
     mark('app started');
 
     // ensure() 可能复用了切换运行时目录前留下的 detached 模拟器。此时
@@ -973,39 +1094,121 @@ async function runLaunchInner(pkg) {
     // 确认在线后再重发一次作用域，才能让代理找到实际的 emulator 窗口。
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* 诊断性兜底 */ } }
 
-    // 2) 应用真的活下来了，才把画面嵌进窗口（否则用户会看到闪一下的桌面/崩溃页）
-    const embedded = await appWin.embed();
-    if (!embedded) appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
-    mark(`embedded=${embedded}`);
+    // 2) 应用真的活下来了，才把画面接上来（否则用户会先看到闪一下的桌面/崩溃页）
+    let embedded = false;
+    let detached = false;
+    if (wantStandalone) {
+      // 一步到位：不 SetParent、不采样黑帧，直接把模拟器自己的窗口亮出来。
+      // 软件渲染 / 无硬件加速的机器上嵌入必黑，先嵌再摘只会让用户多等一轮。
+      detached = await appWin.standalone();
+      mark(`standalone=${detached}`);
+      if (!detached) {
+        appLog(`standalone failed: ${appWin.lastEmbedError || 'unknown'}`);
+        // 代理说找不到画面窗口 = qemu 还活着但 Qt 窗口没了（上游 #42）。
+        // 这时候再怎么切显示方式都没用，只能重启一次运行时。
+        try {
+          if (await emuWindowGone()) {
+            mark('standalone: emu window gone -> cold restart and relaunch app');
+            appWin.setState({ ready: false, tip: '模拟器画面窗口丢失，正在重启安卓并重新打开应用…' });
+            await stopHeadlessRuntime();
+            r = await installer.launch(pkg, launchOptions);
+            if (!r || !r.ok) throw new Error((r && r.error) || '运行时重启后应用未能重新启动');
+            if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
+            detached = await appWin.standalone();
+            appLog(`standalone after runtime restart=${detached}`);
+          }
+        } catch (e) {
+          appLog(`standalone recovery failed: ${e && e.message}`);
+        }
+      }
+    } else {
+      embedded = await appWin.embed();
+      // 启动阶段仍可能在启动应用后才发现 HWND 丢失（例如 detach/window close 竞态）。
+      // 这种情况下现在的 App 已经在 guest 中运行；停掉并重新 ensure 后必须重新启动它，
+      // 不能只重启 Android 然后对空桌面尝试 embed。
+      if (!embedded && !appWin.external && !appWin.blackDetached
+          && (appWin.lastEmbedError || '').startsWith('emu=0')) {
+        try {
+          if (await hasHeadlessRuntimeWindow()) {
+            mark('headless runtime detected after app start -> cold restart and relaunch app');
+            appWin.setState({ ready: false, tip: '模拟器画面窗口丢失，正在重启安卓并重新打开应用…' });
+            await stopHeadlessRuntime();
+            r = await installer.launch(pkg, launchOptions);
+            if (!r || !r.ok) throw new Error((r && r.error) || '运行时重启后应用未能重新启动');
+            mark('app relaunched after runtime restart');
+            if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
+            embedded = await appWin.embed().catch(() => false);
+            appLog(`embed after runtime restart=${embedded} error=${appWin.lastEmbedError || ''}`);
+          }
+        } catch (e) {
+          appLog(`headless runtime recovery failed: ${e && e.message}`);
+        }
+      }
+      // 嵌入成功但宿主画黑帧时，appwin 会自己摘成独立窗口：这不是「嵌入失败」，
+      // 而是「换了一条能看见画面的路」，顶层不能再去重试 SetParent（必然再黑一次）。
+      detached = !embedded && !!appWin.blackDetached;
+      if (detached) {
+        appLog(`embed black frame (mean=${appWin.lastBlackMean}) -> detached standalone window`);
+        // 这台机器嵌入必黑：记下来。下次点应用直接走独立窗口，不再让用户先对着
+        // 一块黑屏等几秒（实测用户的判断就是「程序没反应 / 一直加载」）。
+        if (engCfg.windowMode !== 'embedded' && engCfg.embeddedBlack !== true) {
+          try {
+            store.saveSettings({ engine: { embeddedBlack: true } });
+            appLog('remembered standalone mode for this machine (embeddedBlack=true)');
+          } catch (e) { appLog(`save embeddedBlack failed: ${e.message}`); }
+        }
+      } else if (!embedded) {
+        appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
+      }
+    }
+    mark(`embedded=${embedded} detached=${detached}`);
     // 嵌入完成后把窗口从别的窗口底下抬出来。否则上层窗口（浏览器等）会盖住安卓画面，
     // 用户看到的是「黑屏 / 画面没填满」，鼠标也点不到应用（全被上层窗口吃掉）。
     // 短暂 topmost 再立刻撤销，只借用一次置顶把 Z 序抬到最前，不会长期霸占顶层。
     if (appWin.isOpen) {
-      try {
-        appWin.win.show();
-        appWin.win.setAlwaysOnTop(true);
-        appWin.win.moveTop();
-        appWin.win.focus();
-        setTimeout(() => {
-          if (appWin.isOpen) {
-            try { appWin.win.setAlwaysOnTop(false); } catch (_) { /* 窗口已关 */ }
-          }
-        }, 700);
-      } catch (_) { /* 窗口可能刚关闭 */ }
+      if (detached) {
+        // 独立窗口：把这块永远连不上画面的黑壳直接藏起来。代理 detach 时已经把
+        // 模拟器窗口亮出来并抢到前台 —— 用户点应用就该看到画面，而不是黑壳。
+        try { appWin.win.hide(); } catch (_) { /* 窗口可能刚关 */ }
+        send('toast', {
+          type: 'success',
+          message: `《${(store.getApp(pkg) || {}).label || pkg}》已在「Android Emulator」窗口打开。`,
+        });
+        appLog('standalone window shown; host window hidden');
+      } else {
+        try {
+          appWin.win.show();
+          appWin.win.setAlwaysOnTop(true);
+          appWin.win.moveTop();
+          appWin.win.focus();
+          setTimeout(() => {
+            if (appWin.isOpen) {
+              try { appWin.win.setAlwaysOnTop(false); } catch (_) { /* 窗口已关 */ }
+            }
+          }, 700);
+        } catch (_) { /* 窗口可能刚关闭 */ }
+      }
     }
-    appWin.setState(appWin.external
-      // 非 Windows：画面只能留在模拟器自己的窗口里。不要显示黑屏，
-      // 直接在应用窗口里写明「去哪看画面」（upstream #24）。
-      ? { ready: false, tip: platform.supportNote() }
-      // Windows 上 embed=false 仍然代表画面句柄尚未接上：启动遮罩必须继续留着，
-      // 否则 shell 会把黑底当成「已经就绪」，用户只能看到一块黑屏。
-      : embedded
-        ? { ready: true, tip: '' }
-        : { ready: false, tip: '正在连接安卓画面…' });
+    appWin.setState(detached
+      // 独立窗口：宿主已隐藏，这条状态只在用户从任务栏把它调出来时才看得到
+      ? { ready: true, tip: '画面在「Android Emulator」窗口里显示。' }
+      : appWin.external
+        // 非 Windows：画面只能留在模拟器自己的窗口里。不要显示黑屏，
+        // 直接在应用窗口里写明「去哪看画面」（upstream #24）。
+        ? { ready: false, tip: platform.supportNote() }
+        // Windows 上 embed=false 仍然代表画面句柄尚未接上：启动遮罩必须继续留着，
+        // 否则 shell 会把黑底当成「已经就绪」，用户只能看到一块黑屏。
+        : embedded
+          ? { ready: true, tip: '' }
+          : { ready: false, tip: '正在连接安卓画面…' });
     if (appWin.external) appLog(`embed unsupported on ${platform.platform}: external window mode`);
     // 嵌入失败（模拟器窗口还没建好）时按递增间隔有限重试；
     // 每次成功都显式更新 ready，失败则一直保留启动遮罩而不是露出黑屏。
-    if (!embedded && !appWin.external) {
+    // 独立窗口模式下不去试嵌入：那台机器的宿主渲染路径本来就是坏的。
+    if (!embedded && !appWin.external && !detached && !wantStandalone) {
+      // embed() 失败只说明找不到目标 HWND 或 SetParent 失败，不等于运行时坏了。
+      // 先让 Qt 窗口有时间建好，按既有策略短暂重试；若 guest 已开机但窗口持续缺失，
+      // 下一次启动入口会先识别无头运行时并做完整重启 + 应用重启。
       const delays = [1200, 2400, 4800, 8000];
       (async () => {
         for (let i = 0; i < delays.length; i += 1) {
@@ -1023,7 +1226,7 @@ async function runLaunchInner(pkg) {
           }
         }
         if (appWin.isOpen && appWin.pkg === pkg) {
-          appWin.setState({ ready: false, tip: '安卓画面暂未连接，请关闭窗口后重试。' });
+          appWin.setState({ ready: false, tip: '安卓画面窗口没有连接。请关闭当前窗口后再点开应用，程序会自动重建显示通道。' });
           appLog('embed retries exhausted; keeping startup overlay visible');
         }
       })().catch((e) => appLog(`embed retry loop failed: ${e.message}`));
@@ -1040,8 +1243,8 @@ async function runLaunchInner(pkg) {
       winAgent.setPerformanceMode(!!game).catch(() => {});
     }
     send('app:launched', { package: pkg, engine: r.engine });
-    appLog(`launch ok ${pkg} embedded=${embedded}`);
-    return { ok: true, embedded };
+    appLog(`launch ok ${pkg} embedded=${embedded} detached=${detached}`);
+    return { ok: true, embedded, detached };
   } catch (e) {
     appLog(`launch failed ${pkg}: ${e && (e.stack || e.message)}`);
     try { appWin.close({ keepApp: true }); } catch (_) { /* ignore */ }
@@ -1519,6 +1722,96 @@ function registerIpc() {
   ipcMain.handle('settings:refreshPointer', async () => { refreshPointerMapping(); return true; });
   // 兼容旧界面：语义已改为「按设置重新同步」
   ipcMain.handle('settings:unhook', async () => { refreshPointerMapping(); return true; });
+
+  /* ---------------- 安卓客机：语言与预装应用（core/guest.js） ---------------- */
+
+  /** 设置页需要的事实：目标语言、是否已验证、分组清单、设备上的实时状态 */
+  ipcMain.handle('guest:state', async () => {
+    const s = store.getSettings();
+    const desired = String((s.guest && s.guest.locale) || '');
+    const base = {
+      desired,
+      verified: !!(s.guest && s.guest.localeVerified),
+      groups: guest.GROUPS.map((g) => ({
+        id: g.id, label: g.label, note: g.note, risk: g.risk,
+        defaultOn: !!g.defaultOn, total: g.packages.length, remaining: g.packages.length,
+      })),
+      online: false,
+      live: null,
+    };
+    if (!runtime) return base;
+    const online = await runtime.client().isOnline().catch(() => false);
+    if (!online) return base;
+    const live = await guest.readState(runtime.client()).catch((e) => ({ error: e.message }));
+    return { ...base, online: true, live };
+  });
+
+  /** 精简：把勾选分组里的预装应用从当前用户移除（可逆，不动系统分区） */
+  ipcMain.handle('guest:trim', async (_e, opts = {}) => {
+    const groups = Array.isArray(opts && opts.groups) ? opts.groups.map(String) : [];
+    if (!runtime || !(await runtime.client().isOnline().catch(() => false))) {
+      return { ok: false, error: '安卓还没启动，先打开一个应用让运行时起来再精简' };
+    }
+    const r = await guest.trim(runtime.client(), groups);
+    store.saveSettings({ guest: { groups } });
+    return { ok: true, ...r };
+  });
+
+  /** 恢复：把移除过的预装应用装回来 */
+  ipcMain.handle('guest:restore', async () => {
+    if (!runtime || !(await runtime.client().isOnline().catch(() => false))) {
+      return { ok: false, error: '安卓还没启动，先打开一个应用让运行时起来再恢复' };
+    }
+    return { ok: true, ...(await guest.restore(runtime.client())) };
+  });
+
+  /**
+   * 切换安卓系统语言。
+   * 实测结论（Play 镜像 ro.debuggable=0，不许 root）：
+   *   - adb root / setprop persist.sys.locale 都不行；
+   *   - 模拟器 -prop 只支持 qemu.* 属性，传 locale 会被丢弃；
+   *   - 唯一可用的：`settings put system system_locales zh-CN`（shell 可写）
+   *     然后**重启安卓**——这个值只在开机时被读取。
+   * 重启走 `adb shell reboot`：安卓自己重启，模拟器进程不动，快照也不受影响，
+   * 比关掉整个运行时再冷启动快得多（实测 30 秒内回到桌面）。
+   */
+  ipcMain.handle('guest:localize', async (_e, opts = {}) => {
+    const locale = String((opts && opts.locale) || guest.LOCALE_TAG);
+    store.saveSettings({ guest: { locale, localeVerified: false } });
+    if (!runtime || !(await runtime.client().isOnline().catch(() => false))) {
+      return { ok: false, error: '安卓还没启动，先打开一个应用让运行时起来，再切换语言' };
+    }
+    const client = runtime.client();
+    const applied = await guest.applyLocale(client, locale);
+    if (!applied.ok) return { ok: false, error: applied.error, applied };
+    send('runtime:log', `系统语言已写入（${locale}），正在重启安卓…`);
+    await client.shell('reboot', { timeout: 6000 }).catch(() => {});
+    // 先等 adb 真的掉线（reboot 指令下发到内核接手有 1~3 秒延迟）
+    let wentOffline = false;
+    for (let i = 0; i < 40; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 800));
+      // eslint-disable-next-line no-await-in-loop
+      if (!(await client.isOnline().catch(() => false))) { wentOffline = true; break; }
+    }
+    const ready = await runtime.waitAndroidReady(client, 240000, (m) => send('runtime:log', m));
+    // 重启后系统会重新读一遍 system_locales；这里读回真实界面语言，别只看设置值
+    const probe = await guest.probeLocale(client, locale).catch(() => null);
+    const active = !!(probe && probe.active);
+    store.saveSettings({ guest: { localeVerified: active } });
+    return {
+      ok: true, locale, applied, wentOffline, ready, active, probe,
+    };
+  });
+
+  /** 兜底入口：直接在安卓里打开语言设置（-prop 万一不生效时手动选一次） */
+  ipcMain.handle('guest:openLocaleSettings', async () => {
+    if (!runtime || !(await runtime.client().isOnline().catch(() => false))) {
+      return { ok: false, error: '安卓还没启动，先打开一个应用' };
+    }
+    await runtime.client().shell('am start -a android.settings.LOCALE_SETTINGS', { timeout: 15000 });
+    return { ok: true };
+  });
 
   ipcMain.handle('runtime:status', async () => runtime.status());
   ipcMain.handle('runtime:probe', async () => runtime.probe());
@@ -2274,6 +2567,7 @@ function registerIpc() {
       const accel = await runtime.provisioner.emulatorAccel();
       if (accel.ok) return { ok: true, already: true, accel, note: '硬件加速已可用，无需额外操作' };
 
+      const firmware = await virtualizationFirmwareEnabled();
       const hv = await runtime.provisioner.hypervisor();
       if (hv.dll) {
         // 系统带 WinHvPlatform.dll：开启「虚拟机平台」功能（可能需要重启）
@@ -2284,9 +2578,15 @@ function registerIpc() {
         return {
           ok,
           restartNeeded: r.restart || r2.restart,
+          firmwareEnabled: firmware,
           accel: after,
           note: ok
-            ? (r.restart ? '已开启「虚拟机平台」，请重启电脑后获得最佳性能' : '「虚拟机平台」已开启，硬件加速即时生效')
+            ? (firmware === false
+              ? '系统功能已提交开启，但 BIOS 里虚拟化（AMD SVM / Intel VT-x）还没打开：'
+                + '请先重启进 BIOS 开启它，回到 Windows 后再重启一次。'
+              : ((r.restart || r2.restart)
+                ? '已开启「虚拟机平台」，请重启电脑后生效'
+                : '「虚拟机平台」已开启，硬件加速即时生效'))
             : (r.error || r2.error || '无法开启系统虚拟化功能'),
         };
       }
@@ -2308,12 +2608,24 @@ function registerIpc() {
         proc.on('error', (e) => reject(e));
       });
       const after = await runtime.provisioner.emulatorAccel();
-      return { ok: after.ok, accel: after, note: after.ok ? 'AEHD 硬件加速已启用' : after.note };
+      return {
+        ok: after.ok,
+        accel: after,
+        firmwareEnabled: firmware,
+        note: after.ok ? 'AEHD 硬件加速已启用'
+          : (firmware === false ? 'BIOS 里虚拟化（SVM / VT-x）未开启，AEHD 驱动无法运行' : after.note),
+      };
     } catch (e) {
       return { ok: false, error: e.message };
     }
   }
   ipcMain.handle('provision:enableVirtualization', () => enableVirtualizationImpl());
+
+  /** 设置页「硬件加速」状态：只读、带缓存，不触发任何提权或安装 */
+  ipcMain.handle('provision:accelStatus', async () => {
+    try { return { ok: true, accel: await runtime.provisioner.emulatorAccel() }; }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
 
   ipcMain.handle('provision:installAdb', async () => {
     try {
@@ -2793,6 +3105,9 @@ function registerIpc() {
     if (!/^https?:\/\//i.test(u)) throw new Error('只允许打开 http/https 链接');
     return shell.openExternal(u);
   });
+
+  /** 打开 Windows「启用或关闭 Windows 功能」对话框（一键开启失败时的手动兜底） */
+  ipcMain.handle('system:openWindowsFeatures', () => openWindowsFeatures());
 
   /** 打开本地目录（设置页「打开数据目录」等按钮用；window.open('file://') 会被 open 拦截器吞掉） */
   ipcMain.handle('shell:openPath', (_e, p) => {

@@ -21,6 +21,9 @@ const TITLEBAR_H = 38;
  */
 const EMU_PAD = 8;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 宿主侧画面亮度低于这个值（连续多次）就算黑帧。0.6.7 删掉检测后
+// 「嵌入成功但一片黑」会被当成启动成功，用户完全不知道发生了什么。
+const BLACK_MEAN = Number(process.env.APKSTART_BLACK_MEAN || 40);
 
 function iconUrl(p) {
   if (!p || !fs.existsSync(p)) return '';
@@ -43,6 +46,12 @@ class AppWindow {
     // 模拟器窗口已成功嵌入本窗口。显示类事件（show/restore）靠它决定
     // 是否要顺带把被 minimize→agent.hide() 藏掉的模拟器窗口重新亮出来。
     this._embedded = false;
+    // 嵌入后检测到宿主画黑帧、已自动摘成独立窗口（上层据此给出明确提示）
+    this.blackDetached = false;
+    // 当前就用独立窗口显示（没有嵌入宿主）。上层据此决定是否还需要 fit / embed。
+    this.standaloneActive = false;
+    // 宿主窗口被刻意隐藏（独立窗口模式下不该让用户看到一块黑壳）
+    this._hidden = false;
     // 兼容旧日志字段：跟随模式已移除，这些值恒为 false，仅避免上层读取到 undefined
     this.lastEmbedFollow = false;
     this.lastEmbedFollowReason = '';
@@ -126,10 +135,16 @@ class AppWindow {
    *   lcd 是模拟器 LCD 尺寸（横屏应用为 1920x1080），窗口按它定比例。
    */
   open(o) {
-    const { pkg, label, iconPath, lcd, fullscreen } = o;
+    const { pkg, label, iconPath, lcd, fullscreen, hidden } = o;
     // 保留外部（main）通过 onWindowClosed() 注册的回调：open 可能被反复调用
     this._closedCb = o.onClosed || this._closedCb;
     if (this.isOpen && this.pkg === pkg) {
+      // 独立窗口模式：用户再点一次这个应用，该把模拟器窗口抬到前面，
+      // 而不是把藏着黑壳的宿主窗口弹出来。
+      if (this.standaloneActive) {
+        this.revealStandalone().catch(() => {});
+        return this.win;
+      }
       this.win.show();
       this.win.focus();
       this._revealEmbedded();
@@ -138,6 +153,9 @@ class AppWindow {
     this.close({ keepApp: true });
 
     this.pkg = pkg;
+    // 独立窗口模式：宿主窗口只作为「这个应用还开着」的状态载体，不显示出来。
+    // 用户要看的是模拟器自己的窗口，不是一块永远连不上画面的黑壳。
+    this._hidden = !!hidden;
     this.lcd = lcd || null;
     this.portrait = (lcd && lcd.w && lcd.h) ? { w: lcd.w, h: lcd.h } : { w: 540, h: 960 };
     this.state = {
@@ -189,12 +207,13 @@ class AppWindow {
       try { this.win.setTitle(label || 'ApkStart'); } catch (_) { /* 窗口可能已销毁 */ }
     });
     this.win.once('ready-to-show', () => {
-      this.win.show();
+      if (!this._hidden) this.win.show();
       this._push();
     });
     // 同主窗口的兜底：首帧事件收不到时不能让用户对着「没反应」猜。
     setTimeout(() => {
       try {
+        if (this._hidden) return;
         if (this.win && !this.win.isDestroyed() && !this.win.isVisible()) {
           this.win.show();
           this._push();
@@ -327,6 +346,45 @@ class AppWindow {
     this.scheduleFit();
   }
 
+  /** 宿主侧模拟器窗口的平均亮度；抓不到返回 null（绝不能据此误判成黑屏） */
+  async _frameBrightness() {
+    try {
+      const r = await this.agent.pixmean();
+      if (!r || r.ok === false) return null;
+      const v = Number(r.mean);
+      return Number.isFinite(v) && v >= 0 ? v : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * 嵌入成功后确认宿主真的在画画面。
+   * 现场：SetParent 成功、窗口尺寸正确、adb screencap 也有内容，
+   * 但 Qt/GL 的交换链在嵌入后死掉，窗口纯黑。连续多次采样都黑才动手，
+   * 中间做一次无害重绘；仍黑就把窗口摘成独立窗口，让用户看得见、点得到。
+   */
+  async _looksBlackAfterEmbed() {
+    // 首帧可能还没到，先给它一点时间
+    await sleep(600);
+    // 5 次跨越约 3 秒：应用刚启动时常挂着全黑启动图，只看一眼就摘窗口会误伤好机器。
+    // 只要有一次测到画面就立即收工；中间做一次重绘，顺手救回失焦导致的黑帧。
+    for (let i = 0; i < 5; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const mean = await this._frameBrightness();
+      this.lastEmbedMean = mean;
+      if (mean === null || mean >= BLACK_MEAN) return false;
+      if (i === 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await this.agent.refresh().catch(() => {});
+      }
+      // eslint-disable-next-line no-await-in-loop
+      if (i < 4) await sleep(700);
+    }
+    this.lastBlackMean = this.lastEmbedMean;
+    return true;
+  }
+
   async embed() {
     if (!this.isOpen) return false;
     // 非 Windows / 没有原生代理：嵌入这条路根本不存在。
@@ -350,6 +408,23 @@ class AppWindow {
       // 真因是 chrome 渲染层尺寸 / 面板尺寸，由 agent 的 Fit 与 -skin 负责。
       if (r && r.ok) {
         this._embedded = true;
+        this.blackDetached = false;
+        this.standaloneActive = false;
+        // 之前是独立窗口模式（窗口被藏起来了）：现在嵌成了，得让宿主露出来
+        if (this._hidden) {
+          this._hidden = false;
+          try { this.win.show(); } catch (_) { /* 窗口可能刚关 */ }
+        }
+        // eslint-disable-next-line no-await-in-loop
+        if (await this._looksBlackAfterEmbed()) {
+          // 刷新也救不回来：摘成独立窗口。画面还在，只是不能嵌进应用里。
+          // eslint-disable-next-line no-await-in-loop
+          await this.agent.detach().catch(() => {});
+          this._embedded = false;
+          this.blackDetached = true;
+          this.lastEmbedError = 'black-frame-detached';
+          return false;
+        }
         return true;
       }
       // eslint-disable-next-line no-await-in-loop
@@ -360,6 +435,44 @@ class AppWindow {
     this.lastEmbedError = last ? (last.error || `emu=${last.emu}`) : 'no-response';
     this._embedded = false;
     return false;
+  }
+
+  /**
+   * 直接把画面放到模拟器自己的窗口里，完全不碰 SetParent。
+   *
+   * 为什么需要这条路：在软件渲染 / 无硬件加速的机器上，嵌进宿主后 Qt 的
+   * 交换链会失效 —— 安卓侧画得好好的，宿主窗口却是一块黑底。旧逻辑是
+   * 「先嵌 → 采样发现黑 → 再摘成独立窗口」，用户每次启动都要先对着黑屏
+   * 等三秒，还以为是程序卡死了。这里一步到位：打开应用就把模拟器窗口
+   * 亮出来并抢到前台。
+   */
+  async standalone() {
+    if (!this.agent || this.agent.available === false) {
+      this.external = true;
+      this.lastEmbedError = 'no-native-agent';
+      return false;
+    }
+    const r = await this.agent.detach().catch((e) => ({ ok: false, error: e.message }));
+    if (!r || !r.ok) {
+      // 代理说找不到模拟器窗口：这已经不是「显示方式」的问题，
+      // 而是 qemu 活着但 Qt 画面窗口没了（上层会走重启运行时的恢复流程）。
+      this.lastEmbedError = (r && r.error) || 'emu-window-missing';
+      return false;
+    }
+    this._embedded = false;
+    this.blackDetached = true;
+    this.standaloneActive = true;
+    // 宿主窗口只留作状态载体，不能挡在画面前面
+    this._hidden = true;
+    try { if (this.isOpen) this.win.hide(); } catch (_) { /* 窗口可能刚关 */ }
+    return true;
+  }
+
+  /** 独立窗口模式下把模拟器窗口重新亮出来并置前（从主界面再点一次应用时用）。 */
+  async revealStandalone() {
+    if (!this.standaloneActive) return false;
+    const r = await this.agent.detach().catch(() => null);
+    return !!(r && r.ok);
   }
 
   async fitNow() {
@@ -489,6 +602,9 @@ class AppWindow {
     const win = this.win;
     const pkg = this.pkg;
     this._embedded = false;
+    this.blackDetached = false;
+    this.standaloneActive = false;
+    this._hidden = false;
     this._syncHook(false);
     if (!keepApp && pkg && this._onCloseApp) this._onCloseApp(pkg);
     this._selfClose = true;

@@ -652,8 +652,14 @@ async function launchApp(pkg) {
   });
   const r = await api.launch(pkg);
   if (r.ok) {
-    // 应用有自己的窗口，主界面自动收起；这里只留一句提示，然后隐藏窗口
-    t.update({ title: '已启动', body: '应用正在独立窗口中运行（顶部可旋转屏幕）。', type: 'ok' });
+    // 嵌入后宿主画黑帧时，程序会摘成独立窗口：必须说清楚，别让用户对着黑底以为又坏了
+    t.update(r.detached
+      ? {
+        title: '已在独立窗口打开',
+        body: '画面在「Android Emulator」窗口里，这里不再显示黑屏；下次启动会直接用它。',
+        type: 'ok',
+      }
+      : { title: '已启动', body: '应用正在独立窗口中运行（顶部可旋转屏幕）。', type: 'ok' });
     setTimeout(t.dismiss, 1600);
     setTimeout(() => api.winHide(), 900);
     setTimeout(refreshApps, 1200);
@@ -865,6 +871,87 @@ function bindAndroid() {
   $('btnAndroidApps').addEventListener('click', () => open('apps'));
 }
 
+/* ---------------- 安卓客机：中文界面 + 预装应用精简 ---------------- */
+// guest:state 每次都会问一遍设备（pm list packages -u 有点慢），所以缓存 15 秒，
+// 用户点了精简/恢复之后再强制刷新。
+let guestCache = null;
+let guestFetchedAt = 0;
+
+function guestCheckedIds(r) {
+  const saved = (state.settings && state.settings.guest && state.settings.guest.groups) || [];
+  const source = saved.length ? saved : (r.groups || []).filter((g) => g.defaultOn).map((g) => g.id);
+  return new Set(source);
+}
+
+function renderGuest(r) {
+  const note = $('guestLocaleText');
+  if (!note) return;
+  const desired = r.desired || '';
+  const live = r.live || null;
+  const liveZh = !!(live && live.localeChinese);
+  const liveTag = (live && live.locale) || '';
+  const parts = [];
+  if (desired === 'zh-CN') {
+    if (liveZh) parts.push('已生效：系统界面为简体中文');
+    else if (!r.online) parts.push('已保存设置；安卓现在没运行，下次启动时会应用');
+    else parts.push(`还没生效（当前 ${liveTag || '系统默认'}）——点下面的按钮会重启一次安卓来完成切换`);
+  } else {
+    parts.push(`当前是镜像默认语言（${liveTag || '英文'}），未做汉化`);
+  }
+  if (r.online && live && !live.error) {
+    const gone = (live.trimmed || []).length;
+    parts.push(gone ? `已移除 ${gone} 个预装应用` : '预装应用未做精简');
+  } else {
+    parts.push('安卓未运行，预装应用状态未知');
+  }
+  note.textContent = parts.join(' · ');
+
+  const wrap = $('guestTrimList');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  if (!r.online || !live || live.error) {
+    const tip = document.createElement('div');
+    tip.className = 'guest-empty';
+    tip.textContent = '打开任意一个应用让安卓运行起来，这里会显示可以精简的预装应用。';
+    wrap.appendChild(tip);
+    return;
+  }
+  const checked = guestCheckedIds(r);
+  for (const g of (live.groups || r.groups || [])) {
+    const row = document.createElement('label');
+    row.className = `guest-item${g.risk === 'danger' ? ' danger' : ''}${g.remaining === 0 ? ' gone' : ''}`;
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.value = g.id;
+    box.checked = checked.has(g.id);
+    const body = document.createElement('div');
+    const t = document.createElement('div');
+    t.className = 'gt';
+    t.textContent = g.label;
+    const d = document.createElement('div');
+    d.className = 'gd';
+    d.textContent = g.note;
+    const c = document.createElement('div');
+    c.className = 'gcount';
+    const total = Number(g.total || 0);
+    const left = Number(g.remaining || 0);
+    c.textContent = total === 0
+      ? '当前系统里没有这一组应用'
+      : (left === 0 ? `已全部移除（${total} 个，可一键恢复）` : `还有 ${left} / ${total} 个在系统里`);
+    body.append(t, d, c);
+    row.append(box, body);
+    wrap.appendChild(row);
+  }
+}
+
+async function refreshGuest(force = false) {
+  if (!guestCache || force || Date.now() - guestFetchedAt > 15000) {
+    guestCache = await api.guestState().catch(() => null);
+    guestFetchedAt = Date.now();
+  }
+  if (guestCache) renderGuest(guestCache);
+}
+
 function fillSettings(s) {
   $('setEngineMode').value = s.engine.mode;
   $('setAdbPath').value = s.adbPath || '';
@@ -905,12 +992,14 @@ function fillSettings(s) {
   if ($('setResourceMode')) $('setResourceMode').value = eng.resourceMode || 'balanced';
   if ($('setRenderSize')) $('setRenderSize').value = eng.renderSize || 'auto';
   if ($('setGpuMode')) $('setGpuMode').value = eng.gpuMode || 'auto';
+  if ($('setWindowMode')) $('setWindowMode').value = eng.windowMode || 'auto';
   if ($('setDataGB')) $('setDataGB').value = String(Number(eng.dataPartitionGB || 0));
   if ($('setFastDns')) $('setFastDns').checked = eng.fastDns !== false;
   if ($('setKeepSnapshot')) $('setKeepSnapshot').checked = eng.keepSnapshot !== false;
   $('setDisplayMode').value = d.mode === 'fullscreen' ? 'fullscreen' : 'window';
   $('setPortrait').value = d.portrait || '900x1600';
   $('portraitField').hidden = $('setDisplayMode').value === 'fullscreen';
+  refreshGuest();
 }
 
 /** 数据分区实际大小 + 磁盘余量，显示在设置页容量选择下方 */
@@ -1093,6 +1182,7 @@ async function openSettings() {
   $('settingsMask').classList.add('on');
   refreshAndroid();
   refreshDataInfo();
+  refreshAccelStatus();
 }
 
 function closeSettings() {
@@ -1318,6 +1408,17 @@ function bindSettings() {
       refreshProfileText();
     });
   }
+  if ($('setWindowMode')) {
+    $('setWindowMode').addEventListener('change', async (e) => {
+      const patch = { engine: { windowMode: e.target.value } };
+      // 用户明确选「嵌入」时清掉「这台机器嵌入必黑」的记忆：否则他选完
+      // 还是走独立窗口，会以为设置根本没生效。
+      if (e.target.value === 'embedded') patch.engine.embeddedBlack = false;
+      state.settings = await api.setSettings(patch);
+      fillSettings(state.settings);
+      toast({ title: '显示方式已保存', body: '下一次打开应用生效', type: 'ok' });
+    });
+  }
   if ($('setImageFlavor')) {
     $('setImageFlavor').addEventListener('change', async (e) => {
       const old = (state.settings && state.settings.runtime && state.settings.runtime.systemImageFlavor) || 'google_apis_playstore';
@@ -1367,6 +1468,102 @@ function bindSettings() {
     $('setDataGB').addEventListener('change', (e) => {
       save({ engine: { dataPartitionGB: Number(e.target.value) || 0 } });
       refreshDataInfo();
+    });
+  }
+  if ($('btnEnableAccel')) $('btnEnableAccel').addEventListener('click', runEnableVirtualization);
+
+  /* ---- 安卓客机：中文界面 ---- */
+  if ($('btnGuestZh')) {
+    $('btnGuestZh').addEventListener('click', async () => {
+      const { response } = await api.confirm({
+        title: '把安卓系统切换成简体中文？',
+        message: '会把语言写进安卓设置，并让安卓自己重启一次（大约半分钟）。',
+        detail: '• 已安装的应用、登录状态和存档都保留，只是把系统界面语言换成中文\n'
+          + '• 重启时模拟器窗口会短暂断开，随后自动恢复，不用管它\n'
+          + '• 如果之后又变回英文，用「在安卓里手动改语言」在设置里选一次简体中文即可',
+        okLabel: '切换为中文',
+      });
+      if (response !== 1) return;
+      const t = toast({ title: '正在切换安卓系统语言…', body: '安卓会重启一次，大约半分钟', sticky: true, spinner: true });
+      const r = await api.guestLocalize('zh-CN').catch((e) => ({ ok: false, error: e.message }));
+      if (!r || !r.ok) { t.update({ title: '切换失败', body: (r && r.error) || '请稍后重试' }); return; }
+      t.dismiss();
+      if (r.active) {
+        toast({ title: '已切换为简体中文', body: '桌面、设置和系统应用都已经变成中文。', type: 'ok', sticky: true });
+      } else {
+        toast({
+          title: '语言已写入，但还没生效',
+          body: `重启后系统仍是 ${(r.probe && r.probe.config) || '英文'}，可以用「在安卓里手动改语言」手动选一次简体中文。`,
+          type: 'warn', sticky: true,
+        });
+      }
+      refreshGuest(true);
+    });
+  }
+  if ($('btnGuestLocaleSettings')) {
+    $('btnGuestLocaleSettings').addEventListener('click', async () => {
+      const r = await api.guestOpenLocaleSettings().catch((e) => ({ ok: false, error: e.message }));
+      if (!r || !r.ok) {
+        toast({ title: '需要先打开一次应用', body: (r && r.error) || '让安卓运行起来后再试', type: 'error' });
+      } else {
+        toast({ title: '已打开安卓语言设置', body: '在模拟器窗口里点「＋」添加语言，选「简体中文」后拖到第一位。', type: 'info', sticky: true });
+      }
+    });
+  }
+  if ($('btnGuestTrim')) {
+    $('btnGuestTrim').addEventListener('click', async () => {
+      const groups = [...document.querySelectorAll('#guestTrimList input[type=checkbox]:checked')].map((n) => n.value);
+      if (!groups.length) {
+        toast({ title: '先勾选要精简的分组', type: 'info' });
+        return;
+      }
+      const { response } = await api.confirm({
+        title: `从安卓里移除这 ${groups.length} 组预装应用？`,
+        message: '只对当前用户移除，系统分区不动，随时可以一键恢复。',
+        detail: '你的应用、桌面布局和其它设置都不受影响；被移除的应用不再占桌面、也不再后台运行。',
+        okLabel: '开始精简',
+      });
+      if (response !== 1) return;
+      const t = toast({ title: '正在精简预装应用…', sticky: true, spinner: true });
+      const r = await api.guestTrim(groups).catch((e) => ({ ok: false, error: e.message }));
+      if (!r || !r.ok) { t.update({ title: '精简失败', body: (r && r.error) || '请稍后重试' }); return; }
+      t.dismiss();
+      const failed = (r.failed || []).length;
+      toast({
+        title: `已移除 ${(r.removed || []).length} 个预装应用`,
+        body: failed ? `有 ${failed} 个被系统保护、没有移除（不影响使用）。` : '桌面图标会随之消失，随时可以一键恢复。',
+        type: failed ? 'warn' : 'ok',
+      });
+      refreshGuest(true);
+    });
+  }
+  if ($('btnGuestRestore')) {
+    $('btnGuestRestore').addEventListener('click', async () => {
+      const t = toast({ title: '正在恢复预装应用…', sticky: true, spinner: true });
+      const r = await api.guestRestore().catch((e) => ({ ok: false, error: e.message }));
+      if (!r || !r.ok) { t.update({ title: '恢复失败', body: (r && r.error) || '请稍后重试' }); return; }
+      t.dismiss();
+      const n = (r.restored || []).length;
+      toast({ title: n ? `已恢复 ${n} 个预装应用` : '没有需要恢复的应用', type: n ? 'ok' : 'info' });
+      refreshGuest(true);
+    });
+  }
+  if ($('btnOpenFeatures')) {
+    $('btnOpenFeatures').addEventListener('click', async () => {
+      const r = await api.openWindowsFeatures().catch(() => ({ ok: false }));
+      if (r && r.ok) {
+        toast({
+          title: '已打开 Windows 功能',
+          body: '请勾选「Windows 虚拟机监控程序平台」和「虚拟机平台」，确定后重启电脑。',
+          type: 'info', sticky: true,
+        });
+      } else {
+        toast({
+          title: '打不开 Windows 功能',
+          body: (r && r.error) || '请从开始菜单搜索「启用或关闭 Windows 功能」后手动开启。',
+          type: 'error',
+        });
+      }
     });
   }
   if ($('btnGrowData')) {
@@ -2450,6 +2647,47 @@ function renderEnvCheck(r) {
   });
 }
 
+/** 设置页「硬件加速」状态：只读探测（带缓存），失败也不能挡住设置页 */
+async function refreshAccelStatus() {
+  const el = $('accelStatusText');
+  if (!el) return;
+  const r = await api.accelStatus().catch(() => null);
+  const a = r && r.accel;
+  if (!r || !a) { el.textContent = '无法检测硬件加速状态'; return; }
+  el.textContent = a.ok
+    ? `已启用 · ${a.kind === 'whpx' ? 'WHPX' : (a.kind === 'aehd' ? 'AEHD' : '硬件加速')}`
+    : '未启用 · 当前是纯软件模拟（开机慢，可能直接崩）';
+}
+
+/**
+ * 一键开启硬件加速：设置页按钮与环境自检的「修复」共用一套提示。
+ * 主要由主进程决定走 WHPX 还是 AEHD；这里负责把「要重启」「BIOS 还没开」
+ * 这两件真正影响结果的事说清楚。
+ */
+async function runEnableVirtualization() {
+  const t = toast({ title: '正在开启硬件加速…', body: '请在弹出的窗口点「是」', sticky: true, spinner: true });
+  const r = await api.enableVirtualization().catch(() => ({ ok: false }));
+  if (r.ok) {
+    const biosPending = r.firmwareEnabled === false;
+    t.update({
+      title: biosPending ? '还需在 BIOS 开启虚拟化' : '硬件加速已启用',
+      body: biosPending
+        ? '系统功能已开启，但 BIOS 里的 SVM / VT-x 还没打开。请重启进 BIOS 开启，再回 Windows 重启一次。'
+        : (r.restartNeeded ? '已开启，请重启电脑后生效。' : (r.note || '已生效')),
+      type: 'ok', sticky: true,
+    });
+  } else {
+    t.update({
+      title: '未能自动开启',
+      body: `${r.error || r.note || '请重试。'}也可以点「打开 Windows 功能」手动勾选；弹窗要点「是」才会执行。`,
+      type: 'error', sticky: true,
+    });
+  }
+  setTimeout(refreshAccelStatus, 800);
+  setTimeout(selfCheck, 1000);
+  return r;
+}
+
 async function fixIssue(issue) {
   switch (issue.fix) {
     case 'vcRedist': {
@@ -2465,14 +2703,7 @@ async function fixIssue(issue) {
       break;
     }
     case 'virtualization': {
-      const t = toast({ title: '正在开启硬件加速…', body: '请在弹出的窗口点「是」', sticky: true, spinner: true });
-      const r = await api.enableVirtualization().catch(() => ({ ok: false }));
-      if (r.ok) {
-        t.update({ title: '硬件加速已启用', body: r.restartNeeded ? '请重启电脑以获得最佳性能' : (r.note || ''), type: 'ok' });
-        setTimeout(t.dismiss, 3200);
-      } else {
-        t.update({ title: '未能开启', body: r.error || '请重试', type: 'error', sticky: true });
-      }
+      await runEnableVirtualization();
       break;
     }
     case 'disk': {
@@ -2655,6 +2886,16 @@ async function runRepair() {
   box.innerHTML = '';
   (r.steps || []).forEach((st) => line(`${st.ok ? '✓' : '✕'} ${st.label}${st.detail ? ` — ${st.detail}` : ''}`, st.ok ? 'ok' : 'bad'));
   if (r.empty) line('这套问题没有可自动执行的动作，直接换低配参数再试一次。', 'run');
+  // 开启硬件加速要重启才生效：别在这里立刻重试，那只会再崩一次还白等十几分钟
+  if (r.retry && r.retry.needsReboot) {
+    closeRepair();
+    toast({
+      title: '请重启电脑后生效',
+      body: '硬件加速功能已经开启。重启电脑再打开应用，安卓就会走硬件加速，不再崩在软件模拟上。',
+      type: 'info', sticky: true,
+    });
+    return;
+  }
 
   const retry = r.retry || plan.retry || {};
   closeRepair();

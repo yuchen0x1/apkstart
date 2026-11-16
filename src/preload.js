@@ -29,6 +29,13 @@ contextBridge.exposeInMainWorld('apkstart', {
   refreshPointerMapping: () => invoke('settings:refreshPointer'),
   restoreMouseHook: () => invoke('settings:unhook'),
 
+  // 安卓客机：系统语言汉化 + 预装应用精简/恢复
+  guestState: () => invoke('guest:state'),
+  guestTrim: (groups) => invoke('guest:trim', { groups: groups || [] }),
+  guestRestore: () => invoke('guest:restore'),
+  guestLocalize: (locale) => invoke('guest:localize', { locale: locale || 'zh-CN' }),
+  guestOpenLocaleSettings: () => invoke('guest:openLocaleSettings'),
+
   runtimeStatus: () => invoke('runtime:status'),
   setImageFlavor: (flavor) => invoke('runtime:setImageFlavor', flavor),
   runtimeProbe: () => invoke('runtime:probe'),
@@ -71,6 +78,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   installAehd: () => invoke('provision:installAehd'),
   enableAccel: () => invoke('provision:enableAccel'),
   enableVirtualization: () => invoke('provision:enableVirtualization'),
+  accelStatus: () => invoke('provision:accelStatus'),
   downloadIso: () => invoke('provision:downloadIso'),
   createDisk: (gb) => invoke('provision:createDisk', gb),
   importIso: () => invoke('provision:importIso'),
@@ -107,6 +115,7 @@ contextBridge.exposeInMainWorld('apkstart', {
 
   openExternal: (url) => invoke('shell:open', url),
   openPath: (p) => invoke('shell:openPath', p),
+  openWindowsFeatures: () => invoke('system:openWindowsFeatures'),
 
   // 首次运行引导向导
   sysDrives: () => invoke('sys:drives'),

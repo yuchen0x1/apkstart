@@ -32,6 +32,18 @@ public class ApkAgent
     [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr Hwnd; public uint Message; public IntPtr WParam; public IntPtr LParam; public uint Time; public int X; public int Y; }
     // Minimal PROCESS_BASIC_INFORMATION: enough to read InheritedFromUniqueProcessId.
     [StructLayout(LayoutKind.Sequential)] public struct PBI { public IntPtr R1; public IntPtr Peb; public IntPtr R2a; public IntPtr R2b; public IntPtr Pid; public IntPtr ParentPid; }
+    // 宿主侧黑屏检测：PrintWindow 抓一帧，只统计画面中央区域，避开 Qt 自带的灰边。
+    [StructLayout(LayoutKind.Sequential)] public struct BITMAPINFOHEADER
+    {
+        public int biSize; public int biWidth; public int biHeight;
+        public short biPlanes; public short biBitCount; public int biCompression;
+        public int biSizeImage; public int biXPelsPerMeter; public int biYPelsPerMeter;
+        public int biClrUsed; public int biClrImportant;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct BITMAPINFO
+    {
+        public BITMAPINFOHEADER bmiHeader; public int bmiColors;
+    }
 
     public delegate bool EnumProc(IntPtr h, IntPtr p);
     public delegate IntPtr HookProc(int code, IntPtr wp, IntPtr lp);
@@ -51,6 +63,15 @@ public class ApkAgent
     [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr h, IntPtr rgn, bool redraw);
     [DllImport("gdi32.dll")] static extern IntPtr CreateRectRgn(int l, int t, int r, int b);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+    // 黑屏检测用的 GDI 调用（0.6.7 曾随跟随模式一起删掉，导致嵌入黑屏无人发现）
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleBitmap(IntPtr dc, int w, int hh);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+    [DllImport("gdi32.dll")] static extern int GetDIBits(IntPtr dc, IntPtr bmp, uint start, uint lines, byte[] bits, ref BITMAPINFO bi, uint usage);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
@@ -121,6 +142,9 @@ public class ApkAgent
     static readonly ConcurrentQueue<string> _events = new ConcurrentQueue<string>();
     static long _lastToolSweep = 0;
     static long _embedAt = 0;
+    // 嵌入后检测到宿主画黑帧时会 detach 成独立窗口；此标志让常驻压制循环
+    // 不要把用户正在看的这个独立窗口又藏掉。下一次 embed / park 时清掉。
+    static volatile bool _standalone = false;
     // 常驻压制：默认一开机就开，把模拟器主窗 + 工具栏 + 控制台黑窗压住。
     // 与「embed 完成就关掉」的旧逻辑不同，它是**常驻**的 —— sweep 会跳过已经嵌进
     // 我们窗口的那一个窗口，其余一律藏起来（含 ApkStart 退出后回到桌面的那个黑窗）。
@@ -453,6 +477,8 @@ public class ApkAgent
             string cls = ClassOf(h);
             // 只藏明确的弹窗类：Qt 提示窗 / 对话框 / 控制台。
             // 绝不碰 QWindowIcon / subWin —— 那是正在嵌入的 LCD，藏掉就全黑且点击失效。
+            // 黑屏兜底摘出来的独立窗口也是这一类：正在给用户看，必须放过。
+            if (_standalone && cls.IndexOf("QWindowIcon", StringComparison.Ordinal) >= 0) return true;
             bool safe = cls.IndexOf("QWindowTool", StringComparison.Ordinal) >= 0
                      || cls.IndexOf("ConsoleWindowClass", StringComparison.Ordinal) >= 0
                      || cls.IndexOf("CASCADIA_HOSTING_WINDOW_CLASS", StringComparison.Ordinal) >= 0
@@ -503,6 +529,62 @@ public class ApkAgent
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         RedrawWindow(_emu, IntPtr.Zero, IntPtr.Zero,
             RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+
+    /**
+     * 采样模拟器窗口当前画面的平均亮度（-1 = 抓不到，不要据此下结论）。
+     * SetParent 成功、尺寸也对，但 Qt/GL 渲染表面死掉时窗口就是一片黑；
+     * 只有抓像素才能发现。实测黑帧 mean≈27，正常画面 mean≈84~130。
+     * 只取中央 76%：四周的灰色内边距会把纯黑抬高，导致漏判。
+     */
+    static int MeanBrightness(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return -1;
+        RECT r;
+        if (!GetWindowRect(hwnd, out r)) return -1;
+        int w = r.R - r.L, h = r.B - r.T;
+        if (w <= 8 || h <= 8) return -1;
+        IntPtr screen = GetDC(IntPtr.Zero);
+        IntPtr mem = CreateCompatibleDC(screen);
+        IntPtr bmp = CreateCompatibleBitmap(screen, w, h);
+        IntPtr old = SelectObject(mem, bmp);
+        int mean = -1;
+        try
+        {
+            if (PrintWindow(hwnd, mem, 2))
+            {
+                BITMAPINFO bi = new BITMAPINFO();
+                bi.bmiHeader.biSize = 40;
+                bi.bmiHeader.biWidth = w;
+                bi.bmiHeader.biHeight = -h;   // 负数 = 自上而下，省一次翻转
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                bi.bmiHeader.biCompression = 0;
+                byte[] bits = new byte[w * h * 4];
+                if (GetDIBits(mem, bmp, 0, (uint)h, bits, ref bi, 0) > 0)
+                {
+                    long sum = 0; int n = 0;
+                    int y0 = (int)(h * 0.12), y1 = (int)(h * 0.88);
+                    int x0 = (int)(w * 0.12) * 4, x1 = (int)(w * 0.88) * 4;
+                    int stride = w * 4;
+                    for (int yy = y0; yy < y1; yy += 2)
+                    {
+                        int off = yy * stride;
+                        for (int xx = x0; xx < x1; xx += 512) { sum += bits[off + xx]; n++; }
+                    }
+                    if (n > 0) mean = (int)(sum / n);
+                }
+            }
+        }
+        catch { mean = -1; }
+        finally
+        {
+            SelectObject(mem, old);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            ReleaseDC(IntPtr.Zero, screen);
+        }
+        return mean;
     }
 
     // 列出宿主窗口的直接子窗口（诊断用）：确认 Chrome_RenderWidgetHostHWND 是否存在。
@@ -576,7 +658,8 @@ public class ApkAgent
         bool embedded = _emu != IntPtr.Zero && ep != IntPtr.Zero
                      && (ep == _host || ep == _chromeRender);
         IntPtr e = embedded ? _emu : FindEmulator();
-        if (!embedded && e != IntPtr.Zero && IsWindowVisible(e)) ShowWindow(e, 0);
+        // 黑屏兜底摘出来的独立窗口是用户正在看的画面，绝不能再压掉
+        if (!embedded && !_standalone && e != IntPtr.Zero && IsWindowVisible(e)) ShowWindow(e, 0);
         HideToolWindows();
         HideConsoleWindows();
         HideStrayWindows();
@@ -628,6 +711,7 @@ public class ApkAgent
     static bool Embed(IntPtr host, IntPtr emu)
     {
         if (host == IntPtr.Zero || emu == IntPtr.Zero) return false;
+        _standalone = false;   // 重新嵌入：上次兜底摘出来的独立窗口不再豁免压制
         HideToolWindows();
         // 网页层子窗口铺满宿主客户区，坐标系与宿主一致，所以后面 Fit 传的矩形不用改。
         IntPtr parent = FindChromeRender(host);
@@ -735,9 +819,12 @@ public class ApkAgent
         SetWindowPos(_emu, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    static void Detach()
+    static bool Detach()
     {
-        if (_emu == IntPtr.Zero) return;
+        // 独立窗口模式可能一步到位（从没嵌入过）：此时 _emu 还是空，得现找。
+        if (_emu == IntPtr.Zero) _emu = FindEmulator();
+        if (_emu == IntPtr.Zero) return false;
+        _standalone = true;   // 用户要靠这个窗口看画面，常驻压制循环必须放过它
         SetParent(_emu, IntPtr.Zero);
         uint style = (uint)GetWindowLong(_emu, GWL_STYLE);
         style &= ~WS_CHILD;
@@ -747,7 +834,12 @@ public class ApkAgent
         ex |= WS_EX_APPWINDOW;
         SetWindowLong(_emu, GWL_EXSTYLE, ex);
         SetWindowPos(_emu, IntPtr.Zero, 60, 40, 480, 853, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        ShowWindow(_emu, 5);
+        // 摘出来的窗口必须自己抢到前台：以前它出现在 ApkStart 应用窗口后面，
+        // 用户只看到前面那块黑壳，以为程序没反应（实测就是这么误判的）。
+        SetForegroundWindow(_emu);
         _emu = IntPtr.Zero;
+        return true;
     }
 
     // 与 Detach 相同，但**不显示**窗口：宿主窗口即将销毁时调用。
@@ -755,6 +847,7 @@ public class ApkAgent
     // 于是就凭空多出一个 "Android Emulator - apkstart5554" 的黑窗。
     static void ParkEmulator()
     {
+        _standalone = false;
         if (_emu == IntPtr.Zero) _emu = FindEmulator();
         IntPtr e = _emu;
         if (e == IntPtr.Zero) { _host = IntPtr.Zero; return; }
@@ -1173,6 +1266,11 @@ public class ApkAgent
                         Refresh();
                         Reply(sock, "{\"ok\":true}");
                     }
+                    else if (cmd == "pixmean")
+                    {
+                        // 采样模拟器窗口当前画面的平均亮度，判定「嵌入成功但全黑」
+                        Reply(sock, "{\"ok\":true,\"mean\":" + MeanBrightness(_emu) + "}");
+                    }
                     else if (cmd == "emuok")
                     {
                         Reply(sock, "{\"ok\":true,\"alive\":" + (EmuAlive() ? "true" : "false") + "}");
@@ -1205,8 +1303,10 @@ public class ApkAgent
                     }
                     else if (cmd == "detach")
                     {
-                        Detach();
-                        Reply(sock, "{\"ok\":true}");
+                        // 找不到模拟器窗口时如实回 false：上层要靠这个值区分
+                        // 「已经切到独立窗口」和「窗口根本没了，得重启运行时」。
+                        bool detached = Detach();
+                        Reply(sock, "{\"ok\":" + (detached ? "true" : "false") + "}");
                     }
                     else if (cmd == "hook")
                     {

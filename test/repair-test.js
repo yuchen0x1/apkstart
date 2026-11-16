@@ -36,7 +36,7 @@ const facts = (over = {}) => buildFacts({
 const planOf = (code, over = {}) => buildPlan({ diagnosis: { code, title: `诊断-${code}` }, facts: facts(over), attempts: [] });
 
 test('每个诊断码都能出方案（有结论、有解释、有动作）', () => {
-  const codes = ['TIMEOUT', 'ACCEL', 'CPU_FEATURE', 'GPU_INIT', 'ACCESS_VIOLATION', 'MEMORY',
+  const codes = ['TIMEOUT', 'ACCEL', 'TCG_CRASH', 'CPU_FEATURE', 'GPU_INIT', 'ACCESS_VIOLATION', 'MEMORY',
     'DISK_FULL', 'IMAGE', 'AVD_LOCK', 'DLL', 'PORT_BUSY', 'NON_ASCII', 'UNKNOWN', '不存在的码'];
   for (const code of codes) {
     const p = planOf(code);
@@ -54,6 +54,15 @@ test('超时 + 无加速：判为「慢」，给出低配重试，并要求 15 �
   assert(p.actions.some((a) => a.id === 'low-spec'), '缺低配重试');
   assert(p.retry && p.retry.lowspec === true && p.retry.timeoutMs >= 900000, '低配重试没延长超时');
   assert(p.why.some((t) => /Android 12/.test(t)), '必须说明「换 12 也没用」，否则用户会继续试错方向');
+});
+
+test('TCG 崩溃：一键修复指向开启硬件加速，且不安排无意义的立刻重试', () => {
+  const p = planOf('TCG_CRASH', { accel: { ok: false, kind: '', note: '' } });
+  assert.strictEqual(p.level, 'slow');
+  assert(p.actions.some((a) => a.id === 'accel' && a.kind === 'auto'), '缺「一键开启硬件加速」动作');
+  assert.strictEqual(p.canAutoFix, true, '应当可以一键修复');
+  assert(p.retry && p.retry.needsReboot === true, '开启后要重启，不能立刻重试');
+  assert(p.why.some((t) => /TCG/.test(t)), '要解释为什么换后端无效');
 });
 
 test('超时 + 有加速：优先怀疑渲染，动作里要有换软件渲染', () => {

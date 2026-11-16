@@ -33,6 +33,15 @@ const DEFAULT_SETTINGS = {
     // 免得每次开机都先白等 20 多秒再退到软件渲染。升级运行时会自动失效。
     badGpu: '',
     forceTcg: false,         // 保留给高级排障；正常路径已由 doctor 自动回退
+    // 应用画面显示方式：
+    //   auto       先试嵌入，一旦宿主画黑帧就永久改用独立窗口（默认，推荐）
+    //   embedded   始终嵌进 ApkStart 的应用窗口（老行为）
+    //   standalone 始终用模拟器自己的窗口（画面立刻可见，不折腾 SetParent）
+    // 实测在软件渲染 + 无硬件加速的机器上，SetParent 之后宿主必黑：每次都要先给
+    // 用户看 3 秒黑屏再摘成独立窗口。auto 学一次就够，之后直接一步到位。
+    windowMode: 'auto',
+    // auto 模式的记忆位：这台机器嵌入后必然黑帧（由黑帧采样成功后写回）
+    embeddedBlack: false,
     audio: true,             // 安卓应用的声音（提示音/视频）。关闭可省一点 CPU
     // ---- 轻量容器（默认全开省资源，用户可逐项关掉）----
     liteMode: true,          // 收敛 vCPU 配额，避免 qemu 占满物理核拖慢 Windows
@@ -130,6 +139,21 @@ const DEFAULT_SETTINGS = {
   wizardDone: false,         // 首次运行引导向导：完成或跳过后置 true，不再弹出
   wizardVersion: '',         // 最近一次完成引导的 ApkStart 版本；升级后重新展示关键步骤
   androidVolumeInitialized: false, // 首次接入运行时把媒体音量设为 50%，之后尊重用户调整
+  // 安卓客机自己的语言与预装应用（见 core/guest.js）。
+  // locale 空 = 保持镜像默认（英文），不做任何改动；'zh-CN' = 目标语言为中文。
+  // 新安装默认中文：首次开机会写入 system_locales 并重启一次安卓使其生效
+  // （见 engine.prepare 的首次开机收尾）。老用户升级时 deepMerge 保留他们已存的
+  // 空值，不会替他们改语言。
+  guest: {
+    locale: 'zh-CN',
+    localeVerified: false,   // 上一次开机后读回系统语言确认已经是中文
+    groups: [],              // 上次勾选的精简分组（只用于回显）
+    // 首次开机收尾是否已完成。只对「全新 / 重置过的 /data」执行一次：
+    // 老用户升级时这两个键虽是新加的，但 androidVolumeInitialized===true
+    // 会把它们挡在门外，不会去动别人正在用的系统。
+    localeRebootDone: false, // 写完 system_locales 后已让安卓重启过一次
+    autoTrimDone: false,     // 已按默认分组（defaultOn）精简过预装应用
+  },
   update: {
     // 发现新版本：通知后自动下载；没有应用窗口在前台时自动重启安装，
     // 有应用窗口则等窗口关闭再装（不打断正在玩的应用）。关掉则只通知、手动更新。

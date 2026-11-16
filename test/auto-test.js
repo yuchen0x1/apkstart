@@ -127,15 +127,42 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(doctor.diagnose(['panic: AVD apkstart is already running']).code === 'AVD_LOCK');
     assert(doctor.diagnose(['non-ASCII path is not supported']).code === 'NON_ASCII');
     assert(doctor.diagnose(['random line']).code === 'UNKNOWN');
+    // 现场日志（User 0.6.7）：Vulkan 不兼容 + Guest Angle 不支持，必须归到图形后端
+    assert(doctor.diagnose(['ERROR | Failed to create Vulkan instance. Error VK_ERROR_INCOMPATIBLE_DRIVER.']).code === 'GPU_INIT');
+    assert(doctor.diagnose(['INFO | Platform does not support Guest Angle']).code === 'GPU_INIT');
+    assert(doctor.diagnose(['UpdateLayeredWindowIndirect failed']).code === 'GPU_INIT');
   });
 
-  await test('日志诊断：emulator 以 0xC0000005 退出要判定为渲染后端崩溃', () => {
+  await test('日志诊断：emulator 以 0xC0000005 退出判为进程访问冲突，不武断归咎显卡', () => {
     // 实测 issue #20/#25：打印完 Userspace boot properties 后 exit 3221225477
     assert(doctor.diagnose(['emulator exit 3221225477']).code === 'ACCESS_VIOLATION');
     assert(doctor.diagnose(['... 0xC0000005 ...']).code === 'ACCESS_VIOLATION');
     // 崩溃日志里通常也带着渲染初始化信息：必须优先判崩溃，而不是 GPU_INIT
     const mixed = ['Graphics backend: gfxstream', 'emulator exit 3221225477'];
     assert(doctor.diagnose(mixed).code === 'ACCESS_VIOLATION', '崩溃应优先于普通渲染日志');
+    assert(!/渲染后端崩溃/.test(doctor.diagnose(['emulator exit 3221225477']).title),
+      '不能把所有访问冲突都说成渲染后端崩溃');
+  });
+
+  await test('多种软件后端都崩在 0xC0000005：判定 TCG 问题并停止等价重试', () => {
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    const d = doctor.diagnose(['emulator exit 3221225477']);
+    const swangle = { gpu: 'swangle', accel: 'off' };
+    emu.attempts = [{ diagnosis: 'ACCESS_VIOLATION', gpu: 'swiftshader', accel: 'off' }];
+    assert(emu._softwareTcgCrashed(swangle, d) === false, '只有一次崩溃时还应继续重试');
+    emu.attempts.push({ diagnosis: 'ACCESS_VIOLATION', gpu: 'swangle', accel: 'off' });
+    assert(emu._softwareTcgCrashed(swangle, d) === true, '两个软件后端同码崩溃后应止损');
+    assert(emu._softwareTcgCrashed({ gpu: 'host', accel: 'on' }, d) === false, '硬件加速崩溃不算 TCG 问题');
+    assert(emu._softwareTcgCrashed(swangle, doctor.diagnose(['Address already in use'])) === false,
+      '端口占用不能被算进崩溃次数');
+    const advice = doctor.tcgCrashDiagnosis();
+    assert(advice.code === 'TCG_CRASH' && /WHPX/.test(advice.hint) && /AEHD/.test(advice.hint),
+      '止损结论要给出启用硬件加速的具体步骤');
+    assert(/一键开启硬件加速/.test(advice.hint), '结论要把用户导向设置页的一键按钮');
+    assert(/一键开启硬件加速/.test(doctor.noAccelDiagnosis().hint)
+      && /一键开启硬件加速/.test(doctor.diagnose(['acceleration not available']).hint),
+      '无加速类结论也要指向同一个一键入口');
   });
 
   await test('CPU 指令集：QEMU 的无害警告不许当成结论（#15 误诊回归）', () => {
@@ -582,6 +609,40 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/ready-to-show/.test(main), '正常路径仍然优先用 ready-to-show');
   });
 
+  await test('无头运行时按ADB在线+开机完成+两次句柄缺失判定，重启后重新启动目标应用', () => {
+    const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+    const helperStart = main.indexOf('async function hasHeadlessRuntimeWindow()');
+    const helperEnd = main.indexOf('async function runLaunch(pkg)', helperStart);
+    assert(helperStart >= 0 && helperEnd > helperStart, '必须有独立的无头窗口检测函数');
+    const helper = main.slice(helperStart, helperEnd);
+    assert(/engine\.mode === 'attach'/.test(helper), 'attach 模式不能擅自重启外部模拟器');
+    assert(/client\(\)\.isOnline\(\)/.test(helper), '必须确认ADB在线后才诊断');
+    assert(/sys\.boot_completed/.test(helper), '必须确认guest开机完成后才诊断');
+    assert(/const first = await probe\(\)/.test(helper) && /const second = await probe\(\)/.test(helper),
+      '窗口缺失必须间隔复测，不能单次误判');
+    assert(!/runtime\.vmRunning/.test(helper), '接管实例没有child handle，不能依赖vmRunning');
+
+    const preflight = main.indexOf('if (await hasHeadlessRuntimeWindow())');
+    const launch = main.indexOf('let r = await installer.launch(pkg, launchOptions)');
+    assert(preflight >= 0 && launch > preflight, '无头检测必须先于正常应用启动');
+    const embedCall = main.indexOf('embedded = await appWin.embed();');
+    const detachedMark = main.indexOf('detached = !embedded && !!appWin.blackDetached', embedCall);
+    assert(embedCall >= 0 && detachedMark > embedCall, '必须能定位「启动完成后嵌入」这一段');
+    const afterStart = main.slice(embedCall, detachedMark);
+    assert(/stopHeadlessRuntime\(\)/.test(afterStart), '启动与嵌入之间丢窗口时必须停止旧运行时');
+    assert(/installer\.launch\(pkg, launchOptions\)/.test(afterStart),
+      '运行时重启后必须重新拉起目标应用，不能只嵌入Android桌面');
+    const stopStart = main.indexOf('async function stopHeadlessRuntime()');
+    const stopEnd = main.indexOf('async function runLaunch(pkg)', stopStart);
+    const stop = main.slice(stopStart, stopEnd);
+    assert(/snapshotWorthSaving = false/.test(stop) && /forceColdBootOnNextStart\(\)/.test(stop),
+      '重启前必须跳过故障快照并安排一次冷启动');
+    assert(/await runtime\.stop\(\{ graceful: false \}\)/.test(stop), '无头运行时必须非优雅停止');
+    assert(/_consoleAlive\(\)/.test(stop) && /旧模拟器仍在线/.test(stop),
+      '重启前必须等控制台端口释放，避免 ensure 重新接管旧实例');
+    assert(/_activeApps\.clear\(\)/.test(stop), '重启系统后要清理旧容器会话状态');
+  });
+
   // 上游 #41：模拟器窗口比例由 hw.lcd 在开机时锁死（wm size 只改逻辑分辨率，
   // emu rotate 只转窗口不转安卓，resize-display 只认内置预设档）。
   // 唯一可行的路是「按应用方向选 LCD 冷启动」，这条链路的关键分支用测试钉住。
@@ -644,7 +705,29 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/setLandscape\(true, \{ fullscreen: true \}\)/.test(mainSrc), '进全屏时必须显式告知要保持最大化');
   });
 
-  // 启动路径上绝不能做破坏性动作：等网络可以，停掉虚拟机再冷启动不行 ——  // 那会在 adb install / am start 途中把设备弄没，直接变成「应用打不开」。
+  // 用户实测反馈：点了应用只看到「左边一块黑屏一直在加载」，真正能用的画面在
+  // 右边的「Android Emulator」窗口里，而且要自己去发现。所以必须有「直接给
+  // 独立窗口」这条路，而不是每次都先嵌入、黑了再摘。
+  await test('独立窗口模式：跳过嵌入、藏掉黑壳，并记住这台机器嵌入必黑', () => {
+    const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+    const appwinSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'appwin.js'), 'utf8');
+    const ps1 = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'win', 'agent.ps1'), 'utf8');
+    const store = require('../src/core/store');
+    assert(store.getSettings().engine.windowMode === 'auto', '默认应是 auto（嵌入失败即改用独立窗口）');
+    assert(/wantStandalone/.test(mainSrc), '启动流程要按设置决定是否走独立窗口');
+    assert(/await appWin\.standalone\(\)/.test(mainSrc), '独立窗口模式必须直接 detach，不能先 SetParent');
+    assert(/!detached && !wantStandalone\)/.test(mainSrc), '独立窗口模式下不能再进 embed 重试');
+    assert(/embeddedBlack: true/.test(mainSrc), '嵌入必黑要写回设置，下次不再先黑一遍');
+    assert(/已在「Android Emulator」窗口打开/.test(mainSrc), '要把「去哪看画面」说清楚');
+    assert(/async standalone\(\)/.test(appwinSrc), 'appwin 要提供一步到位的独立窗口方法');
+    assert(/this\._hidden = true/.test(appwinSrc), '独立窗口模式下必须藏掉黑壳宿主窗口');
+    assert(/static bool Detach\(\)/.test(ps1) && /SetForegroundWindow\(_emu\)/.test(ps1),
+      '摘出来的窗口必须自己抢前台，否则会被黑壳盖住');
+    assert(/bool detached = Detach\(\)/.test(ps1), 'detach 找不到窗口时要如实回 false');
+  });
+
+  // 启动路径上绝不能做破坏性动作：等网络可以，停掉虚拟机再冷启动不行 ——
+  // 那会在 adb install / am start 途中把设备弄没，直接变成「应用打不开」。
   await test('拉起应用前只等待网络，绝不重启虚拟机', () => {
     const installSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'installer.js'), 'utf8');
     assert(/waitForNetwork\(\{ onLog, timeoutMs: 20000 \}\)/.test(installSrc), '启动路径应只等 20 秒，不重启');

@@ -201,6 +201,28 @@ const PLANS = {
     retry: { lowspec: true, timeoutMs: 900000 },
   }),
 
+  /** 多个软件后端同码崩溃：换 GPU 无效，唯一的真修复是把硬件加速开起来 */
+  TCG_CRASH: (f) => ({
+    level: LEVEL.SLOW,
+    headline: '纯软件模拟（TCG）本身崩了，继续换渲染后端没有意义。',
+    why: [
+      machineSentence(f),
+      '这次是 swiftshader / swangle / software 等多个软件后端全部以 0xC0000005 退出，'
+        + '说明崩溃点在模拟器 / TCG 层，而不是显卡驱动。',
+      'x86_64 的安卓镜像要靠 WHPX / AEHD 才能稳定开机。'
+        + '「设置 → 性能与资源」里的「一键开启硬件加速」会自动申请管理员权限开启系统功能'
+        + '（或安装 AEHD 驱动），完成后按提示重启；BIOS 里的 SVM / VT-x 也要打开。',
+      vmNote(f),
+      IMAGE_MYTH,
+    ].filter(Boolean),
+    actions: [
+      { id: 'accel', label: '一键开启硬件加速', kind: KIND.AUTO, hint: '自动开启 WHPX 或安装 AEHD，可能需要重启' },
+      { id: 'report', label: '导出诊断报告', kind: KIND.MANUAL, hint: '仍失败时附上 CPU / 系统版本' },
+    ],
+    // 开启硬件加速后必须重启才生效，UI 看到 needsReboot 就不做无意义的立刻重试
+    retry: { needsReboot: true },
+  }),
+
   CPU_FEATURE: (f) => ({
     level: LEVEL.BLOCKED,
     headline: '这台 CPU 缺少模拟器需要的指令，程序在它上面跑不起来。',
