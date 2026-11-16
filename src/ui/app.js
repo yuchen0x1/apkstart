@@ -1431,6 +1431,33 @@ function closeSettings() {
 
 let lastUpdate = null;
 
+/**
+ * 主按钮该是什么状态。三种情况必须分开，否则用户点下去不知道会发生什么：
+ *   ready  → 安装包已经在本地，「重启并安装」
+ *   auto   → 有可下载的安装包，「立即更新」会下载 + 自动重启安装
+ *   retry  → 只看到发布页、安装包还没传上来（CI 构建 10~20 分钟），
+ *            点一下会强制重查，传完了就直接下载安装
+ */
+function updateAction(info) {
+  if (info && info.downloaded) return { text: '重启并安装', mode: 'ready' };
+  if (info && info.asset) return { text: '立即更新', mode: 'auto' };
+  return { text: '重新检查并下载', mode: 'retry' };
+}
+
+/** 「已下载，可立即重启安装」那一行 */
+function renderUpdateReady(info) {
+  const row = $('updateReady');
+  const txt = $('updateReadyText');
+  if (!row || !txt) return;
+  const on = !!(info && info.downloaded);
+  row.hidden = !on;
+  row.style.display = on ? '' : 'none';
+  if (on) {
+    txt.textContent = `v${String(info.downloadedVersion || info.version || '').replace(/^v/i, '')} 已下载完成`
+      + '，随时可以重启安装（正在用的安卓应用会被一起关掉）';
+  }
+}
+
 /** 把一次检查结果画到设置面板（也用于启动时静默检查推送过来的状态） */
 function renderUpdate(info) {
   lastUpdate = info || null;
@@ -1441,10 +1468,15 @@ function renderUpdate(info) {
   if (!cur || !st || !btn) return;
   if (!info) return;
   if (info.current) cur.textContent = `v${info.current}`;
+  // 每次重画都先清掉「已下载」提示，避免上次的残留一直挂着
+  renderUpdateReady(info.hasUpdate && info.downloaded ? info : null);
+  const pendingRow = $('updatePending');
+  if (pendingRow) { pendingRow.hidden = true; pendingRow.style.display = 'none'; }
 
   if (info.ok === false) {
     st.textContent = `检查失败：${info.error || '网络不可用'}`;
     showUpdateBtn(false);
+    showPageBtn(false);
     if (bar) bar.hidden = true;
     return;
   }
@@ -1456,8 +1488,15 @@ function renderUpdate(info) {
     const stale = info.stale ? '（离线缓存，可能不是最新）' : '';
     st.textContent = `发现新版本 ${info.tag}${src ? `（${src}）` : ''}${bad ? `；${bad} 不可达` : ''}${stale}`;
     showUpdateBtn(true);
-    btn.textContent = info.asset ? '立即更新' : '打开下载页';
-    btn.dataset.mode = info.asset ? 'auto' : 'manual';
+    const a = updateAction(info);
+    btn.textContent = a.text;
+    btn.dataset.mode = a.mode;
+    // 已下载时下面那行自带「重启并安装」，主按钮就不再重复出现同一个动作
+    showUpdateBtn(!info.downloaded);
+    // 发布页兜底入口：不管能不能自动更新，用户都得有一条自己拿包的路
+    showPageBtn(true);
+    // 只看得到发布页 = 安装包还在上传：把「为什么点不到自动更新」直接写在面板上
+    if (pendingRow && !info.asset) { pendingRow.hidden = false; pendingRow.style.display = ''; }
     // 更新日志 = 该版本的发布说明（GitHub Release body），完整展示（可滚动）。
     // 按轻量 markdown 渲染成 HTML，面板里不再露出 #、**、表格竖线这些记号。
     const note = $('updateNote');
@@ -1477,6 +1516,7 @@ function renderUpdate(info) {
     const stale = info.stale ? '（离线缓存）' : '';
     st.textContent = `已是最新版本（v${info.current}）${src ? ` · 经由 ${src}` : ''}${stale}`;
     showUpdateBtn(false);
+    showPageBtn(false);
     if (bar) bar.hidden = true;
   }
 }
@@ -1484,6 +1524,13 @@ function renderUpdate(info) {
 /** .btn 自带 display:inline-flex，会盖掉 hidden 属性，所以这里直接改 display */
 function showUpdateBtn(on) {
   const btn = $('btnDoUpdate');
+  if (!btn) return;
+  btn.hidden = !on;
+  btn.style.display = on ? '' : 'none';
+}
+
+function showPageBtn(on) {
+  const btn = $('btnUpdatePage');
   if (!btn) return;
   btn.hidden = !on;
   btn.style.display = on ? '' : 'none';
@@ -1504,6 +1551,15 @@ function renderUpdateProgress(p) {
   if (bar && fill) {
     bar.hidden = false;
     fill.style.width = `${Math.max(0, Math.min(100, p.percent || 0))}%`;
+  }
+  // 下载校验完 → 载荷在本地等着装：主按钮让位给下面那行「重启并安装」，
+  // 不然用户会以为还得再点一次「立即更新」重新下载一遍
+  if (p.stage === 'ready') {
+    showUpdateBtn(false);
+    if (lastUpdate) {
+      lastUpdate = { ...lastUpdate, downloaded: true, downloadedVersion: lastUpdate.version };
+      renderUpdateReady(lastUpdate);
+    }
   }
 }
 
@@ -1537,25 +1593,47 @@ function bindUpdate() {
 
   check.addEventListener('click', () => runCheck(false));
 
-  go.addEventListener('click', async () => {
-    if (go.dataset.mode === 'manual') {
-      api.updateOpenRelease(lastUpdate && lastUpdate.htmlUrl);
-      return;
-    }
+  const applyNow = async () => {
+    if (go.disabled) return;
+    const label = go.textContent;
     go.disabled = true;
     go.textContent = '更新中…';
     const r = await api.updateApply().catch((e) => ({ ok: false, error: e.message }));
     if (!r || !r.ok) {
       go.disabled = false;
-      go.textContent = '立即更新';
-      if (r && r.error && !r.manual) {
+      // 失败后按「当前是否已有安装包」还原文案，而不是永远回到「立即更新」
+      const a = updateAction(lastUpdate);
+      go.textContent = a.text;
+      go.dataset.mode = a.mode;
+      if (r && r.code === 'no-asset') {
+        // 用固定句式，别把长错误串直接糊到界面上（也更方便英文界面翻译）
+        const msg = '安装包还没上传完，稍后再试一次';
+        $('updateState').textContent = msg;
+        toast({ title: '安装包还没上传完', body: msg, type: 'warn' });
+      } else if (r && r.error && !r.manual) {
         $('updateState').textContent = `更新失败：${r.error}`;
         toast({ title: '更新失败', body: r.error, type: 'error' });
       }
-    } else {
-      $('updateState').textContent = `已下载 v${r.version}，正在重启完成安装…`;
+      if (label === '重启并安装') go.textContent = '重启并安装';
+      return;
     }
-  });
+    $('updateState').textContent = `已下载 v${r.version}，正在重启完成安装…`;
+  };
+
+  go.addEventListener('click', applyNow);
+
+  // 「已下载」那一行的重启按钮：和主按钮走同一条路径（不会重新下载）
+  const restart = $('btnUpdateRestart');
+  if (restart) restart.addEventListener('click', applyNow);
+
+  // 发布页：始终保留的手动出口（安装包还在上传、或想自己挑安装版/便携版时用）
+  const page = $('btnUpdatePage');
+  if (page) {
+    page.addEventListener('click', () => {
+      api.updateOpenRelease((lastUpdate && lastUpdate.htmlUrl)
+        || 'https://github.com/yuchen0x1/apkstart/releases');
+    });
+  }
 
   // 失败报告开关：默认开（只落本机），关掉后连摘要也不生成
   const ra = $('setReportAuto');

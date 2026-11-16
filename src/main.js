@@ -851,6 +851,9 @@ async function autoUpdateFlow(info) {
     autoUpdateJob = job;
     autoUpdateTag = info.tag || info.version;
     appLog(`auto update payload ready: ${job.mode} v${job.version}`);
+    // 告诉界面「包已经在本地」：设置页的按钮要变成「重启并安装」，
+    // 否则用户看到「立即更新」会以为还得再点一次重新下载。
+    send('update:state', { ...info, downloaded: true, downloadedVersion: job.version });
     if (appWin && appWin.isOpen && appWin.pkg) {
       send('toast', {
         type: 'info',
@@ -877,8 +880,33 @@ function handleUpdateFound(info) {
   if (info.asset && store.getSettings().update.autoUpdate !== false) {
     autoUpdateFlow(info).catch((e) => appLog(`auto update error: ${e.message}`));
   } else {
-    notify('发现新版本', `ApkStart ${info.tag} 已发布，可在「设置 → 软件更新」里一键更新`);
+    notify('发现新版本', info.asset
+      ? `ApkStart ${info.tag} 已发布，可在「设置 → 软件更新」里一键更新`
+      : `ApkStart ${info.tag} 已发布，安装包还在上传，完成后会自动下载`);
+    // 只看到发布页、安装包还在上传：过几分钟自动重查，别让用户自己盯着刷新
+    if (!info.asset) scheduleUpdateRetry();
   }
+}
+
+// 发布页已出现但安装包还没传完（CI 打包 10~20 分钟）时的自动重查。
+// 有次数上限，免得网络/仓库异常时空转；查到包后 handleUpdateFound 会接着走下载。
+let updateRetryTimer = null;
+let updateRetryLeft = 0;
+function scheduleUpdateRetry() {
+  if (updateRetryTimer) return;
+  if (updateRetryLeft <= 0) updateRetryLeft = 3;
+  updateRetryTimer = setTimeout(async () => {
+    updateRetryTimer = null;
+    updateRetryLeft -= 1;
+    const fresh = await updater.check({ force: true }).catch(() => null);
+    if (fresh) {
+      handleUpdateFound(fresh);
+      if (fresh.hasUpdate && !fresh.asset) scheduleUpdateRetry();
+    } else if (updateRetryLeft > 0) {
+      scheduleUpdateRetry();
+    }
+  }, 120000);
+  if (updateRetryTimer.unref) updateRetryTimer.unref();
 }
 
 async function runUpdate() {
@@ -886,7 +914,7 @@ async function runUpdate() {
   updateBusy = true;
   const sendProgress = (p) => send('update:progress', p);
   try {
-    const info = updateInfo && updateInfo.hasUpdate ? updateInfo : await updater.check();
+    let info = updateInfo && updateInfo.hasUpdate ? updateInfo : await updater.check();
     updateInfo = info;
     if (!info.hasUpdate) return { ok: false, error: '已经是最新版本' };
     // 自动更新已经把载荷下载好了：直接装，不再重复下载
@@ -899,8 +927,23 @@ async function runUpdate() {
       return { ok: true, version: info.version || autoUpdateTag, mode: job.mode };
     }
     if (!info.asset) {
-      shell.openExternal(info.htmlUrl || Updater.repoUrl()).catch(() => {});
-      return { ok: false, error: '该版本没有可直接安装的包，已打开 GitHub 发布页', manual: true };
+      // 发布页先出、安装包后传（CI 打包要 10~20 分钟）。这段时间 check() 会给出
+      // hasUpdate=true、asset=null —— 旧实现直接把用户丢去浏览器自己下载，
+      // 明明「一键更新」就在眼前却点不动。这里强制重查一次（跳过 10 分钟缓存）：
+      // 包已经传完就继续下载安装，没传完就如实告诉用户，别假装成功。
+      sendProgress({ stage: 'check', percent: 0, message: '正在重新检查安装包…' });
+      info = await updater.check({ force: true });
+      updateInfo = info;
+      if (!info.hasUpdate) return { ok: false, error: '已经是最新版本' };
+    }
+    if (!info.asset) {
+      const v = String(info.version || info.tag || '').replace(/^v/i, '');
+      return {
+        ok: false,
+        code: 'no-asset',
+        error: `v${v} 的安装包还没上传完（构建通常需要 10~20 分钟），稍后再点一次即可；`
+          + '也可以点「打开下载页」自己挑安装版或便携版',
+      };
     }
     sendProgress({ stage: 'download', percent: 0, message: '准备下载…' });
     const job = await updater.prepare(info);
@@ -3268,7 +3311,15 @@ function registerIpc() {
       // 用户主动点「检查更新」→ 跳过缓存，必定重新问一次两个源
       const info = await updater.check({ force: opts.force !== false });
       updateInfo = info;
-      return { ok: true, ...info };
+      // 后台已经把包下好了（autoUpdateJob 就绪）：把状态一起带上，
+      // 否则重查一次后按钮会从「重启并安装」退回「立即更新」，看着像白下了。
+      const downloaded = !!autoUpdateJob;
+      return {
+        ok: true,
+        ...info,
+        downloaded: downloaded && info.hasUpdate,
+        downloadedVersion: downloaded ? autoUpdateJob.version : undefined,
+      };
     } catch (e) {
       return { ok: false, error: e.message, current: app.getVersion() };
     }

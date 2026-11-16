@@ -913,5 +913,11 @@
   "没有找到匹配的设置项，换个词试试？": "No matching settings — try another keyword.",
   "版本信息": "Version",
   "数据目录": "Data folder",
-  "运行时目录": "Runtime folder"
+  "运行时目录": "Runtime folder",
+  "重新检查并下载": "Re-check and download",
+  "重启并安装": "Restart and install",
+  "安装包还没上传完": "Installer not uploaded yet",
+  "安装包还没上传完，稍后再试一次": "The installer is still uploading — try again in a minute",
+  "安装包还在上传，完成后会自动下载安装；也可以先点「打开下载页」手动下载": "The installer is still uploading; it will download and install automatically once ready. You can also grab it from the download page now.",
+  "\u0001 已下载完成，随时可以重启安装（正在用的安卓应用会被一起关掉）": "Version \u0001 downloaded. Restart to install now — running Android apps will be closed."
 }
