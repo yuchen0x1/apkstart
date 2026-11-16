@@ -563,7 +563,7 @@ class Runtime {
       try { this._freeformReady = await client.ensureFreeform(); } catch (_) { /* ignore */ }
     }
     // 国产用户第一次进入运行时时，系统桌面默认可能是英文且媒体音量为 0。
-    // 这里在 Android 真正可用后一次性设置中文环境与 50% 媒体音量，之后保留用户自己的调整。
+    // 这里在 Android 真正可用后一次性设置中文环境与 100% 媒体音量，之后保留用户自己的调整。
     if (!this._guestDefaultsReady) {
       // 全新（或刚重置）的 /data：音量初始化标记还没置过位。
       // 这个值必须在音量初始化写盘**之前**取，后面「首次开机收尾」要靠它判断。
@@ -583,7 +583,9 @@ class Runtime {
           const out = await client.shell('cmd media_session volume --stream 3 --get 2>/dev/null', { timeout: 10000 });
           const vg = parseVolumeGet(out);
           const max = vg && vg.max > 0 ? vg.max : 15;
-          const target = Math.max(0, Math.min(max, Math.round(max * 0.5)));
+          // 默认拉满：镜像出厂常常是 0（静音），用户第一次刷短视频听不到声音
+          // 会以为是坏的；嫌吵的用户自己会拉低，但「没声音」不是用户会主动修的。
+          const target = max;
           await client.shell(`cmd media_session volume --stream 3 --set ${target} 2>/dev/null`, { timeout: 10000 });
           let after = parseVolumeGet(await client.shell('cmd media_session volume --stream 3 --get 2>/dev/null', { timeout: 10000 }));
           for (let i = 0; after && after.cur !== target && i < max; i += 1) {
@@ -1310,10 +1312,7 @@ class Runtime {
         try { store.saveApps([]); } catch (_) { /* ignore */ }
       }
       // /data 被删了，guest 里的语言与音量也一起回到出厂值：
-      // 清掉这个一次性标记，下次开机重新设中文环境 + 50% 音量，
-      // 否则重置过的机器会一直是英文界面 / 可能的静音状态。
-      // /data 被删了，guest 里的语言与音量也一起回到出厂值：
-      // 清掉这个一次性标记，下次开机重新设中文环境 + 50% 音量，
+      // 清掉这个一次性标记，下次开机重新设中文环境 + 100% 音量，
       // 否则重置过的机器会一直是英文界面 / 可能的静音状态。
       // 首次开机收尾的两个标记也一起清：新 /data 要重新走一遍
       // 「写中文 → 重启生效 → 精简预装」的流程。

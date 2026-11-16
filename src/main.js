@@ -292,10 +292,10 @@ async function decodeIcon(raw) {
   return Buffer.from(String(url).split(',')[1] || '', 'base64');
 }
 
-/** 开机自启：默认开启，不需要用户去设置里勾 */
+/** 开机自启：默认关闭（用户可在「设置 → 通用」里打开） */
 function applyAutoStart() {
   if (!app.isPackaged) return; // 开发时不写注册表
-  const on = !!store.getSettings().autoStart;
+  const on = store.getSettings().autoStart === true;
   try {
     // 必须显式给 name，否则注册表里的启动项会叫 "electron.app.Electron"
     app.setLoginItemSettings({

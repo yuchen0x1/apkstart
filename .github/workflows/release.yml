@@ -59,6 +59,12 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "发布版本：$tag"
 
+      # README 的版本行与「最新更新」由 tools/update-readme.js 从 package.json +
+      # CHANGELOG 生成。verify 阶段的 npm test 里已有同样的断言，这里再挡一次，
+      # 是为了让失败原因直接写清楚「跑 npm run readme:sync」，而不是埋在某条用例里。
+      - name: 校验 README 版本信息
+        run: node tools/update-readme.js --check
+
       # 发行说明统一由 tools/release-notes.js 产出（手写 release-notes 文件 → CHANGELOG
       # 段落 → git log 三级兜底），正文一律去掉重复的版本大标题，并自动补齐下载、升级、
       # 支持范围等每版都必须保留的基础信息。

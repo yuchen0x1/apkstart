@@ -63,11 +63,31 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(big.dataMB === 24 * 1024, '设置里的数据分区容量必须生效');
   });
 
-  await test('大内存机器不会无限吃内存', () => {
+  await test('大内存机器按物理内存放大（不再写死 3GB / 4 核，但仍有封顶）', () => {
     const host = { totalMB: 65536, freeMB: 50000, cores: 32, home: 'C:\\x', homeAscii: true, tmp: TMP, platform: 'win32', arch: 'x64', rdp: false };
-    const p = doctor.chooseProfile({ host, accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 200000, port: 5554, adbPort: 5044 });
-    assert(p.memoryMB <= 3072 && p.cores <= 4, `高配也应封顶：${p.memoryMB}MB / ${p.cores}核`);
+    const p = doctor.chooseProfile({
+      host, accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 200000, port: 5554, adbPort: 5044,
+    });
+    // 64GB / 32 线程：1/4 内存 = 16GB → 封顶 8GB；线程的一半 = 16 → 封顶 8 核
+    assert(p.memoryMB === 8192, `64GB 机器应给到 8GB，实际 ${p.memoryMB}`);
+    assert(p.cores === 8, `32 线程应给到 8 核，实际 ${p.cores}`);
+    assert(p.heapMB >= 512, `内存 8GB 时 dalvik 堆应放大，实际 ${p.heapMB}`);
     assert(p.accel === 'on');
+
+    // 中等机器按比例走：16GB / 12 线程 → 4GB / 6 核（不是一律 3GB/4核）
+    const mid = doctor.chooseProfile({
+      host: { ...host, totalMB: 16384, freeMB: 12000, cores: 12 },
+      accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 200000,
+    });
+    assert(mid.memoryMB === 4096, `16GB 机器应给 4GB，实际 ${mid.memoryMB}`);
+    assert(mid.cores === 6, `12 线程应给 6 核，实际 ${mid.cores}`);
+
+    // 但绝不会「有多少给多少」：内存与核心都有硬上限
+    const huge = doctor.chooseProfile({
+      host: { ...host, totalMB: 262144, freeMB: 200000, cores: 128 },
+      accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 500000,
+    });
+    assert(huge.memoryMB === 8192 && huge.cores === 8, `256GB/128 线程也必须封顶：${huge.memoryMB}MB / ${huge.cores}核`);
   });
 
   await test('可见嵌入模式优先使用 swangle（软件渲染但 WebView 合成正常）', () => {
@@ -810,7 +830,9 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const s = store.getSettings();
     assert(s.engine.headless === false, 'headless 必须被迁移成 false');
     assert(s.hideAfterLaunch === false, 'hideAfterLaunch 必须为 false');
-    assert(s.autoStart === true && s.autoDeploy === true, '开机自启/一键部署默认开启');
+    // 开机自启改成默认关闭（用户明确要求：不该替所有人决定开机就拉起后台进程）；
+    // 一键部署仍然是默认开启的，首次运行不用点任何按钮。
+    assert(s.autoStart === false && s.autoDeploy === true, '开机自启默认关闭、一键部署默认开启');
     assert(s.createStartMenuShortcut === true, '开始菜单快捷方式默认开启');
   });
 
@@ -994,8 +1016,8 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const host = { totalMB: 32768, freeMB: 20000, cores: 16, home: 'C:\\x', homeAscii: true, tmp: TMP, platform: 'win32', arch: 'x64', rdp: false };
     const lite = doctor.liteProfile({ host, engine: {} });
     // 老逻辑是 floor(核数/4) 夹到 2~3 —— 8 核机器只给 2 个 vCPU，视频应用直接卡。
-    // 现在均衡模式给「一半物理核、上限 4」，省资源模式固定 2。
-    assert(lite && lite.cores === 4, `16 核机器均衡模式应给 4 核，实际 ${lite && lite.cores}`);
+    // 现在是「一半物理核、上限 8」，省资源模式固定 2。
+    assert(lite && lite.cores === 8, `16 核机器均衡模式应给 8 核，实际 ${lite && lite.cores}`);
     const save = doctor.liteProfile({ host, engine: { resourceMode: 'save' } });
     assert(save.cores === 2, `省资源模式应固定 2 核，实际 ${save.cores}`);
     assert(doctor.liteProfile({ host, engine: { liteMode: false } }) === null, '显式关闭应返回 null');
@@ -1006,7 +1028,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       settings: { engine: { autoMemory: true, liteMode: true } },
       accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 100000,
     });
-    assert(auto.lite === true && auto.cores <= 4, JSON.stringify({ lite: auto.lite, cores: auto.cores }));
+    assert(auto.lite === true && auto.cores >= 2 && auto.cores <= 8, JSON.stringify({ lite: auto.lite, cores: auto.cores }));
     const manual = doctor.autoProfile({
       settings: { engine: { autoMemory: false, cores: 6, liteMode: true } },
       accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 100000,

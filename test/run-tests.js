@@ -297,6 +297,27 @@ test('旧 media 工具的报错 / 单数字 / 异常输出都解析为 null', ()
   assert(parseVolumeGet('5') === null, '只有一个数字无法判定上限');
   assert(parseVolumeGet('12 4') === null, '当前比上限还大 = 输出不像音量信息');
 });
+test('真机日志噪音不能当音量（滑杆被拽回 0% 的回归）', () => {
+  // 真机（Android 11+）输出带 [V] 日志，第一行就有 stream=3。
+  // 旧实现取「前两个整数」→ cur=3 / max=9 → 显示 33%，设置也落到 60% 档。
+  const real = '[V] will control stream=3 (STREAM_MUSIC)\n'
+    + '[V] will get volume\n'
+    + '[V] Connecting to AudioService\n'
+    + '[V] volume is 9 in range [0..15]';
+  assert(JSON.stringify(parseVolumeGet(real)) === '{"cur":9,"max":15}', '真机输出应解析成 9/15');
+  // status() 里整段被 tr 压成一行后的样子
+  const oneLine = real.replace(/\n/g, ' ');
+  assert(JSON.stringify(parseVolumeGet(oneLine)) === '{"cur":9,"max":15}', '压成一行后同样成立');
+  // 只截到第一行（老实现 echo 的行为）时，宁可解析不出，也不能吐一个假音量
+  assert(parseVolumeGet('[V] will control stream=3 (STREAM_MUSIC)') === null, '纯日志行必须为 null');
+});
+test('dumpsys audio 片段也能解析（media_session 不可用时回退）', () => {
+  const block = '- STREAM_MUSIC: Muted: false Min: 0 Max: 15 Current: 11 (speaker): 11, 11 ';
+  assert(JSON.stringify(parseVolumeGet(block)) === '{"cur":11,"max":15}', 'dumpsys Current/Max');
+  const legacy = '- STREAM_MUSIC: Max: 15 streamVolume:11 ';
+  assert(JSON.stringify(parseVolumeGet(legacy)) === '{"cur":11,"max":15}', 'dumpsys streamVolume');
+  assert(parseVolumeGet('- STREAM_MUSIC: Muted: false') === null, '没有档位信息 = null，不能兜成 0');
+});
 test('音量百分比换算：0-15 档映射到 0-100', () => {
   const vg = parseVolumeGet('volume: 8/15');
   const percent = Math.round((vg.cur / vg.max) * 100);

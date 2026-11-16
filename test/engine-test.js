@@ -421,6 +421,30 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       '音量读取失败时必须保留未初始化状态，以便下次启动重试');
   });
 
+  await test('首次初始化把媒体音量拉满到 100%（含按键兜底）', async () => {
+    store.saveSettings({ androidVolumeInitialized: false });
+    const rt = new Runtime(TMP);
+    rt._freeformReady = true;
+    let level = 0;
+    const MAX = 5;
+    const client = {
+      serial: 'attached-device',
+      async shell(command) {
+        if (command.includes('system_locales')) return '';
+        // 模拟 Android 14 Play 镜像：--set 被 AudioService 静默拒绝（返回 0 但不生效）
+        if (command.includes('--set')) return '';
+        if (command.includes('input keyevent 24')) { level = Math.min(MAX, level + 1); return ''; }
+        if (command.includes('input keyevent 25')) { level = Math.max(0, level - 1); return ''; }
+        if (command.includes('--get')) return `volume: ${level}/${MAX}`;
+        return '';
+      },
+    };
+    await rt.prepare(client);
+    assert(level === MAX, `首次开机应把媒体音量拉满到 ${MAX}/${MAX}，实际 ${level}`);
+    assert(store.getSettings().androidVolumeInitialized === true, '读到满档后应写入初始化标记');
+    store.saveSettings({ androidVolumeInitialized: false });
+  });
+
   await test('设置音量返回设备实际档位并标记校验结果', async () => {
     const { AndroidSettings } = require('../src/core/android');
     let n = 0;

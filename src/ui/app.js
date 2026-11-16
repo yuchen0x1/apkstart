@@ -809,6 +809,18 @@ async function handleMenu(act) {
 // ---------------- 安卓系统设置 ----------------
 
 let volumeTimer = null;
+// 刚拖过滑杆的时刻：这段时间内不让状态刷新把滑杆拽回去（拖完到设备回读有 1~2 秒延迟）
+let volumeTouchedAt = 0;
+let volumeBusy = false;
+let volumePending = null;
+
+/** 只改滑杆和百分比文字，两个地方永远同步 */
+function renderVolume(percent) {
+  const slider = $('setAndroidVolume');
+  if (!slider) return;
+  slider.value = String(percent);
+  $('androidVolumeText').textContent = `${percent}%`;
+}
 
 async function refreshAndroid() {
   const el = $('androidStatus');
@@ -819,17 +831,64 @@ async function refreshAndroid() {
     el.textContent = r && r.error ? `运行时未就绪（${String(r.error).slice(0, 36)}）` : '运行时未启动';
     return;
   }
+  // 音量读不出来（镜像差异）时显示「未知」，绝不兜成 0 —— 否则滑杆会被拽回最左边
+  const volText = typeof r.volume === 'number' ? `音量 ${r.volume}%` : '音量未知';
   el.textContent = `Android ${r.sdk || '?'} · ${r.wifi ? 'Wi-Fi 已开' : 'Wi-Fi 已关'}` +
-    `${r.airplane ? ' · 飞行模式' : ''} · 音量 ${r.volume}%`;
+    `${r.airplane ? ' · 飞行模式' : ''} · ${volText}`;
   $('setAndroidWifi').checked = !!r.wifi;
   $('setAndroidAirplane').checked = !!r.airplane;
   $('setAndroidAnim').checked = !r.animationsOff;
-  $('setAndroidVolume').value = r.volume;
-  $('androidVolumeText').textContent = `${r.volume}%`;
+  if (typeof r.volume === 'number' && !volumeBusy && Date.now() - volumeTouchedAt > 1500) {
+    renderVolume(r.volume);
+  }
   if (r.fontScale) $('setAndroidFont').value = Number(r.fontScale).toFixed(2);
   if (r.density) {
     const opt = [...$('setAndroidDensity').options].find((o) => o.value === String(r.density));
     if (opt) $('setAndroidDensity').value = String(r.density);
+  }
+}
+
+/** 提交音量：用设备回读的真实百分比回填滑杆，而不是用户拖到的理论值 */
+async function applyVolume(percent) {
+  // 调整期间用户可能又拖了一次：只记最后一个值，等这一轮结束再补跑，
+  // 免得几次 adb 调用互相叠加（有些镜像要走音量键，一次要好几百毫秒到几秒）
+  if (volumeBusy) {
+    volumePending = percent;
+    return;
+  }
+  volumeBusy = true;
+  $('androidVolumeText').textContent = `${percent}% …`;
+  try {
+    const r = await api.android.set('volume', percent).catch(() => null);
+    volumeTouchedAt = Date.now();
+    if (!r || !r.ok) {
+      renderVolume(percent);
+      toast({ type: 'error', title: `音量调整失败：${(r && r.error) || '运行时未就绪'}` });
+      return;
+    }
+    const actual = typeof r.actualVolume === 'number' ? r.actualVolume : null;
+    // 三种结果分开说清楚，别一边显示 100% 一边设备还是原样：
+    //   1) 回读等于目标      → 正常
+    //   2) 回读到别的档位    → 设备没接受（这类镜像上 --set 被 AudioService 拒绝）
+    //   3) 回读不到          → 保留用户拖到的值，不猜
+    if (actual === null) {
+      renderVolume(percent);
+      toast({ type: 'ok', title: '音量已调整' });
+    } else {
+      renderVolume(actual);
+      if (r.verified === false && actual !== Number(percent)) {
+        toast({ type: 'warn', title: `设备没有接受音量调整（当前 ${actual}%）` });
+      } else {
+        toast({ type: 'ok', title: '音量已调整' });
+      }
+    }
+    await refreshAndroid();
+  } finally {
+    volumeBusy = false;
+    volumeTouchedAt = Date.now();
+    const next = volumePending;
+    volumePending = null;
+    if (next !== null) applyVolume(next);
   }
 }
 
@@ -848,9 +907,12 @@ function bindAndroid() {
   $('setAndroidFont').addEventListener('change', (e) => set('fontScale', Number(e.target.value), '字体大小已调整'));
   $('setAndroidDensity').addEventListener('change', (e) => set('density', Number(e.target.value), '显示大小已调整'));
   $('setAndroidVolume').addEventListener('input', (e) => {
-    $('androidVolumeText').textContent = `${e.target.value}%`;
+    const v = Number(e.target.value);
+    // 拖动过程中只更新本地显示，停手 260ms 再提交，避免把 adb 打满
+    $('androidVolumeText').textContent = `${v}%`;
+    volumeTouchedAt = Date.now();
     clearTimeout(volumeTimer);
-    volumeTimer = setTimeout(() => set('volume', Number(e.target.value), '音量已调整'), 260);
+    volumeTimer = setTimeout(() => applyVolume(v), 260);
   });
   $('btnAndroidRefresh').addEventListener('click', () => refreshAndroid());
   $('btnAndroidTune').addEventListener('click', async () => {
@@ -957,8 +1019,11 @@ function fillSettings(s) {
   $('setAdbPath').value = s.adbPath || '';
   $('setDevice').value = s.device || '';
   $('setSystemImage').value = s.runtime.isoPath || '';
-  $('setMemory').value = s.engine.memoryMB;
-  $('setCores').value = s.engine.cores;
+  // 内存 / 核心是下拉框：老配置里可能存着不在选项里的数值（旧版是数字输入框），
+  // 补一条「自定义」再选中，否则会显示成空白，用户以为设置丢了。
+  fillChoice($('setMemory'), Number(s.engine.memoryMB) || 0,
+    (v) => `${Math.round((Number(v) / 1024) * 10) / 10} GB（自定义）`);
+  fillChoice($('setCores'), Number(s.engine.cores) || 0, (v) => `${v} 核（自定义）`);
   $('setIdle').value = s.engine.idleShutdownMinutes;
   if ($('setSourcePref')) $('setSourcePref').value = (s.runtime && s.runtime.sourcePreference) || 'auto';
   if ($('setAutoMirror')) $('setAutoMirror').checked = (s.runtime && s.runtime.autoMirror) !== false;
@@ -986,7 +1051,9 @@ function fillSettings(s) {
   $('setSharedDir').value = s.sharedDir || '';
   $('setDeviceSharedDir').value = s.deviceSharedDir || '';
   const d = s.display || {};
-  $('setAutoStart').checked = s.autoStart !== false;
+  // 默认关闭：开机自启只对「每天都用」的人有意义，其他人白等一次登录启动。
+  // 老版本默认是 true，所以这里必须写 === true，不能再用 !== false。
+  $('setAutoStart').checked = s.autoStart === true;
   if ($('setLanguage')) $('setLanguage').value = s.language || 'auto';
   const eng = s.engine || {};
   if ($('setResourceMode')) $('setResourceMode').value = eng.resourceMode || 'balanced';
@@ -1023,6 +1090,15 @@ async function refreshDataInfo() {
 async function refreshProfileText() {
   const r = await api.doctorProfile().catch(() => null);
   if ($('autoProfileText')) $('autoProfileText').textContent = (r && r.text) || '自动模式';
+  // 把「你的电脑有多少内存/多少线程」直接摆出来：只写「自动：3GB」用户没法判断
+  // 是程序没看配置，还是这就是它算出来的结果。
+  const hostEl = $('hostSpecText');
+  const host = r && r.profile && r.profile.host;
+  if (hostEl && host) {
+    const gb = (mb) => `${(Number(mb) / 1024).toFixed(Number(mb) % 1024 === 0 ? 0 : 1)} GB`;
+    hostEl.textContent = `你的电脑：${gb(host.totalMB)} 内存 · ${host.cores} 线程`
+      + `（当前可用 ${gb(host.freeMB)}）`;
+  }
   const tierEl = $('autoTierText');
   if (tierEl) {
     const why = [r && r.why, r && r.manual].filter(Boolean).join(' ');
@@ -1151,6 +1227,164 @@ function imageRestartNote(res) {
     : '下次打开应用时生效。';
 }
 
+/* ---------------- 设置：分类导航 / 搜索 ---------------- */
+
+/** 当前打开的分类（关闭再打开时回到上次看的那一页） */
+let settingsSec = 'general';
+
+/**
+ * 切到某个分类页。
+ * 标题与副标题不在 data-* 里，而是从每个 section 里那份隐藏的 `.set-sec-meta`
+ * 复制过来 —— 那份文字也在 DOM 里，所以英文界面下 i18n 已经把它翻译过了。
+ */
+function openSettingsSection(secId) {
+  const secs = [...document.querySelectorAll('.set-sec')];
+  const target = secs.find((s) => s.dataset.sec === secId) || secs[0];
+  if (!target) return;
+  settingsSec = target.dataset.sec;
+  for (const s of secs) s.classList.toggle('on', s === target);
+  for (const b of document.querySelectorAll('.set-nav-item')) {
+    b.classList.toggle('on', b.dataset.sec === settingsSec);
+  }
+  const meta = target.querySelector('.set-sec-meta');
+  const h = meta && meta.querySelector('h2');
+  const p = meta && meta.querySelector('p');
+  if ($('setTitle')) $('setTitle').textContent = h ? h.textContent : '';
+  if ($('setSub')) $('setSub').textContent = p ? p.textContent : '';
+  // 搜索命中页开着时切分类 = 退出搜索
+  if ($('setSearch')) $('setSearch').value = '';
+  if ($('setHits')) { $('setHits').hidden = true; $('setHits').innerHTML = ''; }
+  if ($('setBody')) $('setBody').scrollTop = 0;
+}
+
+/** 设置项索引：只建一次（面板的 DOM 是静态的，动态内容会通过 fieldset 之类插进来，这里不管） */
+let settingsIndexCache = null;
+function settingsIndex() {
+  if (settingsIndexCache) return settingsIndexCache;
+  const out = [];
+  for (const sec of document.querySelectorAll('.set-sec')) {
+    const meta = sec.querySelector('.set-sec-meta h2');
+    const secName = meta ? meta.textContent : (sec.dataset.sec || '');
+    for (const field of sec.querySelectorAll('.field, .group-title')) {
+      const labelEl = field.querySelector('label');
+      const label = (labelEl ? labelEl.textContent : field.textContent) || '';
+      const text = String(field.textContent || '').replace(/\s+/g, ' ').trim();
+      out.push({
+        sec: sec.dataset.sec,
+        secName,
+        el: field,
+        hasLabel: !!labelEl,
+        label: label.replace(/[:：]\s*$/, '').replace(/\s+/g, ' ').trim(),
+        text,
+      });
+    }
+  }
+  settingsIndexCache = out;
+  return out;
+}
+
+/** 高亮命中的关键字（只处理纯文本，先转义） */
+function markHits(s, q) {
+  const safe = esc(s);
+  if (!q) return safe;
+  const re = new RegExp(`(${esc(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'ig');
+  return safe.replace(re, '<mark>$1</mark>');
+}
+
+/**
+ * 搜索：不隐藏任何设置项，而是给一份「命中列表」——
+ * 点一条就跳到对应分类并把那一项闪一下。
+ * 之所以不是「过滤当前页的字段」：用户找的是「内存」，他不知道内存属于哪一页，
+ * 直接把命中的几项摊开给他最省事。
+ */
+function runSettingsSearch(q) {
+  const box = $('setHits');
+  if (!box) return;
+  const query = String(q || '').trim().toLowerCase();
+  const body = $('setBody');
+  if (!query) {
+    openSettingsSection(settingsSec);
+    return;
+  }
+  const hits = settingsIndex().filter((it) => it.label.toLowerCase().includes(query)
+    || it.text.toLowerCase().includes(query));
+  // 命中项多的时候优先显示「标题就有这个词」的：搜「内存」时，先给出「内存」那一项，
+  // 而不是一堆正文里顺便提到内存的段落。
+  hits.sort((a, b) => Number(b.hasLabel && b.label.toLowerCase().includes(query))
+    - Number(a.hasLabel && a.label.toLowerCase().includes(query)));
+  box.innerHTML = '';
+  if (!hits.length) {
+    box.innerHTML = '<div class="set-hit-empty">没有找到匹配的设置项，换个词试试？</div>';
+  } else {
+    for (const h of hits.slice(0, 24)) {
+      const b = document.createElement('button');
+      b.className = 'set-hit';
+      // 没写 label 的字段（只有一段说明的那种）用正文前几十个字当代称，单行截断，
+      // 不然一整段话会把结果列表撑成一大坨。
+      const title = (h.hasLabel ? h.label : h.text.slice(0, 56));
+      b.innerHTML = `<span class="hit-text">${markHits(title, q)}</span>`
+        + `<span class="hit-sec">${esc(h.secName)}</span>`;
+      b.addEventListener('click', () => {
+        openSettingsSection(h.sec);
+        // 页切回来之后元素才有布局，等一帧再滚
+        requestAnimationFrame(() => {
+          h.el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          h.el.classList.remove('flash');
+          void h.el.offsetWidth;
+          h.el.classList.add('flash');
+          setTimeout(() => h.el.classList.remove('flash'), 1400);
+        });
+      });
+      box.appendChild(b);
+    }
+  }
+  // 标题也换成「搜索结果」：不然会出现「关于」标题下面列着内存设置项这种错位感
+  if ($('setTitle')) $('setTitle').textContent = '搜索结果';
+  if ($('setSub')) {
+    $('setSub').textContent = hits.length ? `找到 ${hits.length} 项匹配` : '没有匹配的设置项';
+  }
+  box.hidden = false;
+  // 结果页不属于任何分类：把左栏高亮清掉，否则会出现「通用」亮着却列着各页结果
+  for (const b of document.querySelectorAll('.set-nav-item')) b.classList.remove('on');
+  document.querySelectorAll('.set-sec').forEach((s) => s.classList.remove('on'));
+  if (body) body.scrollTop = 0;
+}
+
+function bindSettingsNav() {
+  if ($('settingsNav')) {
+    $('settingsNav').addEventListener('click', (e) => {
+      const btn = e.target.closest('.set-nav-item');
+      if (!btn) return;
+      openSettingsSection(btn.dataset.sec);
+    });
+  }
+  if ($('setSearch')) {
+    $('setSearch').addEventListener('input', (e) => runSettingsSearch(e.target.value));
+    $('setSearch').addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { e.target.value = ''; runSettingsSearch(''); }
+      // 回车直接跳到第一条命中
+      if (e.key === 'Enter') {
+        const first = $('setHits') && $('setHits').querySelector('.set-hit');
+        if (first) first.click();
+      }
+    });
+  }
+  openSettingsSection(settingsSec);
+}
+
+/** 下拉框回填：值不在选项里时补一条「自定义」，避免旧配置显示成空白 */
+function fillChoice(sel, value, fmt) {
+  if (!sel) return;
+  const v = String(value == null ? '' : value);
+  if (![...sel.options].some((o) => o.value === v)) {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = fmt ? fmt(v) : v;
+    sel.appendChild(o);
+  }
+  sel.value = v;
+}
+
 async function openSettings() {
   state.settings = await api.getSettings();
   fillSettings(state.settings);
@@ -1162,6 +1396,8 @@ async function openSettings() {
   }
   const verEl = document.getElementById('aboutVer');
   if (verEl && info.version) verEl.textContent = `v${info.version}`;
+  if ($('aboutDataDir')) $('aboutDataDir').textContent = info.dataDir || '—';
+  if ($('aboutRuntimeDir')) $('aboutRuntimeDir').textContent = info.runtimeDir || '—';
   const curVerEl = document.getElementById('updateCurrent');
   if (curVerEl && info.version) curVerEl.textContent = `v${info.version}`;
   const assoc = await api.assocStatus();
@@ -1179,6 +1415,8 @@ async function openSettings() {
       : '统计不可用';
   }).catch(() => { $('usageText').textContent = '统计不可用'; });
 
+  // 每次打开都重放一次分类页：语言可能刚改过，标题要从（已翻译的）meta 里重新取
+  openSettingsSection(settingsSec);
   $('settingsMask').classList.add('on');
   refreshAndroid();
   refreshDataInfo();
@@ -2549,6 +2787,7 @@ async function init() {
   await initI18n();
   bindEvents();
   bindSettings();
+  bindSettingsNav();
   bindUpdate();
   bindAndroid();
   state.settings = await api.getSettings();

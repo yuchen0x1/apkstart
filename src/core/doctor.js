@@ -175,9 +175,11 @@ function liteProfile({ host = hostInfo(), engine = {} } = {}) {
   const cores = engine && engine.resourceMode === 'save'
     ? 2
     // 老逻辑是 floor(核数/4) 再夹到 2~3 —— 8 核机器只给 2 个 vCPU，软件解码视频
-    // （红果/抖音这类）直接卡成幻灯片。改成「一半物理核、上限 4」：
-    // 8 核给 4、4 核给 2，桌面仍有富余核，视频也够用。
-    : clamp(Math.floor((host.cores || 2) / 2), 2, 4);
+    // （红果/抖音这类）直接卡成幻灯片。后来改成「一半物理核、上限 4」，
+    // 但 24 线程的机器也只有 4 核，和用户「我内存/核心这么多，你只给这么点」的
+    // 观感严重不符。现在上限放到 8：16 线程给 8、8 核给 4、4 核给 2。
+    // 轻量模式的「让着桌面」由进程优先级（below）保证，不靠砍 vCPU 数量。
+    : clamp(Math.floor((host.cores || 2) / 2), 2, 8);
   return { cores, priority: 'below' };
 }
 
@@ -282,18 +284,26 @@ function chooseProfile({
   const lowTier = tier.tier === 'low' && engine.resourceMode !== 'smooth';
   const spec = lowTier ? lowSpecProfile({ host, emulatorVersion, diskMB: disk }) : null;
 
-  // 3GB 足够 Android 14 与主流应用；再高只会放大内存占用和 quickboot 快照体积
-  let memoryMB = clamp(Math.floor((host.totalMB * 0.22) / 256) * 256, 2048, 3072);
-  // 物理可用内存不够时下调；Android 14 最低 2G，低于此只能靠 TCG 慢速跑
-  if (host.freeMB && host.freeMB < memoryMB + 1024) {
-    memoryMB = Math.max(2048, Math.floor((host.freeMB * 0.5) / 256) * 256);
+  // 内存：按物理内存的 1/4 给，2GB 起、8GB 封顶。
+  // 旧实现是「0.22 倍但硬封顶 3072」，于是 64GB 的机器也只分到 3GB ——
+  // 用户看到「我 64G 内存你只给 3G」会以为程序根本没读配置（实测反馈最多的就是这条）。
+  // 8GB 封顶的理由：安卓侧单个应用几乎吃不满 4GB，再往上只有 quickboot 快照
+  // （ram.bin 约等于内存大小）和宿主机内存压力跟着涨，收益接近 0。
+  let memoryMB = clamp(Math.floor((host.totalMB * 0.25) / 512) * 512, 2048, 8192);
+  // 物理可用内存不够时下调；Android 14 最低 2G，低于此只能靠 TCG 慢速跑。
+  // 判断用的余量也跟着内存放大：给虚拟机 N GB，宿主机自己至少还要留 2GB 才不至于swap。
+  if (host.freeMB && host.freeMB < memoryMB + 2048) {
+    memoryMB = Math.max(2048, Math.floor(((host.freeMB - 1024) * 0.6) / 512) * 512);
   }
   // 低配档只往下压，不会把上面的自动值抬高
   if (spec) memoryMB = Math.min(memoryMB, spec.memoryMB);
-  // 手动值永远最后生效、永远优先
-  if (overrides.memoryMB) memoryMB = clamp(Number(overrides.memoryMB) || memoryMB, 1536, 8192);
+  // 手动值永远最后生效、永远优先（下拉里最大 16GB，够跑任何安卓应用）
+  if (overrides.memoryMB) memoryMB = clamp(Number(overrides.memoryMB) || memoryMB, 1536, 16384);
 
-  let cores = clamp(Math.floor(host.cores / 2), 2, 4);
+  // 核心：物理线程数的一半，2 核起、8 核封顶。
+  // 旧实现硬封顶 4 核，24 线程的机器也只有 4 核 —— 安卓侧多开应用时明显偏紧。
+  // 8 核封顶：安卓的调度器超过 8 个 vCPU 基本吃不到收益，反而更容易被宿主机抢时间片。
+  let cores = clamp(Math.floor(host.cores / 2), 2, 8);
   if (overrides.cores) cores = clamp(Number(overrides.cores) || cores, 1, 8);
   // 用户没手动指定核数时才由轻量模式收敛，手动值永远优先
   const lite = settings ? liteProfile({ host, engine }) : null;
@@ -343,7 +353,8 @@ function chooseProfile({
   return {
     memoryMB,
     cores,
-    heapMB: memoryMB >= 3072 ? 384 : 256,
+    // dalvik 堆上限跟着内存走：内存给到 6GB 以上时 384MB 堆会先成为瓶颈（大应用频繁 GC）
+    heapMB: memoryMB >= 6144 ? 512 : (memoryMB >= 3072 ? 384 : 256),
     dataMB,
     lcd,
     gpu,

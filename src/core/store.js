@@ -131,14 +131,18 @@ const DEFAULT_SETTINGS = {
   freeform: false,           // 共享一个运行时窗口，不再用 Android freeform 小窗
   hideAfterLaunch: false,    // 主进程必须常驻，否则一退出就把 Android 运行时杀掉了
   notifyOnInstall: true,
-  autoStart: true,           // 开机自启，默认开启，用户无需设置
+  // 开机自启：默认关闭。
+  // 以前默认开着，等于替所有人做了「每次登录都拉起一个后台进程」的决定 ——
+  // 只在偶尔用的时候，它的代价（拖慢开机、常驻内存）比收益大。
+  // 需要的人可以在「设置 → 通用」里打开；老配置里已存的 true 不会被强行改掉。
+  autoStart: false,
   // 界面语言（upstream #38）：auto = 跟随系统；zh-CN / en-US = 明确指定。
   // 中文是源语言，英文靠 src/i18n/en-US.json 的词典覆盖；缺条目时回落中文原文。
   language: 'auto',
   autoDeploy: true,          // 首次运行自动完成全部部署，不再分 1~5 步
   wizardDone: false,         // 首次运行引导向导：完成或跳过后置 true，不再弹出
   wizardVersion: '',         // 最近一次完成引导的 ApkStart 版本；升级后重新展示关键步骤
-  androidVolumeInitialized: false, // 首次接入运行时把媒体音量设为 50%，之后尊重用户调整
+  androidVolumeInitialized: false, // 首次接入运行时把媒体音量拉满（100%），之后尊重用户调整
   // 安卓客机自己的语言与预装应用（见 core/guest.js）。
   // locale 空 = 保持镜像默认（英文），不做任何改动；'zh-CN' = 目标语言为中文。
   // 新安装默认中文：首次开机会写入 system_locales 并重启一次安卓使其生效

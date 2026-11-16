@@ -39,6 +39,25 @@ $env:APKSTART_TEST_APK="C:\path\to\any.apk"; npm test
 
 - 不要在测试里访问外网。需要网络行为的测试请起本地 `http` 服务（参考 `test/engine-test.js`）。
 
+## 发版流程
+
+版本号只有 `package.json` 和 `CHANGELOG.md` 两个来源，README 里的一切版本信息都是生成出来的，
+**不要手改**（手改过的版本 0.6.7 → 0.6.8 就是漏改的典型）：
+
+```powershell
+# 1) 改版本号 + 写 CHANGELOG 段落（标题形如 ## [0.6.9] — 2026-11-20）
+# 2) 让 README 跟上（会重写版本行与「最新更新」区块，其它文字不动）
+npm run readme:sync
+
+# 3) 全量测试：README 版本与 package.json 不一致会直接失败
+npm test
+
+# 4) 打 tag 触发发布（.github/workflows/release.yml：测试 → 生成发行说明 → 建 Release → 构建上传）
+git tag v0.6.9 && git push origin v0.6.9
+```
+
+`npm run readme:check` 只检查不写入，适合放进 CI 或提交前钩子。
+
 ## 提交信息
 
 使用 Conventional Commits 风格，例如：
