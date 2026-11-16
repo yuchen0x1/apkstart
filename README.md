@@ -9,20 +9,6 @@
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6.svg" alt="Windows 10/11 x64" />
 </p>
 
-## 项目星图
-
-点击下方图表可查看 ApkStart 在 GitHub 上的 Star 增长历史：
-
-<p align="center">
-  <a href="https://www.star-history.com/?repos=yuchen0x1%2Fapkstart&type=date&legend=top-left">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&theme=dark&legend=top-left" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&legend=top-left" />
-      <img src="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&legend=top-left" alt="ApkStart GitHub Star History" width="800" />
-    </picture>
-  </a>
-</p>
-
 ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管理所需的 Android 运行时，把安卓应用包装成可以从桌面、开始菜单或资源管理器直接打开的 Windows 应用。
 
 > 当前版本：**0.6.7**。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 和 [发布说明](docs/releases/release-notes.md)。
@@ -188,3 +174,17 @@ ApkStart 使用 Android Emulator、QEMU、adb 和 Android 系统镜像作为运�
 ## 许可证
 
 [MIT](LICENSE)
+
+## 项目星图
+
+点击下方图表可查看 ApkStart 在 GitHub 上的 Star 增长历史：
+
+<p align="center">
+  <a href="https://www.star-history.com/?repos=yuchen0x1%2Fapkstart&type=date&legend=top-left">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&theme=dark&legend=top-left" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&legend=top-left" />
+      <img src="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&legend=top-left" alt="ApkStart GitHub Star History" width="800" />
+    </picture>
+  </a>
+</p>
