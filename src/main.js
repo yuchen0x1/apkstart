@@ -948,7 +948,15 @@ async function runLaunchInner(pkg) {
 
     const r = await installer.launch(pkg, {
       lcdOrientation,
-      onLog: (m) => { send('runtime:log', m); appLog(`  rt ${m}`); },
+      onLog: (m) => {
+        send('runtime:log', m);
+        appLog(`  rt ${m}`);
+        // 首次打开大型 APK 时，安装本身可能持续几十秒；把这段真实状态
+        // 传到应用窗口，避免用户把安装等待误认为启动卡死。
+        if (/应用尚未安装|正在自动安装|正在安装应用/.test(String(m || '')) && appWin.isOpen) {
+          appWin.setState({ ready: false, tip: '首次启动正在安装应用，可能需要几十秒…' });
+        }
+      },
       onMark: mark,
       beforeStart: async (rt) => {
         mark('engine ready');
@@ -960,10 +968,15 @@ async function runLaunchInner(pkg) {
     });
     mark('app started');
 
+    // ensure() 可能复用了切换运行时目录前留下的 detached 模拟器。此时
+    // armAgent 在窗口打开阶段只看到了 settings.runtime.dir，必须在运行时
+    // 确认在线后再重发一次作用域，才能让代理找到实际的 emulator 窗口。
+    if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* 诊断性兜底 */ } }
+
     // 2) 应用真的活下来了，才把画面嵌进窗口（否则用户会看到闪一下的桌面/崩溃页）
     const embedded = await appWin.embed();
     if (!embedded) appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
-    mark(`embedded=${embedded} mean=${appWin.lastEmbedMean}`);
+    mark(`embedded=${embedded}`);
     // 嵌入完成后把窗口从别的窗口底下抬出来。否则上层窗口（浏览器等）会盖住安卓画面，
     // 用户看到的是「黑屏 / 画面没填满」，鼠标也点不到应用（全被上层窗口吃掉）。
     // 短暂 topmost 再立刻撤销，只借用一次置顶把 Z 序抬到最前，不会长期霸占顶层。
@@ -984,29 +997,36 @@ async function runLaunchInner(pkg) {
       // 非 Windows：画面只能留在模拟器自己的窗口里。不要显示黑屏，
       // 直接在应用窗口里写明「去哪看画面」（upstream #24）。
       ? { ready: false, tip: platform.supportNote() }
-      : { ready: true, tip: '' });
+      // Windows 上 embed=false 仍然代表画面句柄尚未接上：启动遮罩必须继续留着，
+      // 否则 shell 会把黑底当成「已经就绪」，用户只能看到一块黑屏。
+      : embedded
+        ? { ready: true, tip: '' }
+        : { ready: false, tip: '正在连接安卓画面…' });
     if (appWin.external) appLog(`embed unsupported on ${platform.platform}: external window mode`);
-    // 画面已经显示出来了，但有两类降级需要告知用户：
-    //  - dpi：SetParent 被拒（显示器缩放与模拟器不一致），只能让窗口跟着走
-    //  - black：嵌入成功但渲染表面失效（emulator 37.x + Win11 26xxx），像素自检抓到全黑
-    // 旧版这两种情况都是完全静默的，用户只能对着黑窗口自己猜。
-    if (embedded && appWin.lastEmbedFollow) {
-      const black = appWin.lastEmbedFollowReason === 'black';
-      appLog(black
-        ? `embed black (mean=${appWin.lastBlackMean}) -> follow mode: ${pkg}`
-        : `embed degraded to follow mode (DPI awareness mismatch): ${pkg}`);
-      send('toast', {
-        type: 'info',
-        message: black
-          ? '当前显卡驱动下安卓画面无法嵌入窗口，已自动切换为「跟随模式」显示（画面正常，可正常使用）。'
-          : '当前显示器的 DPI 设置与模拟器不一致，窗口以「跟随模式」显示。若画面有黑边或错位，请把显示器缩放调成 100% 后重试。',
-      });
-    }
-    // 嵌入失败（模拟器窗口还没建好）时再补两次：用户看到的是黑窗口，
-    // 后台补上就恢复正常，不用让用户手动重开。
+    // 嵌入失败（模拟器窗口还没建好）时按递增间隔有限重试；
+    // 每次成功都显式更新 ready，失败则一直保留启动遮罩而不是露出黑屏。
     if (!embedded && !appWin.external) {
-      setTimeout(() => { if (appWin.isOpen) appWin.embed().catch(() => {}); }, 1500);
-      setTimeout(() => { if (appWin.isOpen) appWin.embed().catch(() => {}); }, 4000);
+      const delays = [1200, 2400, 4800, 8000];
+      (async () => {
+        for (let i = 0; i < delays.length; i += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((resolve) => setTimeout(resolve, delays[i]));
+          if (!appWin.isOpen || appWin.pkg !== pkg) return;
+          appWin.setState({ ready: false, tip: `正在连接安卓画面…（${i + 2}/${delays.length + 1}）` });
+          // eslint-disable-next-line no-await-in-loop
+          const ok = await appWin.embed().catch(() => false);
+          mark(`embed retry ${i + 1}/${delays.length}=${ok}`);
+          if (ok) {
+            appWin.setState({ ready: true, tip: '' });
+            appLog(`embed recovered on retry ${i + 1}/${delays.length}`);
+            return;
+          }
+        }
+        if (appWin.isOpen && appWin.pkg === pkg) {
+          appWin.setState({ ready: false, tip: '安卓画面暂未连接，请关闭窗口后重试。' });
+          appLog('embed retries exhausted; keeping startup overlay visible');
+        }
+      })().catch((e) => appLog(`embed retry loop failed: ${e.message}`));
     }
     // 容器会话：环境已经就绪，这里只做「按应用裁剪 + 打开后台轮询」，
     // 不再为这个 App 重新引导一遍 Android。鼠标键位钩子由窗口 focus 事件
@@ -1014,6 +1034,11 @@ async function runLaunchInner(pkg) {
     deviceSize.value = null;
     appWin.refreshPointer();
     await runtime.beginApp(pkg, { onActive: onContainerActive }).catch(() => {});
+    // 游戏/低延迟模式：让窗口代理降频扫描，减少全桌面 EnumWindows 造成的整机卡顿
+    if (winAgent) {
+      const game = store.getSettings().engine && store.getSettings().engine.priorityMode === 'game';
+      winAgent.setPerformanceMode(!!game).catch(() => {});
+    }
     send('app:launched', { package: pkg, engine: r.engine });
     appLog(`launch ok ${pkg} embedded=${embedded}`);
     return { ok: true, embedded };
@@ -3028,16 +3053,24 @@ if (!gotLock) {
     // 「哪些窗口才算我们的」= 运行时目录 + 随包的 engine 目录。
     // 窗口代理只允许碰这些进程创建的窗口 —— 别的 Qt 应用（微信 4.x 就是 Qt6，
     // 窗口类名和模拟器一模一样）一个都不许动，见 agent.ps1 的 SetScope。
-    const agentScope = () => {
+    const agentScope = async () => {
       const dirs = [];
       try { dirs.push(runtime.provisioner.root); } catch (_) { /* ignore */ }
       try { dirs.push(path.join(APP_ROOT, 'engine')); } catch (_) { /* ignore */ }
-      return dirs.filter(Boolean);
+      // ensure() 可能接管上一进程留下的 detached runtime。它可能来自旧的
+      // 便携版目录（例如用户刚把 runtime 从 D: 切到 E:），所以不能只相信当前
+      // settings.runtime.dir；把活动 emulator/qemu 的实际目录加入作用域，避免
+      // agent.ps1 误把在线但已接管的窗口过滤成 emu=0。
+      try {
+        const active = await runtime.activeRuntimeRoots();
+        if (Array.isArray(active)) dirs.push(...active);
+      } catch (_) { /* 进程探测失败不影响正常启动 */ }
+      return [...new Set(dirs.filter(Boolean))];
     };
     // 范围存在代理进程的内存里，代理一重建就没了 —— 所以每次开机压制前都重发一次。
     armAgent = async (agent) => {
       if (!agent) return { ok: false };
-      const dirs = agentScope();
+      const dirs = await agentScope();
       // 第二个参数是本进程 pid：代理据此拒绝把窗口嵌进「不是我们的」窗口
       await agent.scope(dirs, process.pid).catch(() => null);
       if (!dirs.length) appLog('agent scope 为空：不压制任何窗口（避免误伤其他软件）');

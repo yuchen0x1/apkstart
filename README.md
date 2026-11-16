@@ -9,19 +9,33 @@
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6.svg" alt="Windows 10/11 x64" />
 </p>
 
+## 项目星图
+
+点击下方图表可查看 ApkStart 在 GitHub 上的 Star 增长历史：
+
+<p align="center">
+  <a href="https://www.star-history.com/?repos=yuchen0x1%2Fapkstart&type=date&legend=top-left">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&theme=dark&legend=top-left" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&legend=top-left" />
+      <img src="https://api.star-history.com/chart?repos=yuchen0x1/apkstart&type=date&legend=top-left" alt="ApkStart GitHub Star History" width="800" />
+    </picture>
+  </a>
+</p>
+
 ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管理所需的 Android 运行时，把安卓应用包装成可以从桌面、开始菜单或资源管理器直接打开的 Windows 应用。
 
-> 当前版本：**0.6.6**。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 和 [发布说明](docs/releases/release-notes.md)。
+> 当前版本：**0.6.7**。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 和 [发布说明](docs/releases/release-notes.md)。
 
 ## 最新更新
 
-### Unreleased（尚未发布）
+### v0.6.7
 
-- 低配机器会自动收敛内存、核心数、分辨率和渲染后端，启动失败时显示本次实际参数。
-- 支持导入并独立启用自有的 x86_64 Android 模拟器镜像；导入失败不会改动当前默认运行时。
-- 默认镜像统一为 Android 14 · Google Play · x86_64，Google APIs / AOSP 仍可在设置中显式选择。
+- 对齐上游方案根治「启动后黑屏」：窗口代理按宿主客户区自校正并持续重新贴合，移除跟随模式降级。
+- 模拟器参数收口（`‑no‑skin` / `‑accel` / 快照），AVD 与自定义镜像快照互相隔离。
+- 新增游戏 / 低延迟模式、低配自动调优、自有 x86_64 镜像导入。
 
-完整历史与本地验证范围见 [CHANGELOG.md](CHANGELOG.md) 和 [发布说明](docs/releases/release-notes.md)；本节内容尚未对应已发布版本。
+完整历史与本地验证范围见 [CHANGELOG.md](CHANGELOG.md) 和 [发布说明](docs/releases/release-notes.md)。
 
 ## 当前界面
 

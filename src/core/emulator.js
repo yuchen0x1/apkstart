@@ -76,7 +76,13 @@ class EmulatorEngine {
     this.snapshotWorthSaving = null;
     // 「下一次启动强制 -wipe-data」的一次性标记：只由「修复网络」设置。
     this._forceWipe = false;
+    // 「下一次启动不加载快照」的一次性标记（上游同款）：快照可能是在虚拟机没网时
+    // 存的，恢复出来依旧没网；网络修复流程设置它后强制冷启一次。
+    this._coldBoot = false;
   }
+
+  /** 让下一次启动跳过快照、冷启动一次（对齐上游 forceColdBootOnNextStart） */
+  forceColdBootOnNextStart() { this._coldBoot = true; }
 
   /**
    * 让「下一次启动」带上 -wipe-data（仅「修复网络」在等待超时后使用）。
@@ -143,21 +149,21 @@ class EmulatorEngine {
   }
 
   /**
-   * 当前该用哪套 AVD：默认镜像 → apkstart，自定义镜像 → apkstart-custom。
-   *
-   * 不做实例内缓存：切换镜像只需要重启运行时，下一次 start() 就会走到新的名字，
-   * 不会出现「设置里换了镜像，却还把文件写进默认 AVD」这种最难查的串味问题。
-   * 底层 ImageStore.active() 自己按 activeImageId 做了缓存，这里再取一次很便宜。
+   * AVD 名回到上游的常量 apkstart；只有自定义镜像用独立的 apkstart-custom。
+   * 之前从 imageProfile() 动态取名让默认路径也变成「按镜像拼名字」，
+   * 和上游的快照 / AVD 清理逻辑越走越远。
    */
   get avdName() {
     const act = this._activeImageInfo();
-    if (act && act.ok && act.custom) return CUSTOM_AVD_NAME;
-    try {
-      const p = this.provisioner.imageProfile();
-      return p.avd || AVD_NAME;
-    } catch (_) {
-      return AVD_NAME;
-    }
+    return (act && act.ok && act.custom) ? CUSTOM_AVD_NAME : AVD_NAME;
+  }
+
+  /**
+   * 快照名跟着 AVD 走：自定义 AVD 用 apkstart-custom-apkstart，
+   * 绝不和默认 AVD 共用一份 apkstart 快照（切换镜像后加载旧快照 = 应用全丢）。
+   */
+  get snapshotName() {
+    return this.avdName === AVD_NAME ? SNAPSHOT_NAME : `${this.avdName}-${SNAPSHOT_NAME}`;
   }
 
   /** emulator.exe 与系统镜像目录（优先用户运行时目录，回退到仓库内 engine/） */
@@ -263,7 +269,7 @@ class EmulatorEngine {
    * 白等几秒。这里按文件大小校验，顺手清掉空壳和旧版遗留的 default_boot（单个 3GB）。
    */
   hasSnapshot() {
-    const base = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`, 'snapshots', SNAPSHOT_NAME);
+    const base = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`, 'snapshots', this.snapshotName);
     const size = (p) => { try { return fs.statSync(p).size; } catch (_) { return 0; } };
     const pb = size(path.join(base, 'snapshot.pb'));
     // 新版 emulator（37.x）写的是 ram.bin，老版本写 ram.img。
@@ -279,11 +285,11 @@ class EmulatorEngine {
 
   /** 清掉旧版遗留/失败重命名留下的快照目录（default_boot 里的 ram.img 可达 3GB） */
   _cleanLegacySnapshots() {
-    const dir = path.dirname(path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`, 'snapshots', SNAPSHOT_NAME));
+    const dir = path.dirname(path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`, 'snapshots', this.snapshotName));
     let names = [];
     try { names = fs.readdirSync(dir); } catch (_) { return; }
     for (const name of names) {
-      if (name === SNAPSHOT_NAME) continue;
+      if (name === this.snapshotName) continue;
       if (/^default_boot$|\.stale-\d+$/i.test(name)) {
         try { fs.rmSync(path.join(dir, name), { recursive: true, force: true }); } catch (_) { /* ignore */ }
       }
@@ -628,6 +634,7 @@ class EmulatorEngine {
     const hasSwGL = emuDir && fs.existsSync(path.join(emuDir, 'opengl32sw.dll'));
     return {
       ...process.env,
+      ...(plan.accel === 'off' ? { ANDROID_I_WANT_MY_TCG: 'yes' } : {}),
       ANDROID_SDK_ROOT: safeRoot,
       ANDROID_HOME: safeRoot,
       ANDROID_AVD_HOME: avdHome,
@@ -677,8 +684,9 @@ class EmulatorEngine {
     if (headless) {
       args.push('-no-window');
     } else {
-      // 不要模拟器自带的手机外壳；侧边浮动工具栏由窗口代理隐藏。
-      args.push('-no-skin');
+      // 不能再传 -no-skin：上游实测它会覆盖上面的 -skin，让面板尺寸退回 config.ini
+      // 的旧值 —— 表现就是「画面只占左上角一条 / 黑边 / 比例不对」。
+      // 设备外壳本来就不会画（ShowDeviceFrame=no + 这组 style 参数）。
       // 注意：不能用 -qt-hide-window。它会让模拟器**根本不创建**那个 Qt 窗口，
       // 而窗口代理正是靠 SetParent 把这个窗口嵌进应用窗口来显示画面的 ——
       // 用了它之后 probe 永远找不到窗口，用户看到的是一个全黑的应用窗口。
@@ -703,20 +711,21 @@ class EmulatorEngine {
       // 下次按 -snapshot apkstart 找又找不到 —— 等于白存一次，还得再冷启一遍。
       // 所以这里连快照名一起给：不强求加载，但存就存到 apkstart 里。
       if (!wantSnapshot) args.push('-no-snapshot');
-      else args.push('-snapshot', SNAPSHOT_NAME, '-no-snapshot-load');
+      else args.push('-snapshot', this.snapshotName, '-no-snapshot-load');
     } else if (!wantSnapshot) {
       args.push('-no-snapshot');
     } else if (snapshot !== false) {
-      args.push('-snapshot', SNAPSHOT_NAME);
-      if (!this.hasSnapshot()) args.push('-no-snapshot-load');
+      args.push('-snapshot', this.snapshotName);
+      // 快照可能存于「虚拟机没网」的状态；网络修复要求这次冷启动。
+      if (!this.hasSnapshot() || this._coldBoot) args.push('-no-snapshot-load');
     } else {
       args.push('-no-snapshot');
     }
     if (wipe) args.push('-wipe-data');
-    // 只在确认 WHPX/AEHD 可用时显式打开硬件加速。无加速时不传
-    // `-accel off`：emulator 37.x 在部分 Windows/显卡组合下会在 guest
-    // 刚开始执行时以 0xC0000005 崩溃；不传参数仍会走官方支持的 TCG 路径。
-    if (accel === 'on') args.push('-accel', 'on');
+    // 对齐上游：只在明确关闭硬件加速时传 `-accel off`（配合 env 里的
+    // ANDROID_I_WANT_MY_TCG）。绝不传 `-accel on` —— 上游实测 37.x 在部分
+    // Windows/显卡组合下会因此以 0xC0000005 崩溃；不传参数走官方默认路径即可。
+    if (accel === 'off') args.push('-accel', 'off');
     return args;
   }
 
@@ -1282,6 +1291,8 @@ class EmulatorEngine {
       }
       // eslint-disable-next-line no-await-in-loop
       this.spawnOnce({ ...plan, wipe: plan.wipe || avd.wipePending || forceWipe }, { headless, onLog, logFile });
+      // _coldBoot 只对这次 spawn 生效，避免之后每次开机都退化成长时间冷启动
+      this._coldBoot = false;
       // 参数错误 / DLL 缺失会立刻退出
       // eslint-disable-next-line no-await-in-loop
       const dead = await this._waitSpawnSettled(2200);
@@ -1616,7 +1627,7 @@ class EmulatorEngine {
   /** 用 adb 触发一次快照保存（失败返回 false，调用方决定要不要再试） */
   _saveViaAdb(adbPath, { timeout = 45000 } = {}) {
     return new Promise((resolve) => {
-      execFile(adbPath, ['-s', this.serial, 'emu', 'avd', 'snapshot', 'save', SNAPSHOT_NAME],
+      execFile(adbPath, ['-s', this.serial, 'emu', 'avd', 'snapshot', 'save', this.snapshotName],
         { timeout, windowsHide: true }, (err) => resolve(!err));
     });
   }

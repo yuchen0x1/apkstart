@@ -167,29 +167,21 @@ class WinAgent extends EventEmitter {
       cmd: 'fit',
       x: Math.round(rect.x), y: Math.round(rect.y),
       w: Math.round(rect.w), h: Math.round(rect.h),
+      // 模拟器 Qt 窗口比 LCD 多一圈 8px 灰边，向上溢出后压在标题栏上的那条
+      // 由代理裁掉；否则点标题栏按钮时会从缝隙里冒出黑边。
+      clipTop: Math.round(rect.clipTop || 0),
     }, 3000);
   }
 
   async refresh() { return this.call({ cmd: 'refresh' }, 3000); }
 
+  /** 低延迟模式：让窗口代理降频扫描，避免全桌面 EnumWindows 抢走游戏的 CPU */
+  async setPerformanceMode(on) { return this.call({ cmd: 'perf', on: on ? 1 : 0 }, 3000); }
+
   async rotate(dir = 'left') { return this.call({ cmd: 'rotate', dir }, 8000); }
   async hide() { return this.call({ cmd: 'hide' }, 3000); }
   async show() { return this.call({ cmd: 'show' }, 3000); }
   async detach() { return this.call({ cmd: 'detach' }, 5000); }
-  /**
-   * 采样模拟器窗口当前画面的平均亮度（0~255）。-1 表示采样失败。
-   * 用于识别「SetParent 成功但画面全黑」：窗口在、尺寸对、Qt 子窗口 vis:true，
-   * 但渲染表面已失效（实测于 emulator 37.x + Win11 26xxx）。
-   */
-  async pixmean() { return this.call({ cmd: 'pixmean' }, 6000); }
-  /** 强制切换为「窗口跟随」模式（不 reparent，模拟器窗口作为宿主的被拥有窗口跟随） */
-  async follow(rect) {
-    return this.call({
-      cmd: 'follow',
-      x: Math.round(rect.x), y: Math.round(rect.y),
-      w: Math.round(rect.w), h: Math.round(rect.h),
-    }, 5000);
-  }
   async probe() { return this.call({ cmd: 'probe' }, 4000); }
   /** 列出当前可见的顶层窗口（用于验证「只有软件界面 / 只有安卓应用窗口」） */
   async windows() { return this.call({ cmd: 'windows' }, 4000); }

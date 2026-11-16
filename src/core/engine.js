@@ -853,6 +853,50 @@ class Runtime {
   }
 
   /**
+   * 返回当前仍在运行的 emulator/qemu 所属 runtime 目录。
+   *
+   * 便携版允许用户把 runtime 目录换盘，但旧版模拟器是 detached 的：如果用户
+   * 在它还运行时切换目录，ensure() 会先复用在线设备，窗口实际仍来自旧目录。
+   * 窗口代理必须同时信任这套「已接管」运行时，否则它会因为路径作用域不一致把
+   * 模拟器窗口过滤掉，最终表现为 embed emu=0 + 黑屏。
+   * 只沿活动 emulator 端口找进程，再取其可执行文件路径；不扫描/放行所有 Qt 窗口。
+   */
+  async activeRuntimeRoots() {
+    if (process.platform !== 'win32') return [];
+    const ports = await this.emulatorPorts().catch(() => []);
+    if (!ports.length) return [];
+    const roots = new Set();
+    const exePath = (pid) => new Promise((resolve) => {
+      const n = Number(pid);
+      if (!Number.isInteger(n) || n <= 0) return resolve('');
+      const command = `$p=Get-Process -Id ${n} -ErrorAction SilentlyContinue; if($p){$p.Path}`;
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      }, (err, stdout) => resolve(err ? '' : String(stdout || '').trim()));
+    });
+
+    for (const port of ports) {
+      // eslint-disable-next-line no-await-in-loop
+      const pid = await this.pidOnPort(port);
+      // eslint-disable-next-line no-await-in-loop
+      const exe = await exePath(pid);
+      if (!exe) continue;
+      let dir = path.dirname(path.resolve(exe));
+      // qemu 的可执行文件位于 runtime/emulator/qemu/...；向上收敛到 runtime，
+      // 这样 emulator.exe 与 qemu 两类窗口都能被同一个作用域命中。
+      for (let i = 0; i < 8 && dir; i += 1) {
+        roots.add(dir);
+        if (/[/\\](?:runtime|engine)$/i.test(dir)) break;
+        const next = path.dirname(dir);
+        if (next === dir) break;
+        dir = next;
+      }
+    }
+    return [...roots];
+  }
+
+  /**
    * 清理上一次运行遗留、却没被接管的孤儿模拟器。
    * 关掉 ApkStart 时 emulator 是 detached 的，qemu 会存活；下次启动时它仍占着 AVD 锁，
    * 表现为冷启直接 FATAL "Running multiple emulators with the same AVD"。

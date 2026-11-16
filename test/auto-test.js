@@ -487,9 +487,11 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(!/swiftshader_indirect/.test(fresh));
     assert(/-memory 2048/.test(fresh) && /-cores 2/.test(fresh));
     const hardware = emu.buildArgs({ gpu: 'host', memoryMB: 2048, cores: 2, accel: 'on', snapshot: false }).join(' ');
-    assert(/-accel on/.test(hardware), '检测到硬件加速时必须显式传 -accel on');
+    // 对齐上游：绝不显式传 -accel on（37.x 在部分机器会因此崩在 guest 启动瞬间）；
+    // 只有明确要求关闭加速时才传 -accel off，并配合 ANDROID_I_WANT_MY_TCG。
+    assert(!/-accel on/.test(hardware), '硬件加速走默认路径，不显式传 -accel on');
     const software = emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, accel: 'off', snapshot: false }).join(' ');
-    assert(!/-accel off/.test(software), '软件回退不能强制传 -accel off（部分机器会崩溃）');
+    assert(/-accel off/.test(software), '明确关闭加速时传 -accel off');
     if (!emu.hasSnapshot()) {
       // 没有快照时必须「只禁加载、不禁保存」：-no-snapshot 会连退出自动保存一起关掉，
       // 那样第一次冷启动结束后永远产生不了快照，用户每次点开都是全量引导。
@@ -699,7 +701,9 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     const win = emu.buildArgs({ headless: false, gpu: 'software' }).join(' ');
     assert(!/-no-window/.test(win), '窗口模式不能再用 -no-window');
-    assert(/-no-skin/.test(win), '窗口模式应去掉手机外壳');
+    // 上游 0.4.1 实测：-no-skin 会覆盖 -skin，面板尺寸退回 config.ini 旧值
+    //（横屏失效 / 画面只占左上角一条），窗口模式绝不能再传它。
+    assert(!/-no-skin/.test(win), '窗口模式不能传 -no-skin（会覆盖 -skin）');
     const headless = emu.buildArgs({ headless: true }).join(' ');
     assert(/-no-window/.test(headless) && !/-no-skin/.test(headless));
   });
@@ -1264,6 +1268,21 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     // 传空数组也不能抛：那等于「什么都不压制」，由调用方决定要不要告警
     const empty = await a.scope([]);
     assert(sent[1].dirs === '' && empty.ok === true, '空范围也要能下发（代理收到后一个窗口都不动）');
+  });
+
+  await test('游戏/低延迟模式：代理可降频扫描，且 UI 提供入口', async () => {
+    const { WinAgent } = require('../src/core/agent');
+    const a = new WinAgent();
+    const sent = [];
+    a.call = async (obj) => { sent.push(obj); return { ok: true }; };
+    await a.setPerformanceMode(true);
+    await a.setPerformanceMode(false);
+    assert(sent[0].cmd === 'perf' && sent[0].on === 1, '开启低延迟要下发 perf=1');
+    assert(sent[1].cmd === 'perf' && sent[1].on === 0, '关闭低延迟要下发 perf=0');
+    const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'ui', 'index.html'), 'utf8');
+    assert(/<option value="game"/.test(html), '设置页要能选游戏/低延迟模式');
+    const appwin = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'appwin.js'), 'utf8');
+    assert(/priorityMode === 'game'/.test(appwin), '游戏模式不能装全局鼠标钩子');
   });
 
   await test('双源：同名整包两边都有时，两个地址都要留着（否则 Gitee 永远轮不到）', async () => {

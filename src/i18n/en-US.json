@@ -366,6 +366,7 @@
   "快捷方式都还在": "Shortcuts are all in place",
   "性能与资源占用": "Performance & resources",
   "性能优先 · 运行时与前台同等优先级": "Performance first · runtime runs at the same priority as foreground",
+  "游戏 / 低延迟 · 不装鼠标钩子，窗口代理降频扫描": "Game / low latency · no mouse hooks, slower agent sweeps",
   "恢复失败": "Restore failed",
   "恢复应用需要先启动运行时": "Start the runtime before restoring an app",
   "恢复默认镜像": "Restore default image",

@@ -882,7 +882,8 @@ function fillSettings(s) {
   $('setAudio').checked = s.engine.audio !== false;
   $('setLiteMode').checked = s.engine.liteMode !== false;
   $('setPrewarm').checked = s.engine.prewarm !== false;
-  $('setPriorityMode').value = s.engine.priorityMode === 'performance' ? 'performance' : 'balanced';
+  $('setPriorityMode').value = ['performance', 'game'].includes(s.engine.priorityMode)
+    ? s.engine.priorityMode : 'balanced';
   $('setDeepTrim').checked = !!s.engine.deepTrim;
   $('setMouseRightBack').checked = s.engine.mouseRightBack !== false;
   $('setMouseWheelMode').value = ['smooth', 'native', 'off'].includes(s.engine.mouseWheelMode)

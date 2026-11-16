@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ApkStart — Windows 上的安卓应用运行器</title>
+<meta name="description" content="ApkStart：让安卓应用像 Windows 原生软件一样被安装和使用。双击 .apk 即安装，每个应用一个桌面图标，独立窗口运行，数据双向互通。" />
+<link rel="icon" type="image/png" href="images/logo.png" />
+<noscript><style>.reveal { opacity: 1 !important; transform: none !important; }</style></noscript>
+<style>
+  :root {
+    --bg: #f6f8fb;
+    --surface: #ffffff;
+    --ink: #14202e;
+    --ink-2: #45566b;
+    --ink-3: #7a8ca1;
+    --line: #e3e9f1;
+    --brand: #1f6feb;
+    --brand-2: #2dd4a7;
+    --android: #3ddc84;
+    --hero-1: #0b1b33;
+    --hero-2: #10294d;
+    --hero-3: #0e3a5c;
+    --radius: 16px;
+    --shadow: 0 10px 30px rgba(18, 38, 63, 0.08);
+    --shadow-lg: 0 24px 60px rgba(10, 30, 60, 0.18);
+    --max: 1120px;
+    --font: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: var(--font);
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  img { max-width: 100%; display: block; }
+  a { color: inherit; text-decoration: none; }
+
+  .wrap { width: min(var(--max), calc(100% - 48px)); margin-inline: auto; }
+
+  /* ===== Nav ===== */
+  .nav {
+    position: fixed; inset: 0 0 auto 0; z-index: 50;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    background: rgba(11, 27, 51, 0.72);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .nav-inner {
+    display: flex; align-items: center; gap: 28px;
+    height: 64px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: #fff; font-size: 18px; letter-spacing: .2px; }
+  .brand img { width: 30px; height: 30px; border-radius: 8px; }
+  .nav-links { display: flex; gap: 22px; margin-left: auto; }
+  .nav-links a {
+    color: rgba(255, 255, 255, 0.78); font-size: 14.5px; font-weight: 500;
+    transition: color .2s;
+  }
+  .nav-links a:hover { color: #fff; }
+  .nav-cta {
+    padding: 9px 18px; border-radius: 999px; font-size: 14px; font-weight: 600;
+    background: linear-gradient(135deg, var(--brand), #4f8dff);
+    color: #fff !important; box-shadow: 0 8px 20px rgba(31, 111, 235, 0.35);
+    transition: transform .2s, box-shadow .2s;
+  }
+  .nav-cta:hover { transform: translateY(-1px); box-shadow: 0 12px 26px rgba(31, 111, 235, 0.45); }
+
+  /* ===== Hero ===== */
+  .hero {
+    position: relative;
+    padding: 150px 0 90px;
+    background:
+      radial-gradient(1000px 520px at 85% -10%, rgba(45, 212, 167, 0.22), transparent 60%),
+      radial-gradient(900px 480px at 10% 110%, rgba(31, 111, 235, 0.28), transparent 55%),
+      linear-gradient(160deg, var(--hero-1) 0%, var(--hero-2) 52%, var(--hero-3) 100%);
+    color: #fff;
+    overflow: hidden;
+  }
+  .hero::before {
+    content: "";
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+    background-size: 44px 44px;
+    mask-image: radial-gradient(ellipse 80% 70% at 50% 30%, #000 30%, transparent 75%);
+    pointer-events: none;
+  }
+  .hero-grid {
+    position: relative;
+    display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 56px; align-items: center;
+  }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 7px 14px; border-radius: 999px;
+    background: rgba(61, 220, 132, 0.12);
+    border: 1px solid rgba(61, 220, 132, 0.35);
+    color: #9df0c3; font-size: 13px; font-weight: 600; letter-spacing: .3px;
+    margin-bottom: 22px;
+  }
+  .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--android); box-shadow: 0 0 12px var(--android); }
+  h1 {
+    font-size: clamp(34px, 5vw, 56px);
+    line-height: 1.18; font-weight: 800; letter-spacing: -0.5px;
+    margin-bottom: 18px;
+  }
+  h1 .grad {
+    background: linear-gradient(92deg, #7ef0c0 0%, #6db3ff 55%, #a8c7ff 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero-sub {
+    font-size: 18px; color: rgba(255, 255, 255, 0.82); max-width: 540px;
+    margin-bottom: 32px;
+  }
+  .hero-actions { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 30px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 14px 26px; border-radius: 12px;
+    font-size: 15.5px; font-weight: 650;
+    transition: transform .18s ease, box-shadow .18s ease, background .18s;
+    border: 1px solid transparent; cursor: pointer;
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, #2dd4a7, #1f6feb);
+    color: #fff; box-shadow: 0 14px 32px rgba(31, 111, 235, 0.4);
+  }
+  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 18px 40px rgba(31, 111, 235, 0.5); }
+  .btn-ghost {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.22);
+    color: #fff;
+  }
+  .btn-ghost:hover { background: rgba(255, 255, 255, 0.16); transform: translateY(-2px); }
+  .hero-badges { display: flex; flex-wrap: wrap; gap: 10px; }
+  .badge {
+    padding: 6px 13px; border-radius: 8px; font-size: 12.5px; font-weight: 600;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: rgba(255, 255, 255, 0.85);
+    font-family: var(--mono);
+  }
+  .hero-shot {
+    position: relative;
+  }
+  .hero-shot .frame {
+    border-radius: 18px; overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    box-shadow: var(--shadow-lg);
+    background: #0c1a2e;
+    transform: perspective(1400px) rotateY(-8deg) rotateX(3deg);
+    transition: transform .5s ease;
+  }
+  .hero-shot:hover .frame { transform: perspective(1400px) rotateY(-3deg) rotateX(1deg); }
+  .hero-shot .glow {
+    position: absolute; inset: 12% -8% -12% 8%;
+    background: radial-gradient(closest-side, rgba(45, 212, 167, 0.35), transparent 70%);
+    filter: blur(28px); z-index: -1;
+  }
+
+  /* ===== Stat strip ===== */
+  .stats {
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+  }
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 20px; padding: 34px 0;
+  }
+  .stat { text-align: center; padding: 8px 12px; }
+  .stat .num {
+    font-size: 30px; font-weight: 800; letter-spacing: -0.5px;
+    background: linear-gradient(135deg, var(--brand), var(--brand-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .stat .label { color: var(--ink-3); font-size: 13.5px; font-weight: 600; margin-top: 2px; }
+
+  /* ===== Sections ===== */
+  section { padding: 88px 0; }
+  .sec-head { text-align: center; max-width: 680px; margin: 0 auto 52px; }
+  .sec-tag {
+    display: inline-block; padding: 6px 14px; border-radius: 999px;
+    background: rgba(31, 111, 235, 0.1); color: var(--brand);
+    font-size: 13px; font-weight: 700; letter-spacing: .6px; margin-bottom: 14px;
+  }
+  h2 { font-size: clamp(28px, 3.6vw, 40px); line-height: 1.28; letter-spacing: -0.4px; font-weight: 800; }
+  .sec-head p { margin-top: 14px; color: var(--ink-2); font-size: 17px; }
+
+  /* ===== Features ===== */
+  .features { background: var(--bg); }
+  .feat-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 28px 24px;
+    box-shadow: var(--shadow);
+    transition: transform .25s ease, box-shadow .25s ease, border-color .25s;
+  }
+  .card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 18px 40px rgba(18, 38, 63, 0.12);
+    border-color: rgba(31, 111, 235, 0.35);
+  }
+  .card .icon {
+    width: 46px; height: 46px; border-radius: 12px;
+    display: grid; place-items: center; font-size: 22px;
+    background: linear-gradient(135deg, rgba(31, 111, 235, 0.12), rgba(45, 212, 167, 0.14));
+    margin-bottom: 16px;
+  }
+  .card h3 { font-size: 17px; font-weight: 750; margin-bottom: 8px; letter-spacing: -0.2px; }
+  .card p { color: var(--ink-2); font-size: 14.5px; line-height: 1.72; }
+
+  /* ===== Enhancements ===== */
+  .enhance { background: var(--surface); border-block: 1px solid var(--line); }
+  .enhance-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
+  }
+  .chip-list { display: flex; flex-direction: column; gap: 12px; }
+  .chip {
+    display: flex; gap: 13px; align-items: flex-start;
+    padding: 17px 18px; border-radius: 13px;
+    background: var(--bg); border: 1px solid var(--line);
+  }
+  .chip .tick {
+    flex: none; width: 22px; height: 22px; border-radius: 50%; margin-top: 2px;
+    background: linear-gradient(135deg, var(--brand-2), var(--brand));
+    color: #fff; font-size: 12px; font-weight: 800;
+    display: grid; place-items: center;
+  }
+  .chip b { display: block; font-size: 14.8px; margin-bottom: 2px; }
+  .chip span { color: var(--ink-2); font-size: 13.5px; line-height: 1.65; }
+
+  /* ===== Flow ===== */
+  .flow { background: var(--bg); }
+  .flow-track {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+    counter-reset: step;
+  }
+  .step {
+    position: relative;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 26px 22px 24px;
+    box-shadow: var(--shadow);
+  }
+  .step::before {
+    counter-increment: step;
+    content: counter(step, decimal-leading-zero);
+    font-family: var(--mono); font-size: 13px; font-weight: 700;
+    color: var(--brand); background: rgba(31, 111, 235, 0.1);
+    padding: 4px 11px; border-radius: 999px;
+  }
+  .step h3 { font-size: 16.5px; margin: 14px 0 8px; font-weight: 750; }
+  .step p { color: var(--ink-2); font-size: 13.8px; line-height: 1.7; }
+  .flow-note {
+    margin-top: 26px; text-align: center;
+    color: var(--ink-3); font-size: 14px;
+  }
+  .flow-note code {
+    font-family: var(--mono); font-size: 12.8px;
+    background: rgba(31, 111, 235, 0.09); color: var(--brand);
+    padding: 3px 9px; border-radius: 6px;
+  }
+
+  /* ===== Requirements ===== */
+  .reqs { background: var(--bg); }
+  .req-table-wrap {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow);
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 15px 22px; text-align: left; font-size: 14.8px; }
+  thead th {
+    background: linear-gradient(135deg, #12294a, #173a63);
+    color: #fff; font-weight: 650; font-size: 13.5px; letter-spacing: .4px;
+  }
+  tbody tr { border-top: 1px solid var(--line); }
+  tbody tr:hover { background: rgba(31, 111, 235, 0.04); }
+  td:first-child { font-weight: 700; width: 18%; }
+  td:nth-child(2) { color: var(--ink-2); width: 34%; }
+  td:nth-child(3) { color: var(--ink-2); }
+  .req-notes { margin-top: 22px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .note {
+    padding: 16px 18px; border-radius: 12px;
+    background: var(--surface); border: 1px solid var(--line);
+    font-size: 13.8px; color: var(--ink-2); line-height: 1.7;
+  }
+  .note b { color: var(--ink); }
+
+  /* ===== Download ===== */
+  .download {
+    background:
+      radial-gradient(900px 420px at 85% 0%, rgba(45, 212, 167, 0.18), transparent 60%),
+      linear-gradient(165deg, var(--hero-1), var(--hero-2) 60%, var(--hero-3));
+    color: #fff;
+  }
+  .download .sec-tag { background: rgba(255, 255, 255, 0.12); color: #bfe6ff; }
+  .download .sec-head p { color: rgba(255, 255, 255, 0.78); }
+  .dl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; margin-top: 12px; }
+  .dl-card {
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 18px; padding: 34px 30px;
+    backdrop-filter: blur(8px);
+    transition: transform .25s, background .25s;
+  }
+  .dl-card:hover { transform: translateY(-5px); background: rgba(255, 255, 255, 0.11); }
+  .dl-card.featured {
+    background: linear-gradient(155deg, rgba(45, 212, 167, 0.22), rgba(31, 111, 235, 0.2));
+    border-color: rgba(126, 240, 192, 0.4);
+  }
+  .dl-card .tagline { font-size: 12.5px; font-weight: 700; letter-spacing: 1px; color: #9df0c3; margin-bottom: 8px; }
+  .dl-card h3 { font-size: 23px; font-weight: 800; margin-bottom: 6px; }
+  .dl-card .size { font-family: var(--mono); font-size: 13px; color: rgba(255, 255, 255, 0.7); margin-bottom: 18px; }
+  .dl-card ul { list-style: none; margin-bottom: 26px; }
+  .dl-card li {
+    position: relative; padding-left: 22px; margin-bottom: 9px;
+    font-size: 14.5px; color: rgba(255, 255, 255, 0.86);
+  }
+  .dl-card li::before {
+    content: "✓"; position: absolute; left: 0; top: 0;
+    color: var(--brand-2); font-weight: 800;
+  }
+  .dl-card .btn { width: 100%; justify-content: center; }
+  .dl-foot {
+    margin-top: 30px; text-align: center;
+    color: rgba(255, 255, 255, 0.65); font-size: 13.5px;
+  }
+  .dl-foot a { color: #9df0c3; text-decoration: underline; text-underline-offset: 3px; }
+
+  /* ===== Footer ===== */
+  footer {
+    background: #081223; color: rgba(255, 255, 255, 0.62);
+    padding: 52px 0 36px; font-size: 14px;
+  }
+  .foot-grid {
+    display: flex; flex-wrap: wrap; gap: 28px;
+    justify-content: space-between; align-items: flex-start;
+    padding-bottom: 30px; border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .foot-brand { display: flex; align-items: center; gap: 11px; color: #fff; font-weight: 750; font-size: 18px; }
+  .foot-brand img { width: 32px; height: 32px; border-radius: 8px; }
+  .foot-links { display: flex; flex-wrap: wrap; gap: 20px; }
+  .foot-links a { color: rgba(255, 255, 255, 0.68); transition: color .2s; }
+  .foot-links a:hover { color: #fff; }
+  .foot-bottom {
+    padding-top: 22px; display: flex; flex-wrap: wrap; gap: 12px;
+    justify-content: space-between; font-size: 12.8px; color: rgba(255, 255, 255, 0.45);
+  }
+
+  /* ===== Reveal animation ===== */
+  .reveal { opacity: 0; transform: translateY(22px); transition: opacity .7s ease, transform .7s ease; }
+  .reveal.on { opacity: 1; transform: none; }
+
+  /* ===== Responsive ===== */
+  @media (max-width: 980px) {
+    .hero-grid { grid-template-columns: 1fr; gap: 44px; }
+    .hero-shot .frame { transform: none; }
+    .feat-grid { grid-template-columns: repeat(2, 1fr); }
+    .flow-track { grid-template-columns: repeat(2, 1fr); }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .dl-grid { grid-template-columns: 1fr; }
+    .enhance-grid { grid-template-columns: 1fr; }
+    .req-notes { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 680px) {
+    .wrap { width: calc(100% - 32px); }
+    .nav-links { display: none; }
+    .hero { padding: 118px 0 64px; }
+    .feat-grid { grid-template-columns: 1fr; }
+    .flow-track { grid-template-columns: 1fr; }
+    section { padding: 62px 0; }
+    th, td { padding: 12px 14px; font-size: 13.5px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ===== Nav ===== -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <img src="images/logo.png" alt="ApkStart Logo" />
+      ApkStart
+    </a>
+    <div class="nav-links">
+      <a href="#features">核心特性</a>
+      <a href="#enhance">增强分支</a>
+      <a href="#flow">工作原理</a>
+      <a href="#requirements">配置要求</a>
+    </div>
+    <a class="nav-cta" href="#download">立即下载</a>
+  </div>
+</nav>
+
+<!-- ===== Hero ===== -->
+<header class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div>
+      <div class="eyebrow"><span class="dot"></span>开源 · MIT 协议 · v0.6.4</div>
+      <h1>Windows 上的<br /><span class="grad">安卓应用运行器</span></h1>
+      <p class="hero-sub">
+        让安卓应用像 Windows 原生软件一样被安装和使用——
+        双击 .apk 即安装，每个应用一个桌面图标、一个独立窗口，
+        全程无需打开任何模拟器界面。
+      </p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#download">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 12 5 5 5-5"/><path d="M5 21h14"/></svg>
+          下载安装包
+        </a>
+        <a class="btn btn-ghost" href="https://github.com/yuchen0x1/apkstart" target="_blank" rel="noopener">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.73.5.5 5.73.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.54-3.88-1.54-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.7.08-.7 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.75.4-1.27.74-1.56-2.56-.29-5.26-1.28-5.26-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.5 3.17-1.18 3.17-1.18.63 1.59.23 2.76.12 3.05.74.81 1.18 1.84 1.18 3.1 0 4.43-2.7 5.4-5.28 5.69.42.36.79 1.07.79 2.17v3.22c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.73 18.27.5 12 .5Z"/></svg>
+          GitHub 仓库
+        </a>
+      </div>
+      <div class="hero-badges">
+        <span class="badge">Windows 10 / 11 x64</span>
+        <span class="badge">MIT License</span>
+        <span class="badge">零第三方依赖</span>
+        <span class="badge">Android 11 · API 34</span>
+      </div>
+    </div>
+    <div class="hero-shot">
+      <div class="glow"></div>
+      <div class="frame">
+        <img src="images/app.png" alt="ApkStart 主界面" />
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ===== Stats ===== -->
+<div class="stats">
+  <div class="wrap stats-grid">
+    <div class="stat reveal"><div class="num">95 MB</div><div class="label">轻量版体积（运行时按需下载）</div></div>
+    <div class="stat reveal"><div class="num">0 依赖</div><div class="label">壳层零第三方依赖，解析器全部手写</div></div>
+    <div class="stat reveal"><div class="num">4 档</div><div class="label">装前兼容性预检结论，不编结果</div></div>
+    <div class="stat reveal"><div class="num">双向</div><div class="label">文件同步按 SHA-256 三方合并，不静默覆盖</div></div>
+  </div>
+</div>
+
+<!-- ===== Features ===== -->
+<section class="features" id="features">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="sec-tag">CORE FEATURES</div>
+      <h2>像用原生软件一样用安卓应用</h2>
+      <p>从安装到启动、从窗口到搜索、从数据到备份，ApkStart 把安卓应用完整地接进 Windows 的使用习惯里。</p>
+    </div>
+    <div class="feat-grid">
+      <div class="card reveal">
+        <div class="icon">🖱️</div>
+        <h3>双击 .apk 即安装</h3>
+        <p>注册 .apk 文件关联后，在资源管理器里双击 APK，自动解析 → 安装 → 生成桌面图标，全程无需打开任何模拟器界面。</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🧩</div>
+        <h3>每个应用一个桌面图标</h3>
+        <p>图标从 APK 内部离线提取并转为多尺寸 ICO，双击桌面图标直接启动该应用，与打开原生 Windows 软件的体验一致。</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🪟</div>
+        <h3>应用就是一个窗口</h3>
+        <p>窗口带真实应用图标、按竖屏比例摆好位置；全屏铺满屏幕高度并居中，窗口模式可自由拖动缩放且按应用记忆尺寸。</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🔍</div>
+        <h3>能被 Windows 搜到</h3>
+        <p>安装后创建桌面 + 开始菜单快捷方式，按应用名在开始菜单搜索即可直达，任务栏按应用分组。</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">📁</div>
+        <h3>数据互通</h3>
+        <p>本机共享目录与安卓 /sdcard 持续双向同步，按内容哈希三方合并，两侧都改会保留两份并生成冲突副本，不会静默覆盖你的文件。</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🩺</div>
+        <h3>装之前先告诉你行不行</h3>
+        <p>兼容性检查覆盖系统版本、原生库架构、Google Play 依赖、硬件权限、拆分 APK 分片，结论分四档并给出理由；拿不准的标「未知」。</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">💾</div>
+        <h3>导出与备份</h3>
+        <p>右键任意应用可导出 APK，或生成 app.apk + meta.json 备份目录，之后一键装回。拿不到的数据如实写明原因，不冒充「备份成功」。</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon">🪶</div>
+        <h3>极致轻量</h3>
+        <p>壳层零第三方依赖（ZIP / PNG / ICO / AXML 解析都是手写的），运行时按需拉起、空闲自动回收，也可完全复用本机已有安卓运行时。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Enhancements ===== -->
+<section class="enhance" id="enhance">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="sec-tag">ENHANCED FORK</div>
+      <h2>独立增强分支，为日常使用打磨</h2>
+      <p>基于 RoutineMiku/apkstart 持续维护与发版，针对真实使用痛点做了大量修复与加固。</p>
+    </div>
+    <div class="enhance-grid">
+      <div class="chip-list reveal">
+        <div class="chip"><div class="tick">✓</div><div><b>首次运行引导向导</b><span>新用户一步步完成部署配置，不再对着空白界面猜下一步。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>多源测速与慢速逃生</b><span>每次现测现选下载源，实测吞吐排序，失败自动换线；检测到本地代理自动走代理。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>在线自动更新</b><span>发现新版本系统通知 + 后台下载，不打断正在使用的应用，等窗口关闭再静默安装。</span></div></div>
+      </div>
+      <div class="chip-list reveal">
+        <div class="chip"><div class="tick">✓</div><div><b>应用窗口鼠标点击修复</b><span>修复窗口模式下的鼠标事件透传问题，触控与点击都跟手。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>Android 11+ 音量命令修复</b><span>高版本安卓的媒体音量控制恢复正常，快捷键可用。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>网络不折腾</b><span>走 QEMU 用户态 NAT 复用主机网卡，不创建虚拟网卡 / 虚拟交换机，不装驱动。</span></div></div>
+      </div>
+      <div class="chip-list reveal">
+        <div class="chip"><div class="tick">✓</div><div><b>多项安全加固</b><span>更新链路只认本仓库，装后核对版本、失败回滚，安装包校验到位。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>脱敏诊断报告</b><span>开机失败自动生成已脱敏的诊断报告，修复窗口一键上报，问题定位不靠猜。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>闪退自动恢复</b><span>存活观察 18 秒，闪退自动重试 / 重置数据 / 补权限，应用尽量拉得起来。</span></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Flow ===== -->
+<section class="flow" id="flow">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="sec-tag">HOW IT WORKS</div>
+      <h2>从双击到启动，四步直达</h2>
+      <p>没有模拟器控制台，没有多余界面——用户看到的只有应用本身。</p>
+    </div>
+    <div class="flow-track">
+      <div class="step reveal">
+        <h3>双击桌面图标</h3>
+        <p>每个已安装应用都有真实图标快捷方式（.lnk），双击即触发 <b>ApkStart.exe --launch 包名</b>。</p>
+      </div>
+      <div class="step reveal">
+        <h3>按需拉起运行时</h3>
+        <p>运行时未启动则自动拉起 Android Emulator（API 34）；空闲自动回收，也可复用本机已有运行时。</p>
+      </div>
+      <div class="step reveal">
+        <h3>解析真实入口启动</h3>
+        <p>按系统解析出的 LAUNCHER 入口启动（而非 APK 里的主 Activity），并做 18 秒存活观察与自动恢复。</p>
+      </div>
+      <div class="step reveal">
+        <h3>窗口即应用</h3>
+        <p>模拟器窗口自动改标题、换真实应用图标、按竖屏比例摆放——全屏居中或自由窗口，F11 随时切换。</p>
+      </div>
+    </div>
+    <div class="flow-note reveal">
+      运行时自持管理 · 位于 <code>%APPDATA%\apkstart\runtime</code> · 数据与快照可迁移到其它盘
+    </div>
+  </div>
+</section>
+
+<!-- ===== Requirements ===== -->
+<section class="reqs" id="requirements">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="sec-tag">REQUIREMENTS</div>
+      <h2>配置要求</h2>
+      <p>没有硬件加速也能跑（纯软件模拟），但推荐开启虚拟化以获得流畅体验。</p>
+    </div>
+    <div class="req-table-wrap reveal">
+      <table>
+        <thead>
+          <tr><th>项</th><th>最低</th><th>推荐</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>系统</td><td>Windows 10 x64（1903+）</td><td>Windows 11</td></tr>
+          <tr><td>CPU</td><td>4 逻辑核，支持虚拟化（VT-x / AMD-V，未开启时走软件模拟）</td><td>8 核及以上</td></tr>
+          <tr><td>内存</td><td>8 GB</td><td>16 GB 及以上</td></tr>
+          <tr><td>磁盘</td><td>约 8 GB 可用空间（镜像 + 数据分区 + 快照）</td><td>20 GB 及以上（装大型游戏更宽裕）</td></tr>
+          <tr><td>显卡</td><td>无硬性要求（无加速时自动软件渲染）</td><td>支持 OpenGL ES / Vulkan 的独显或核显</td></tr>
+          <tr><td>网络</td><td>仅首次部署需要联网下载运行时（完整版离线可用）</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="req-notes">
+      <div class="note reveal"><b>Windows 7 / 8 不能运行</b>——依赖 Electron 23+ 与新版 WHPX / AEHD 加速组件。建议在 BIOS 开启虚拟化并勾选「虚拟机平台」Windows 功能，或使用内置 AEHD 驱动。</div>
+      <div class="note reveal"><b>C 盘空间紧张？</b>在「设置 → 系统集成」里把运行时数据目录与安卓数据目录改到其它盘，应用与存档不会丢；已生成的 AVD 目录可整体剪切后切换设置。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Download ===== -->
+<section class="download" id="download">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <div class="sec-tag">DOWNLOAD</div>
+      <h2>选择适合你的版本</h2>
+      <p>两个发行版功能一致，区别只在运行时的获取方式。当前版本 v0.6.4。</p>
+    </div>
+    <div class="dl-grid">
+      <div class="dl-card featured reveal">
+        <div class="tagline">推荐 · 离线完整版</div>
+        <h3>安装版 Setup.exe</h3>
+        <div class="size">约 1.3 GB · 含全部运行时</div>
+        <ul>
+          <li>一个 EXE 包含 adb / Emulator / 系统镜像</li>
+          <li>装完首次启动自动展开镜像，之后零联网</li>
+          <li>装到当前用户目录，不要求管理员权限</li>
+          <li>自动更新走静默安装，不打断使用中的应用</li>
+        </ul>
+        <a class="btn btn-primary" href="https://github.com/yuchen0x1/apkstart/releases" target="_blank" rel="noopener">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 12 5 5 5-5"/><path d="M5 21h14"/></svg>
+          前往 Releases 下载
+        </a>
+      </div>
+      <div class="dl-card reveal">
+        <div class="tagline">轻量 · 便携版</div>
+        <h3>Portable.zip</h3>
+        <div class="size">约 95 MB · 解压后约 226 MB</div>
+        <ul>
+          <li>首次启动才在后台下载运行时</li>
+          <li>多源测速自动选最快线路，失败自动换源</li>
+          <li>检测到本地代理自动走代理加速</li>
+          <li>更新只覆盖程序目录，已装应用与快照不丢</li>
+        </ul>
+        <a class="btn btn-ghost" href="https://github.com/yuchen0x1/apkstart/releases" target="_blank" rel="noopener">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 12 5 5 5-5"/><path d="M5 21h14"/></svg>
+          前往 Releases 下载
+        </a>
+      </div>
+    </div>
+    <div class="dl-foot reveal">
+      源码构建与更多发行说明见 <a href="https://github.com/yuchen0x1/apkstart#readme" target="_blank" rel="noopener">GitHub README</a> ·
+      问题与建议请提交至 <a href="https://github.com/yuchen0x1/apkstart/issues" target="_blank" rel="noopener">Issues</a>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Footer ===== -->
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <img src="images/logo.png" alt="ApkStart" />
+        ApkStart
+      </div>
+      <div class="foot-links">
+        <a href="https://github.com/yuchen0x1/apkstart" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/yuchen0x1/apkstart/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/yuchen0x1/apkstart/blob/main/CHANGELOG.md" target="_blank" rel="noopener">更新日志</a>
+        <a href="https://github.com/yuchen0x1/apkstart/blob/main/SECURITY.md" target="_blank" rel="noopener">安全策略</a>
+        <a href="https://github.com/yuchen0x1/apkstart/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">参与贡献</a>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <div>© 2025–2026 ApkStart · MIT License · 独立增强分支，上游项目 RoutineMiku/apkstart</div>
+      <div>本站为静态宣传页，仅供参考，下载以 GitHub Releases 为准</div>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Scroll reveal
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((e) => {
+      if (e.isIntersecting) {
+        e.target.classList.add("on");
+        io.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.12, rootMargin: "0px 0px -40px 0px" });
+  document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+
+  // Nav background solidification on scroll
+  const nav = document.querySelector(".nav");
+  const onScroll = () => {
+    if (window.scrollY > 20) nav.style.background = "rgba(8, 18, 35, 0.92)";
+    else nav.style.background = "rgba(11, 27, 51, 0.72)";
+  };
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+</script>
+</body>
+</html>
