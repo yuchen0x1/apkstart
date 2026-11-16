@@ -60,7 +60,8 @@ jobs:
           echo "发布版本：$tag"
 
       # 发行说明统一由 tools/release-notes.js 产出（手写 release-notes 文件 → CHANGELOG
-      # 段落 → git log 三级兜底），正文一律去掉重复的版本大标题。
+      # 段落 → git log 三级兜底），正文一律去掉重复的版本大标题，并自动补齐下载、升级、
+      # 支持范围等每版都必须保留的基础信息。
       - name: 生成发行说明
         env:
           TAG: ${{ steps.version.outputs.tag }}

@@ -12,6 +12,7 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const { AdbClient } = require('./adb');
+const { parseVolumeGet } = require('./android');
 const store = require('./store');
 const { Provisioner } = require('./provision');
 const { EmulatorEngine } = require('./emulator');
@@ -60,6 +61,7 @@ class Runtime {
     this.lastActivity = Date.now();
     this._watchdog = null;
     this._freeformReady = false;
+    this._guestDefaultsReady = false;
     this._client = null;
     this._bootLog = [];
     this._activeApps = new Set();  // 容器会话：当前打开的应用窗口
@@ -119,6 +121,13 @@ class Runtime {
       emulatorVersion: env.emulator.version,
       sysimgOk: env.sysimg.ok,
       sysimgNote: env.sysimg.note,
+      // 镜像来源：默认 Play 镜像 还是 用户导入的自定义镜像（以及它为什么不可用）。
+      // 顶栏徽标、设置页「当前镜像」都用这两个字段，避免各处自己猜。
+      sysimgCustom: !!(env.sysimg && env.sysimg.custom),
+      imageName: (env.activeImage && env.activeImage.ok && env.activeImage.custom)
+        ? env.activeImage.name : '',
+      imageWhy: (env.activeImage && env.activeImage.custom && !env.activeImage.ok)
+        ? env.activeImage.reason : '',
       accel: env.accel,
       vmRunning: this.emulator.running() || !!(this.vmProc && !this.vmProc.killed),
       vmStarting: this.vmStarting,
@@ -136,6 +145,10 @@ class Runtime {
       error: '',
       serial: this.emuSerial,
       autoProfile: this.emulator.profile ? doctor.describeProfile(this.emulator.profile) : '',
+      // 为什么是这组参数（低配降级的原因 / 哪些项是用户手动钉住的）：
+      // 首页横幅与设置页都显示同一句话，避免「显示的」和「实跑的」对不上。
+      autoProfileWhy: this.emulator.profile ? doctor.describeTuning(this.emulator.profile) : '',
+      autoProfileManual: this.emulator.profile ? doctor.describeManual(this.emulator.profile) : '',
       diagnosis: this.emulator.lastDiagnosis || null,
       attempts: this.emulator.attempts || [],
       // 「上次为什么没起来」：内存里没有就回落到落盘记录，设置页/诊断都能显示真实原因
@@ -547,6 +560,42 @@ class Runtime {
     }
     if (!this._freeformReady) {
       try { this._freeformReady = await client.ensureFreeform(); } catch (_) { /* ignore */ }
+    }
+    // 国产用户第一次进入运行时时，系统桌面默认可能是英文且媒体音量为 0。
+    // 这里在 Android 真正可用后一次性设置中文环境与 50% 媒体音量，之后保留用户自己的调整。
+    if (!this._guestDefaultsReady) {
+      let volumeReady = store.getSettings().androidVolumeInitialized === true;
+      try {
+        await client.shell(
+          'settings put system system_locales zh-CN 2>/dev/null; '
+          + 'setprop persist.sys.locale zh-CN 2>/dev/null; '
+          + 'setprop persist.sys.language zh 2>/dev/null; '
+          + 'setprop persist.sys.country CN 2>/dev/null',
+          { timeout: 15000 },
+        );
+      } catch (_) { /* 旧版镜像不支持 cmd locale 时，后面的兼容设置仍会生效 */ }
+      if (store.getSettings().androidVolumeInitialized !== true) {
+        try {
+          const out = await client.shell('cmd media_session volume --stream 3 --get 2>/dev/null', { timeout: 10000 });
+          const vg = parseVolumeGet(out);
+          const max = vg && vg.max > 0 ? vg.max : 15;
+          const target = Math.max(0, Math.min(max, Math.round(max * 0.5)));
+          await client.shell(`cmd media_session volume --stream 3 --set ${target} 2>/dev/null`, { timeout: 10000 });
+          let after = parseVolumeGet(await client.shell('cmd media_session volume --stream 3 --get 2>/dev/null', { timeout: 10000 }));
+          for (let i = 0; after && after.cur !== target && i < max; i += 1) {
+            const key = after.cur < target ? 24 : 25; // VOLUME_UP / VOLUME_DOWN
+            await client.shell(`input keyevent ${key}`, { timeout: 5000 });
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            after = parseVolumeGet(await client.shell('cmd media_session volume --stream 3 --get 2>/dev/null', { timeout: 10000 }));
+          }
+          // 只有重新读取到目标档位才算完成初始化。读取失败时不能把“未知状态”
+          // 当成成功，否则本次启动可能仍然是静音，而后续启动又不会再修复。
+          if (after && after.cur === target) store.saveSettings({ androidVolumeInitialized: true });
+          else throw new Error('媒体音量未能调整到默认值');
+          volumeReady = true;
+        } catch (_) { /* 音频服务尚未完全起来时，下次进入运行时再试 */ }
+      }
+      this._guestDefaultsReady = volumeReady;
     }
     // 横屏 LCD 下不需要（也不允许）留 wm size 覆盖：旧版本「全屏=平板排版」会把
     // 1280x720 写进 /data 并在重启后继续生效，横屏 LCD 再套一层覆盖就变成
@@ -1078,7 +1127,12 @@ class Runtime {
     });
   }
 
-  usage() { return require('./layers').summary(this.provisioner.paths().root); }
+  usage() {
+    // 只把「当前这轮用的那套 AVD」当作活动 AVD：另一套（默认 ↔ 自定义镜像）
+    // 的快照不该被当成可回收项列出来，否则用户一清理，切回去就要重新冷启动。
+    const layers = require('./layers');
+    return layers.summary(this.provisioner.paths().root, { keepAvd: `${this.emulator.avdName}.avd` });
+  }
 
   /**
    * 回收运行时里的旧镜像 / 旧 AVD / 锁文件 / 快照。
@@ -1093,7 +1147,10 @@ class Runtime {
       stoppedVm = true;
     }
     const report = require('./layers').prune(this.provisioner.paths().root, {
-      apply, aggressive, keepSnapshots: !includeSnapshots && this.vmRunning,
+      apply,
+      aggressive,
+      keepAvd: `${this.emulator.avdName}.avd`,
+      keepSnapshots: !includeSnapshots && this.vmRunning,
     });
     // 预览阶段若停了机，给用户一个提示：清完可手动重启运行时
     return { ...report, apply, stoppedVm };
@@ -1103,7 +1160,8 @@ class Runtime {
    * 彻底重置安卓数据（清空 /data 用户分区 + 已装应用 + 快速启动快照），
    * 把 AVD 还原成「刚装好系统、没有任何第三方 app」的干净状态。
    * 这一项会真实删除 8–16GB 的用户数据镜像，必须二次确认（UI 负责），且只动
-   * 当前活动 AVD（apkstart.avd），不动只读基础镜像、不动其它 AVD。
+   * 当前活动 AVD（默认镜像 apkstart.avd / 自定义镜像 apkstart-custom.avd），
+   * 不动只读基础镜像、不动另一个 AVD。
    * 保留 config.ini / hardware-qemu.ini，AVD 仍有效，下次点开应用会重新冷启动建数据。
    * @returns {{ok:boolean, reclaimed:number, avdDir:string, error?:string}}
    */
@@ -1112,7 +1170,11 @@ class Runtime {
     const path = require('path');
     try {
       if (this.vmRunning) await this.stop().catch(() => {});
-      const avdDir = path.join(this.provisioner.paths().avdHome, 'apkstart.avd');
+      // 必须取「当前活动 AVD」：写死 apkstart.avd 时，用自定义镜像的用户点「重置数据」
+      // 清的是默认镜像那份用户数据（应用的存档、登录态全没了），而真正出问题的
+      // 自定义 AVD 一个字节都没动 —— 既丢了数据，又没修好问题。
+      const avdName = (this.emulator && this.emulator.avdName) || 'apkstart';
+      const avdDir = path.join(this.provisioner.paths().avdHome, `${avdName}.avd`);
       let reclaimed = 0;
       if (fs.existsSync(avdDir)) {
         for (const e of fs.readdirSync(avdDir, { withFileTypes: true })) {
@@ -1142,7 +1204,16 @@ class Runtime {
       }
       // 用户数据镜像被删后，用户侧「已安装 app」的记录也要清掉，
       // 否则桌面/启动器还显示着其实已不存在的 app。
-      try { store.saveApps([]); } catch (_) { /* ignore */ }
+      // 但这份清单是两套 AVD 共用的：自定义镜像下重置只影响 apkstart-custom，
+      // 默认镜像里的应用其实还在（点开时会自动装回来），清空等于把它们的记录也删了。
+      const customActive = avdName === 'apkstart-custom';
+      if (!customActive) {
+        try { store.saveApps([]); } catch (_) { /* ignore */ }
+      }
+      // /data 被删了，guest 里的语言与音量也一起回到出厂值：
+      // 清掉这个一次性标记，下次开机重新设中文环境 + 50% 音量，
+      // 否则重置过的机器会一直是英文界面 / 可能的静音状态。
+      try { store.saveSettings({ androidVolumeInitialized: false }); } catch (_) { /* ignore */ }
       return { ok: true, reclaimed, avdDir };
     } catch (e) {
       return { ok: false, reclaimed: 0, avdDir: '', error: e.message };

@@ -304,6 +304,5 @@ test('音量百分比换算：0-15 档映射到 0-100', () => {
   const maxed = parseVolumeGet('volume: 15/15');
   assert(Math.round((maxed.cur / maxed.max) * 100) === 100, '满档应为 100%');
 });
-
 console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
 process.exit(failed ? 1 : 0);

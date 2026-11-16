@@ -30,13 +30,30 @@ function dirSize(dir) { return walk(dir).reduce((n, f) => n + f.size, 0); }
 const exists = (p) => { try { return fs.existsSync(p); } catch (_) { return false; } };
 
 /**
+ * 归本程序管理的 AVD。内置三档各自隔离，再加自定义镜像：
+ *   apkstart.avd            —— Google Play（默认）
+ *   apkstart-aosp.avd       —— 纯 AOSP 实验档
+ *   apkstart-googleapis.avd —— Google APIs
+ *   apkstart-custom.avd     —— 自定义镜像
+ * 两者都是「用户正在用的 AVD」，清理逻辑绝不能把它们当「非活动 AVD」删掉 ——
+ * 那里面是已装应用、存档和快照。只有既不在这个表里、也不在别处的才允许回收。
+ */
+const MANAGED_AVDS = [
+  'apkstart-googleapis.avd', 'apkstart-aosp.avd', 'apkstart.avd', 'apkstart-custom.avd',
+];
+
+/**
  * 盘点运行时占用，并列出「可安全回收」的条目。
  * @returns {{total:number, groups:Array, candidates:Array}}
  */
-function analyze(root, { keepAvd = 'apkstart.avd', aggressive = false, keepSnapshots = false } = {}) {
+function analyze(root, {
+  keepAvd = 'apkstart.avd', protectedAvds = MANAGED_AVDS,
+  aggressive = false, keepSnapshots = false,
+} = {}) {
   const groups = [];
   const candidates = [];
   if (!exists(root)) return { total: 0, groups, candidates };
+  const keep = new Set([].concat(keepAvd || [], protectedAvds || []));
 
   const groupOf = (name, dir) => {
     const size = dirSize(dir);
@@ -76,11 +93,11 @@ function analyze(root, { keepAvd = 'apkstart.avd', aggressive = false, keepSnaps
   const stray = path.join(root, 'x86_64');
   if (exists(stray)) add(stray, dirSize(stray), '解压错位产生的重复镜像目录', 'dir');
 
-  // 4) 非活动 AVD：产品只用 apkstart 一个；测试期遗留的 apkstart-arm / -houdini 等可清
+  // 4) 非活动 AVD：三档内置镜像与自定义镜像都受保护；测试期遗留的 apkstart-arm / -houdini 等可清
   const avdHome = path.join(root, 'avd');
   if (exists(avdHome)) {
     for (const e of fs.readdirSync(avdHome, { withFileTypes: true })) {
-      if (!e.isDirectory() || !e.name.endsWith('.avd') || e.name === keepAvd) continue;
+      if (!e.isDirectory() || !e.name.endsWith('.avd') || keep.has(e.name)) continue;
       add(path.join(avdHome, e.name), dirSize(path.join(avdHome, e.name)),
         '非活动 AVD（含 8-16GB 的旧用户数据镜像）', 'dir');
     }
@@ -88,7 +105,9 @@ function analyze(root, { keepAvd = 'apkstart.avd', aggressive = false, keepSnaps
     for (const f of walk(avdHome)) {
       if (/\.lock$/i.test(f.path)) add(f.path, f.size, '上次异常退出残留的锁文件');
     }
-    // 6) 快速启动快照：ram.img ≈ 分配给虚拟机的内存，损坏或配置变更后必须丢弃
+    // 6) 快速启动快照：ram.img ≈ 分配给虚拟机的内存，损坏或配置变更后必须丢弃。
+    //    只清理「当前正在用的那套 AVD」的快照：另一套 AVD 的快照属于另一种镜像，
+    //    删了它等于让用户切回去时白等一次冷启动。
     const activeAvd = path.join(avdHome, keepAvd);
     if (exists(activeAvd) && !keepSnapshots) {
       for (const e of fs.readdirSync(activeAvd, { withFileTypes: true })) {
@@ -130,8 +149,10 @@ function analyze(root, { keepAvd = 'apkstart.avd', aggressive = false, keepSnaps
  * 回收。必须显式传 apply:true；调用方（UI/构建脚本）负责先展示清单并取得确认。
  * 安全约束：任何目标都必须在 root 之内，且不允许把 root 自身删掉。
  */
-function prune(root, { apply = false, keepAvd, aggressive = false, keepSnapshots = false, onRemove = () => {} } = {}) {
-  const report = analyze(root, { keepAvd, aggressive, keepSnapshots });
+function prune(root, {
+  apply = false, keepAvd, protectedAvds, aggressive = false, keepSnapshots = false, onRemove = () => {},
+} = {}) {
+  const report = analyze(root, { keepAvd, protectedAvds, aggressive, keepSnapshots });
   const rootAbs = path.resolve(root);
   const removed = [];
   let saved = 0;
@@ -152,8 +173,8 @@ function prune(root, { apply = false, keepAvd, aggressive = false, keepSnapshots
 }
 
 /** 给设置页用的简短摘要 */
-function summary(root) {
-  const a = analyze(root);
+function summary(root, opts = {}) {
+  const a = analyze(root, opts);
   const mb = (n) => (n >= 1048576 * 1024
     ? `${(n / 1073741824).toFixed(2)} GB`
     : `${(n / 1048576).toFixed(0)} MB`);
@@ -183,4 +204,4 @@ function summary(root) {
   };
 }
 
-module.exports = { analyze, prune, summary, walk, dirSize };
+module.exports = { analyze, prune, summary, walk, dirSize, MANAGED_AVDS };

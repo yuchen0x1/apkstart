@@ -116,7 +116,24 @@ class AndroidSettings {
     const max = vg ? vg.max : 15;
     const target = Math.max(0, Math.min(max, Math.round((v / 100) * max)));
     await this._sh([`cmd media_session volume --stream 3 --set ${target}`]);
-    return { ok: true, volume: v };
+    // 部分 Android 14 Google Play 镜像会接受 --set 但不刷新 AudioService 的实际档位。
+    // 用音量键事件校正一次，并重新读取确认，避免界面显示已调整而应用仍然静音。
+    let after = parseVolumeGet(await this._sh(['cmd media_session volume --stream 3 --get']));
+    for (let i = 0; after && after.cur !== target && i < max; i += 1) {
+      const key = after.cur < target ? 24 : 25; // VOLUME_UP / VOLUME_DOWN
+      await this._sh([`input keyevent ${key}`]);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      after = parseVolumeGet(await this._sh(['cmd media_session volume --stream 3 --get']));
+    }
+    const actualVolume = after ? Math.round((after.cur / after.max) * 100) : null;
+    return {
+      ok: true,
+      volume: v,
+      actualVolume,
+      // 供设置页在 Android 音频服务未及时刷新时显示真实状态；
+      // 保留 ok=true 兼容旧调用方，初始化链路仍会严格校验。
+      verified: !!after && after.cur === target,
+    };
   }
 
   /** 关闭系统动画 = 明显的「变快」体感，且几乎不损失功能 */

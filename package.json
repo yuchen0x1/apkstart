@@ -41,7 +41,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test": "node test/run-tests.js && node test/engine-test.js && node test/auto-test.js && node test/sync-test.js && node test/updater-test.js && node test/security-test.js && node test/compat-test.js && node test/backup-test.js && node test/uninstall-test.js && node test/i18n-test.js && node test/repair-test.js && node test/report-test.js && node test/collector-test.js && node test/release-notes-test.js",
+    "test": "node test/run-tests.js && node test/engine-test.js && node test/auto-test.js && node test/sync-test.js && node test/updater-test.js && node test/security-test.js && node test/compat-test.js && node test/backup-test.js && node test/uninstall-test.js && node test/i18n-test.js && node test/repair-test.js && node test/lowspec-test.js && node test/image-adapter-test.js && node test/report-test.js && node test/collector-test.js && node test/release-notes-test.js",
     "test:sync": "node test/sync-test.js",
     "test:updater": "node test/updater-test.js",
     "test:security": "node test/security-test.js",

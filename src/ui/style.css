@@ -7,9 +7,11 @@
   --text: #1b1f24;
   --muted: #6b7480;
   --faint: #97a0ac;
-  --brand: #16a34a;
-  --brand-dark: #12833c;
-  --brand-soft: #eaf7ef;
+  /* 小米风格强调色：橙色用于主操作、选中状态和通知进度。 */
+  --brand: #ff6900;
+  --brand-dark: #e85d00;
+  --brand-soft: #fff1e8;
+  --mi-red: #f04438;
   --danger: #dc2626;
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, .06);
   --shadow-md: 0 8px 24px rgba(16, 24, 40, .10);
@@ -117,7 +119,7 @@ body {
   color: var(--faint);
   transition: border-color .15s, box-shadow .15s;
 }
-.search:focus-within { border-color: #b9c6d4; box-shadow: 0 0 0 3px rgba(22,163,74,.08); }
+.search:focus-within { border-color: #f2b48d; box-shadow: 0 0 0 3px rgba(255,105,0,.10); }
 .search input {
   border: none; outline: none; background: transparent;
   width: 100%; font-size: 13px; color: var(--text);
@@ -413,7 +415,7 @@ body {
   margin-left: auto; margin-right: auto;
 }
 .settings-page .group { padding-top: 20px; padding-bottom: 12px; }
-.settings-page .group-title { font-size: 12px; margin-bottom: 13px; }
+.settings-page .group-title { font-size: 12px; margin-bottom: 13px; color: var(--brand-dark); }
 .settings-page .field { margin-bottom: 15px; }
 .settings-page .field.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .settings-page .modal-body::-webkit-scrollbar-thumb { border-color: var(--bg); }
@@ -461,13 +463,22 @@ body {
 .group:last-child { border-bottom: none; }
 .group-title {
   font-size: 11.5px; font-weight: 650; letter-spacing: .4px;
-  color: var(--faint); text-transform: uppercase;
+  color: var(--brand-dark); text-transform: uppercase;
   margin-bottom: 10px;
 }
 
 .field { margin-bottom: 12px; }
 .field label { display: block; font-size: 12.5px; margin-bottom: 6px; color: var(--text); font-weight: 500; }
 .field .sub { display: block; font-size: 11.5px; color: var(--faint); margin-top: 2px; line-height: 1.5; }
+.miui-note {
+  display: block;
+  margin: -3px 0 14px;
+  padding: 9px 11px;
+  border-left: 3px solid var(--brand);
+  border-radius: 8px;
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+}
 .field input[type=text], .field input[type=number], .field select {
   width: 100%; height: 32px;
   border: 1px solid var(--line);
@@ -478,7 +489,7 @@ body {
   background: var(--panel-2);
   outline: none;
 }
-.field input:focus, .field select:focus { border-color: #b9c6d4; box-shadow: 0 0 0 3px rgba(22,163,74,.08); }
+.field input:focus, .field select:focus { border-color: #f2b48d; box-shadow: 0 0 0 3px rgba(255,105,0,.10); }
 .field input[readonly] { color: var(--muted); }
 .field .row { display: flex; gap: 8px; }
 .checkbox-inline { display: inline-flex; align-items: center; gap: 6px; margin-top: 7px; font-size: 12px; color: var(--faint); }
@@ -510,6 +521,16 @@ body {
 }
 .switch:checked { background: var(--brand); }
 .switch:checked::after { transform: translateX(16px); }
+.field .row input.switch {
+  /* .field .row input 的 flex:1 不能作用到开关，否则会拉成整行绿色长条。 */
+  flex: 0 0 38px;
+  width: 38px;
+  min-width: 38px;
+  height: 22px;
+  padding: 0;
+  margin: 0;
+}
+.switch:focus-visible { outline: 2px solid color-mix(in srgb, var(--brand) 55%, transparent); outline-offset: 3px; }
 
 .note {
   margin: 2px 0 12px;

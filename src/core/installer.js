@@ -102,6 +102,8 @@ class Installer {
   /** 兼容镜像按「首次遇到 ARM 应用」按需下载，作为共享只读基础层只下一次 */
   async ensureCompatImage(onProgress) {
     const prov = this.runtime.provisioner;
+    const current = prov.systemImageInfo();
+    if (current && current.armTranslation && current.armTranslation.enabled) return true;
     if (prov.playImageInfo().ok) return true;
     onProgress({ stage: 'runtime', message: '首次安装 ARM 应用：正在下载兼容镜像（约 1.5GB，只需一次）…' });
     await prov.installPlayImage((p) => onProgress({ stage: 'runtime', message: p.message, percent: p.percent }));
@@ -112,7 +114,7 @@ class Installer {
   /** 切换镜像必须重启运行时；重启后把已装应用从本地 APK 备份重新灌回去 */
   async switchToCompat(onProgress) {
     const apps = store.getApps();
-    store.saveSettings({ runtime: { compatImage: true } });
+    store.saveSettings({ runtime: { compatImage: true, systemImageFlavor: 'google_apis_playstore' } });
     onProgress({ stage: 'runtime', message: '正在切换到兼容镜像并重启运行时…' });
     try { await this.runtime.stop(); } catch (_) { /* ignore */ }
     // 等旧设备从 adb 列表里消失，避免被 ensure() 当成可复用实例
@@ -148,14 +150,14 @@ class Installer {
     return rt;
   }
 
-  async install(filePath, onProgress = () => {}) {
+  async install(filePath, onProgress = () => {}, { meta: cachedMeta = null } = {}) {
     onProgress({ stage: 'parse', message: '正在解析 APK…' });
-    let meta;
+    let meta = cachedMeta;
     let bundle = null;
     if (/\.(apks|xapk)$/i.test(filePath)) {
       bundle = await parseBundle(filePath);
       meta = bundle.meta;
-    } else {
+    } else if (!meta) {
       meta = parseApk(filePath);
     }
     onProgress({
@@ -166,7 +168,9 @@ class Installer {
 
     try {
       // 零配置：仅含 ARM 库的应用自动补齐带 ARM 翻译层的镜像，用户不用开任何开关
-      if (isArmOnly(meta) && !this.runtime.provisioner.playImageInfo().ok) {
+      const currentImage = this.runtime.provisioner.systemImageInfo();
+      const armReady = !!(currentImage && currentImage.armTranslation && currentImage.armTranslation.enabled);
+      if (isArmOnly(meta) && !armReady) {
         await this.ensureCompatImage(onProgress);
         const switched = await this.switchToCompat(onProgress);
         return this.finishInstall(switched, meta, filePath, bundle, onProgress);
@@ -197,7 +201,9 @@ class Installer {
       else await client.install(filePath);
     } catch (e) {
       // 到了这一步还报 ABI 不匹配：说明当前运行时是 AOSP 镜像，自动切兼容镜像再装一次
-      if (e.code === 'NO_MATCHING_ABIS' && !this.runtime.provisioner.playImageInfo().ok) {
+      const currentImage = this.runtime.provisioner.systemImageInfo();
+      const armReady = !!(currentImage && currentImage.armTranslation && currentImage.armTranslation.enabled);
+      if (e.code === 'NO_MATCHING_ABIS' && !armReady) {
         await this.ensureCompatImage(onProgress);
         const rt2 = await this.switchToCompat(onProgress);
         onProgress({ stage: 'install', message: '已切换兼容镜像，正在重新安装…' });
@@ -459,15 +465,22 @@ class Installer {
         await rt.client.install(app.apkPath).catch((e) => onLog(`自动安装失败：${e.message}`));
       }
     }
-    // 观察 25 秒并要求「连续存活 5 秒」才算启动成功。
+    // 观察一段时间并要求「连续存活 4 秒」才算启动成功。
     // 关键：进程"还没起来"和"起来过又没了"必须分开看。以前一看到 pidof 为空就判失败，
-    // 结果大型应用（红果这种首启要十几秒的）在加载途中就被 force-stop 重启，
+    // 结果大型应用（红果、抖音这种首启要十几秒的）在加载途中就被 force-stop 重启，
     // 反复三轮才勉强起来，用户感知就是"点了要等一分钟"。
+    //
+    // 观察窗口按机器能力给：没有硬件加速（纯 TCG）或已被自动降级的低配机上，
+    // 抖音这种应用的进程可能要几十秒才出现，25 秒必然误判成"启动失败"。
+    const prof = (this.runtime && this.runtime.emulator && this.runtime.emulator.profile) || null;
+    const slowMachine = !!(prof && (prof.accelOk === false || prof.tuned));
+    const aliveBudgetMs = slowMachine ? 45000 : 25000;
+    let everSeen = false;
     const staysAlive = async () => {
       const t0 = Date.now();
       let aliveSince = 0;
       let seen = false;
-      while (Date.now() - t0 < 25000) {
+      while (Date.now() - t0 < aliveBudgetMs) {
         // 先查再睡：常驻容器里热启动往往 1 秒内就能看到进程，
         // 先 sleep 1 秒等于把最快的那条路径硬生生拖慢一秒。
         // eslint-disable-next-line no-await-in-loop
@@ -476,6 +489,7 @@ class Installer {
           if (seen) return false; // 起来过又消失 = 真的崩了
         } else {
           seen = true;
+          everSeen = true;
           if (!aliveSince) aliveSince = Date.now();
           if (Date.now() - aliveSince >= 4000) return true;
         }
@@ -490,6 +504,7 @@ class Installer {
       await rt.client.grantRuntimePermissions(pkg).catch(() => {});
       onMark('permissions granted');
       let ok = false;
+      let cacheRetried = false;
       for (let attempt = 1; attempt <= 3 && !ok; attempt += 1) {
         if (attempt > 1) {
           // eslint-disable-next-line no-await-in-loop
@@ -508,7 +523,16 @@ class Installer {
           await start();
         } catch (e) {
           // 有明确崩溃日志才交给外层（可能要切兼容镜像）；没有证据多半只是启动慢，重试即可
-          if (e.code === 'APP_CRASHED' && e.crash) throw e;
+          if (e.code === 'APP_CRASHED' && e.crash) {
+            if (!cacheRetried) {
+              cacheRetried = true;
+              onLog('检测到应用启动异常，正在清理临时缓存并重试（不会删除个人数据）…');
+              await rt.client.clearCache(pkg).catch(() => {});
+              await sleep(700);
+            } else {
+              throw e;
+            }
+          }
           started = false;
         }
         onMark(`am start #${attempt} ${started ? 'ok' : 'fail'}`);
@@ -520,6 +544,18 @@ class Installer {
       if (!ok) {
         // 兜底：异常退出会留下「半初始化」的数据，导致之后每次都崩。
         // 清一次应用数据再拉起来，成功率最高（用户不必自己去设置里清缓存）。
+        //
+        // 但**只有「进程真的起来过又死了」才算数据可疑**。如果进程从头到尾没出现过
+        // （低配机 / 无硬件加速时抖音首启要几十秒），那只是慢，不是数据坏了 ——
+        // 这时候 pm clear 会把登录态、草稿、离线缓存一起删掉，是最不该发生的事。
+        if (!everSeen) {
+          const err = new Error(
+            `应用在 ${Math.round(aliveBudgetMs / 1000)} 秒内还没起来（机器较慢，首次启动尤其明显）。`
+            + '已保留应用数据，稍后再点一次通常就能进。',
+          );
+          err.code = 'APP_SLOW';
+          throw err;
+        }
         onLog('应用连续退出，正在重置应用数据后重试…');
         await rt.client.shell(`pm clear ${shellQuote(pkg)}`, { timeout: 20000 }).catch(() => '');
         await sleep(800);
@@ -537,7 +573,23 @@ class Installer {
         throw err;
       }
     } catch (e) {
-      if (e.code === 'APP_CRASHED' && !this.runtime.provisioner.playImageInfo().ok) {
+      // 自定义镜像（多半是纯 x86_64 AOSP）通常没有 houdini/ARM 转译，arm64-only 的应用
+      // （抖音就是）必然崩。这时**不能**走下面「切兼容镜像」：imageChoice() 优先返回
+      // 用户选的自定义镜像，切了也不会生效，只会让用户以为程序在修、其实原地打转。
+      let actImg = null;
+      try { actImg = this.runtime.provisioner.activeImage(); } catch (_) { actImg = null; }
+      if (e.code === 'APP_CRASHED' && actImg && actImg.ok && actImg.custom) {
+        const err = new Error(
+          `「${(app && app.label) || pkg}」是按 ARM 编译的应用，需要 ARM 转译层；`
+          + `当前使用的自定义镜像「${actImg.name || actImg.id}」没有转译层，所以一启动就退出。`
+          + '请在「设置 → 高级参数 → 自定义安卓镜像」里点「恢复默认镜像」再试（默认镜像带 ARM 转译）。',
+        );
+        err.code = 'NEEDS_ARM_TRANSLATION';
+        throw err;
+      }
+      const currentImage = this.runtime.provisioner.systemImageInfo();
+      const armReady = !!(currentImage && currentImage.armTranslation && currentImage.armTranslation.enabled);
+      if (e.code === 'APP_CRASHED' && !armReady) {
         // 崩溃来自 ARM 翻译层：自动切镜像、重装备份 APK、再启动一次
         onLog('检测到 ARM 翻译层崩溃，正在自动切换兼容镜像…');
         await this.ensureCompatImage(onLog ? (m) => onLog(m.message || '') : () => {});

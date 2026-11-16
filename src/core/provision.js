@@ -15,6 +15,7 @@ const { download, downloadAny, downloadAnyParallel, downloadMulti, head } = requ
 const { ZipArchive, ZipFile } = require('./zip');
 const { Sources, getGithubToken, ghApiHeaders } = require('./sources');
 const { cmpVer } = require('./version');
+const { ImageStore } = require('./images');
 
 const IS_WIN = process.platform === 'win32';
 
@@ -31,11 +32,12 @@ const SOURCES = {
   sysImgIndexes: [
     'https://dl.google.com/android/repository/sys-img/android/sys-img2-3.xml',
     'https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-3.xml',
+    'https://dl.google.com/android/repository/sys-img/google_apis_playstore/sys-img2-3.xml',
   ],
   aehdFallback: 'https://dl.google.com/android/repository/aehd-windows_v2.2.zip',
   // 兜底：索引不可用时直接用的已知版本
   emulatorFallback: 'https://dl.google.com/android/repository/emulator-windows_x64-16847572.zip',
-  sysimgFallback: 'https://dl.google.com/android/repository/sys-img/google_apis_playstore/x86_64-34_r14.zip',
+  sysimgFallback: 'https://dl.google.com/android/repository/sys-img/google_apis/x86_64-34_r14.zip',
   // ARM 兼容镜像（Google Play 版，内置 native bridge）
   playImgIndex: 'https://dl.google.com/android/repository/sys-img/google_apis_playstore/sys-img2-3.xml',
   playImgFallback: 'https://dl.google.com/android/repository/sys-img/google_apis_playstore/x86_64-34_r14.zip',
@@ -86,11 +88,47 @@ function absUrl(u, base = REPO_BASE) {
  *   - 用户装国产 ARM 应用时必然失败，还要手动切镜像（实用门槛）；
  *   - 两份镜像各 0.6~3GB，运行时目录动辄十几 GB；
  *   - 切换镜像要 wipe-data，已装应用全丢。
- * 现在统一为 Android 14 Google Play x86_64：x86 应用、ARM 应用、GMS 都能跑，
- * 全机只存一份只读基础层（容器式共享），按需下载一次即可。
+ * 现在默认使用 Android 14 Google Play x86_64：x86 应用、ARM 应用、GMS 都能跑，
+ * 全机只存一份只读基础层（容器式共享），按需下载一次即可。Google APIs / AOSP
+ * 仍作为可显式选择的独立档位保留。
  */
-const PLAY_SYSIMG = { api: '34', tag: 'google_apis_playstore', abi: 'x86_64' };
-const DEFAULT_SYSIMG = PLAY_SYSIMG;
+const IMAGE_PROFILES = Object.freeze({
+  google_apis: {
+    id: 'google_apis', api: '34', tag: 'google_apis', abi: 'x86_64',
+    avd: 'apkstart-googleapis', label: 'Google APIs', shortLabel: 'Google APIs（无 Play 商店）',
+    gms: true, playStore: false, armTranslation: true,
+    fallback: 'https://dl.google.com/android/repository/sys-img/google_apis/x86_64-34_r14.zip',
+    index: 'https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-3.xml',
+  },
+  default: {
+    id: 'default', api: '34', tag: 'default', abi: 'x86_64',
+    avd: 'apkstart-aosp', label: '纯 AOSP', shortLabel: '纯 AOSP（无 Google）',
+    gms: false, playStore: false, armTranslation: false,
+    fallback: '',
+    index: 'https://dl.google.com/android/repository/sys-img/android/sys-img2-3.xml',
+  },
+  google_apis_playstore: {
+    id: 'google_apis_playstore', api: '34', tag: 'google_apis_playstore', abi: 'x86_64',
+    avd: 'apkstart', label: 'Google Play', shortLabel: 'Google Play（兼容模式）',
+    gms: true, playStore: true, armTranslation: true,
+    fallback: 'https://dl.google.com/android/repository/sys-img/google_apis_playstore/x86_64-34_r14.zip',
+    index: 'https://dl.google.com/android/repository/sys-img/google_apis_playstore/sys-img2-3.xml',
+  },
+});
+const PLAY_SYSIMG = IMAGE_PROFILES.google_apis_playstore;
+// 发布运行时、README 与旧版兼容数据都以 Google Play 为默认档位；Google APIs
+// 与纯 AOSP 仍可在设置里显式选择，并使用各自独立的 AVD。
+const DEFAULT_SYSIMG = IMAGE_PROFILES.google_apis_playstore;
+
+function normalizeImageFlavor(flavor) {
+  const key = String(flavor || '').trim().toLowerCase();
+  if (key === 'aosp' || key === 'pure' || key === 'default') return 'default';
+  if (key === 'play' || key === 'playstore' || key === 'google_play'
+    || key === 'google_apis_playstore') return 'google_apis_playstore';
+  // 显式选择 Google APIs 时保留它；空值/未知值回到默认 Google Play 档。
+  if (key === 'google_apis' || key === 'apis' || key === 'gms') return 'google_apis';
+  return 'google_apis_playstore';
+}
 
 const MIN_SIZE = {
   adb: 5 * 1024 * 1024,
@@ -153,11 +191,41 @@ class Provisioner {
     this._hypervisor = null;
     this._cache = { adbVersion: '', qemuVersion: '' };
     this._sources = new Sources(() => store.getSettings());
+    this._images = null;
   }
 
   /** 双源/镜像的统一入口（测速缓存也在这里，多个组件共用一份） */
   get sources() {
     return this._sources;
+  }
+
+  /**
+   * 自定义镜像适配层。
+   * 运行时目录可以被用户在设置里改来改去，所以 root 一变就重建一个实例，
+   * 避免记录还指向上一个运行时目录下的 custom-images。
+   */
+  get images() {
+    const root = this.root;
+    if (!this._images || this._images.root !== root) {
+      this._images = new ImageStore({
+        root,
+        extractZip: (zipPath, dest, opts) => this.extractZip(zipPath, dest, opts),
+      });
+    }
+    return this._images;
+  }
+
+  /**
+   * 当前生效的自定义镜像。
+   * 没配置 → { ok:true, custom:false }；配了但坏了 → { ok:false, custom:true, reason }。
+   * 任何异常都退化成「用默认镜像」，绝不让镜像层的问题挡住开机。
+   */
+  activeImage() {
+    try {
+      return this.images.active();
+    } catch (e) {
+      return { ok: false, custom: false, id: '', reason: e.message };
+    }
   }
 
   /** 缓存指纹：引擎文件与加速驱动任一变化就换 key */
@@ -204,11 +272,22 @@ class Provisioner {
     return r && r.trim() ? r : path.join(store.DATA_DIR, 'runtime');
   }
 
+  /** 当前内置系统镜像档位。自定义镜像仍由 ImageStore 独立管理。 */
+  imageProfile(flavor = null) {
+    const selected = normalizeImageFlavor(flavor || (store.getSettings().runtime || {}).systemImageFlavor);
+    return IMAGE_PROFILES[selected] || DEFAULT_SYSIMG;
+  }
+
+  imageProfiles() {
+    return Object.values(IMAGE_PROFILES).map((p) => ({ ...p }));
+  }
+
   paths() {
     const root = this.root;
-    const sysTag = DEFAULT_SYSIMG.tag;
-    const sysApi = DEFAULT_SYSIMG.api;
-    const sysAbi = DEFAULT_SYSIMG.abi;
+    const profile = this.imageProfile();
+    const sysTag = profile.tag;
+    const sysApi = profile.api;
+    const sysAbi = profile.abi;
     // AVD（含用户数据、已装应用、quickboot 快照）必须落在可写且不会被清理的地方。
     // 单文件发行版的运行时是随包解压到临时目录的，把 AVD 放进去等于每次退出都丢应用。
     // 只要运行时目录不在 %APPDATA% 里，就把 AVD 固定指到用户数据目录。
@@ -244,6 +323,8 @@ class Provisioner {
       emulatorExe: path.join(root, 'emulator', 'emulator.exe'),
       sysImgRoot: sysRoot,
       sysImgDir: path.join(sysRoot, `android-${sysApi}`, sysTag, sysAbi),
+      // 自定义镜像的索引与（ZIP 导入时）副本都放这里，绝不与默认镜像目录混在一起
+      customImagesDir: path.join(root, 'custom-images'),
       avdHome: insideData ? path.join(root, 'avd') : writable,
       aehdDir: path.join(root, 'aehd'),
       imagesDir: path.join(root, 'images'),
@@ -251,6 +332,9 @@ class Provisioner {
       disk: path.join(root, 'images', 'android.qcow2'),
       tmp: path.join(root, '_tmp'),
       sysTag, sysApi, sysAbi,
+      sysFlavor: profile.id,
+      sysLabel: profile.shortLabel,
+      sysAvd: profile.avd,
     };
   }
 
@@ -306,6 +390,8 @@ class Provisioner {
       adb: 64, emulator: 600, sysimg: 1800, playimg: 1800, qemu: 320, iso: 1100, aehd: 64,
       // 运行时整包：1.5GB 压缩包 + 展开后 ~3.3GB 镜像，峰值同时存在
       runtime: 5000,
+      // 自定义镜像 ZIP 包：解压后与压缩包峰值同时存在
+      image: 4000,
     }[component] || 512; // MB
     const buf = 1024; // 额外预留 1GB（快照 / 数据分区 / 解压中间文件）
     const dir = targetDir || this.root;
@@ -421,26 +507,38 @@ class Provisioner {
     const iso = this.inspectIso(isoPath);
     const diskSize = fileSize(diskPath);
     const sysimg = this.systemImageInfo();
+    // 自定义镜像的状态单独给出：ok=false + custom=true 表示「用户启用了自定义镜像，
+    // 但它现在不可用（目录被移走/文件缺失）」，此时运行时会回落默认镜像。
+    const activeImage = this.activeImage();
 
-    // 完整版（内置运行时）只带一份 API 34 Google Play 镜像，它同时是主镜像与兼容镜像；
-    // 不再依赖 compatImage 开关，避免「镜像明明在，却因为没勾开关而判定未部署」
+    // 当前档位必须有自己的镜像才算就绪。Google Play 旧 AVD 仍单独报告，
+    // 但不能拿它冒充 Google APIs / AOSP，避免切档后错误接管旧用户数据。
     const compatReady = this.playImageInfo().ok;
-    const emulatorReady = emulator.ok && (sysimg.ok || compatReady);
+    const emulatorReady = emulator.ok && sysimg.ok;
     const qemuReady = qemu.ok && diskSize > MIN_SIZE.disk;
 
     return {
       adb: { ...adb, required: true },
       emulator: { ...emulator, required: true, note: emulator.ok ? emulator.version : '未安装' },
       sysimg: {
-        ok: sysimg.ok || compatReady,
+        ok: sysimg.ok,
         dir: sysimg.dir,
-        size: sysimg.ok ? sysimg.size : (compatReady ? this.playImageInfo().size : 0),
-        api: sysimg.ok ? sysimg.api : (compatReady ? PLAY_SYSIMG.api : sysimg.api),
+        size: sysimg.size,
+        api: sysimg.api,
+        abi: sysimg.abi || this.imageProfile().abi,
+        flavor: sysimg.flavor || this.imageProfile().id,
+        label: sysimg.label || this.imageProfile().shortLabel,
+        // 当前跑的是不是自定义镜像：设置页与修复窗口据此显示镜像来源
+        custom: !!sysimg.custom,
+        imageId: sysimg.id || '',
         required: false,
-        note: sysimg.ok
-          ? `Android ${sysimg.api}（${(sysimg.size / 1073741824).toFixed(2)} GB）`
-          : (compatReady ? `Android ${PLAY_SYSIMG.api}（ARM 兼容镜像）` : (sysimg.note || '未下载')),
+        note: sysimg.custom
+          ? sysimg.note
+          : (sysimg.ok
+            ? `Android ${sysimg.api}（${(sysimg.size / 1073741824).toFixed(2)} GB）`
+            : (sysimg.note || `未下载：${this.imageProfile().shortLabel}`)),
       },
+      activeImage,
       playImage: this.playImageInfo(),
       accel,
       qemu: { ...qemu, required: false },
@@ -843,11 +941,18 @@ class Provisioner {
 
   /** 从 sys-img 索引里解析默认 AOSP 系统镜像地址 */
   async resolveSysimgUrl() {
-    const cached = store.getSettings().runtime.sysimgUrl;
-    if (cached && cached.trim()) return absUrl(cached, baseOf(SOURCES.sysImgIndexes[0]));
-    if (this._cache.sysimgUrl) return this._cache.sysimgUrl;
-    const want = `system-images;android-${DEFAULT_SYSIMG.api};${DEFAULT_SYSIMG.tag};${DEFAULT_SYSIMG.abi}`;
-    for (const idx of [SOURCES.playImgIndex, ...SOURCES.sysImgIndexes]) {
+    const profile = this.imageProfile();
+    const runtime = store.getSettings().runtime || {};
+    const cached = runtime.sysimgUrl;
+    // 旧版本只有一个 sysimgUrl；没有 flavor 标记时仅把它视为 Google APIs
+    // 的旧缓存，不能让切到 AOSP/Play 后误用另一档下载地址。
+    if (cached && cached.trim() && runtime.sysimgFlavor === profile.id) {
+      return absUrl(cached, baseOf(profile.index || SOURCES.sysImgIndexes[0]));
+    }
+    if (this._cache.sysimgUrl && this._cache.sysimgFlavor === profile.id) return this._cache.sysimgUrl;
+    const want = `system-images;android-${profile.api};${profile.tag};${profile.abi}`;
+    const indexes = [profile.index, ...SOURCES.sysImgIndexes, SOURCES.playImgIndex].filter((x, i, a) => x && a.indexOf(x) === i);
+    for (const idx of indexes) {
       try {
         // eslint-disable-next-line no-await-in-loop
         const xml = await this._fetchText(idx);
@@ -862,14 +967,16 @@ class Provisioner {
           if (hit) {
             this._cache.sysimgUrl = hit.url;
             this._cache.sysimgSha1 = hit.sha1 || '';
+            this._cache.sysimgFlavor = profile.id;
             return this._cache.sysimgUrl;
           }
         }
       } catch (_) { /* 换下一个索引 */ }
     }
-    this._cache.sysimgUrl = SOURCES.sysimgFallback;
+    this._cache.sysimgUrl = profile.fallback || '';
     this._cache.sysimgSha1 = '';
-    return SOURCES.sysimgFallback;
+    this._cache.sysimgFlavor = profile.id;
+    return this._cache.sysimgUrl;
   }
 
   async emulatorVersion() {
@@ -1009,46 +1116,50 @@ class Provisioner {
   /** 系统镜像是否完整（system.img 是硬指标，缺失或过小都视为没下完） */
   systemImageInfo() {
     const p = this.paths();
-    const roots = [p.sysImgRoot, path.join(this.root, 'system-images'), path.join(this.appRoot, 'engine', 'system-images')];
-    // 先在默认位置（API34 Play）找，再退到「随便哪套镜像」。
-    // 单文件发行版可能只带一套更小的 AOSP 镜像，写死 API34 会导致
-    // 镜像明明在包里却报"未下载"，用户被迫联网下载一套新的。
-    const preferred = [p.sysImgDir,
-      path.join(this.appRoot, 'engine', 'system-images',
-        `android-${DEFAULT_SYSIMG.api}`, DEFAULT_SYSIMG.tag, DEFAULT_SYSIMG.abi)];
-    const candidates = [...preferred];
-    for (const root of roots) {
-      let apis = [];
-      try { apis = fs.readdirSync(root).filter((d) => /^android-\d+$/.test(d)); } catch (_) { continue; }
-      apis.sort((a, b) => Number(b.split('-')[1]) - Number(a.split('-')[1]));
-      for (const api of apis) {
-        let tags = [];
-        try { tags = fs.readdirSync(path.join(root, api)); } catch (_) { continue; }
-        for (const tag of tags) {
-          let abis = [];
-          try { abis = fs.readdirSync(path.join(root, api, tag)); } catch (_) { continue; }
-          for (const abi of abis) candidates.push(path.join(root, api, tag, abi));
-        }
-      }
+    // 自定义镜像优先：用户既然明确启用了它，检查的就是它。
+    // 但它不可用时**不在这里报错**，而是静默回落到默认镜像并把原因留在 activeImage() 里 ——
+    // 镜像目录被误删/移走不该让整台机器开不了机。
+    const act = this.activeImage();
+    if (act && act.ok && act.custom) {
+      return {
+        ok: true, custom: true, id: act.id, name: act.name,
+        dir: act.dir, size: act.size, api: act.api, tag: act.tag, abi: act.abi,
+        note: `自定义镜像 ${act.name}（Android ${act.api} · ${act.abi}）`,
+      };
     }
+    const profile = this.imageProfile();
+    // 只检查当前选中的内置档位。旧版「随便挑一套已有镜像」会让设置页显示
+    // Google APIs、实际却接管 Google Play AVD，导致应用数据和界面状态串台。
+    const candidates = [
+      p.sysImgDir,
+      path.join(this.appRoot, 'engine', 'system-images',
+        `android-${profile.api}`, profile.tag, profile.abi),
+    ];
     let missing = null;
     for (const dir of candidates) {
       const system = path.join(dir, 'system.img');
       const kernel = path.join(dir, 'kernel-ranchu');
       const size = fileSize(system);
-      const m = /system-images[\\/]android-(\d+)[\\/]([^\\/]+)[\\/]([^\\/]+)$/.exec(dir);
-      const api = m ? Number(m[1]) : DEFAULT_SYSIMG.api;
-      const tag = m ? m[2] : DEFAULT_SYSIMG.tag;
-      const abi = m ? m[3] : DEFAULT_SYSIMG.abi;
+      const api = profile.api;
+      const tag = profile.tag;
+      const abi = profile.abi;
       if (size > MIN_SIZE.sysimg && fs.existsSync(kernel)) {
-        return { ok: true, dir, size, api, tag, abi };
+        return {
+          ok: true, dir, size, api, tag, abi,
+          flavor: profile.id, label: profile.shortLabel,
+          googleServices: { gms: profile.gms, playStore: profile.playStore },
+          armTranslation: { enabled: profile.armTranslation },
+        };
       }
       if (!missing && fs.existsSync(dir)) {
-        missing = { ok: false, dir, size, api, tag, abi, note: size ? '镜像不完整' : '缺少 system.img' };
+        missing = { ok: false, dir, size, api, tag, abi, flavor: profile.id, note: size ? '镜像不完整' : '缺少 system.img' };
       }
     }
     if (missing) return missing;
-    return { ok: false, dir: p.sysImgDir, size: 0, api: DEFAULT_SYSIMG.api, tag: DEFAULT_SYSIMG.tag, note: '未下载' };
+    return {
+      ok: false, dir: p.sysImgDir, size: 0, api: profile.api, tag: profile.tag,
+      abi: profile.abi, flavor: profile.id, label: profile.shortLabel, note: '未下载',
+    };
   }
 
   /**
@@ -1182,22 +1293,37 @@ class Provisioner {
     return '';
   }
 
-  /** 只下载一份通用基础镜像（Android 14 Play x86_64），不再有「普通/兼容」两套 */
+  /** 下载当前选中的内置系统镜像档位。 */
   async installSystemImage(onProgress = () => {}) {
-    if (this.playImageInfo().ok) return this.playImageInfo();
-    return this.installPlayImage(onProgress);
+    const profile = this.imageProfile();
+    const ready = this.imageInfo(profile.id);
+    if (ready.ok) return ready;
+    return this.installImage(profile.id, onProgress);
   }
 
-  /** ARM 兼容镜像（Google Play 版）是否已就位 */
-  playImageInfo() {
+  /** 某个内置系统镜像是否已就位。 */
+  imageInfo(flavor = null) {
+    const profile = this.imageProfile(flavor);
     const p = this.paths();
-    const dir = path.join(p.sysImgRoot, `android-${PLAY_SYSIMG.api}`, PLAY_SYSIMG.tag, PLAY_SYSIMG.abi);
+    const root = p.sysImgRoot;
+    const dir = path.join(root, `android-${profile.api}`, profile.tag, profile.abi);
     const size = fileSize(path.join(dir, 'system.img'));
     if (size > MIN_SIZE.sysimg && fs.existsSync(path.join(dir, 'kernel-ranchu'))) {
-      return { ok: true, dir, size, api: PLAY_SYSIMG.api, tag: PLAY_SYSIMG.tag };
+      return {
+        ok: true, dir, size, api: profile.api, tag: profile.tag, abi: profile.abi,
+        flavor: profile.id, label: profile.shortLabel,
+        googleServices: { gms: profile.gms, playStore: profile.playStore },
+        armTranslation: { enabled: profile.armTranslation },
+      };
     }
-    return { ok: false, dir, size, note: size ? '镜像不完整' : '未下载' };
+    return {
+      ok: false, dir, size, api: profile.api, tag: profile.tag, abi: profile.abi,
+      flavor: profile.id, label: profile.shortLabel, note: size ? '镜像不完整' : '未下载',
+    };
   }
+
+  /** ARM 兼容镜像（Google Play 版）是否已就位，保留给旧安装流程。 */
+  playImageInfo() { return this.imageInfo('google_apis_playstore'); }
 
   /** 解析 Google Play 版镜像地址（<url> 相对索引文件所在目录） */
   async resolvePlayUrl() {
@@ -1223,49 +1349,51 @@ class Provisioner {
     return this._cache.playUrl;
   }
 
-  /** 下载并安装 ARM 兼容镜像（Google Play 版，约 1.5GB） */
-  async installPlayImage(onProgress = () => {}) {
+  /** 下载并安装指定内置镜像。 */
+  async installImage(flavor = null, onProgress = () => {}) {
+    const profile = this.imageProfile(flavor);
     const p = this.ensureDirs();
-    await this.guardDisk('playimg', p.sysImgRoot);
-    const url = await this.resolvePlayUrl();
-    const sha1 = this._cache.playSha1 || '';
-    const zip = path.join(p.tmp, 'play-sysimg.zip');
-    onProgress({ stage: 'download', message: '下载 ARM 兼容镜像（Android 14，约 1.5GB）…', percent: 1 });
+    await this.guardDisk(profile.id === 'google_apis_playstore' ? 'playimg' : 'sysimg', p.sysImgRoot);
+    const url = profile.id === 'google_apis_playstore' ? await this.resolvePlayUrl() : await this.resolveSysimgUrl();
+    const sha1 = profile.id === 'google_apis_playstore' ? (this._cache.playSha1 || '') : (this._cache.sysimgSha1 || '');
+    if (!url) throw new Error(`找不到 ${profile.shortLabel} 的官方系统镜像地址`);
+    const zip = path.join(p.tmp, `${profile.id}-sysimg.zip`);
+    onProgress({ stage: 'download', message: `下载${profile.shortLabel}（Android ${profile.api}，约 1.5GB）…`, percent: 1 });
     await downloadAnyParallel(this._downloadUrls(url), zip, {
       connections: 8,
       minChunk: 4 * 1024 * 1024,
       expectSha1: sha1 || undefined,
       onProgress: (pr) => onProgress({
         stage: 'download',
-        message: `下载兼容镜像 ${(pr.got / 1048576).toFixed(0)}MB / ${(pr.total / 1048576).toFixed(0)}MB`
+        message: `下载${profile.shortLabel} ${(pr.got / 1048576).toFixed(0)}MB / ${(pr.total / 1048576).toFixed(0)}MB`
           + (pr.speed ? `（${(pr.speed / 1048576).toFixed(1)} MB/s）` : ''),
         percent: Math.round(pr.percent * 0.8),
         canResume: true,
       }),
     });
-    if (fileSize(zip) < MIN_SIZE.sysimg) throw new Error('兼容镜像下载不完整，可重试续传');
+    if (fileSize(zip) < MIN_SIZE.sysimg) throw new Error('系统镜像下载不完整，可重试续传');
 
-    const dest = path.join(p.sysImgRoot, `android-${PLAY_SYSIMG.api}`, PLAY_SYSIMG.tag);
+    const dest = path.join(p.sysImgRoot, `android-${profile.api}`, profile.tag);
     fs.mkdirSync(dest, { recursive: true });
-    onProgress({ stage: 'extract', message: '解压兼容镜像（3GB，需十余秒）…', percent: 82 });
+    onProgress({ stage: 'extract', message: `解压${profile.shortLabel}（约 3GB，需十余秒）…`, percent: 82 });
     await this.extractZip(zip, dest, {
       onEntry: (_n, i, total) => onProgress({
         stage: 'extract',
-        message: `解压兼容镜像 ${i}/${total}`,
+        message: `解压${profile.shortLabel} ${i}/${total}`,
         percent: 82 + Math.round((i / Math.max(1, total)) * 15),
       }),
     });
     fs.rmSync(zip, { force: true });
 
-    const info = this.playImageInfo();
-    if (!info.ok) throw new Error('兼容镜像解压后校验失败');
-    // 旧版（API 30）兼容镜像不再使用，成功装好后清理腾空间
-    for (const old of ['android-30']) {
-      const legacy = path.join(p.sysImgRoot, old, 'google_apis_playstore');
-      if (fs.existsSync(legacy)) fs.rmSync(legacy, { recursive: true, force: true });
-    }
-    onProgress({ stage: 'done', message: 'ARM 兼容镜像就绪，重新启动运行时即可生效', percent: 100 });
+    const info = this.imageInfo(profile.id);
+    if (!info.ok) throw new Error(`${profile.shortLabel} 解压后校验失败`);
+    onProgress({ stage: 'done', message: `${profile.shortLabel}就绪，重新启动运行时即可生效`, percent: 100 });
     return info;
+  }
+
+  /** 旧 IPC/安装流程仍调用这个名字，语义固定为 Google Play 档。 */
+  async installPlayImage(onProgress = () => {}) {
+    return this.installImage('google_apis_playstore', onProgress);
   }
 
   /** 下载 AEHD 驱动（小文件）；安装需要管理员权限，交给引导流程 */
@@ -1471,4 +1599,14 @@ class Provisioner {
   }
 }
 
-module.exports = { Provisioner, SOURCES, MIN_SIZE, absUrl, baseOf };
+module.exports = {
+  Provisioner,
+  SOURCES,
+  IMAGE_PROFILES,
+  PLAY_SYSIMG,
+  DEFAULT_SYSIMG,
+  normalizeImageFlavor,
+  MIN_SIZE,
+  absUrl,
+  baseOf,
+};

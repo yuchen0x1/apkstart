@@ -159,11 +159,6 @@ function shortPath(p) {
 }
 
 /**
- * 推导零配置启动参数。
- * 用户设置里若显式给了 engine.memoryMB / cores / gpuMode，则作为上限/覆盖，
- * 但不会再因为「没设置」而用 4G/4核 硬编码把小内存机器搞崩。
- */
-/**
  * 「轻量容器」配额：只约束最影响主机手感的那一项 —— vCPU 数。
  *
  * 旧逻辑给 16 核机器分 4 核，qemu 的 4 个 vCPU 线程会长期占满物理核，
@@ -186,45 +181,164 @@ function liteProfile({ host = hostInfo(), engine = {} } = {}) {
   return { cores, priority: 'below' };
 }
 
+/**
+ * 机器档位：把「没有硬件虚拟化 / 内存小 / CPU 弱」翻译成一档可执行的策略。
+ *
+ * 只看 hostInfo() 已经采到的只读信息（CPU 型号、内存、核数、加速状态、磁盘余量），
+ * 不新增任何 WMI / 注册表查询 —— 这段逻辑会在设置页、开机前、诊断报告里反复跑。
+ *
+ * 用打分而不是写死 `if (mem < 8G)`，是为了让每条扣分都能说清「这台机器差在哪」：
+ * 设置页要能解释为什么降级，诊断报告要能复现同一个结论，单测也能逐个阈值验证。
+ */
+const TIER_SCORE = { tinyRam: 3, weakRam: 2, tinyCpu: 3, weakCpu: 1, noAccel: 3, tightDisk: 1 };
+
+function machineTier({ host = hostInfo(), accel = null, diskMB = 0 } = {}) {
+  const totalMB = Number(host.totalMB) || 0;
+  const cores = Number(host.cores) || 0;
+  const accelOk = !!(accel && accel.ok);
+  const reasons = [];
+  let score = 0;
+  if (totalMB) {
+    if (totalMB <= 4096) { score += TIER_SCORE.tinyRam; reasons.push(`物理内存只有 ${(totalMB / 1024).toFixed(1)}GB`); }
+    else if (totalMB <= 6144) { score += TIER_SCORE.weakRam; reasons.push(`物理内存 ${(totalMB / 1024).toFixed(1)}GB，余量不大`); }
+  }
+  if (cores) {
+    // 2 核以下不能只靠「一半核」收敛：那会算出 1 个 vCPU，Android 反而起不来，
+    // 所以弱 CPU 的判定放在这里，具体给几个核由 lowSpecProfile() 决定。
+    if (cores <= 2) { score += TIER_SCORE.tinyCpu; reasons.push(`CPU 只有 ${cores} 核`); }
+    else if (cores <= 4) { score += TIER_SCORE.weakCpu; reasons.push(`CPU ${cores} 核`); }
+  }
+  if (!accelOk) {
+    score += TIER_SCORE.noAccel;
+    reasons.push('没有可用的硬件虚拟化（WHPX / AEHD 都不可用），只能走软件模拟');
+  }
+  if (diskMB && diskMB < 8192) {
+    score += TIER_SCORE.tightDisk;
+    reasons.push(`安卓数据盘只剩 ${(diskMB / 1024).toFixed(1)}GB`);
+  }
+  // 内存和 CPU 都富余时，即使没有 VT 也不砍画质：那种机器缺的只是速度，
+  // 降分辨率只会让它白白变丑，换不来能不能开机。
+  let tier = score >= 4 ? 'low' : (score >= 2 ? 'balanced' : 'high');
+  if (tier === 'low' && totalMB >= 16384 && cores >= 8) tier = 'balanced';
+  return { tier, score, reasons, accelOk, totalMB, cores };
+}
+
+/**
+ * 低配档的保守参数（纯函数）。
+ *
+ * 只覆盖「最影响能不能开机、会不会把主机拖死」的四项：内存、vCPU、分辨率、
+ * 渲染后端，外加一项快照策略。每一项都只往下调，绝不抬高自动值；
+ * 用户在设置里手动填的值由 chooseProfile() 在其后覆盖，永远优先。
+ */
+function lowSpecProfile({ host = hostInfo(), emulatorVersion = '', diskMB = 0 } = {}) {
+  const totalMB = Number(host.totalMB) || 0;
+  // Android 14 镜像自身就要 2GB：再往下砍会在开机阶段就 OOM / 反复 GC，
+  // 结果是「更慢甚至起不来」，所以 2GB 是底线（<3GB 的机器 blocker 会直接劝退）。
+  const memoryMB = totalMB && totalMB < 3072 ? 1536 : 2048;
+  // 2 个 vCPU：给 1 个 Android 引导不起来；给 4 个在 2~4 核的机器上会和
+  // Windows 桌面抢核，用户感受就是「一打开整机就卡」。
+  const cores = 2;
+  // 540×960：像素量只有 720×1280 的 56%。软件渲染最先撞到的是填充率，
+  // 而手机比例的窗口里肉眼几乎看不出差别。
+  const lcd = { w: 540, h: 960, dpi: 240 };
+  const all = gpuCandidates(emulatorVersion);
+  // 软件渲染优先：低配机器多半是旧显卡 + 旧驱动，host 后端初始化失败要白等
+  // 二十多秒才降级，几次重试下来开机时间就彻底不可用了。swangle（ANGLE +
+  // SwiftShader）同样是软件渲染，但合成路径对 WebView 友好，比裸 software 稳
+  // （裸 software 会出现「点同意后一直黑屏」）。老引擎没有 swangle 时退回
+  // swiftshader_indirect。
+  const soft = all.filter((g) => /swangle|swiftshader|software|lavapipe/.test(g));
+  const gpu = soft.find((g) => /swangle/.test(g)) || soft[0] || all[0];
+  const gpus = gpu ? [gpu, ...all.filter((g) => g !== gpu)] : all;
+  // 快照：低配机器冷启动最贵（TCG 8~15 分钟），quickboot 是唯一能让「第二次
+  // 打开就能用」的东西，所以默认保留；只有磁盘放不下（ram.bin ≈ 分配内存，
+  // 再叠加数据分区）时才关掉 —— 磁盘写满会让下一次开机直接失败。
+  const snapshot = !(diskMB > 0 && diskMB < 8192);
+  return { memoryMB, cores, lcd, gpu, gpuCandidates: gpus, snapshot };
+}
+
+/**
+ * 推导零配置启动参数。
+ *
+ * 三层，从下往上覆盖：
+ *   1. 按机器实况算基线（内存取物理内存的 22%、vCPU 取一半物理核、加速状态决定分辨率）；
+ *   2. 低配档（machineTier → lowSpecProfile）只往下压，且只压内存 / 核数 / 分辨率 /
+ *      渲染后端 / 快照策略这五项；
+ *   3. 用户手动指定（autoMemory=false 时的内存与核数、gpuMode、renderSize、
+ *      keepSnapshot、liteMode）永远最后生效、永远优先。
+ * 同一个函数既给设置页展示、也给 emulator 实跑，两边不会各说各话。
+ */
 function chooseProfile({
   host = hostInfo(), accel, emulatorVersion = '', diskMB = 0,
   port = 5554, adbPort = 5044, overrides = {}, settings = null,
 } = {}) {
   const accelOk = !!(accel && accel.ok);
+  const engine = (settings && settings.engine) || {};
+  const disk = diskMB || freeDiskMB(host.tmp);
+
+  // 低配识别只做一次：设置页展示、开机实跑、诊断报告都读这一份结论，三处永远一致。
+  // 用户把「资源策略」调成「流畅」等于明确要性能，此时不自动降级。
+  const tier = machineTier({ host, accel, diskMB: disk });
+  const lowTier = tier.tier === 'low' && engine.resourceMode !== 'smooth';
+  const spec = lowTier ? lowSpecProfile({ host, emulatorVersion, diskMB: disk }) : null;
+
   // 3GB 足够 Android 14 与主流应用；再高只会放大内存占用和 quickboot 快照体积
   let memoryMB = clamp(Math.floor((host.totalMB * 0.22) / 256) * 256, 2048, 3072);
   // 物理可用内存不够时下调；Android 14 最低 2G，低于此只能靠 TCG 慢速跑
   if (host.freeMB && host.freeMB < memoryMB + 1024) {
     memoryMB = Math.max(2048, Math.floor((host.freeMB * 0.5) / 256) * 256);
   }
+  // 低配档只往下压，不会把上面的自动值抬高
+  if (spec) memoryMB = Math.min(memoryMB, spec.memoryMB);
+  // 手动值永远最后生效、永远优先
   if (overrides.memoryMB) memoryMB = clamp(Number(overrides.memoryMB) || memoryMB, 1536, 8192);
 
   let cores = clamp(Math.floor(host.cores / 2), 2, 4);
   if (overrides.cores) cores = clamp(Number(overrides.cores) || cores, 1, 8);
   // 用户没手动指定核数时才由轻量模式收敛，手动值永远优先
-  const lite = settings ? liteProfile({ host, engine: settings.engine || {} }) : null;
+  const lite = settings ? liteProfile({ host, engine }) : null;
   if (lite && !overrides.cores) cores = Math.min(cores, lite.cores);
+  // 低配档再压一层。用户显式关掉轻量容器（liteMode:false）属于手动配置，
+  // 那种情况下低配档也不越过用户。
+  if (spec && lite && !overrides.cores) cores = Math.min(cores, spec.cores);
 
-  const disk = diskMB || freeDiskMB(host.tmp);
   // /data 容量：应用本体、游戏资源包和它们的「更新包」都占这里，4GB 太容易满
   // （表现就是应用内更新时提示「磁盘空间不足」）。默认按磁盘余量给 6/8GB，
   // 用户也可以直接在设置里指定（改大后下次开机就地扩容，不丢数据）。
-  const wantGB = Number((settings && settings.engine && settings.engine.dataPartitionGB) || 0);
+  const wantGB = Number(engine.dataPartitionGB || 0);
   const autoDataMB = disk && disk < 12288 ? 4096 : 6144;
   const dataMB = wantGB > 0 ? clamp(Math.round(wantGB * 1024), 2048, 65536) : autoDataMB;
 
   const gpus = gpuCandidates(emulatorVersion);
   const gpuPinned = !!(overrides.gpuMode && overrides.gpuMode !== 'auto' && gpus.includes(overrides.gpuMode));
-  const gpu = gpuPinned ? overrides.gpuMode : gpus[0];
+  // 低配档把软件渲染排到最前；用户手动指定后端（gpuPinned）时完全不干预
+  const orderedGpus = !gpuPinned && spec ? [spec.gpu, ...gpus.filter((g) => g !== spec.gpu)] : gpus;
+  const gpu = gpuPinned ? overrides.gpuMode : orderedGpus[0];
 
-  // 渲染分辨率：auto 时按加速状态选（软件模拟降到 540x960 保流畅）
-  const wantLcd = String((settings && settings.engine && settings.engine.renderSize) || 'auto');
-  const lcd = /^\d{3,4}x\d{3,4}$/.test(wantLcd)
+  // 渲染分辨率：auto 时按加速状态选（软件模拟降到 540x960 保流畅）。
+  // 低配档即使有硬件加速也降一档：这类机器最先撞到的是填充率，不是内存带宽。
+  const wantLcd = String(engine.renderSize || 'auto');
+  const lcdByUser = /^\d{3,4}x\d{3,4}$/.test(wantLcd);
+  const lcd = lcdByUser
     ? { ...lcdFor({ accelOk }), ...(() => {
       const [w, h] = wantLcd.split('x').map(Number);
       return { w, h, dpi: w <= 540 ? 240 : (w <= 720 ? 320 : 420) };
     })() }
-    : lcdFor({ accelOk });
+    : (spec ? { ...spec.lcd } : lcdFor({ accelOk }));
+
+  // 快照策略：用户关掉就不存；低配档按磁盘余量决定；其余保持「退出时按需存」
+  const snapshot = engine.keepSnapshot === false ? false : (spec ? spec.snapshot : true);
+
+  // 被用户手动钉住的项：设置页据此说明「自动降级没有覆盖你的设置」，
+  // 诊断报告也能一眼看出这组参数里哪些是人为指定的。
+  const manual = [];
+  if (overrides.memoryMB) manual.push('memoryMB');
+  if (overrides.cores) manual.push('cores');
+  if (gpuPinned) manual.push('gpuMode');
+  if (lcdByUser) manual.push('renderSize');
+  if (engine.keepSnapshot === false) manual.push('keepSnapshot');
+  if (engine.liteMode === false) manual.push('liteMode');
+  if (engine.resourceMode === 'smooth') manual.push('resourceMode');
 
   return {
     memoryMB,
@@ -233,7 +347,7 @@ function chooseProfile({
     dataMB,
     lcd,
     gpu,
-    gpuCandidates: gpus,
+    gpuCandidates: orderedGpus,
     gpuPinned,
     // Windows emulator 37.x 不应依赖隐式默认值：检测到 WHPX/AEHD 时明确
     // 传 `-accel on`，否则某些环境会悄悄走 TCG，开机时间从几十秒变成数分钟。
@@ -244,10 +358,16 @@ function chooseProfile({
     accelOk,
     port,
     adbPort,
-    snapshot: true,
+    snapshot,
     lite: !!lite,
-    // 无加速的纯软件模拟在 Windows 上确实能起来，但 Android 14 冷启动可能 5-10 分钟
-    bootTimeoutMs: accelOk ? 240000 : 600000,
+    // 机器档位与「为什么是这组参数」：设置页、一键修复、诊断报告三处共用
+    tier: tier.tier,
+    tierReasons: tier.reasons,
+    tuned: !!spec,
+    manual,
+    // 无加速的纯软件模拟在 Windows 上确实能起来，但 Android 14 冷启动可能 5-10 分钟；
+    // 低配档即使有加速（弱 CPU）也要多给两分钟，别让它在快开完时被砍。
+    bootTimeoutMs: accelOk ? (spec ? 420000 : 240000) : 600000,
     emulatorVersion,
     host,
   };
@@ -305,7 +425,12 @@ function planVariants(profile, { preferSoftware = false } = {}) {
     }
   }
   for (const gpu of ordered) {
-    out.push({ ...profile, gpu, label: `${gpu} / ${profile.accel === 'on' ? '硬件加速' : '软件模拟'}`, wipe: false, snapshot: true });
+    // snapshot 跟随 profile：低配档在磁盘紧张时会关掉快照（ram.bin 放不下），
+    // 这里若硬写 true，等于把那个判断又抹掉了。
+    out.push({
+      ...profile, gpu, label: `${gpu} / ${profile.accel === 'on' ? '硬件加速' : '软件模拟'}`,
+      wipe: false, snapshot: profile.snapshot !== false,
+    });
   }
   out.push({
     ...profile,
@@ -593,9 +718,57 @@ function noAccelDiagnosis() {
 
 /** 人类可读的一行摘要，放在设置页让高级用户知道自动选了什么 */
 function describeProfile(p) {
-  return `自动：${(p.memoryMB / 1024).toFixed(1)}GB 内存 · ${p.cores} 核 · ${p.gpu} 渲染 · `
-    + `${p.accelOk ? '硬件加速' : '软件模拟'} · ${p.snapshot ? '按需快照' : '冷启动'}`
+  if (!p || !p.memoryMB) return '正在检测本机参数…';
+  const lcd = p.lcd && p.lcd.w ? `${p.lcd.w}×${p.lcd.h}` : '';
+  const snap = p.snapshot === false ? '冷启动（不存快照）' : 'quickboot 快照';
+  return `${p.tuned ? '低配自动降级' : '自动'}：${(p.memoryMB / 1024).toFixed(1)}GB 内存 · ${p.cores} 核`
+    + `${lcd ? ` · ${lcd}` : ''} · ${p.gpu} 渲染 · ${p.accelOk ? '硬件加速' : '软件模拟'} · ${snap}`
     + `${p.lite ? ' · 轻量容器' : ''} · 端口 ${p.port}`;
+}
+
+/** 手动钉住的项 → 中文名（设置页 / 报告共用） */
+const MANUAL_LABELS = {
+  memoryMB: '内存',
+  cores: 'CPU 核心数',
+  gpuMode: '渲染后端',
+  renderSize: '画质',
+  keepSnapshot: '快速启动快照',
+  liteMode: '轻量容器',
+  resourceMode: '资源策略',
+};
+
+/**
+ * 「为什么是这组参数」。
+ * 低配降级最容易被误解成「软件偷偷把画质调低了」，所以必须把触发原因摊开说；
+ * 用户选了「流畅」而机器又是低配时也要讲清楚「这次按你的选择不降级」。
+ */
+function describeTuning(p) {
+  if (!p) return '';
+  const why = Array.isArray(p.tierReasons) ? p.tierReasons.filter(Boolean) : [];
+  if (p.tuned) return `已按低配机器自动降级：${why.join('；') || '机器性能偏低'}。`;
+  if (p.tier === 'low') return `检测到低配机器（${why.join('；') || '性能偏低'}），但资源策略是「流畅」，本次不降级。`;
+  return '';
+}
+
+/** 「哪些是你自己指定的」——降低「为什么我的设置没生效」这类困惑 */
+function describeManual(p) {
+  const list = (p && Array.isArray(p.manual)) ? p.manual : [];
+  if (!list.length) return '';
+  return `手动指定：${list.map((k) => MANUAL_LABELS[k] || k).join('、')}（手动值优先，自动降级不会覆盖）。`;
+}
+
+/**
+ * 单轮尝试的参数摘要：失败时贴给用户看的就是它。
+ * 只保留一眼能判断「这组参数到底保守到什么程度」的几项。
+ */
+function describeAttempt(plan) {
+  if (!plan) return '';
+  const parts = [plan.gpu, `${plan.memoryMB}MB`, `${plan.cores}核`];
+  if (plan.lcd && plan.lcd.w) parts.push(`${plan.lcd.w}x${plan.lcd.h}`);
+  if (plan.snapshot === false) parts.push('不存快照');
+  if (plan.accel === 'off') parts.push('软件模拟');
+  if (plan.wipe) parts.push('清数据');
+  return parts.filter(Boolean).join(' / ');
 }
 
 /** 导出诊断报告（纯文本，便于发邮件/贴 issue） */
@@ -651,6 +824,9 @@ function writeReport({ dataDir, profile, logLines = [], extra = {} }) {
     '== 自动配置 ==',
     JSON.stringify(profile || {}, null, 2),
     describeProfile(profile || chooseProfile()),
+    // 低配降级会改变分辨率与渲染后端，报告里必须写清「为什么」，否则用户会
+    // 以为软件偷偷把画质调低了（而且换台机器复现不出来）。
+    ...[describeTuning(profile), describeManual(profile)].filter(Boolean),
     '',
     '== 诊断 ==',
     `${d.code}：${d.title}`,
@@ -705,8 +881,10 @@ function vcRedistOk() {
 
 module.exports = {
   hostInfo, hostBranding, systemVendor, looksVirtual, freeDiskMB, isAsciiPath, shortPath, lcdFor, orientLcd, liteProfile,
-  versionNumbers, gpuCandidates, chooseProfile, planVariants,
+  versionNumbers, gpuCandidates, machineTier, lowSpecProfile, chooseProfile, planVariants,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey, imageIdentity,
-  diagnose, notes, timeoutDiagnosis, noAccelDiagnosis, describeProfile, writeReport, vcRedistOk,
+  diagnose, notes, timeoutDiagnosis, noAccelDiagnosis,
+  describeProfile, describeTuning, describeManual, describeAttempt,
+  writeReport, vcRedistOk,
 };

@@ -16,7 +16,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
-const { buildNotes, stripTitle, fromFile, fromChangelog, fromGit } = require(path.join(ROOT, 'tools', 'release-notes.js'));
+const { buildNotes, stripTitle, fromFile, fromChangelog, fromGit, appendBasics } = require(path.join(ROOT, 'tools', 'release-notes.js'));
 
 let passed = 0;
 const fails = [];
@@ -60,7 +60,33 @@ test('手写 release-notes 文件优先，且剥掉重复标题', () => {
   });
   const r = buildNotes({ tag: 'v9.0.0', root: dir });
   assert.strictEqual(r.source, 'release-notes');
-  assert.strictEqual(r.body.trim(), '来自文件');
+  assert(r.body.startsWith('来自文件\n'), '正文应保留手写内容');
+  assert(r.body.includes('ApkStart-v9.0.0-win64-portable.zip'), '应自动补齐下载清单');
+  assert(r.body.includes('## 升级'), '应自动补齐升级说明');
+  assert(r.body.includes('## 支持范围'), '应自动补齐支持范围');
+});
+
+test('已有基础段落不重复，缺失的段落才补齐', () => {
+  const body = appendBasics([
+    '## 这次升级了什么',
+    '',
+    '修了一个问题。',
+    '',
+    '## 下载',
+    '',
+    '已有下载说明。',
+    '',
+    '## 升级',
+    '',
+    '已有升级说明。',
+    '',
+    '## 支持范围',
+    '',
+    '本项目仅支持 Windows 10/11 x64。',
+  ].join('\n'), 'v9.0.0');
+  assert.strictEqual((body.match(/^## 下载$/gm) || []).length, 1, '下载类标题不能重复');
+  assert.strictEqual((body.match(/^## 升级$/gm) || []).length, 1, '升级类标题不能重复');
+  assert.strictEqual((body.match(/^## 支持范围/gm) || []).length, 1, '支持范围不能重复');
 });
 
 test('没有文件时抽取 CHANGELOG 段落（不含标题行、不吞下个版本）', () => {
@@ -88,6 +114,8 @@ test('没有文件时抽取 CHANGELOG 段落（不含标题行、不吞下个版
   assert(r.body.includes('主题一句话'), '应保留主题引导行');
   assert(!r.body.includes('上个版本的内容'), '不能吞掉下个版本');
   assert(!r.body.includes('example.invalid'), '不能吞掉页脚链接');
+  assert(r.body.includes('ApkStart-v9.0.0-win64-portable.zip'), 'CHANGELOG 兜底也应补齐下载清单');
+  assert(r.body.includes('## 升级'), 'CHANGELOG 兜底也应补齐升级说明');
 });
 
 test('合并标题（[8.0.0] / [7.0.0]）里任一版本都能命中', () => {
@@ -128,6 +156,8 @@ test('真实仓库：v0.6.4 走手写文件、正文无重复标题', () => {
   const r = buildNotes({ tag: 'v0.6.4', root: ROOT });
   assert.strictEqual(r.source, 'release-notes');
   assert(!/^#\s/m.test(r.body), '正文不应再有 H1 标题');
+  assert.strictEqual((r.body.match(/^## 下载哪个$/gm) || []).length, 1, '下载信息应只出现一次');
+  assert(r.body.includes('ApkStart-v0.6.4-win64-portable.zip'), '应保留当前版本下载名');
 });
 
 test('真实仓库：当前版本 v0.6.5 有手写发行说明', () => {
@@ -135,6 +165,16 @@ test('真实仓库：当前版本 v0.6.5 有手写发行说明', () => {
   assert.strictEqual(r.source, 'release-notes');
   assert(r.body.includes('导入本地整包'), '发行说明应包含本版新增能力');
   assert(!/^#\s/m.test(r.body), '正文不应再有 H1 标题');
+  assert(r.body.includes('ApkStart-0.6.5-Setup.exe'), '后续版本也必须有完整下载清单');
+  assert(r.body.includes('## 升级'), '后续版本也必须有升级说明');
+});
+
+test('真实仓库：v0.6.6 保留升级内容并补齐基础信息', () => {
+  const r = buildNotes({ tag: 'v0.6.6', root: ROOT });
+  assert.strictEqual(r.source, 'release-notes');
+  assert(r.body.includes('独立的全屏设置页面'), '发行说明应包含本版新增能力');
+  assert(r.body.includes('ApkStart-runtime-v0.6.6.zip'), '应有运行时整包下载项');
+  assert(r.body.includes('已装应用、存档、系统镜像和运行时数据都不受影响'), '应保留升级影响说明');
 });
 
 console.log('\n[src/ui/app.js mdToHtml]');

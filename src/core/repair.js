@@ -40,11 +40,24 @@ function buildFacts(raw = {}) {
     osMajor: Number((/(\d+)\./.exec(osRelease) || [])[1] || 0),
     accel: { ok: !!accel.ok, kind: accel.kind || '', note: accel.note || '' },
     emulatorVersion: String(raw.emulatorVersion || ''),
-    image: { api: image.api || '', tag: image.tag || '', compat: !!image.compat },
+    image: {
+      api: image.api || '',
+      tag: image.tag || '',
+      compat: !!image.compat,
+      // 自定义镜像（image adapter）：名字 / 来源 / 不可用原因。三者都来自
+      // provision.activeImage()，与设置页显示的是同一份数据。
+      custom: !!image.custom,
+      name: image.name || '',
+      source: image.source || '',
+      reason: image.reason || '',
+    },
     freeDiskMB: Number(raw.freeDiskMB) || 0,
     exitCode: raw.exitCode == null ? null : Number(raw.exitCode),
     runtimeDir: String(raw.runtimeDir || ''),
     appVersion: String(raw.appVersion || ''),
+    // 失败时实际采用的启动参数（一行中文摘要）与「是否走了低配自动降级」
+    profileText: String(raw.profileText || ''),
+    tuned: !!raw.tuned,
   };
 }
 
@@ -82,7 +95,21 @@ function buildChecks(f) {
   if (f.vm) {
     out.push({ label: '运行环境', value: `虚拟机 / 云电脑${f.vendor ? `（${f.vendor}）` : ''}`, state: f.accel.ok ? 'warn' : 'bad' });
   }
-  if (f.image.api) {
+  if (f.image.custom) {
+    // 用户自己换了镜像以后，「跑不起来怪谁」就多了一种可能：镜像不对。
+    // 体检表必须把「用的是哪套、从哪来、为什么不可用」摊开，否则只能靠猜。
+    out.push({
+      label: '系统镜像',
+      value: `自定义镜像 · ${f.image.name || '未知'}${f.image.api ? `（Android ${f.image.api}）` : ''}`,
+      state: f.image.reason ? 'bad' : 'ok',
+    });
+    if (f.image.reason) {
+      out.push({ label: '镜像不可用', value: f.image.reason, state: 'bad' });
+    }
+    if (f.image.source) {
+      out.push({ label: '镜像来源', value: f.image.source, state: 'ok' });
+    }
+  } else if (f.image.api) {
     out.push({
       label: '系统镜像',
       value: `Android ${f.image.api}${f.image.compat ? ' · 含 ARM 转译' : ''}`,
@@ -94,6 +121,15 @@ function buildChecks(f) {
       label: '磁盘余量',
       value: gb(f.freeDiskMB),
       state: f.freeDiskMB < 3072 ? 'bad' : (f.freeDiskMB < 8192 ? 'warn' : 'ok'),
+    });
+  }
+  // 「你到底给我分配了什么」是失败反馈里出现最多的一句。把实跑参数摊在体检表里：
+  // 用户不用翻日志，作者也能直接对照每一轮尝试记录判断是不是参数压得太狠。
+  if (f.profileText) {
+    out.push({
+      label: '本次实跑参数',
+      value: f.profileText,
+      state: f.tuned ? 'warn' : 'ok',
     });
   }
   return out;

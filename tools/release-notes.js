@@ -9,7 +9,8 @@
  *
  *   1. 优先 `.github/release-notes-<tag>.md`（手写的完整发行说明）；
  *   2. 其次 CHANGELOG.md 里该版本的段落（内容原样，去掉标题行）；
- *   3. 最后 git log 兜底（上个 tag 到本 tag 的提交列表，而不是自动生成的废话）。
+ *   3. 最后 git log 兜底（上个 tag 到本 tag 的提交列表，而不是自动生成的废话）；
+ *   4. 无论正文来自哪条路，都补齐「下载哪个」「升级」「支持范围」等固定信息。
  *
  * 产出的正文一律**不带重复的版本大标题**：GitHub Release 名称、
  * 应用内「更新日志（vX.Y.Z）」都已经写了版本号，正文再来一行 `# ApkStart vX.Y.Z`
@@ -89,6 +90,53 @@ function fromGit(root, tag, repo) {
 }
 
 /**
+ * 每个 Release 都要有的固定信息。
+ *
+ * 手写发行说明可以专注于「这版升级了什么、修了什么」，但不能因此把用户
+ * 下载和升级时需要的基本信息漏掉。历史正文使用过「下载」「下载与升级」
+ * 等不同标题，所以这里只在同类标题不存在时补齐，避免重复显示。
+ */
+function appendBasics(raw, tag) {
+  let body = tidy(raw);
+  const version = String(tag).replace(/^v/i, '');
+  const hasHeading = (pattern) => body.split('\n').some((line) => (
+    /^#{2,6}\s+/.test(line) && pattern.test(line)
+  ));
+  const sections = [];
+
+  if (!hasHeading(/下载/)) {
+    sections.push([
+      '## 下载哪个',
+      '',
+      '| 文件 | 说明 |',
+      '|---|---|',
+      `| \`ApkStart-v${version}-win64-portable.zip\` | 轻量便携版，运行时首次启动按需下载 |`,
+      `| \`ApkStart-${version}-Setup.exe\` | 完整安装包，内置运行时，离线开箱即用 |`,
+      `| \`ApkStart-runtime-v${version}.zip\` | 运行时整包（便携版下载源，一般不用手动下载） |`,
+    ].join('\n'));
+  }
+
+  if (!hasHeading(/升级/)) {
+    sections.push([
+      '## 升级',
+      '',
+      '安装版直接覆盖安装，便携版替换程序目录即可。已装应用、存档、系统镜像和运行时数据都不受影响。',
+    ].join('\n'));
+  }
+
+  if (!/本项目仅支持\s*Windows\s*10\/11\s*x64/.test(body)) {
+    sections.push([
+      '## 支持范围',
+      '',
+      '本项目仅支持 Windows 10/11 x64。',
+    ].join('\n'));
+  }
+
+  if (sections.length) body = `${body.trim()}\n\n${sections.join('\n\n')}\n`;
+  return tidy(body);
+}
+
+/**
  * 组装发行说明。返回 { body, source }：
  * source ∈ 'release-notes' | 'changelog' | 'git-log'，CI 日志里能看出用的是哪条路。
  */
@@ -105,12 +153,12 @@ function buildNotes(opts = {}) {
   ];
   for (const [source, fn] of attempts) {
     const body = fn();
-    if (body && body.trim()) return { body: tidy(body), source };
+    if (body && body.trim()) return { body: appendBasics(body, vtag), source };
   }
   throw new Error(`找不到 ${vtag} 的任何发行说明来源（release-notes 文件 / CHANGELOG / git log）`);
 }
 
-module.exports = { buildNotes, stripTitle, tidy, fromFile, fromChangelog, fromGit };
+module.exports = { buildNotes, stripTitle, tidy, fromFile, fromChangelog, fromGit, appendBasics };
 
 if (require.main === module) {
   const argv = process.argv.slice(2);

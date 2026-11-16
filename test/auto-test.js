@@ -48,7 +48,9 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(p.cores === 2, `核心应为 2，实际 ${p.cores}`);
     assert(p.accel === 'off', '无硬件加速应自动回退软件模拟');
     assert(p.bootTimeoutMs > 240000, '软件模拟应给更长的开机超时');
-    assert(p.gpu === 'host', `首选渲染应为 host（失败由 planVariants 降级），实际 ${p.gpu}`);
+    // 低配档会把软件渲染提前，避免 host 初始化失败后再白等一轮；
+    // 高配机器仍由 chooseProfile 保持 host 首选。
+    assert(/swangle|software|swiftshader/.test(p.gpu), `低配无加速机器应优先软件渲染，实际 ${p.gpu}`);
     // accel 关闭时的保底参数必须是软件渲染，否则 TCG 下无 GPU 可用
     const lastResort = doctor.planVariants(p).find((v) => v.lastResort);
     assert(lastResort && /software|swiftshader/.test(lastResort.gpu), '保底方案必须用软件渲染');
@@ -186,6 +188,13 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(manual.memoryMB === 6144 && manual.cores === 6 && manual.gpu === 'swiftshader', JSON.stringify(manual));
     const zero = doctor.overridesFromSettings({ autoMemory: false, memoryMB: 0, cores: 0, gpuMode: 'auto' });
     assert(zero.memoryMB === 0 && zero.cores === 0 && zero.gpuMode === '', JSON.stringify(zero));
+  });
+
+  await test('可见模式自动降级后要记录实际成功的启动方案', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'emulator.js'), 'utf8');
+    const recorded = (src.match(/this\.profile = plan;/g) || []).length;
+    assert(recorded >= 2,
+      '启动从 host 自动回退到 swangle/software 后，运行时状态必须展示实际成功的 plan');
   });
 
   console.log('\n[layers.js 容器式瘦身]');
@@ -490,7 +499,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     // 快照确实存在时才走 quickboot。注意要真的「像一个完整快照」：
     // 保存中断会留下只有几十字节 snapshot.pb 的空壳，那种必须判定为没有快照，
     // 否则 emulator 会尝试加载、失败，再回退冷启动，白等几秒。
-    const avdDir = path.join(emu.provisioner.paths().avdHome, 'apkstart.avd');
+    const avdDir = path.join(emu.provisioner.paths().avdHome, `${emu.avdName}.avd`);
     const snapDir = path.join(avdDir, 'snapshots');
     const created = !fs.existsSync(snapDir);
     fs.mkdirSync(path.join(snapDir, 'apkstart'), { recursive: true });
@@ -648,7 +657,7 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
   await test('新版 emulator 写的 ram.bin 必须被认作完整快照（否则刚存好的 3GB 会被当空壳删掉）', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
-    const avdDir = path.join(emu.provisioner.paths().avdHome, 'apkstart.avd');
+    const avdDir = path.join(emu.provisioner.paths().avdHome, `${emu.avdName}.avd`);
     const snapDir = path.join(avdDir, 'snapshots', 'apkstart');
     fs.rmSync(path.join(avdDir, 'snapshots'), { recursive: true, force: true });
     fs.mkdirSync(snapDir, { recursive: true });

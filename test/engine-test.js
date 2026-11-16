@@ -262,6 +262,17 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     assert(p.paths().adbExe.endsWith('adb.exe'), 'adb 路径异常');
   });
 
+  await test('三种内置系统档位使用独立 AVD，默认是 Google Play', async () => {
+    const { IMAGE_PROFILES, normalizeImageFlavor } = require('../src/core/provision');
+    assert(normalizeImageFlavor('google_apis') === 'google_apis', 'Google APIs 别名解析错误');
+    assert(normalizeImageFlavor('aosp') === 'default', 'AOSP 别名解析错误');
+    assert(normalizeImageFlavor('google_apis_playstore') === 'google_apis_playstore', 'Play 档位解析错误');
+    assert(IMAGE_PROFILES.google_apis.avd === 'apkstart-googleapis', 'Google APIs AVD 名称错误');
+    assert(IMAGE_PROFILES.default.avd === 'apkstart-aosp', 'AOSP AVD 名称错误');
+    assert(IMAGE_PROFILES.google_apis_playstore.avd === 'apkstart', '旧 Play AVD 名称不能改变');
+    assert(store.getSettings().runtime.systemImageFlavor === 'google_apis_playstore', '默认档位应为 Google Play');
+  });
+
   await test('空环境检查：adb 未就绪，组件结构完整', async () => {
     const p = new Provisioner(path.join(TMP, 'nonexistent'));
     const env = await p.checkEnv();
@@ -391,6 +402,44 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
 
   console.log('\n[engine.js]');
   const { Runtime } = require('../src/core/engine');
+
+  await test('默认音量只有在读取到目标档位后才写入初始化标记', async () => {
+    store.saveSettings({ androidVolumeInitialized: false });
+    const rt = new Runtime(TMP);
+    rt._freeformReady = true;
+    const client = {
+      serial: 'attached-device',
+      async shell(command) {
+        if (command.includes('system_locales')) return '';
+        if (command.includes('--set')) return '';
+        if (command.includes('--get')) return '音量服务暂不可用';
+        return '';
+      },
+    };
+    await rt.prepare(client);
+    assert(store.getSettings().androidVolumeInitialized !== true,
+      '音量读取失败时必须保留未初始化状态，以便下次启动重试');
+  });
+
+  await test('设置音量返回设备实际档位并标记校验结果', async () => {
+    const { AndroidSettings } = require('../src/core/android');
+    let n = 0;
+    const client = {
+      async shell(command) {
+        n += 1;
+        if (command.includes('--get') && n === 1) return 'volume: 0/15';
+        if (command.includes('--set')) return '';
+        if (command.includes('--get')) return 'volume: 8/15';
+        return '';
+      },
+    };
+    const android = new AndroidSettings({
+      async ensure() { return { ok: true, client }; },
+    });
+    const result = await android.setVolume(50);
+    assert(result.verified === true, '调整后应确认真实档位');
+    assert(result.actualVolume === 53, `实际音量应按设备档位返回约 53%，实际 ${result.actualVolume}`);
+  });
 
   await test('QEMU 启动参数：安装模式挂载 ISO 并从光驱启动', async () => {
     const rt = new Runtime(TMP);

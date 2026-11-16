@@ -36,9 +36,13 @@ const DEFAULT_SETTINGS = {
     audio: true,             // 安卓应用的声音（提示音/视频）。关闭可省一点 CPU
     // ---- 轻量容器（默认全开省资源，用户可逐项关掉）----
     liteMode: true,          // 收敛 vCPU 配额，避免 qemu 占满物理核拖慢 Windows
-    // 一句话策略：save（省资源）/ balanced（均衡）/ smooth（流畅，视频·游戏优先）。
+    // 一句话策略：save（省资源）/ balanced（均衡，自动识别低配机器）/ smooth（流畅，视频·游戏优先）。
     // 界面上只暴露这一个选项，保存时自动翻译成 liteMode / priorityMode / renderSize，
     // 底部仍然保留细项开关给高级用户。
+    // balanced 是默认值，也是「自动」档：doctor.machineTier() 判定为低配的机器
+    // （没有硬件虚拟化 / 内存小 / CPU 弱）会自动再降一档（内存 2GB、2 个 vCPU、
+    // 540x960、软件渲染），不需要用户自己调任何参数。save / smooth 是用户显式
+    // 指定的固定档，选中后不再自动降级 —— 手动配置永远优先。
     resourceMode: 'balanced',
     // 数据分区容量（GB）：应用、游戏缓存和它们的更新包都装在这里。
     // 0 = 自动（按磁盘剩余给 6/8GB）。改大后在下次开安卓时**就地扩容**，不丢已装应用。
@@ -79,7 +83,14 @@ const DEFAULT_SETTINGS = {
     installMode: 'guided',   // guided（引导手动安装） | auto（实验性自动安装）
     emulatorUrl: '',         // 手动指定 emulator 包地址（空 = 自动从 SDK 索引解析最新版）
     sysimgUrl: '',           // 手动指定系统镜像包地址
-    compatImage: false,      // ARM 兼容模式：改用 Google Play 镜像（内置 native bridge，可装 ARM-only 应用）
+    // 自定义镜像（image adapter）：空 = 使用当前内置系统档位。
+    // 这个键只是「指向 custom-images/index.json 里的一条记录」——默认镜像、
+    // 默认 AVD 与已装应用全程不被改写；清空它即恢复默认镜像。
+    activeImageId: '',
+    // 内置系统镜像：新安装默认 Google Play；Google APIs 与纯 AOSP 是可选档位，
+    // 三档各自使用独立 AVD。发布包随带的系统镜像也是 Google Play。
+    systemImageFlavor: 'google_apis_playstore',
+    compatImage: true,       // 旧兼容开关保留，并与默认 Google Play 档位一致
     // 轻量版的运行时整包：默认从本项目 GitHub Release 下载（与「软件更新」同源），
     // 拿不到时自动退回 dl.google.com 分组件下载。可在这里换成自建镜像地址。
     preferGithubRuntime: true,
@@ -117,6 +128,8 @@ const DEFAULT_SETTINGS = {
   language: 'auto',
   autoDeploy: true,          // 首次运行自动完成全部部署，不再分 1~5 步
   wizardDone: false,         // 首次运行引导向导：完成或跳过后置 true，不再弹出
+  wizardVersion: '',         // 最近一次完成引导的 ApkStart 版本；升级后重新展示关键步骤
+  androidVolumeInitialized: false, // 首次接入运行时把媒体音量设为 50%，之后尊重用户调整
   update: {
     // 发现新版本：通知后自动下载；没有应用窗口在前台时自动重启安装，
     // 有应用窗口则等窗口关闭再装（不打断正在玩的应用）。关掉则只通知、手动更新。
@@ -231,6 +244,11 @@ const store = {
 
   getSettings() {
     const s = deepMerge(DEFAULT_SETTINGS, readJson(SETTINGS_FILE, {}));
+    // 旧版曾把「兼容模式」保存成 google_apis + compatImage=true，实际却应使用
+    // Google Play 镜像。只迁移这一种矛盾组合；显式关闭兼容模式的高级档位不改写。
+    if (s.runtime && s.runtime.systemImageFlavor === 'google_apis' && s.runtime.compatImage === true) {
+      s.runtime.systemImageFlavor = 'google_apis_playstore';
+    }
     // 旧版本默认无头运行：应用进程能起来但屏幕上没有窗口，等效于「打不开」。
     // 无条件迁移到带窗口模式，且不再允许通过旧配置把它关掉。
     s.engine.headless = false;

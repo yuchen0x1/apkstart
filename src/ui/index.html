@@ -262,6 +262,13 @@
           </select>
           <span class="sub">改完立即生效。英文界面由内置词典覆盖，日志与诊断报告仍是中文原文（便于搜索与反馈）。</span>
         </div>
+        <div class="field">
+          <label>使用引导</label>
+          <div class="row">
+            <button class="btn ghost sm" id="btnOpenWizard">重新打开首次使用引导</button>
+            <span class="inline-note">可随时查看安装位置、下载源和下一步操作</span>
+          </div>
+        </div>
       </div>
 
       <div class="group">
@@ -320,16 +327,37 @@
         </div>
       </div>
 
+      <div class="group">
+        <div class="group-title">安卓系统镜像</div>
+        <div class="field">
+          <label>系统类型</label>
+          <select id="setImageFlavor">
+            <option value="google_apis_playstore">Google Play · 兼容模式（推荐）</option>
+            <option value="google_apis">Google APIs · 无 Play 商店</option>
+            <option value="default">纯 AOSP · 无 Google（实验）</option>
+          </select>
+          <span class="sub" id="imageFlavorNote">Google Play 默认包含 Google 服务、Play 商店和 ARM 应用兼容层；三种档位使用独立 AVD，切换不会删除其它档位的数据。</span>
+        </div>
+        <div class="field">
+          <span class="inline-note" id="imageFlavorStatus">正在读取系统镜像状态…</span>
+        </div>
+      </div>
+
       <div class="group" id="perfGroup">
         <div class="group-title">性能与资源占用</div>
         <div class="field">
           <label>资源策略</label>
           <select id="setResourceMode">
-            <option value="save">省资源 · 2 核 / 让出前台 / 540p（老机器、挂机）</option>
-            <option value="balanced">均衡 · 一半物理核 / 让出前台 / 720p（推荐）</option>
-            <option value="smooth">流畅 · 不限核数 / 与前台同优先级（视频、游戏）</option>
+            <option value="save">省资源 · 固定 2 核 / 540p（老机器、挂机）</option>
+            <option value="balanced">均衡 · 自动识别低配机器并降级（推荐）</option>
+            <option value="smooth">流畅 · 全核 / 与前台同优先级（视频、游戏）</option>
           </select>
-          <span class="sub">决定安卓虚拟机吃多少 CPU、画面多细腻。红果/抖音发卡就切「流畅」，只想挂着跑小应用就切「省资源」。改完下一次打开应用生效。</span>
+          <span class="sub">决定安卓虚拟机吃多少 CPU、画面多细腻。「均衡」会自动识别低配电脑并改用更保守的参数；「省资源」「流畅」是你手动指定的固定档，选了就不再自动降级。改完下一次打开应用生效。</span>
+        </div>
+        <div class="field">
+          <label>低配电脑自动优化</label>
+          <div class="inline-note" id="autoTierText">正在检测…</div>
+          <span class="sub">检测不到硬件虚拟化（WHPX / AEHD）、内存偏小或 CPU 核心较少的电脑，会自动把内存固定到 2 GB、vCPU 2 个、分辨率 540 × 960、改用软件渲染，并保留快速启动快照。下面手动填的内存、核心数、画质、渲染后端永远优先，自动降级不会覆盖你的设置。</span>
         </div>
         <div class="field two">
           <div>
@@ -353,6 +381,17 @@
               <option value="24">24 GB</option>
             </select>
           </div>
+        </div>
+        <div class="field">
+          <label>渲染后端</label>
+          <select id="setGpuMode">
+            <option value="auto">自动（低配机器用软件渲染）</option>
+            <option value="host">显卡加速 · host（最跟手）</option>
+            <option value="swangle">ANGLE 软件渲染 · swangle（合成最稳）</option>
+            <option value="software">纯软件渲染 · software（最省显存）</option>
+            <option value="lavapipe">lavapipe 软件 Vulkan</option>
+          </select>
+          <span class="sub">自动 = 先按机器性能挑一个（低配机器直接走软件渲染），失败后再逐级降级（显卡 → ANGLE → 纯软件），并把「拉起就崩」的后端记住。手动选一个后端就固定用它、不再自动切换，排障时很有用。</span>
         </div>
         <div class="field">
           <div class="row">
@@ -504,16 +543,16 @@
         </div>
         <div class="field switch-field">
           <div>
-            <label>通用兼容镜像（自动管理）</label>
-            <span class="sub">现在只有一个 Android 14 通用镜像，x86 与 ARM 应用都能跑，首次遇到 ARM 应用时会自动下载，不需要手动切换。此开关仅用于旧配置兼容。</span>
+            <label>ARM 兼容镜像（旧版兼容开关）</label>
+            <span class="sub">新版本请在上面的「系统类型」里选择 Google APIs / 纯 AOSP / Google Play。这个开关只兼容旧配置；打开后会把当前档位切到保留数据的 Google Play AVD。</span>
           </div>
           <input type="checkbox" id="setCompat" class="switch" />
         </div>
         <div class="field" id="compatInstallField" hidden>
-          <label>兼容镜像</label>
+          <label>Google Play 兼容档位</label>
           <div class="row">
             <span class="inline-note" id="compatImgStatus">未下载</span>
-            <button class="btn ghost sm" id="btnInstallPlay">下载兼容镜像</button>
+            <button class="btn ghost sm" id="btnInstallPlay">下载 Google Play 镜像</button>
           </div>
         </div>
         <div class="runtime-actions">
@@ -522,10 +561,39 @@
           <span class="inline-note" id="probeResult"></span>
         </div>
       </div>
+
+      <div class="group">
+        <div class="group-title">自定义安卓镜像（实验性）</div>
+        <div class="field">
+          <label>当前使用的系统镜像</label>
+          <div class="row">
+            <span class="inline-note" id="imageActiveText">正在读取当前镜像…</span>
+            <button class="btn ghost sm" id="btnImageImport">导入镜像</button>
+            <button class="btn ghost sm" id="btnImageRestore">恢复默认镜像</button>
+          </div>
+          <span class="sub" id="imageSourceText">来源：内置 Google 官方镜像，随运行时一起下载</span>
+        </div>
+        <div class="field">
+          <label>已导入的镜像</label>
+          <select id="setActiveImage" style="width:100%"></select>
+          <div class="row" style="margin-top:8px">
+            <button class="btn ghost sm" id="btnImageEnable">启用选中的镜像</button>
+            <button class="btn ghost sm" id="btnImageRemove">移除选中镜像</button>
+            <button class="btn ghost sm" id="btnImageReveal">打开镜像目录</button>
+          </div>
+          <span class="sub" id="imagePickText"></span>
+        </div>
+        <div class="field" id="imageWhyField" hidden>
+          <label>为什么这个镜像不可用</label>
+          <span class="inline-note" id="imageWhy"></span>
+        </div>
+        <span class="sub">只接受能在 QEMU 里直接启动的 x86_64 模拟器系统镜像：必须同时有 system.img、vendor.img、kernel-ranchu、ramdisk.img，可选附带一份 apkstart-image.json 说明 API、ABI、镜像类型、来源、Google 服务、ARM 转译与校验值。手机的 recovery、fastboot 卡刷包与 arm64 手机固件都不能当模拟器镜像；MIUI 没有 x86_64 模拟器版本，导入时会明确告诉你不可用，不会显示成已接入。切换镜像使用独立的安卓数据目录，默认镜像里已装的应用与存档不受影响。</span>
+      </div>
       </details>
 
       <div class="group">
         <div class="group-title">安卓系统设置（不用进安卓桌面）</div>
+        <span class="sub miui-note">首次启动会自动设为简体中文，媒体音量默认 50%；这里的卡片和通知提示采用橙色的小米风格。</span>
         <div class="field">
           <label>运行状态</label>
           <div class="row">

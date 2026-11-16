@@ -595,7 +595,10 @@ async function installFiles(paths) {
       if (response !== 1) { skipped += 1; continue; }
     } else if (comp && comp.level === 'partial') {
       const why = comp.reasons.filter((r) => r.kind === 'warn').map((r) => r.text).join(' ');
-      if (why) toast({ title: `${name}：${comp.label}`, body: why, type: 'warn' });
+      const onlyArmTranslation = comp.reasons
+        .filter((r) => r.kind !== 'info')
+        .every((r) => r.code === 'abi-arm-translated');
+      if (why && !onlyArmTranslation) toast({ title: `${name}：${comp.label}`, body: why, type: 'warn' });
     }
 
     const t = toast({ title: `正在安装 ${name}`, body: '解析 APK…', progress: 8, sticky: true, spinner: true });
@@ -886,6 +889,9 @@ function fillSettings(s) {
     ? s.engine.mouseWheelMode : 'smooth';
   $('setMouseSideButtons').checked = !!s.engine.mouseSideButtons;
   $('setCompat').checked = !!(s.runtime && s.runtime.compatImage);
+  if ($('setImageFlavor')) {
+    $('setImageFlavor').value = (s.runtime && s.runtime.systemImageFlavor) || 'google_apis_playstore';
+  }
   $('setAutoShortcut').checked = !!s.createShortcutOnInstall;
   $('setStartMenuShortcut').checked = s.createStartMenuShortcut !== false;
   $('setShortcutDir').value = s.shortcutDir || '';
@@ -897,6 +903,7 @@ function fillSettings(s) {
   const eng = s.engine || {};
   if ($('setResourceMode')) $('setResourceMode').value = eng.resourceMode || 'balanced';
   if ($('setRenderSize')) $('setRenderSize').value = eng.renderSize || 'auto';
+  if ($('setGpuMode')) $('setGpuMode').value = eng.gpuMode || 'auto';
   if ($('setDataGB')) $('setDataGB').value = String(Number(eng.dataPartitionGB || 0));
   if ($('setFastDns')) $('setFastDns').checked = eng.fastDns !== false;
   if ($('setKeepSnapshot')) $('setKeepSnapshot').checked = eng.keepSnapshot !== false;
@@ -918,6 +925,142 @@ async function refreshDataInfo() {
     + '游戏提示「存储空间不足」就把这里调大后点「立即扩容」——扩容是就地做的，已装应用与存档都保留。';
 }
 
+/**
+ * 拉一次「自动参数摘要」：实跑参数 + 低配降级原因 + 哪些项被手动钉住。
+ * 设置页展示、切换资源策略/内存/核心/渲染后端之后都走这里 ——
+ * 只维护一个来源，界面上就不可能和实跑参数对不上。
+ */
+async function refreshProfileText() {
+  const r = await api.doctorProfile().catch(() => null);
+  if ($('autoProfileText')) $('autoProfileText').textContent = (r && r.text) || '自动模式';
+  const tierEl = $('autoTierText');
+  if (tierEl) {
+    const why = [r && r.why, r && r.manual].filter(Boolean).join(' ');
+    tierEl.textContent = why || (r ? '这台机器不需要降级，参数按均衡档自动选择。' : '自动模式');
+  }
+  return r;
+}
+
+/* ---------------- 自定义镜像（可插拔 image adapter） ---------------- */
+
+/**
+ * 拉一次镜像状态，把「当前用的是哪套 / 从哪来 / 为什么不可用」画到设置页。
+ * 只读 image:status 一个通道：列表、默认镜像健康度、不可用原因都来自同一份数据，
+ * 不会出现「列表说能用、实际起不来」。
+ */
+async function refreshImagePanel() {
+  const box = $('setActiveImage');
+  const r = await api.imageStatus().catch(() => null);
+  const items = (r && Array.isArray(r.items)) ? r.items : [];
+  const def = (r && r.defaultImage) || null;
+  const builtIns = (r && Array.isArray(r.builtInImages)) ? r.builtInImages : [];
+  const selectedBuiltIn = builtIns.find((x) => x.id === (r && r.selectedFlavor)) || def;
+  state.images = items;
+  state.imageStatus = r;
+
+  if ($('setImageFlavor')) {
+    $('setImageFlavor').value = (r && r.selectedFlavor)
+      || (state.settings && state.settings.runtime && state.settings.runtime.systemImageFlavor)
+      || 'google_apis_playstore';
+  }
+  if ($('imageFlavorStatus')) {
+    if (selectedBuiltIn) {
+      const readiness = selectedBuiltIn.ok ? '已下载，可直接启动' : `尚未下载（${selectedBuiltIn.note || '需要下载'}）`;
+      const services = selectedBuiltIn.playStore ? '含 Google Play 商店'
+        : (selectedBuiltIn.gms ? '含 Google 服务，不含 Play 商店' : '不含 Google 服务');
+      $('imageFlavorStatus').textContent = `${selectedBuiltIn.label} · ${services} · ${readiness} · 独立 AVD：${selectedBuiltIn.avd}`;
+    } else {
+      $('imageFlavorStatus').textContent = '系统镜像状态读取失败，请稍后刷新。';
+    }
+  }
+
+  if (box) {
+    box.innerHTML = '';
+    const opt0 = document.createElement('option');
+    opt0.value = '';
+    opt0.textContent = `内置镜像：${(def && def.label) || 'Android 14 · Google Play · x86_64'}`
+      + (def && def.ok === false ? `（当前不可用：${def.note || '未下载'}）` : '');
+    box.appendChild(opt0);
+    for (const it of items) {
+      const o = document.createElement('option');
+      o.value = it.id;
+      // 不可用的镜像也允许选中：只有选中了才看得到「为什么不可用」。
+      // 真正拦住的是启用按钮（paintImageSelection 里按 state 灰掉），
+      // 用 disabled 选项挡住的话，用户永远读不到原因。
+      o.textContent = `${it.name} · Android ${it.api || '?'} · ${it.abi || '?'}`
+        + (it.state === 'ok' ? '' : '（不可用）');
+      box.appendChild(o);
+    }
+    const want = (r && r.activeId) || '';
+    box.value = want;
+    if (box.value !== want) box.value = '';
+  }
+
+  const act = r && r.active;
+  const activeText = $('imageActiveText');
+  if (activeText) {
+    if (act && act.custom && act.ok) {
+      activeText.textContent = `自定义镜像：${act.name}（Android ${act.api} · ${act.abi}）`;
+    } else if (act && act.custom && !act.ok) {
+      activeText.textContent = `自定义镜像「${act.name || act.id}」当前不可用，正在使用默认镜像`;
+    } else {
+      activeText.textContent = `内置镜像：${(def && def.note) || 'Android 14 · Google Play · x86_64'}`;
+    }
+  }
+  paintImageSelection();
+  return r;
+}
+
+/**
+ * 按下拉框当前选中项刷新「来源 / 不可用原因 / 启用按钮」。
+ * 上方「当前使用的系统镜像」那一行永远只描述**正在跑**的镜像；
+ * 这里描述的是下拉里**被选中**的那条，两者分开写，避免「标题说当前、内容说别的」。
+ */
+function paintImageSelection() {
+  const box = $('setActiveImage');
+  const r = state.imageStatus || {};
+  const items = state.images || [];
+  const sel = (box && box.value) || '';
+  const cur = sel ? items.find((x) => x.id === sel) : null;
+  const act = r.active;
+
+  // 当前真正在用的镜像的来源（与上面的 imageActiveText 同一条数据）
+  const activeItem = items.find((x) => x.id === ((r && r.activeId) || ''));
+  const srcEl = $('imageSourceText');
+  if (srcEl) {
+    srcEl.textContent = activeItem && activeItem.sourceText
+      ? `来源：${activeItem.sourceText}`
+      : `来源：内置 ${((r && r.defaultImage && r.defaultImage.label) || 'Google Play')} 官方镜像，随运行时一起下载`;
+  }
+
+  // 选中项的来源：只在下拉里选了某条自定义镜像时才出现
+  const pickEl = $('imagePickText');
+  if (pickEl) {
+    pickEl.textContent = cur ? `来源：${cur.sourceText || '未知'}` : '';
+    pickEl.hidden = !cur;
+  }
+
+  // 选中一条坏镜像 → 显示它自己的原因；没选中 → 显示当前运行时为什么没在用自定义镜像
+  const why = cur
+    ? (cur.state === 'ok' ? '' : (cur.reason || '镜像文件不完整，暂时不能启用'))
+    : ((r.why || (act && act.custom && !act.ok ? act.reason : '')) || '');
+  if ($('imageWhyField')) $('imageWhyField').hidden = !why;
+  if ($('imageWhy')) $('imageWhy').textContent = why;
+
+  // 坏镜像只能看不能启用；移除/打开目录仍然可用，方便用户清掉或去修文件
+  const enable = $('btnImageEnable');
+  if (enable) enable.disabled = !!(cur && cur.state !== 'ok');
+}
+
+/** 切换镜像后必须让用户知道「什么时候真的换过去」 */
+function imageRestartNote(res) {
+  // 主进程已经把旧镜像那台停掉了：下一次打开应用就会按新 AVD 开机
+  if (res && res.stoppedVm) return '已停止当前运行的安卓；下次打开应用时会用这套镜像启动。';
+  return (res && res.needsRestart)
+    ? '正在运行的安卓仍在使用上一次的镜像，关掉应用窗口后重新打开即可生效。'
+    : '下次打开应用时生效。';
+}
+
 async function openSettings() {
   state.settings = await api.getSettings();
   fillSettings(state.settings);
@@ -936,9 +1079,10 @@ async function openSettings() {
   btn.textContent = assoc.registered ? '已关联 · 点击取消' : '未关联 · 点击开启';
   btn.dataset.on = assoc.registered ? '1' : '0';
 
-  api.doctorProfile().then((r) => {
-    if (r && r.text) $('autoProfileText').textContent = r.text;
-  }).catch(() => { $('autoProfileText').textContent = '自动模式'; });
+  // 自动参数摘要：实跑参数 + 降级原因 + 手动项（唯一的展示来源）
+  refreshProfileText();
+  // 镜像来源 / 不可用原因（自定义镜像适配层）
+  refreshImagePanel();
   api.runtimeUsage().then((u) => {
     $('usageText').textContent = u
       ? `共 ${u.totalText}${u.reclaimable ? ` · 可回收 ${u.reclaimableText}（${u.count} 项）` : ' · 已是精简状态'}`
@@ -1148,13 +1292,20 @@ function bindSettings() {
   // 内存 / 核心：填了具体值就关掉「自动」，填 0 又回到自动。
   // 旧代码只写 memoryMB，而 overridesFromSettings 只在 autoMemory=false 时才认它，
   // 于是「手动填了内存」一直被忽略 —— 这是设置页最容易被当成“没用”的一项。
+  // 改完立刻刷新参数摘要：用户要能马上看到「我的值被采纳了」。
+  //
+  // 注意：内存与核数共用 autoMemory 这一个「手动」标记（overridesFromSettings 按它判断），
+  // 所以清空某一项时**不能**把 autoMemory 翻回 true —— 那会把另一项手动值一起作废。
+  // 实测：填了内存 3072、再把核数改回自动，结果实跑回到 2048，而界面还显示 3072。
   $('setMemory').addEventListener('change', (e) => {
     const v = Number(e.target.value) || 0;
-    save(v > 0 ? { engine: { memoryMB: v, autoMemory: false } } : { engine: { memoryMB: 0, autoMemory: true } });
+    save(v > 0 ? { engine: { memoryMB: v, autoMemory: false } } : { engine: { memoryMB: 0 } })
+      .then(() => refreshProfileText());
   });
   $('setCores').addEventListener('change', (e) => {
     const v = Number(e.target.value) || 0;
-    save(v > 0 ? { engine: { cores: v, autoMemory: false } } : { engine: { cores: 0, autoMemory: true } });
+    save(v > 0 ? { engine: { cores: v, autoMemory: false } } : { engine: { cores: 0 } })
+      .then(() => refreshProfileText());
   });
   if ($('setResourceMode')) {
     $('setResourceMode').addEventListener('change', async (e) => {
@@ -1162,10 +1313,48 @@ function bindSettings() {
       state.settings = await api.setSettings({ engine: { resourceMode: e.target.value } });
       fillSettings(state.settings);
       toast({ title: '资源策略已切换', body: '下一次打开应用生效', type: 'ok' });
+      // 「流畅」会让低配机器不再自动降级，摘要要跟着变
+      refreshProfileText();
+    });
+  }
+  if ($('setImageFlavor')) {
+    $('setImageFlavor').addEventListener('change', async (e) => {
+      const old = (state.settings && state.settings.runtime && state.settings.runtime.systemImageFlavor) || 'google_apis_playstore';
+      const requested = e.target.value;
+      const r = await api.setImageFlavor(requested).catch((err) => ({ ok: false, error: err.message }));
+      if (!r || !r.ok) {
+        e.target.value = old;
+        toast({ title: '系统镜像切换失败', body: (r && r.error) || '未知错误', type: 'error' });
+        return;
+      }
+      state.settings = await api.getSettings().catch(() => state.settings);
+      const label = (r.profile && (r.profile.shortLabel || r.profile.label)) || requested;
+      toast({
+        title: '系统镜像已切换',
+        body: `${label} 使用独立 AVD；${r.stoppedVm ? '当前安卓已停止，' : ''}下次启动时按新档位运行。其它档位的数据不会删除。`,
+        type: 'ok',
+      });
+      await refreshImagePanel();
+      refreshStatus().catch(() => {});
     });
   }
   if ($('setRenderSize')) {
-    $('setRenderSize').addEventListener('change', (e) => save({ engine: { renderSize: e.target.value } }));
+    $('setRenderSize').addEventListener('change', (e) => save({ engine: { renderSize: e.target.value } })
+      .then(() => refreshProfileText()));
+  }
+  // 渲染后端：选「自动」交还 doctor 逐级降级；手动选一个就固定用它（排障用）
+  if ($('setGpuMode')) {
+    $('setGpuMode').addEventListener('change', async (e) => {
+      state.settings = await api.setSettings({ engine: { gpuMode: e.target.value } });
+      toast({
+        title: e.target.value === 'auto' ? '渲染后端已交还自动' : '渲染后端已固定',
+        body: e.target.value === 'auto'
+          ? '下次开机会按机器性能重新挑选，失败自动降级'
+          : '下次开机固定使用这个后端，不再自动切换',
+        type: 'ok',
+      });
+      refreshProfileText();
+    });
   }
   if ($('setFastDns')) {
     $('setFastDns').addEventListener('change', (e) => save({ engine: { fastDns: e.target.checked } }));
@@ -1492,10 +1681,10 @@ function bindSettings() {
   $('btnInstallPlay').addEventListener('click', async () => {
     const btn = $('btnInstallPlay');
     btn.disabled = true;
-    const t = toast({ title: '开始下载 ARM 兼容镜像', body: '准备中…', sticky: true, spinner: true, progress: 3 });
+    const t = toast({ title: '开始下载 Google Play 兼容镜像', body: '准备中…', sticky: true, spinner: true, progress: 3 });
     const un = api.on('provision:progress', (p) => {
       if (p.component !== 'playimg') return;
-      t.update({ title: '下载 ARM 兼容镜像', body: p.message || '', progress: p.percent });
+      t.update({ title: '下载 Google Play 兼容镜像', body: p.message || '', progress: p.percent });
     });
     try {
       const r = await api.installPlayImage();
@@ -1530,6 +1719,140 @@ function bindSettings() {
         ? `已就绪（${(env.playImage.size / 1073741824).toFixed(2)} GB）` : '未下载';
     }
   })();
+
+  /* ---------------- 自定义镜像：导入 / 启用 / 恢复 / 移除 ---------------- */
+
+  if ($('setActiveImage')) {
+    // 下拉只是浏览：选中哪条就显示哪条的来源与不可用原因，不点「启用」不会换镜像
+    $('setActiveImage').addEventListener('change', paintImageSelection);
+  }
+
+  if ($('btnImageImport')) {
+    $('btnImageImport').addEventListener('click', async () => {
+      const btn = $('btnImageImport');
+      btn.disabled = true;
+      const t = toast({ title: '正在读取镜像…', body: '检查文件是否齐全、ABI 是否匹配', sticky: true, spinner: true, progress: 5 });
+      const un = api.on('provision:progress', (p) => {
+        if (p && p.component !== 'image') return;
+        t.update({ title: '正在导入自定义镜像', body: (p && p.message) || '', progress: p && p.percent });
+      });
+      try {
+        const r = await api.imageImport();
+        if (r && r.canceled) { t.dismiss(); return; }
+        if (!r || !r.ok) {
+          const why = (r && (r.errors && r.errors.length ? r.errors.join('\n') : r.error)) || '未知错误';
+          t.dismiss();
+          // 失败时明确说「当前镜像没变」，否则用户会以为默认运行时被搞坏了
+          toast({
+            title: '这个镜像不能用作模拟器镜像',
+            body: `${why}\n\n当前使用的镜像没有任何改动。`,
+            type: 'error',
+            sticky: true,
+          });
+          return;
+        }
+        t.update({ title: '镜像已导入', body: (r.item && r.item.name) || '', progress: 100 });
+        setTimeout(() => t.dismiss(), 2500);
+        const warn = (r.warnings && r.warnings.length) ? `\n\n注意：${r.warnings[0]}` : '';
+        toast({
+          title: `已导入 ${(r.item && r.item.name) || '镜像'}`,
+          body: `点「启用选中的镜像」后才会使用它。当前仍在用默认镜像。${warn}`,
+          type: 'ok',
+        });
+        await refreshImagePanel();
+      } catch (e) {
+        t.dismiss();
+        toast({ title: '导入失败', body: `${e.message}\n\n当前使用的镜像没有任何改动。`, type: 'error', sticky: true });
+      } finally {
+        un();
+        btn.disabled = false;
+      }
+    });
+  }
+
+  if ($('btnImageEnable')) {
+    $('btnImageEnable').addEventListener('click', async () => {
+      const id = ($('setActiveImage') || {}).value || '';
+      if (!id) {
+        toast({ title: '当前已经是内置镜像', body: '当前内置档位是 Google Play；如需无 Play 商店的 Google APIs，请在上方选择。', type: 'info' });
+        return;
+      }
+      const r = await api.imageActivate(id);
+      if (!r || !r.ok) {
+        toast({ title: '启用失败', body: (r && (r.error || r.reason)) || '未知错误', type: 'error' });
+        await refreshImagePanel();
+        return;
+      }
+      toast({
+        title: '已切换到自定义镜像',
+        body: `已用独立的安卓数据目录（${r.avd || 'apkstart-custom'}）运行，默认镜像里已装的应用与存档不受影响。\n${imageRestartNote(r)}`,
+        type: 'ok',
+        sticky: true,
+      });
+      await refreshImagePanel();
+      refreshStatus().catch(() => {});
+    });
+  }
+
+  if ($('btnImageRestore')) {
+    $('btnImageRestore').addEventListener('click', async () => {
+      const r = await api.imageRestore();
+      if (!r || !r.ok) {
+        toast({ title: '恢复默认镜像失败', body: (r && r.error) || '未知错误', type: 'error' });
+        return;
+      }
+      toast({
+        title: '已恢复默认镜像',
+        body: `已恢复当前选择的内置系统档位（Android 14 · Google APIs / AOSP / Google Play）。${imageRestartNote(r)}`,
+        type: 'ok',
+      });
+      await refreshImagePanel();
+      refreshStatus().catch(() => {});
+    });
+  }
+
+  if ($('btnImageRemove')) {
+    $('btnImageRemove').addEventListener('click', async () => {
+      const id = ($('setActiveImage') || {}).value || '';
+      if (!id) {
+        toast({ title: '请先选中一条已导入的镜像', body: '默认镜像不能移除。', type: 'info' });
+        return;
+      }
+      const item = (state.images || []).find((x) => x.id === id);
+      const c = await api.confirm({
+        title: '移除自定义镜像',
+        message: `确定移除「${(item && item.name) || id}」的记录吗？`,
+        detail: (item && item.managed)
+          ? '这份镜像是导入 ZIP 时解出来的副本，会一并删除。'
+          : '只删除记录，你自己的镜像文件夹不会被删除。',
+        okLabel: '移除',
+        danger: true,
+      });
+      if (!c || c.response !== 1) return;
+      const r = await api.imageRemove(id);
+      if (!r || !r.ok) {
+        toast({ title: '移除失败', body: (r && r.error) || '未知错误', type: 'error' });
+        return;
+      }
+      toast({
+        title: '已移除',
+        body: r.wasActive
+          ? '这条镜像正在使用，已自动恢复默认镜像。'
+          : (r.keptSourceDir ? `你的镜像文件夹仍然在：${r.keptSourceDir}` : '记录已删除。'),
+        type: 'ok',
+      });
+      await refreshImagePanel();
+    });
+  }
+
+  if ($('btnImageReveal')) {
+    $('btnImageReveal').addEventListener('click', async () => {
+      const id = ($('setActiveImage') || {}).value || '';
+      const r = await api.imageReveal(id);
+      if (!r || !r.ok) toast({ title: '打不开目录', body: (r && r.error) || '目录不存在', type: 'error' });
+    });
+  }
+
   $('btnOpenData').addEventListener('click', async () => {
     const info = await api.info();
     const dir = info.runtimeDir || info.dataDir;
@@ -1834,6 +2157,7 @@ const wizard = {
   recommendedDrive: '',
   deploying: false,
   bar: 0,
+  version: '',
 };
 
 /** 向导进度条的阶段映射：把各阶段（adb / 引擎 / 镜像 / 整包）的 percent 折算成单调递增的 0-100 */
@@ -1967,11 +2291,35 @@ async function wizardStartDeploy() {
 }
 
 function wizardFinish() {
-  api.setSettings({ wizardDone: true }).then((s) => { state.settings = s; }).catch(() => {});
+  api.setSettings({ wizardDone: true, wizardVersion: wizard.version }).then((s) => { state.settings = s; }).catch(() => {});
   api.wizardClose().catch(() => {});
   const mask = document.getElementById('wizardMask');
   if (mask) mask.classList.remove('on');
   refreshStatus().catch(() => {});
+}
+
+async function openWizard() {
+  if (!document.getElementById('wizardMask')) return;
+  const drv = await api.sysDrives().catch(() => null);
+  const configured = String((state.settings && state.settings.runtime && state.settings.runtime.dir) || '');
+  const configuredDrive = /^[A-Za-z]:/.test(configured) ? `${configured.slice(0, 1).toUpperCase()}:` : '';
+  if (drv) {
+    wizard.drives = drv.drives || [];
+    wizard.recommendedDrive = drv.recommended || '';
+    wizard.selectedDrive = wizard.drives.some((d) => d.drive === configuredDrive)
+      ? configuredDrive : (drv.recommended || '');
+    state.settings = { ...(state.settings || {}), __systemDrive: drv.systemDrive || 'C:' };
+  }
+  const source = document.getElementById('wizardSource');
+  if (source) source.value = state.settings?.runtime?.preferGithubRuntime === false ? 'official' : 'github';
+  renderWizardDrives();
+  wizardDirsPreview();
+  wizard.deploying = false;
+  wizard.bar = 0;
+  api.wizardOpen().catch(() => {});
+  wizardShowPage(1);
+  const mask = document.getElementById('wizardMask');
+  if (mask) mask.classList.add('on');
 }
 
 async function bindWizard() {
@@ -1984,28 +2332,18 @@ async function bindWizard() {
     else if (wizard.page === 2) wizardStartDeploy();
     else wizardFinish();   // 完成态才可点（wizardShowPage 已控制 disabled）
   });
+  document.getElementById('btnOpenWizard')?.addEventListener('click', () => {
+    closeSettings();
+    openWizard();
+  });
   api.on('provision:progress', (p) => wizardUpdateProgress(p));
 
-  // 首次运行才弹：已完成向导、或运行时已经就绪（老用户升级）都不打扰
+  const info = await api.info().catch(() => ({}));
+  wizard.version = String(info.version || '');
   const s = state.settings || {};
-  if (s.wizardDone === true) return;
-  if (state.status && state.status.needsSetup === false) {
-    api.setSettings({ wizardDone: true }).then((x) => { state.settings = x; }).catch(() => {});
-    return;
-  }
-  // 拉磁盘列表：推荐 = 剩余最多且 ≥8GB 的非系统盘
-  const drv = await api.sysDrives().catch(() => null);
-  if (drv) {
-    wizard.drives = drv.drives || [];
-    wizard.recommendedDrive = drv.recommended || '';
-    wizard.selectedDrive = drv.recommended || '';
-    state.settings = { ...(state.settings || {}), __systemDrive: drv.systemDrive || 'C:' };
-  }
-  renderWizardDrives();
-  wizardDirsPreview();
-  api.wizardOpen().catch(() => {});
-  wizardShowPage(1);
-  document.getElementById('wizardMask').classList.add('on');
+  // 新安装和版本升级都显示引导，避免旧配置里的 wizardDone 永久跳过关键说明。
+  if (s.wizardDone === true && wizard.version && s.wizardVersion === wizard.version) return;
+  await openWizard();
 }
 
 async function init() {
@@ -2025,7 +2363,7 @@ async function init() {
   await refreshApps();
   refreshAndroid();
   selfCheck();
-  bindWizard();
+  await bindWizard();
   setInterval(refreshStatus, 6000);
   setInterval(refreshApps, 15000);
   setInterval(selfCheck, 60000);

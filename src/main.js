@@ -18,6 +18,7 @@ const compat = require('./core/compat');
 const backup = require('./core/backup');
 const repair = require('./core/repair');
 const feedback = require('./core/report');
+const imageManifest = require('./core/image-manifest');
 const { drawAppIcon } = require('./core/png');
 
 // 品牌 Logo（build/render-logo.js 生成）；缺失时回退到程序化绘制的旧版图标
@@ -107,6 +108,19 @@ function ensureShortcuts() {
 }
 
 /**
+ * 这份配置是不是「旧版硬编码默认值」。
+ *
+ * 旧版本把 memoryMB 写死 4096、gpuMode 写死 swiftshader_indirect（37.x 上已弃用），
+ * 升级后必须纠正回自动。但用户手动填过内存（autoMemory === false）时不能再动：
+ * 那时候的 4096 是用户自己的选择，「手动配置优先」。
+ */
+function legacyEngineDefaults(s) {
+  const eng = (s && s.engine) || {};
+  if (eng.autoMemory === false) return false;
+  return eng.gpuMode === 'swiftshader_indirect' || eng.memoryMB === 4096;
+}
+
+/**
  * 完整版（内置运行时）自动接管：
  * 发行包里 ApkStart.exe 旁边带有 runtime/（emulator + platform-tools + AEHD + ARM 兼容镜像）。
  * 首次启动（settings.json 尚不存在）时直接把 runtime.dir 指向它并开启兼容模式，
@@ -167,8 +181,11 @@ function bootstrapBundledRuntime() {
     // 一律尊重：他可能就是为了省 C 盘空间、或让多个便携版共用一个运行时。
     // 旧版在这里无条件覆盖成 exe 旁边的 bundled runtime，表现就是
     // 「设置里改了运行时数据目录，结果还是下到旧目录 / AppData」（issue #23）。
+    // 只有「旧版的硬编码默认值」才需要纠正：老配置里 memoryMB 恒为 4096、
+    // gpuMode 恒为已弃用的 swiftshader_indirect，且 autoMemory 是默认的 true。
+    // 用户手动填过值（autoMemory === false）就一个字都不能动 —— 手动配置优先。
     if (explicit && !sameTree && fs.existsSync(currentExe)) {
-      if (s.engine.gpuMode === 'swiftshader_indirect' || s.engine.memoryMB === 4096) {
+      if (legacyEngineDefaults(s)) {
         store.saveSettings({ engine: { gpuMode: 'auto', autoMemory: true, memoryMB: 0, cores: 0 } });
       }
       return;
@@ -176,23 +193,33 @@ function bootstrapBundledRuntime() {
     // 已有可用运行时（含在线版）就尊重它：AVD 用户数据就在该目录下，不能悄悄搬走
     if (currentOk) {
       // 但仍把自动参数打开，旧配置里的硬编码 4G/4核/弃用 GPU 模式不能继续用
-      if (s.engine.gpuMode === 'swiftshader_indirect' || s.engine.memoryMB === 4096) {
+      if (legacyEngineDefaults(s)) {
         store.saveSettings({ engine: { gpuMode: 'auto', autoMemory: true, memoryMB: 0, cores: 0 } });
       }
       return;
     }
     // 包里带的是 Google Play 镜像才开兼容模式；AOSP 镜像带的是原生 x86_64 库
     let playBundled = false;
+    let googleApisBundled = false;
+    let aospBundled = false;
     try {
       const root = path.join(bundled, 'system-images');
       for (const api of fs.readdirSync(root)) {
         for (const tag of fs.readdirSync(path.join(root, api))) {
           if (/playstore|google_apis/i.test(tag)) playBundled = true;
+          if (/^google_apis$/i.test(tag)) googleApisBundled = true;
+          if (/^default$/i.test(tag)) aospBundled = true;
         }
       }
     } catch (_) { /* 忽略 */ }
+    const bundledFlavor = playBundled ? 'google_apis_playstore'
+      : (googleApisBundled ? 'google_apis' : (aospBundled ? 'default' : 'google_apis_playstore'));
     store.saveSettings({
-      runtime: { dir: bundled, compatImage: playBundled },
+      runtime: {
+        dir: bundled,
+        compatImage: bundledFlavor === 'google_apis_playstore',
+        systemImageFlavor: bundledFlavor,
+      },
       engine: { gpuMode: 'auto', autoMemory: true },
     });
   } catch (_) { /* 接管失败不阻塞启动，走在线引导 */ }
@@ -396,6 +423,27 @@ let deploying = false;
 // 后台却已经往默认目录（C 盘）开下，选择就失去意义了。向导关闭后重新安排。
 let wizardOpen = false;
 let wizardAutoDeployTimer = null;
+function onboardingPending() {
+  const s = store.getSettings();
+  return s.wizardDone !== true || String(s.wizardVersion || '') !== String(app.getVersion());
+}
+
+function scheduleAutoDeploy(delay = 20000) {
+  if (wizardAutoDeployTimer) clearTimeout(wizardAutoDeployTimer);
+  wizardAutoDeployTimer = setTimeout(() => {
+    wizardAutoDeployTimer = null;
+    if (onboardingPending()) {
+      send('toast', { type: 'info', message: '请先完成首次使用引导；运行环境不会在后台静默下载。' });
+      return;
+    }
+    send('toast', { type: 'info', message: '即将准备运行环境，可在设置 → 运行时查看进度。' });
+    autoDeploy().then((r) => {
+      if (r && r.ok) send('toast', { type: 'ok', message: '运行时已自动准备完成' });
+    }).catch(() => {});
+  }, delay);
+  if (wizardAutoDeployTimer.unref) wizardAutoDeployTimer.unref();
+}
+
 async function autoDeploy({ force = false } = {}) {
   // 向导打开期间拦截的是「后台定时」的自动部署；向导自己点「开始安装」走 force=true
   if (!force && wizardOpen) return { ok: false, error: 'wizard' };
@@ -652,6 +700,19 @@ function buildTray() {
 
 let installBusy = null;   // 正在安装的文件路径：双击 APK 连点会走 second-instance，不能并发装
 let lastInstallErr = { msg: '', at: 0 };
+const APK_META_CACHE = new Map();
+
+function parseApkCached(filePath) {
+  if (!/\.apk$/i.test(filePath)) return null;
+  const key = path.resolve(filePath).toLowerCase();
+  const st = fs.statSync(filePath);
+  const hit = APK_META_CACHE.get(key);
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.meta;
+  const meta = parseApk(filePath);
+  APK_META_CACHE.set(key, { size: st.size, mtimeMs: st.mtimeMs, meta });
+  while (APK_META_CACHE.size > 8) APK_META_CACHE.delete(APK_META_CACHE.keys().next().value);
+  return meta;
+}
 
 async function runInstall(filePath) {
   showWindow();
@@ -667,7 +728,9 @@ async function runInstall(filePath) {
   installBusy = filePath;
   send('install:start', { file: filePath });
   try {
-    const result = await installer.install(filePath, (p) => send('install:progress', p));
+    let parsedMeta = null;
+    try { parsedMeta = parseApkCached(filePath); } catch (_) { /* installer 会给出统一解析错误 */ }
+    const result = await installer.install(filePath, (p) => send('install:progress', p), { meta: parsedMeta });
     send('install:done', result);
     // 新建的桌面图标要让资源管理器立刻刷新，否则用户会以为「没创建快捷方式」
     windowctl.refreshShell().catch(() => {});
@@ -1076,14 +1139,19 @@ async function compatEnv() {
     const st = await runtime.status();
     if (st && st.sdk) { sdk = Number(st.sdk) || 34; live = true; }
   } catch (_) { /* 运行时还没起来：用默认值 */ }
+  let profile = null;
+  try { profile = runtime.provisioner.imageProfile(); } catch (_) { /* ignore */ }
+  const armTranslation = profile ? !!profile.armTranslation : true;
+  const playServices = profile ? !!profile.gms : true;
   return {
     sdk,
     abis: ['x86_64'],
-    // 内置镜像带 ARM 转译层；缺了会在安装失败时自动切兼容镜像（见 adb.js 的指引）
-    armTranslation: true,
-    // 内置的是 API 34 Google Play 镜像
-    playServices: true,
-    source: live ? `当前运行时（Android ${compat.sdkName(sdk)}）` : '内置运行时（Android 14，来自镜像配置）',
+    armTranslation,
+    playServices,
+    imageFlavor: profile ? profile.id : 'google_apis_playstore',
+    source: live
+      ? `当前运行时（Android ${compat.sdkName(sdk)} · ${profile ? profile.shortLabel : '系统镜像'}）`
+      : `内置运行时（Android 14 · ${profile ? profile.shortLabel : 'Google Play（兼容模式）'}）`,
   };
 }
 
@@ -1189,7 +1257,7 @@ function registerIpc() {
       throw new Error('只支持 .apk / .xapk / .apks 文件');
     }
     if (!fs.existsSync(filePath)) throw new Error('文件不存在或已被移动');
-    const info = parseApk(filePath);
+    const info = parseApkCached(filePath);
     const result = compat.analyze(info, await compatEnv());
     // 图标是 Buffer，跨 IPC 传一次就是几百 KB，这里没必要带出去
     const { iconPng, iconSvg, ...rest } = info;
@@ -1297,8 +1365,16 @@ function registerIpc() {
 
   ipcMain.handle('settings:get', () => store.getSettings());
   ipcMain.handle('settings:set', (_e, patch) => {
-    const next = store.saveSettings(patch);
-    if (patch && patch.autoStart !== undefined) applyAutoStart();
+    // activeImageId 只能由图像适配层写（image:activate / image:restore）：
+    // 那两个入口会先体检镜像。渲染层直接改这个键等于绕过校验，
+    // 可能出现「设置里说在用自定义镜像，实际文件早没了」的状态。
+    let safePatch = patch;
+    if (patch && patch.runtime && 'activeImageId' in patch.runtime) {
+      const { activeImageId, ...rest } = patch.runtime;
+      safePatch = { ...patch, runtime: rest };
+    }
+    const next = store.saveSettings(safePatch);
+    if (safePatch && safePatch.autoStart !== undefined) applyAutoStart();
     // 语言变了（upstream #38）：主进程的菜单/对话框是下次打开才读到新语言，
     // 托盘菜单得重建一次，否则托盘里还是旧语言直到重启。
     if (patch && patch.language !== undefined) {
@@ -1335,6 +1411,33 @@ function registerIpc() {
       } catch (_) { /* ignore */ }
     }
     return next;
+  });
+
+  /** 切换内置系统镜像档位：先停掉旧 AVD，再写入选择；其它档位的 AVD/数据保留。 */
+  ipcMain.handle('runtime:setImageFlavor', async (_e, flavor) => {
+    try {
+      const profile = runtime.provisioner.imageProfile(String(flavor || ''));
+      const prev = runtime.provisioner.imageProfile();
+      if (profile.id === prev.id) {
+        return { ok: true, flavor: profile.id, profile, stoppedVm: false, changed: false };
+      }
+      let stoppedVm = false;
+      if (runtime.vmRunning) {
+        await runtime.stop();
+        if (runtime.vmRunning) throw new Error('当前安卓运行时未能停止，未切换系统镜像');
+        stoppedVm = true;
+      }
+      store.saveSettings({ runtime: {
+        systemImageFlavor: profile.id,
+        // 旧兼容开关必须与档位保持一致，否则旧配置迁移会把刚选的
+        // Google APIs/AOSP 再次改回 Google Play。
+        compatImage: profile.id === 'google_apis_playstore',
+      } });
+      appLog(`built-in image flavor changed: ${prev.id} -> ${profile.id}; AVD=${profile.avd}`);
+      return { ok: true, flavor: profile.id, profile, stoppedVm, changed: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
   });
 
   /**
@@ -1438,8 +1541,16 @@ function registerIpc() {
     const env = await runtime.provisioner.checkEnv().catch(() => ({}));
     let image = null;
     try { image = runtime.emulator.imageChoice(); } catch (_) { image = null; }
+    // 自定义镜像的「来源 / 不可用原因」：修复窗口要能直接回答「是不是我换的镜像害的」
+    let act = null;
+    try { act = runtime.provisioner.activeImage(); } catch (_) { act = null; }
     // BIOS 厂商只在「要判断这是不是云电脑」时读一次：它比 CPU 型号更能识破被遮蔽的虚拟机
     const vendor = doctor.systemVendor();
+    // 实跑参数（低配机器上会被自动降级）：修复窗口的体检表里要显示它，
+    // 否则用户只会看到「起不来」，不知道自己被降到了 540×960 / 2 核。
+    // 进程重启过时内存里已经没有 profile，退回上次落盘的记录 —— 结论要和当时一致。
+    const profile = runtime.emulator.profile;
+    const lf = runtime.emulator.lastFailure ? runtime.emulator.lastFailure() : null;
     return repair.buildFacts({
       ...host,
       vendor,
@@ -1447,11 +1558,21 @@ function registerIpc() {
       osRelease: os.release(),
       accel: (env && env.accel) || { ok: false },
       emulatorVersion: env && env.emulator && env.emulator.version,
-      image: image && { api: image.api, tag: image.tag, compat: image.compat },
+      image: image && {
+        api: image.api,
+        tag: image.tag,
+        compat: image.compat,
+        custom: !!image.custom,
+        name: image.name || (act && act.name) || '',
+        source: image.custom ? imageManifest.describeSource((act && act.source) || image.source || {}) : '',
+        reason: act && act.custom && !act.ok ? act.reason : '',
+      },
       freeDiskMB: doctor.freeDiskMB(p.avdHome),
       exitCode: runtime.emulator.lastExitCode,
       runtimeDir: p.root,
       appVersion: app.getVersion(),
+      profileText: profile ? doctor.describeProfile(profile) : String((lf && lf.profileText) || ''),
+      tuned: profile ? !!profile.tuned : !!(lf && lf.tuned),
     });
   }
 
@@ -1795,19 +1916,34 @@ function registerIpc() {
 
   ipcMain.handle('doctor:profile', async () => {
     const doctor = require('./core/doctor');
-    // 已经开机就用实跑参数；没开机也要按「真实引擎版本 + 真实加速状态」推导，
-    // 否则设置页会显示已弃用的 swiftshader_indirect / 软件模拟，和实跑不一致。
-    let p = runtime.emulator.profile;
-    if (!p) {
-      const env = await runtime.provisioner.checkEnv();
-      p = doctor.autoProfile({
-        settings: store.getSettings(),
-        accel: env.accel,
-        emulatorVersion: env.emulator.version || '',
-        diskMB: doctor.freeDiskMB(store.DATA_DIR),
-      });
-    }
-    return { profile: p, text: doctor.describeProfile(p) };
+    // 设置页展示的是「按当前设置，下次开机会用的参数」：用户刚改完内存/画质就该看到结果。
+    // 引擎版本与加速状态走真实探测（checkEnv 有落盘缓存，status 每 6 秒也在用它，代价极小），
+    // 否则 37.x 机器上会显示已弃用的 swiftshader_indirect，和实跑对不上。
+    const env = await runtime.provisioner.checkEnv().catch(() => null);
+    // 探测失败时用「上次开机的加速状态」兜底，别把有加速的机器显示成软件模拟
+    const accel = (env && env.accel)
+      || (runtime.emulator.profile ? { ok: runtime.emulator.profile.accelOk } : undefined);
+    const p = doctor.autoProfile({
+      settings: store.getSettings(),
+      accel,
+      emulatorVersion: (env && env.emulator && env.emulator.version) || '',
+      diskMB: doctor.freeDiskMB(store.DATA_DIR),
+    });
+    // 运行时正在用另一组参数（改完设置还没重开）时说明一句，避免「改了没反应」的错觉
+    const running = runtime.emulator.profile;
+    const sig = (x) => (x ? `${x.memoryMB}|${x.cores}|${x.lcd && x.lcd.w}x${x.lcd && x.lcd.h}|${x.gpu}|${x.snapshot !== false}` : '');
+    const pending = !!running && sig(running) !== sig(p);
+    return {
+      profile: p,
+      text: doctor.describeProfile(p),
+      // 低配降级的原因 / 哪些项是用户手动钉住的：设置页要能解释「为什么变保守了」
+      why: [doctor.describeTuning(p), pending ? '当前运行的安卓仍在使用上次的参数，改完重开应用即生效。' : '']
+        .filter(Boolean).join(' '),
+      manual: doctor.describeManual(p),
+      tier: p.tier || '',
+      tuned: !!p.tuned,
+      running: running ? doctor.describeProfile(running) : '',
+    };
   });
 
   ipcMain.handle('doctor:report', async () => {
@@ -2238,6 +2374,263 @@ function registerIpc() {
   ipcMain.handle('provision:check', async () => runtime.provisioner.checkEnv());
   ipcMain.handle('provision:probeSources', async () => runtime.provisioner.probeSources());
 
+  /* ---------------- 自定义镜像（可插拔 image adapter） ---------------- */
+
+  /** 把一条镜像记录压成设置页需要的形状（不要 dir 之外的大字段） */
+  function imageItemOut(it) {
+    return {
+      id: it.id,
+      name: it.name,
+      api: it.api,
+      abi: it.abi,
+      tag: it.tag,
+      type: it.type,
+      vendor: it.vendor,
+      dir: it.dir,
+      managed: it.managed,
+      size: it.size,
+      importedAt: it.importedAt,
+      active: it.active,
+      state: it.state,
+      reason: it.reason,
+      summary: it.summary,
+      sourceText: imageManifest.describeSource(it.source || {}),
+      googleServices: it.googleServices,
+      armTranslation: it.armTranslation,
+    };
+  }
+
+  /**
+   * 当前镜像状态：默认镜像的健康度 + 已导入的自定义镜像 + 为什么不可用。
+   * 设置页只读这一个通道，避免「列表说能用、实际起不来」。
+   */
+  ipcMain.handle('image:status', async () => {
+    try {
+      const p = runtime.provisioner;
+      const st = p.images.status();
+      const selected = p.imageProfile();
+      const builtIn = p.imageProfiles().map((profile) => {
+        const info = p.imageInfo(profile.id);
+        return {
+          id: profile.id,
+          api: profile.api,
+          tag: profile.tag,
+          abi: profile.abi,
+          label: profile.shortLabel,
+          note: info.ok ? `${profile.shortLabel} · Android ${profile.api}（${(info.size / 1073741824).toFixed(2)} GB）` : (info.note || '未下载'),
+          ok: !!info.ok,
+          dir: info.dir,
+          avd: profile.avd,
+          gms: profile.gms,
+          playStore: profile.playStore,
+          armTranslation: profile.armTranslation,
+          active: profile.id === selected.id && !st.activeId,
+        };
+      });
+      const current = builtIn.find((x) => x.id === selected.id) || builtIn[0];
+      const env = await p.checkEnv().catch(() => null);
+      return {
+        ok: true,
+        activeId: st.activeId,
+        active: st.active,
+        why: st.why,
+        items: st.items.map(imageItemOut),
+        dir: st.dir,
+        selectedFlavor: selected.id,
+        builtInImages: builtIn,
+        defaultImage: current,
+        emulatorVersion: (env && env.emulator && env.emulator.version) || '',
+        runtimeDir: p.paths().root,
+      };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  /** 预览一个来源（不导入、不写任何东西）：设置页在确认前先看能不能用 */
+  ipcMain.handle('image:inspect', async (_e, src) => {
+    try {
+      const env = await runtime.provisioner.checkEnv().catch(() => null);
+      const report = await runtime.provisioner.images.inspectSource(String(src || ''), {
+        emulatorVersion: (env && env.emulator && env.emulator.version) || '',
+      });
+      return {
+        ok: report.ok,
+        errors: report.errors,
+        warnings: report.warnings,
+        summary: report.summary,
+        api: report.api,
+        abi: report.abi,
+        tag: report.tag,
+        size: report.size,
+        dir: report.dir,
+        suggestedId: report.suggestedId,
+        provider: report.provider,
+      };
+    } catch (e) {
+      return { ok: false, errors: [e.message], warnings: [] };
+    }
+  });
+
+  /**
+   * 导入自定义镜像。
+   * 失败时**不改变当前生效的镜像**：settings.runtime.activeImageId 只在 activate 里写，
+   * 导入只往 custom-images/index.json 里加一条记录。
+   */
+  ipcMain.handle('image:import', async (_e, opts = {}) => {
+    try {
+      let src = String(opts.path || '').trim();
+      if (!src) {
+        // Windows 上没法用同一个对话框既选文件夹又选文件，所以先问一句
+        const pick = await dialog.showMessageBox(mainWindow || undefined, {
+          type: 'question',
+          title: '导入自定义安卓镜像',
+          message: '要导入哪种形式的镜像？',
+          detail: '推荐选镜像文件夹（里面直接放着 system.img / vendor.img / kernel-ranchu / ramdisk.img，'
+            + '以及可选的 apkstart-image.json 清单）。也可以选事先打好的 ZIP 包。',
+          buttons: ['选择镜像文件夹', '选择 ZIP / 清单文件', '取消'],
+          defaultId: 0,
+          cancelId: 2,
+          noLink: true,
+        });
+        if (pick.response === 2) return { ok: false, canceled: true };
+        const dirMode = pick.response === 0;
+        const r = await dialog.showOpenDialog(mainWindow || undefined, dirMode
+          ? { title: '选择镜像文件夹', properties: ['openDirectory'] }
+          : {
+            title: '选择镜像 ZIP 包或清单文件',
+            filters: [{ name: '镜像包', extensions: ['zip', 'json'] }],
+            properties: ['openFile'],
+          });
+        if (r.canceled || !r.filePaths.length) return { ok: false, canceled: true };
+        src = r.filePaths[0];
+      }
+
+      const p = runtime.provisioner;
+      // ZIP 要先解压出来（解压后与压缩包峰值同时占盘），先挡一下磁盘
+      if (/\.zip$/i.test(src)) {
+        await p.guardDisk('image', p.paths().root);
+      }
+      const env = await p.checkEnv().catch(() => null);
+      const res = await p.images.import(src, {
+        emulatorVersion: (env && env.emulator && env.emulator.version) || '',
+        onProgress: (x) => send('provision:progress', { ...x, component: 'image' }),
+      });
+      appLog(`custom image imported: ${res.record.id} (${res.record.dir})`);
+      return { ok: true, item: imageItemOut(res.record), warnings: res.warnings, checksums: res.checksums };
+    } catch (e) {
+      // 把「为什么不行」原样交回去：设置页直接显示，不做二次包装
+      return { ok: false, error: e.message, errors: e.errors || [e.message] };
+    }
+  });
+
+  /**
+   * 换镜像前先把正在跑的运行时停掉。
+   *
+   * 为什么必须停：模拟器是 detached 的独立进程，下次启动走 adoptExisting —— 那是按端口
+   * 接管，不认「现在该用哪套镜像」。不停的话旧镜像那台会被原样接管：设置页显示新镜像、
+   * 实际还在跑旧的，用户会以为「切换没生效」，接着反复点启用。
+   * 停的时候走正常路径，快照照常保存，切回来还是秒开。
+   */
+  async function stopVmForImageSwitch() {
+    if (!runtime || !runtime.vmRunning) return false;
+    try {
+      await runtime.stop();
+      // runtime.stop() 的某些后端会吞掉关机异常；不能只看 Promise 没拒绝，
+      // 还要确认旧进程真的已经离线，否则改完 activeImageId 后仍可能被
+      // adoptExisting() 原样接管成旧镜像。
+      if (runtime.vmRunning) throw new Error('运行时仍在运行');
+      return true;
+    } catch (e) {
+      appLog(`stop before image switch failed: ${e && e.message}`);
+      return false;
+    }
+  }
+
+  /** 启用一套已导入的镜像（启用前会重新体检；失败则保持当前镜像不变） */
+  ipcMain.handle('image:activate', async (_e, id) => {
+    try {
+      const targetId = String(id || '');
+      const current = runtime.provisioner.images.active();
+      const changing = !(current && current.custom && current.id === targetId);
+      const stoppedVm = changing ? await stopVmForImageSwitch() : false;
+      if (changing && runtime.vmRunning) {
+        return { ok: false, error: '当前安卓运行时未能停止，未切换镜像。请先关闭正在运行的应用后重试。' };
+      }
+      const res = runtime.provisioner.images.activate(targetId);
+      appLog(`custom image activated: ${res.record.id} → AVD ${runtime.emulator.avdName}`);
+      return {
+        ok: true,
+        item: imageItemOut(res.record),
+        avd: runtime.emulator.avdName,
+        // 旧镜像那台已经停了；下次开机会按新的 AVD 冷/快启动
+        needsRestart: stoppedVm,
+        stoppedVm,
+      };
+    } catch (e) {
+      return { ok: false, error: e.message, reason: e.reason || '' };
+    }
+  });
+
+  /** 恢复默认镜像：只清指针，默认镜像与默认 AVD 全程没被动过 */
+  ipcMain.handle('image:restore', async () => {
+    try {
+      const current = runtime.provisioner.images.active();
+      const changing = !!(current && current.custom);
+      const stoppedVm = changing ? await stopVmForImageSwitch() : false;
+      if (changing && runtime.vmRunning) {
+        return { ok: false, error: '当前安卓运行时未能停止，未恢复默认镜像。请先关闭正在运行的应用后重试。' };
+      }
+      runtime.provisioner.images.restoreDefault();
+      appLog('custom image restored to default (Android 14 Play x86_64)');
+      return {
+        ok: true, needsRestart: stoppedVm, stoppedVm, avd: runtime.emulator.avdName,
+      };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  /** 移除一条记录（只删我们自己解出来的副本，绝不删用户的源目录） */
+  ipcMain.handle('image:remove', async (_e, id) => {
+    try {
+      const targetId = String(id || '');
+      const current = runtime.provisioner.images.active();
+      const removingActive = !!(current && current.custom && current.id === targetId);
+      const stoppedVm = removingActive ? await stopVmForImageSwitch() : false;
+      if (removingActive && runtime.vmRunning) {
+        return { ok: false, error: '当前安卓运行时未能停止，未移除正在使用的镜像。请先关闭正在运行的应用后重试。' };
+      }
+      const r = runtime.provisioner.images.remove(targetId);
+      if (!r.ok) return r;
+      // 移除的正好是当前在用的那套：remove() 已经把指针恢复成默认镜像，
+      // 但旧进程还跑着已删除的镜像，必须停掉，否则下次会被接管成「幽灵镜像」。
+      return {
+        ok: true,
+        wasActive: r.wasActive,
+        keptSourceDir: r.keptSourceDir,
+        stoppedVm,
+        avd: runtime.emulator.avdName,
+      };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  /** 在文件管理器里打开镜像目录（排查「文件是不是被移走了」） */
+  ipcMain.handle('image:reveal', async (_e, id) => {
+    try {
+      const st = runtime.provisioner.images.status();
+      const item = st.items.find((x) => x.id === String(id || ''));
+      const dir = item ? item.dir : st.dir;
+      if (!dir || !fs.existsSync(dir)) return { ok: false, error: '目录不存在' };
+      shell.openPath(dir);
+      return { ok: true, dir };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
   ipcMain.handle('runtime:startInstaller', async () => {
     try {
       await runtime.startInstaller({ onLog: (m) => send('runtime:log', m) });
@@ -2448,13 +2841,8 @@ function registerIpc() {
   });
   ipcMain.handle('wizard:close', () => {
     wizardOpen = false;
-    // 向导关掉但没装完（用户跳过）：恢复旧版行为，20 秒后照常后台自动部署
-    if (wizardAutoDeployTimer) clearTimeout(wizardAutoDeployTimer);
-    wizardAutoDeployTimer = setTimeout(() => {
-      wizardAutoDeployTimer = null;
-      autoDeploy().catch(() => {});
-    }, 20000);
-    if (wizardAutoDeployTimer.unref) wizardAutoDeployTimer.unref();
+    // 向导关掉但没装完时仍然等待版本化引导完成，避免用户刚跳过就被静默下载打断。
+    scheduleAutoDeploy();
     return { ok: true };
   });
 
@@ -2776,11 +3164,7 @@ if (!gotLock) {
 
     // 首次运行的组件部署延后 20 秒：冷启动那段时间磁盘/CPU 已经打满，
     // 再并发下载解压只会让桌面更卡。真有应用要打开时 ensure() 自会准备。
-    setTimeout(() => {
-      autoDeploy().then((r) => {
-        if (r && r.ok) send('toast', { type: 'ok', message: '运行时已自动准备完成' });
-      }).catch(() => {});
-    }, 20000).unref?.();
+    scheduleAutoDeploy();
 
     // 启动 8 秒后静默查一次新版本（打包后才有意义）：自动更新开启时
     // 「通知 → 自动下载 → 空闲时自动重启安装」一条龙；关闭则退回只通知。

@@ -749,6 +749,13 @@ class AdbClient {
     await this.shell(`pm clear ${shellQuote(pkg)}`);
   }
 
+  /** 只清理应用缓存，不删除登录态和用户数据；用于应用首次启动异常后的安全重试。 */
+  async clearCache(pkg) {
+    const q = shellQuote(pkg);
+    await this.shell(`cmd package clear --cache-only ${q} 2>/dev/null || pm clear --cache-only ${q}`, { timeout: 8000 });
+    return true;
+  }
+
   /** 导出应用数据（Windows/调试版可用 run-as；否则走 adb backup 兜底） */
   async exportAppData(pkg, localTarPath) {
     const remote = `/sdcard/apkstart-tmp-${pkg}.tar`;   // pull 不经设备 shell，路径里不能带引号

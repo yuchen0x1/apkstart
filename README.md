@@ -13,6 +13,16 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 
 > 当前版本：**0.6.6**。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 和 [发布说明](docs/releases/release-notes.md)。
 
+## 最新更新
+
+### Unreleased（尚未发布）
+
+- 低配机器会自动收敛内存、核心数、分辨率和渲染后端，启动失败时显示本次实际参数。
+- 支持导入并独立启用自有的 x86_64 Android 模拟器镜像；导入失败不会改动当前默认运行时。
+- 默认镜像统一为 Android 14 · Google Play · x86_64，Google APIs / AOSP 仍可在设置中显式选择。
+
+完整历史与本地验证范围见 [CHANGELOG.md](CHANGELOG.md) 和 [发布说明](docs/releases/release-notes.md)；本节内容尚未对应已发布版本。
+
 ## 当前界面
 
 首次启动会显示三步引导：选择安装位置、自动下载运行时、开始使用。默认推荐剩余空间较大的非系统盘，避免把 C 盘占满。
@@ -34,6 +44,7 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 - **独立应用窗口**：应用以独立窗口运行，支持全屏、窗口模式、拖动缩放和按应用记忆窗口尺寸。
 - **首次运行向导**：自动选择运行时和安卓数据目录，显示下载进度；向导可以稍后在设置中重新打开。
 - **运行时一键部署**：自动准备 adb、Android Emulator 和 Android 14 系统镜像，支持测速选源、断点续传、换源重试和本地整包导入。
+- **自定义镜像适配**：可导入带清单的 x86_64 模拟器镜像，单独启用、停用或移除，不影响默认 AVD 和已装应用。
 - **安装前兼容性检查**：安装前检查 Android 版本、ABI、Google Play 依赖、硬件特性和拆分 APK，并用中文说明风险。
 - **文件互通**：`%USERPROFILE%\ApkStartShared` 与安卓侧 `/sdcard/ApkStartShared` 双向同步；冲突文件会保留副本，不会静默覆盖。
 - **导出与备份**：可以导出 APK，也可以生成包含 `app.apk`、`meta.json` 和可选应用数据的备份目录；无法读取私有数据时会明确说明原因。
@@ -156,6 +167,7 @@ ApkStart 使用 Android Emulator、QEMU、adb 和 Android 系统镜像作为运�
 - [贡献指南](CONTRIBUTING.md)
 - [安全边界](SECURITY.md)
 - [架构说明](docs/ARCHITECTURE.md)
+- [自定义镜像适配层](docs/CUSTOM-IMAGES.md)
 - [测试说明](docs/TESTING.md)
 - [升级交付报告](docs/UPGRADE-REPORT.md)
 

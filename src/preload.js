@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   restoreMouseHook: () => invoke('settings:unhook'),
 
   runtimeStatus: () => invoke('runtime:status'),
+  setImageFlavor: (flavor) => invoke('runtime:setImageFlavor', flavor),
   runtimeProbe: () => invoke('runtime:probe'),
   runtimeStart: (opts) => invoke('runtime:start', opts || {}),
   repairPlan: () => invoke('runtime:repairPlan'),
@@ -75,6 +76,15 @@ contextBridge.exposeInMainWorld('apkstart', {
   importIso: () => invoke('provision:importIso'),
   importRuntimePack: () => invoke('provision:importRuntimePack'),
   importDisk: () => invoke('provision:importDisk'),
+
+  // 自定义镜像（可插拔 image adapter）：导入 / 启用 / 恢复默认 / 移除
+  imageStatus: () => invoke('image:status'),
+  imageInspect: (src) => invoke('image:inspect', src),
+  imageImport: (opts) => invoke('image:import', opts || {}),
+  imageActivate: (id) => invoke('image:activate', id),
+  imageRestore: () => invoke('image:restore'),
+  imageRemove: (id) => invoke('image:remove', id),
+  imageReveal: (id) => invoke('image:reveal', id),
 
   selfCheck: () => invoke('doctor:selfCheck'),
   clearLocks: () => invoke('app:clearLocks'),

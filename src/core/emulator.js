@@ -20,6 +20,18 @@ const userdata = require('./userdata');
 
 const AVD_NAME = 'apkstart';
 const SNAPSHOT_NAME = 'apkstart';
+/**
+ * 自定义镜像单独一套 AVD。
+ *
+ * 为什么不复用 apkstart：模拟器发现 image.sysdir 变了就会给旧 userdata 做
+ * -wipe-data（APEX 不兼容会引导循环），那等于「换镜像 = 已装应用全丢」。
+ * 换成一个独立 AVD 以后，默认 AVD（应用、存档、快照）一个字节都不动，
+ * 用户在设置里「恢复默认镜像」就能原样回来。
+ */
+const CUSTOM_AVD_NAME = 'apkstart-custom';
+/** 两个 AVD 都归我们管：清理逻辑必须把它们都当成「活动 AVD」保护起来 */
+const BUILTIN_AVD_NAMES = ['apkstart-googleapis', 'apkstart-aosp'];
+const MANAGED_AVDS = [`${AVD_NAME}.avd`, ...BUILTIN_AVD_NAMES.map((x) => `${x}.avd`), `${CUSTOM_AVD_NAME}.avd`];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -117,23 +129,97 @@ class EmulatorEngine {
 
   get serial() { return `emulator-${this.port}`; }
 
+  /**
+   * 取「当前生效的自定义镜像」。
+   * 单独抽一层是因为单测与早期调用会塞进来一个只实现了几个方法的 provisioner：
+   * 拿不到就当没有自定义镜像，绝不让它把选镜像这条主路径搞崩。
+   */
+  _activeImageInfo() {
+    try {
+      return typeof this.provisioner.activeImage === 'function' ? this.provisioner.activeImage() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * 当前该用哪套 AVD：默认镜像 → apkstart，自定义镜像 → apkstart-custom。
+   *
+   * 不做实例内缓存：切换镜像只需要重启运行时，下一次 start() 就会走到新的名字，
+   * 不会出现「设置里换了镜像，却还把文件写进默认 AVD」这种最难查的串味问题。
+   * 底层 ImageStore.active() 自己按 activeImageId 做了缓存，这里再取一次很便宜。
+   */
+  get avdName() {
+    const act = this._activeImageInfo();
+    if (act && act.ok && act.custom) return CUSTOM_AVD_NAME;
+    try {
+      const p = this.provisioner.imageProfile();
+      return p.avd || AVD_NAME;
+    } catch (_) {
+      return AVD_NAME;
+    }
+  }
+
   /** emulator.exe 与系统镜像目录（优先用户运行时目录，回退到仓库内 engine/） */
   locate() {
     const p = this.provisioner.paths();
     const emuCandidates = [p.emulatorExe, path.join(this.appRoot, 'engine', 'emulator', 'emulator.exe')];
     const emulatorExe = emuCandidates.find((c) => fs.existsSync(c)) || '';
     const img = this.provisioner.systemImageInfo();
-    return { emulatorExe, sysImgDir: img.dir, sysImgOk: img.ok, root: emulatorExe ? path.dirname(path.dirname(emulatorExe)) : p.root };
+    return { emulatorExe, sysImgDir: img.dir, sysImgOk: img.ok, custom: !!img.custom, root: emulatorExe ? path.dirname(path.dirname(emulatorExe)) : p.root };
   }
 
-  /** 选镜像：有通用镜像（API 34 Play）就用它，不再让用户切「兼容模式」 */
+  /**
+   * 选镜像：
+   *   1. 用户在「自定义镜像」里启用了某套 → 用它（导入时已经过了清单 + 字节体检）；
+   *   2. 否则用当前选择的内置镜像（新安装默认 API 34 Google Play）；
+   *   3. 再退到任意一套可用的系统镜像，保证有兜底。
+   */
   imageChoice() {
-    const play = this.provisioner.playImageInfo();
-    const base = this.provisioner.systemImageInfo();
-    if (play.ok) {
-      return { compat: true, api: play.api, tag: play.tag, dir: play.dir, abi: 'x86_64' };
+    const act = this._activeImageInfo();
+    if (act && act.ok && act.custom) {
+      return {
+        compat: false,
+        custom: true,
+        id: act.id,
+        name: act.name,
+        api: act.api,
+        tag: act.tag,
+        dir: act.dir,
+        abi: act.abi,
+        gms: !!(act.googleServices && act.googleServices.gms),
+        playStore: !!(act.googleServices && act.googleServices.playStore),
+        armTranslation: !!(act.armTranslation && act.armTranslation.enabled),
+        source: act.source || {},
+      };
     }
-    return { compat: false, api: base.api, tag: base.tag, dir: base.dir, abi: base.abi || this.provisioner.paths().sysAbi };
+    const base = this.provisioner.systemImageInfo();
+    let profile = null;
+    try { profile = this.provisioner.imageProfile(); } catch (_) { profile = null; }
+    // 兼容旧版测试/外接 provisioner：没有档位接口时仍按旧逻辑认 Play 镜像。
+    if (!profile && typeof this.provisioner.playImageInfo === 'function') {
+      const legacyPlay = this.provisioner.playImageInfo();
+      if (legacyPlay && legacyPlay.ok) {
+        return {
+          compat: true, builtIn: true, flavor: 'google_apis_playstore',
+          api: legacyPlay.api, tag: legacyPlay.tag, dir: legacyPlay.dir, abi: 'x86_64',
+          name: 'Google Play（兼容模式）', gms: true, playStore: true, armTranslation: true,
+        };
+      }
+    }
+    return {
+      compat: !!(profile && profile.armTranslation),
+      builtIn: true,
+      flavor: (profile && profile.id) || base.flavor || 'google_apis_playstore',
+      api: base.api || (profile && profile.api),
+      tag: base.tag || (profile && profile.tag),
+      dir: base.dir,
+      abi: base.abi || (profile && profile.abi) || this.provisioner.paths().sysAbi,
+      name: (profile && profile.shortLabel) || base.label || 'Google Play（兼容模式）',
+      gms: !!(profile && profile.gms),
+      playStore: !!(profile && profile.playStore),
+      armTranslation: !!(profile && profile.armTranslation),
+    };
   }
 
   /**
@@ -145,7 +231,7 @@ class EmulatorEngine {
     this.cancelSnapshotSave();
     this._snapSaved = false;
     try {
-      const snapDir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots');
+      const snapDir = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`, 'snapshots');
       fs.rmSync(snapDir, { recursive: true, force: true });
       return true;
     } catch (_) {
@@ -177,7 +263,7 @@ class EmulatorEngine {
    * 白等几秒。这里按文件大小校验，顺手清掉空壳和旧版遗留的 default_boot（单个 3GB）。
    */
   hasSnapshot() {
-    const base = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots', SNAPSHOT_NAME);
+    const base = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`, 'snapshots', SNAPSHOT_NAME);
     const size = (p) => { try { return fs.statSync(p).size; } catch (_) { return 0; } };
     const pb = size(path.join(base, 'snapshot.pb'));
     // 新版 emulator（37.x）写的是 ram.bin，老版本写 ram.img。
@@ -193,7 +279,7 @@ class EmulatorEngine {
 
   /** 清掉旧版遗留/失败重命名留下的快照目录（default_boot 里的 ram.img 可达 3GB） */
   _cleanLegacySnapshots() {
-    const dir = path.dirname(path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots', SNAPSHOT_NAME));
+    const dir = path.dirname(path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`, 'snapshots', SNAPSHOT_NAME));
     let names = [];
     try { names = fs.readdirSync(dir); } catch (_) { return; }
     for (const name of names) {
@@ -213,7 +299,7 @@ class EmulatorEngine {
    */
   async killOrphanProcesses({ onLog = () => {} } = {}) {
     if (process.platform !== 'win32') return 0;
-    const avdDir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`);
+    const avdDir = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`);
 
     // 快速路径（每次冷启动都会走到）：
     //  - 没有 .lock → 不可能有活着的 emulator 占着这个 AVD，直接返回；
@@ -293,7 +379,7 @@ class EmulatorEngine {
   } = {}) {
     const p = this.provisioner.ensureDirs();
     const home = p.avdHome;
-    const avdDir = path.join(home, `${AVD_NAME}.avd`);
+    const avdDir = path.join(home, `${this.avdName}.avd`);
     fs.mkdirSync(avdDir, { recursive: true });
     this.clearLocks(avdDir);
 
@@ -304,10 +390,14 @@ class EmulatorEngine {
     const choice = this.imageChoice();
     const tag = choice.tag;
     const api = choice.api;
-    const tagDisplay = choice.compat ? 'Google Play (ARM 兼容)' : 'AOSP';
+    // 自定义镜像的 tag.display 用清单里的名字：AVD 列表里一眼能看出「这套不是默认镜像」。
+    // config.ini 声明了 UTF-8 编码，中文名可以直接写。
+    const tagDisplay = choice.custom
+      ? (choice.name || '自定义镜像')
+      : (choice.name || (choice.compat ? 'Google APIs' : '纯 AOSP'));
 
     fs.writeFileSync(
-      path.join(home, `${AVD_NAME}.ini`),
+      path.join(home, `${this.avdName}.ini`),
       `avd.ini.encoding=UTF-8\npath=${avdDir.replace(/\\/g, '/')}\ntarget=android-${api}\n`,
     );
 
@@ -358,7 +448,7 @@ class EmulatorEngine {
       : choice.abi === 'armeabi-v7a' ? 'arm' : choice.abi;
 
     const cfg = [
-      `AvdId=${AVD_NAME}`,
+      `AvdId=${this.avdName}`,
       'avd.ini.displayname=ApkStart',
       'avd.ini.encoding=UTF-8',
       `abi.type=${choice.abi}`,
@@ -379,7 +469,9 @@ class EmulatorEngine {
       'hw.lcd.density=' + screen.dpi,
       'hw.mainKeys=no',
       'ShowDeviceFrame=no',
-      `PlayStore.enabled=${choice.compat}`,
+      // 自定义镜像按清单里的 googleServices 决定：没有 Play 商店就不能声称有，
+      // 否则安卓会去拉起不存在的商店包，设置页里点「Play 商店」直接闪退。
+      `PlayStore.enabled=${!!choice.playStore}`,
       // 快照完全由命令行 -snapshot apkstart 控制：用独立名字，绝不误加载
       // 旧版遗留的 default_boot（那是 API30 镜像的内存状态，加载必进引导循环）。
       'hw.sdCard=no',
@@ -398,7 +490,7 @@ class EmulatorEngine {
     const data = this.ensureDataPartition(avdDir, dataMB);
 
     return {
-      home, avdDir, ini: path.join(home, `${AVD_NAME}.ini`), image: choice,
+      home, avdDir, ini: path.join(home, `${this.avdName}.ini`), image: choice,
       wipePending: this.wipePending, screen, data,
     };
   }
@@ -552,7 +644,7 @@ class EmulatorEngine {
     snapshot = true, wipe = false, lcd = null,
   } = {}) {
     const args = [
-      '-avd', AVD_NAME,
+      '-avd', this.avdName,
       '-port', String(port),
       // 音频：默认开启（让安卓应用的提示音/视频声音能放出来）。
       // 仅当用户在设置里显式关闭时才传 -no-audio 省一点 CPU。
@@ -701,7 +793,7 @@ class EmulatorEngine {
 
   /** 当前 /data 镜像的实际情况（设置页展示用，不启动安卓也能取） */
   dataInfo() {
-    const dir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`);
+    const dir = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`);
     const img = path.join(dir, 'userdata-qemu.img');
     let bytes = 0;
     try { bytes = fs.statSync(img).size; } catch (_) { /* 还没建 */ }
@@ -719,7 +811,7 @@ class EmulatorEngine {
    * 不重建、不丢已装应用与存档。
    */
   resizeDataPartition(dataMB) {
-    const dir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`);
+    const dir = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`);
     return this.ensureDataPartition(dir, dataMB);
   }
 
@@ -734,7 +826,7 @@ class EmulatorEngine {
     return new Promise((resolve) => {
       execFile('powershell.exe', [
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', script, '-Avd', AVD_NAME, '-Level', level,
+        '-File', script, '-Avd', this.avdName, '-Level', level,
       ], { windowsHide: true, timeout: 15000 }, (_err, out) => {
         const m = /CHANGED=(\d+)/.exec(String(out || ''));
         resolve(m ? Number(m[1]) : 0);
@@ -1089,9 +1181,13 @@ class EmulatorEngine {
     // 「低配模式」：一键修复里由用户点一下才启用，只对本次启动生效，不写进设置。
     // 目的不是让机器变快，而是让「本来就慢但能跑」的机器有机会开完机：
     // 降分辨率/减 vCPU 少抢资源，关快照避免加载失败后白等，并给足超时。
+    // 具体数值复用 doctor.lowSpecProfile()，别再在这里写第二份「2 核 / 2G」。
     if (lowspec) {
-      profile.memoryMB = Math.min(profile.memoryMB, 2048);
-      profile.cores = Math.min(profile.cores, 2);
+      const tuned = doctor.lowSpecProfile({
+        host: profile.host, emulatorVersion: emuVersion, diskMB,
+      });
+      profile.memoryMB = Math.min(profile.memoryMB, tuned.memoryMB);
+      profile.cores = Math.min(profile.cores, tuned.cores);
       profile.lcd = doctor.lcdFor({ accelOk: false });
       profile.snapshot = false;
       profile.lowspec = true;
@@ -1191,14 +1287,22 @@ class EmulatorEngine {
       const dead = await this._waitSpawnSettled(2200);
       if (dead || !this.proc) {
         const d = doctor.diagnose(this._attemptLines(logStart, 60));
-        this.attempts.push({ plan: plan.label, diagnosis: d.code, exitCode: this.lastExitCode });
+        this.attempts.push({
+          plan: plan.label, diagnosis: d.code, exitCode: this.lastExitCode,
+          // 实际参数：失败后用户/作者都要能看出「这一轮到底用了多保守的配置」，
+          // 只看 label（gpu / 加速方式）是不够的。
+          params: doctor.describeAttempt(plan),
+        });
         this.lastDiagnosis = d;
         lastError = `${d.title}：${d.hint}`;
         // 磁盘写满不是「换组参数就能好」的问题：继续重试只会反复失败，
         // 而且历史上最后那组参数带 wipe，会把用户数据一起抹掉。直接收工、如实报错。
         if (d.code === 'DISK_FULL') {
           onLog('磁盘空间不足，已停止重试（不会动你的应用与存档）。');
-          this._persistFailure({ profile, why: 'disk-full' });
+          this._persistFailure({
+            profile, profileText: doctor.describeProfile(profile),
+            tuning: doctor.describeTuning(profile), why: 'disk-full',
+          });
           return { ok: false, error: lastError, needsSpace: true, attempts: this.attempts, exitCode: this.lastExitCode };
         }
         // 加速/镜像类结论可能是缓存里的旧数据，作废掉，下次启动重新探测
@@ -1211,6 +1315,11 @@ class EmulatorEngine {
       }
 
       if (!probe) {
+        // The visible-window path may have selected a fallback plan (for example
+        // swangle after host rendering fails). Keep the plan that actually got
+        // spawned so status/doctor:profile can distinguish the running VM from
+        // the next-start profile shown in Settings.
+        this.profile = plan;
         return { ok: true, serial: this.serial, port, accel: accelInfo, logFile, profile, attempts: this.attempts };
       }
 
@@ -1258,6 +1367,11 @@ class EmulatorEngine {
 
       if (ok) {
         const bootMs = Date.now() - started;
+        // `profile` is the desired auto profile, while `plan` is the concrete
+        // attempt that reached Android. A visible launch can fall back from
+        // host to swangle/software without changing the user's settings; keep
+        // the concrete plan for runtime status and diagnostics.
+        this.profile = plan;
         // 这一次真的起来了：清掉上次的失败记录，避免以后「诊断」翻出旧账
         this._clearFailure();
         // 一定要存 quickboot 快照：模拟器进程会随 ApkStart 退出而结束（Electron 的
@@ -1302,7 +1416,10 @@ class EmulatorEngine {
           seconds: Math.round((Date.now() - started) / 1000),
         });
       }
-      this.attempts.push({ plan: plan.label, diagnosis: d.code, timeout: !fatal, exitCode: this.lastExitCode });
+      this.attempts.push({
+        plan: plan.label, diagnosis: d.code, timeout: !fatal, exitCode: this.lastExitCode,
+        params: doctor.describeAttempt(plan),
+      });
       this.lastDiagnosis = d;
       lastError = `${d.title}：${d.hint}`;
       onLog(`${lastError}，自动换一组参数重试…`);
@@ -1340,15 +1457,32 @@ class EmulatorEngine {
       + '只有带窗口起不来，那是宿主 GPU/Vulkan 驱动与模拟器 Qt 窗口的冲突，不是安卓镜像的问题：'
       + '在「设置 → 渲染后端」手动指定 swiftshader 或 lavapipe 再试一次。'
     );
+    const customHint = choice && choice.custom
+      ? `\n当前使用的是自定义镜像「${choice.name}」（${choice.dir}）。`
+        + '如果它在这台机器上起不来，请在「设置 → 自定义安卓镜像」里点「恢复默认镜像」再试 —— '
+        + '默认的 Android 14 Google Play 镜像与它的数据是分开存放的，切换不会丢已装应用。'
+      : '';
     const err = new Error(
       `运行时多次尝试仍未能启动（${d.title}）。\n${d.hint}\n\n`
-      + `已尝试：${this.attempts.map((a) => `${a.plan} → ${a.diagnosis}`).join('；')}\n`
+      // 低配机器上最常被问的一句是「你到底给我分配了什么」。这行就是实跑参数，
+      // 与设置页展示、诊断报告里的是同一份（doctor.describeProfile）。
+      + `实际参数：${doctor.describeProfile(profile)}\n`
+      + `已尝试：${this.attempts.map((a) => `${a.plan}${a.params ? `（${a.params}）` : ''} → ${a.diagnosis}`).join('；')}\n`
+      + `${customHint ? `${customHint.trim()}\n` : ''}`
       + `诊断报告：${report.file}${visibleHint}`,
     );
     err.diagnosis = d;
     err.report = report.file;
     err.attempts = this.attempts;
-    this._persistFailure({ profile, why: 'boot-failed', report: report.file });
+    this._persistFailure({
+      profile, profileText: doctor.describeProfile(profile),
+      tuning: doctor.describeTuning(profile), why: 'boot-failed', report: report.file,
+      // 本次用的是哪套镜像：进程重启后仍要能回答「是不是我换的镜像导致的」
+      image: choice && {
+        custom: !!choice.custom, id: choice.id || '', name: choice.name || '',
+        api: choice.api || '', abi: choice.abi || '', dir: choice.dir || '',
+      },
+    });
     throw err;
   }
 
@@ -1532,4 +1666,4 @@ class EmulatorEngine {
   }
 }
 
-module.exports = { EmulatorEngine, AVD_NAME, SNAPSHOT_NAME };
+module.exports = { EmulatorEngine, AVD_NAME, SNAPSHOT_NAME, CUSTOM_AVD_NAME, MANAGED_AVDS };
