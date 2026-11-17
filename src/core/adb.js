@@ -304,6 +304,26 @@ class AdbClient {
   }
 
   /** 执行一条白名单内的 input 命令；失败会回收会话，调用方可回退到一次性 adb */
+  /**
+   * 回到安卓桌面，并直接打开「所有应用」抽屉。
+   *
+   * Play 镜像自带的是 Pixel 桌面：已安装的应用不在首页，要**从底部上滑**才出来，
+   * 首页只放 Google 自带的那几个。用户按 Home 回去看到一片陌生图标，第一反应就是
+   * 「我装的应用呢」。这里把两步合成一步：HOME → 上滑 → 抽屉，落地即是全部应用。
+   */
+  async androidHome({ timeout = 12000 } = {}) {
+    const size = await this.shell('wm size', { timeout: 8000 }).catch(() => '');
+    // 输出可能有 Override / Physical 两行，取实际生效的那一行
+    const all = [...String(size).matchAll(/(\d+)\s*x\s*(\d+)/g)].map((m) => ({ w: Number(m[1]), h: Number(m[2]) }));
+    const box = all.length ? all[all.length - 1] : { w: 720, h: 1280 };
+    await this.shell('input keyevent KEYCODE_HOME', { timeout });
+    await new Promise((r) => setTimeout(r, 400));
+    const x = Math.round(box.w / 2);
+    // 从下往上滑（Pixel 桌面：上滑 = 打开应用抽屉）
+    await this.shell(`input swipe ${x} ${Math.round(box.h * 0.82)} ${x} ${Math.round(box.h * 0.2)} 220`, { timeout });
+    return { ok: true, size: box };
+  }
+
   async input(cmd, { timeout = 4000 } = {}) {
     const { isInputCommand } = require('./pointer');
     if (!isInputCommand(cmd)) throw new Error('非法的输入命令');

@@ -2560,6 +2560,20 @@ function bindEvents() {
   };
   $('btnInstall').addEventListener('click', pick);
   $('btnInstall2').addEventListener('click', pick);
+  // 「安卓桌面」：Play 镜像的 Pixel 桌面把已装应用放在上滑抽屉里，用户按 Home
+  // 只看到 Google 自带图标，会以为应用丢了。这里一步到位：HOME → 上滑 → 抽屉。
+  const btnHome = $('btnAndroidHome');
+  if (btnHome) btnHome.addEventListener('click', async () => {
+    btnHome.disabled = true;
+    try {
+      const r = await api.androidHome();
+      if (!r || !r.ok) toast({ title: '打不开安卓桌面', body: (r && r.error) || '安卓还没启动', type: 'error' });
+    } catch (e) {
+      toast({ title: '打不开安卓桌面', body: e.message, type: 'error' });
+    } finally {
+      btnHome.disabled = false;
+    }
+  });
   // 共享目录入口移到设置里：同步 + 打开都在「文件互通」组内
   const btnSync = $('btnSyncShared');
   if (btnSync) btnSync.addEventListener('click', async () => {

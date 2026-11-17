@@ -867,6 +867,44 @@ async function runInstall(filePath) {
 let autoUpdateJob = null;
 let autoUpdateTag = '';
 
+/**
+ * 更新已经交给升级脚本后退出。
+ *
+ * 只调 app.quit() 不够：before-quit 里要等窗口代理回包、停模拟器、藏窗口，
+ * 清理一旦卡住，进程会一直活着占住 ApkStart.exe —— 安装器拿不到文件锁，
+ * 静默安装「什么也没做」，用户看到的就是「点重启并安装，没反应，版本还是旧的」。
+ * 所以再加一层硬退出兜底：正常退不掉就直接 exit(0)，文件锁必须让出来。
+ */
+function quitForUpdate() {
+  quitting = true;
+  setTimeout(() => { try { app.quit(); } catch (_) { /* ignore */ } }, 900);
+  setTimeout(() => { try { app.exit(0); } catch (_) { /* ignore */ } }, 15000);
+}
+
+/**
+ * 上次更新有没有装成功。
+ *
+ * 升级脚本在失败时会留下 update/failed.json（并保留安装包），这里读出来告诉用户，
+ * 而不是让用户对着一模一样的旧界面猜「到底更没更新」。读一次就删，不反复打扰。
+ */
+function notifyUpdateFailure() {
+  try {
+    const f = path.join(updater.updateDir, 'failed.json');
+    if (!fs.existsSync(f)) return;
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8')) || {};
+    fs.rmSync(f, { force: true });
+    const v = String(raw.version || '').replace(/^v/i, '');
+    appLog(`previous update failed: v${v} log=${raw.log || ''}`);
+    send('toast', {
+      type: 'warn',
+      sticky: true,
+      message: `上次更新到 ${v || '新版本'} 没有装成功，已回到旧版本。`
+        + '安装包已经下载好了，到「设置 → 软件更新」点一次即可重试（不会重新下载）；'
+        + '如果仍然失败，点「打开下载页」手动安装。',
+    });
+  } catch (_) { /* 标记损坏无关紧要 */ }
+}
+
 function applyAutoUpdate() {
   if (!autoUpdateJob || updateBusy) return;
   const job = autoUpdateJob;
@@ -874,7 +912,7 @@ function applyAutoUpdate() {
   notify('正在自动更新', `即将重启并安装 ApkStart ${autoUpdateTag}`);
   send('update:progress', { stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
   updater.apply(job);
-  setTimeout(() => { quitting = true; app.quit(); }, 900);
+  quitForUpdate();
 }
 
 async function autoUpdateFlow(info) {
@@ -959,7 +997,7 @@ async function runUpdate() {
       autoUpdateJob = null;
       sendProgress({ stage: 'apply', percent: 100, message: '已下载完成，正在替换程序并重启…' });
       updater.apply(job);
-      setTimeout(() => { quitting = true; app.quit(); }, 900);
+      quitForUpdate();
       return { ok: true, version: info.version || autoUpdateTag, mode: job.mode };
     }
     if (!info.asset) {
@@ -986,7 +1024,7 @@ async function runUpdate() {
     sendProgress({ stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
     updater.apply(job);
     // 给界面一点时间显示「即将重启」，然后走正常退出流程（before-quit 会把模拟器窗口藏好）
-    setTimeout(() => { quitting = true; app.quit(); }, 900);
+    quitForUpdate();
     return { ok: true, version: info.version, mode: job.mode };
   } catch (e) {
     sendProgress({ stage: 'error', percent: 0, message: e.message });
@@ -1938,6 +1976,23 @@ function registerIpc() {
 
   ipcMain.handle('runtime:status', async () => runtime.status());
   ipcMain.handle('runtime:probe', async () => runtime.probe());
+  /**
+   * 回到安卓桌面并展开「所有应用」抽屉。
+   * Play 镜像的 Pixel 桌面只把应用放在上滑抽屉里，用户按 Home 看到的是 Google
+   * 自带的几个图标，很容易以为「ApkStart 装的应用不见了」。
+   */
+  ipcMain.handle('runtime:androidHome', async () => {
+    try {
+      const c = runtime.client();
+      if (!(await c.isOnline().catch(() => false))) {
+        return { ok: false, error: '安卓还没启动，先打开一个应用再试' };
+      }
+      await c.androidHome();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
   /**
    * 启动运行时。
    * opts.lowspec / opts.timeoutMs 只由「一键修复」传入，且只对本次启动生效 ——
@@ -3783,6 +3838,8 @@ if (!gotLock) {
     // 「通知 → 自动下载 → 空闲时自动重启安装」一条龙；关闭则退回只通知。
     // 之后每 6 小时再查一次，长期挂着的容器也能收到新版本。
     if (app.isPackaged) {
+      // 先看上次更新有没有装成功：失败标记要尽快告诉用户，别等 8 秒后的检查
+      notifyUpdateFailure();
       setTimeout(() => {
         updater.check().then((info) => handleUpdateFound(info))
           .catch((e) => appLog(`update check failed: ${e.message}`));

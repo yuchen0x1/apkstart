@@ -322,6 +322,56 @@ async function main() {
     assert(/run installer/.test(script), '应正常生成安装脚本，而不是误判大小异常');
   });
 
+  await test('安装形态：卸载器不叫「Uninstall ApkStart.exe」也认得出安装版', async () => {
+    const root = mkTmp();
+    const app = path.join(root, 'app');
+    fs.mkdirSync(app, { recursive: true });
+    const u = mkUpdater(root);
+    // 没有卸载器 = 便携包
+    eq(u.flavor, 'portable', '空目录应判成便携版');
+    // NSIS 默认名
+    fs.writeFileSync(path.join(app, 'Uninstall ApkStart.exe'), 'x');
+    eq(u.flavor, 'setup', '默认卸载器名应判成安装版');
+    fs.rmSync(path.join(app, 'Uninstall ApkStart.exe'));
+    // 自定义 / 第三方便携重打包常见的名字
+    fs.writeFileSync(path.join(app, 'uninstall.exe'), 'x');
+    eq(u.flavor, 'setup', 'uninstall.exe 也要认（判错会拿便携 zip 去覆盖安装目录）');
+  });
+
+  await test('apply(setup) 会先强制结束没退干净的进程（安装器拿不到文件锁会静默失败）', async () => {
+    const root = mkTmp();
+    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+    const u = mkUpdater(root);
+    const script = u.apply({ mode: 'setup', payload: setup, version: '9.9.9', size: 409600 }, { spawn: false });
+    assert(/Stop-Process -Id \d+ -Force/.test(script), '必须强制结束残留进程');
+    const stopAt = script.indexOf('Stop-Process');
+    const runAt = script.indexOf('run installer');
+    assert(stopAt > -1 && stopAt < runAt, '强制结束要在启动安装器之前');
+    assert(/failed\.json/.test(script), '失败要落标记，下次启动告诉用户');
+    assert(/payload kept for manual install/.test(script), '失败时应保留安装包，重试不用重下 1.4GB');
+    // 收尾清理必须以「没有失败标记」为前提
+    assert(/if \(-not \(Test-Path [^)]*failed\.json/.test(script), '失败时不能把载荷删掉');
+  });
+
+  await test('已经下好的安装包会被复用，不会因为上次装失败又重下 1.4GB', async () => {
+    const root = mkTmp();
+    const u = mkUpdater(root);
+    const version = '9.9.9';
+    const dir = path.join(u.dataDir, 'update', version);
+    fs.mkdirSync(dir, { recursive: true });
+    const setup = fakeExe(path.join(dir, `ApkStart-${version}-Setup.exe`));
+    let downloaded = 0;
+    u._downloadParts = async () => { downloaded += 1; };
+    const info = {
+      version,
+      tag: `v${version}`,
+      asset: { name: `ApkStart-${version}-Setup.exe`, size: fs.statSync(setup).size, urls: [], sizes: {} },
+    };
+    const job = await u.prepare(info);
+    eq(job.mode, 'setup', '应识别为安装版');
+    eq(downloaded, 0, '文件已存在且大小正确时不该重新下载');
+  });
+
   console.log('\n[安装版脚本真机执行：模拟「装完目录被清空」]');
 
   /**

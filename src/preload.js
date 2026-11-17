@@ -40,6 +40,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   runtimeStatus: () => invoke('runtime:status'),
   setImageFlavor: (flavor) => invoke('runtime:setImageFlavor', flavor),
   runtimeProbe: () => invoke('runtime:probe'),
+  androidHome: () => invoke('runtime:androidHome'),
   runtimeStart: (opts) => invoke('runtime:start', opts || {}),
   repairPlan: () => invoke('runtime:repairPlan'),
   repairRun: (opts) => invoke('runtime:repairRun', opts || {}),

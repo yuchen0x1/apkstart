@@ -59,8 +59,16 @@ class Updater {
   /** 安装形态：安装版（有卸载器）还是便携包 */
   get flavor() {
     try {
-      const un = fs.readdirSync(this.installDir).find((n) => /^Uninstall .*\.exe$/i.test(n));
+      // 不能只认 NSIS 默认的「Uninstall ApkStart.exe」：自定义打包、第三方重打包、
+      // 以及部分中文安装器会把卸载器叫 uninstall.exe / uninst000.exe。判错成便携版
+      // 的后果很重 —— 会拿便携 zip 去覆盖 Program Files 目录，复制必然失败，
+      // 用户看到的就是「点了重启并安装，没反应，版本还是旧的」（#51 的同一类现场）。
+      const names = fs.readdirSync(this.installDir);
+      const un = names.find((n) => /^uninstall/i.test(n) && /\.exe$/i.test(n))
+        || names.find((n) => /^uninst/i.test(n) && /\.exe$/i.test(n));
       if (un) return 'setup';
+      // 兜底：安装版一定有 resources\app\package.json 且旁边有 electron 的 dll 群，
+      // 便携包同样有；所以只把「卸载器」当唯一判据，其余都按便携处理。
     } catch (_) { /* ignore */ }
     return 'portable';
   }
@@ -139,10 +147,28 @@ class Updater {
     let total = it.asset.size || 0;
     const conns = Math.max(1, Math.min(16, Number((this.settings().runtime || {}).downloadConnections) || 8));
 
+    // 上次已经下完的包就不要再下一遍：安装器失败时载荷是故意留着的（见 apply），
+    // 用户点「重试」如果又走 1.4GB 下载，这个更新就永远试不完了。
+    let reused = false;
+    if (!(it.asset.parts && it.asset.parts.length) && fs.existsSync(file)) {
+      try {
+        const st = fs.statSync(file);
+        const known = [it.asset.size, ...Object.values(it.asset.sizes || {}).map(Number)].filter(Boolean);
+        // 有官方大小就按大小精确比对（最可靠）；拿不到大小才退回「超过 1MB 就当完整」
+        const sizeOk = known.length ? known.includes(st.size) : st.size > 1024 * 1024;
+        if (st.size > 0 && sizeOk) {
+          reused = true;
+          this.onProgress({ stage: 'download', percent: 99, message: '复用上次已下载的更新包…' });
+        }
+      } catch (_) { /* 读不到就重新下 */ }
+    }
+
     // Gitee 附件单文件上限 100MB，所以发布时会把包切成 .part1/.part2。
     // 每个分片单独测速选源（可以一部分来自 Gitee、一部分来自 GitHub 镜像），
     // 下完按顺序拼回整包 —— 对用户来说仍然只是「下载 + 解压」。
-    if (it.asset.parts && it.asset.parts.length) {
+    if (reused) {
+      // 跳过下载，直接进入下面的完整性校验 / 解压
+    } else if (it.asset.parts && it.asset.parts.length) {
       await this._downloadParts(it.asset, file, conns, total);
     } else {
       this.onProgress({ stage: 'download', percent: 1, message: `正在下载 ${it.asset.name}…` });
@@ -407,7 +433,11 @@ class Updater {
     const exe = this.exePath;
     const dir = this.installDir;
     const logFile = path.join(this.updateDir, 'update.log');
+    // 失败标记：升级脚本写到 disk，下次启动由主进程读出来告诉用户
+    //「更新没成功、已回到旧版本」，而不是让用户对着一模一样的旧界面猜。
+    const failFile = path.join(this.updateDir, 'failed.json');
     fs.mkdirSync(this.updateDir, { recursive: true });
+    try { fs.rmSync(failFile, { force: true }); } catch (_) { /* 上次的标记先清掉 */ }
     const waitPid = opts.waitPid || process.pid;
 
     // 替换前最后一道闸：载荷必须真的是 ApkStart，否则宁可放弃更新
@@ -425,9 +455,13 @@ class Updater {
       `$log = ${psq(logFile)}`,
       `function Note($m) { Add-Content -Path $log -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }`,
       `Note 'updater start'`,
-      // 等本进程真正退出（最多 90 秒），否则 exe/dll 仍被占用
-      `try { Wait-Process -Id ${waitPid} -Timeout 90 } catch { }`,
-      `Start-Sleep -Milliseconds 700`,
+      // 等本进程真正退出（最多 60 秒），否则 exe/dll 仍被占用
+      `try { Wait-Process -Id ${waitPid} -Timeout 60 } catch { }`,
+      // 退出被清理流程卡住时（模拟器收尾、窗口代理回包慢），安装器和文件复制都会
+      // 因为「文件被占用」而静默失败 —— 用户看到的就是「点了重启并安装，没反应，
+      // 版本还是旧的」。这里补一刀强制结束，宁可少存一次现场，也不能让更新白做。
+      `try { if (Get-Process -Id ${waitPid} -ErrorAction SilentlyContinue) { Stop-Process -Id ${waitPid} -Force; Note 'app still alive, force stopped' } } catch { }`,
+      `Start-Sleep -Milliseconds 1200`,
     ];
 
     if (job.mode === 'zip') {
@@ -479,6 +513,7 @@ class Updater {
         // 回滚后必须把旧版本拉起来：否则用户看到的是「更新完程序自己关了，再也没打开」，
         // 手动打开还是旧版、又提示更新（#98 的完整现场）。
         `  if (Test-Path -LiteralPath $probe) { Start-Process -FilePath $probe; Note 'relaunched (rolled back)' }`,
+        `  Set-Content -Path ${psq(failFile)} -Value ('{"version":' + (ConvertTo-Json ${psq(String(job.version || ''))}) + ',"log":' + (ConvertTo-Json $log) + '}') -Encoding UTF8`,
         `  exit 1`,
         `}`,
         // 4) 成功：清掉备份与解压目录（新版本里已删除的文件不会被清理，保留无害）
@@ -540,6 +575,12 @@ class Updater {
         `  }`,
         `} else { Note 'backup unavailable, install skipped' }`,
         `if ($ok) { Remove-Item -LiteralPath $bak -Recurse -Force }`,
+        // 装失败：把「版本号 + 日志位置」落成标记，安装包故意留在原处 —— 用户
+        // 下次可以点「安装已下载的更新」直接跑它，不用再下 1.4GB。
+        `if (-not $ok) {`,
+        `  Set-Content -Path ${psq(failFile)} -Value ('{"version":"' + $want + '","log":' + (ConvertTo-Json $log) + '}') -Encoding UTF8`,
+        `  Note 'update failed, payload kept for manual install'`,
+        `}`,
       );
     }
 
@@ -547,7 +588,8 @@ class Updater {
       `if (Test-Path ${psq(exe)}) { Start-Process -FilePath ${psq(exe)}; Note 'relaunched' }`,
       `Note 'updater done'`,
       `Start-Sleep -Milliseconds 400`,
-      `Remove-Item -Path ${psq(path.join(this.updateDir, job.version))} -Recurse -Force`,
+      // 失败时保留载荷：下次「安装已下载的更新」直接跑它，不用再下 1.4GB
+      `if (-not (Test-Path ${psq(failFile)})) { Remove-Item -Path ${psq(path.join(this.updateDir, job.version))} -Recurse -Force }`,
       // 收尾的清理语句失败（目录已被删/被杀软占用）不应该让调用方以为更新失败
       `exit 0`,
     );
