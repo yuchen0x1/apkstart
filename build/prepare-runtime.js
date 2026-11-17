@@ -22,6 +22,11 @@ const MARK = path.join(OUT, '.prepared');
 const SEED_USERDATA = path.join(__dirname, 'seed', 'userdata.img.gz');
 const VENDOR_SWGL = path.join(__dirname, 'vendor', 'opengl32sw.dll');
 const VENDOR_SWGL_NOTICE = path.join(__dirname, 'vendor', 'Qt-LGPL-3.0.txt');
+// 运行时「配方版本」：写在产物里，发版时用来判断上一个 Release 的运行时整包还能不能直接复用。
+// 改了 fetch-runtime / prepare-runtime / slim-runtime / seed / 官方运行时版本时，
+// 必须把这个文件的内容改一下，否则新版本会复用上一版已经压好的运行时（内容却是旧的）。
+const RECIPE_FILE = path.join(__dirname, 'runtime.version');
+const RECIPE_MARK = path.join(OUT, '.runtime-version');
 
 function sizeOf(p) {
   try { return fs.statSync(p).size; } catch (_) { return 0; }
@@ -225,6 +230,11 @@ async function main() {
   }
 
   fs.writeFileSync(MARK, new Date().toISOString());
+  // 配方版本随运行时一起走：下次发版如果内容没变，CI 直接复用上一版整包，
+  // 不再重压 3GB 的 system.img（那一项要 20 分钟以上）。
+  try {
+    fs.writeFileSync(RECIPE_MARK, fs.readFileSync(RECIPE_FILE, 'utf8').trim());
+  } catch (_) { /* 没有版本文件就退化成「无法复用」，不影响构建 */ }
   const gzCount = compressed;
   let total = 0;
   const walk = (d) => {

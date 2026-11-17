@@ -176,20 +176,69 @@ jobs:
           path: .cache/electron-builder
           key: ${{ runner.os }}-electron-builder-v1-${{ hashFiles('package-lock.json') }}
 
-      # 完整运行时约 1GB，最慢的是每版重新下载并压缩 system.img。
-      # 缓存键只由运行时构建逻辑和运行时兼容代码决定；普通应用/文档改动会直接命中缓存。
-      # 如果需要主动刷新上游 Android 运行时，把 runtime-v1 改成 runtime-v2。
+      # 完整运行时约 1.4GB，最慢的是每版重新压 system.img（2 核 runner 约 22 分钟）。
+      #
+      # 缓存键只允许由「真的改变运行时字节」的输入决定：
+      #   build/runtime.version（配方版本，人工在改运行时构建逻辑时 bump）
+      #   + fetch/prepare/slim 脚本 + seed + 软件 OpenGL DLL
+      # 以前还哈希了 src/core/{layers,provision,download}.js —— 那是应用代码，
+      # 改一行加速探测就会让 1.4GB 缓存失效、白压 22 分钟（0.6.10 → 0.6.12 每次都这样）。
       - name: 恢复完整运行时缓存
         id: runtime-cache
         uses: actions/cache@v4
         with:
           path: build/runtime
-          key: ${{ runner.os }}-apkstart-runtime-v1-${{ hashFiles('build/fetch-runtime.js', 'build/prepare-runtime.js', 'build/slim-runtime.js', 'src/core/layers.js', 'src/core/provision.js', 'src/core/download.js', 'build/seed/userdata.img.gz', 'build/vendor/opengl32sw.dll') }}
+          key: ${{ runner.os }}-apkstart-runtime-v2-${{ hashFiles('build/runtime.version', 'build/fetch-runtime.js', 'build/prepare-runtime.js', 'build/slim-runtime.js', 'build/seed/userdata.img.gz', 'build/vendor/opengl32sw.dll') }}
+
+      # 缓存没命中时，先复用上一个 Release 里的运行时整包 —— 那个 zip 本来就是发给轻量版用户的，
+      # 内容一模一样。解压 1~2 分钟，比从官方源重新下载 + xz 压 22 分钟快一个量级。
+      # 配方变了（build/runtime.version 与包内 .runtime-version 不一致）就自动放弃复用、走重建。
+      - name: 复用上一版运行时整包
+        id: prev-runtime
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $want = ''
+          if (Test-Path build/runtime.version) { $want = (Get-Content build/runtime.version -Raw).Trim() }
+          $prev = @(gh release list --exclude-drafts --exclude-pre-releases --limit 20 --json tagName --jq '.[].tagName') |
+                  Where-Object { $_ -and $_ -ne $env:TAG } | Select-Object -First 1
+          if (-not $prev) { Write-Output '没有上一个 Release 可复用，改为重建'; exit 0 }
+          $asset = @(gh release view $prev --json assets --jq '.assets[].name') |
+                   Where-Object { $_ -match '^ApkStart-runtime-v.+\.zip$' } | Select-Object -First 1
+          if (-not $asset) { Write-Output "$prev 没有运行时整包，改为重建"; exit 0 }
+          Write-Output "复用 $prev / $asset"
+          gh release download $prev --pattern $asset --output prev-runtime.zip --clobber
+          if (-not (Test-Path prev-runtime.zip)) { Write-Output '下载失败，改为重建'; exit 0 }
+          Remove-Item -Recurse -Force build/runtime -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force build/runtime | Out-Null
+          tar.exe -xf prev-runtime.zip -C build/runtime
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path 'build/runtime/emulator/emulator.exe')) {
+            Write-Output '解压结果不完整，改为重建'
+            Remove-Item -Recurse -Force build/runtime -ErrorAction SilentlyContinue
+            exit 0
+          }
+          $got = ''
+          if (Test-Path 'build/runtime/.runtime-version') { $got = (Get-Content 'build/runtime/.runtime-version' -Raw).Trim() }
+          if ($got -and $want -and $got -ne $want) {
+            Write-Output "运行时配方已变（$got → $want），改为重建"
+            Remove-Item -Recurse -Force build/runtime
+            exit 0
+          }
+          if (-not $got) {
+            # 标记是本功能上线后才写进产物的：更早的整包没有它，只能按同配方接受。
+            # 从此以后每个运行时整包都带标记，这条分支不会再命中。
+            Write-Output '上一版整包没有配方标记（旧产物），按同配方接受'
+          }
+          Write-Output '复用成功，跳过下载与 22 分钟压缩'
+          "ok=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       # 从 Google 官方源组装运行时（emulator + platform-tools + aehd + Play x86_64 镜像）。
-      # 只有缓存未命中时才执行；命中时直接复用上一个版本已经验证过的运行时。
+      # 缓存命中、或上一版整包复用成功时都跳过。
       - name: 组装运行时
-        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.prev-runtime.outputs.ok != '1'
         run: node build/fetch-runtime.js engine
 
       # prepare-runtime 会把 system.img/vendor.img 压成 xz(LZMA2)。
@@ -197,7 +246,7 @@ jobs:
       # XZ_TIMEOUT_MS 是看门狗：超时自动 kill 并落 gzip 兜底，
       # 绝不重演「stdin 没接 EOF → 0 字节输出 → 挂死 3 小时」。
       - name: 准备运行时（xz 压缩，CI 降档加速）
-        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.prev-runtime.outputs.ok != '1'
         run: node build/prepare-runtime.js --force
         env:
           XZ_PRESET: '6'
@@ -231,6 +280,12 @@ jobs:
           $dir = "build\runtime"
           if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
           $out = "$dir\vc_redist.x64.exe"
+          # 复用上一版整包时这个文件已经在包里了，不用再下一次
+          if ((Test-Path $out) -and ((Get-Item $out).Length -gt 1MB)) {
+            Write-Output "vc_redist 已存在，跳过下载"
+            Get-Item $out | Select-Object Name, Length
+            exit 0
+          }
           Write-Output "下载 VC++ 2015-2022 x64 运行库…"
           curl.exe -L -o $out "https://aka.ms/vs/17/release/vc_redist.x64.exe"
           if (-not (Test-Path $out) -or (Get-Item $out).Length -lt 1MB) { Write-Error "vc_redist 下载失败" }

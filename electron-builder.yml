@@ -37,6 +37,8 @@ extraResources:
     filter:
       - "**/*"
       - "!.prepared"
+      # 只是给 CI 判断「运行时内容有没有变」用的标记，不该出现在用户机器上
+      - "!.runtime-version"
 
 win:
   target:
