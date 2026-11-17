@@ -440,6 +440,17 @@ class Updater {
     try { fs.rmSync(failFile, { force: true }); } catch (_) { /* 上次的标记先清掉 */ }
     const waitPid = opts.waitPid || process.pid;
 
+    // 落一张「有活要干」的凭条：下次启动若版本没变、日志里又没有 updater done，
+    // 就说明这次自动安装根本没跑起来，必须明确告诉用户而不是让他对着旧界面猜。
+    try {
+      fs.writeFileSync(path.join(this.updateDir, 'pending.json'), JSON.stringify({
+        version: String(job.version || '').replace(/^v/i, ''),
+        mode: job.mode,
+        payload: job.payload,
+        at: Date.now(),
+      }), 'utf8');
+    } catch (_) { /* 凭条写不进去不影响更新本身 */ }
+
     // 替换前最后一道闸：载荷必须真的是 ApkStart，否则宁可放弃更新
     if (job.mode === 'zip') {
       if (!job.payload || !fs.existsSync(job.payload)) throw new Error('更新载荷不存在，已取消更新');
@@ -462,6 +473,9 @@ class Updater {
       // 版本还是旧的」。这里补一刀强制结束，宁可少存一次现场，也不能让更新白做。
       `try { if (Get-Process -Id ${waitPid} -ErrorAction SilentlyContinue) { Stop-Process -Id ${waitPid} -Force; Note 'app still alive, force stopped' } } catch { }`,
       `Start-Sleep -Milliseconds 1200`,
+      // 心跳：脚本能走到这一行，说明它真的活着等到了 App 退出。下次启动检查这段日志，
+      // 就能把「没跑起来」和「跑了但装失败」区分开（两者给用户的建议完全不同）。
+      `Note 'app exited, applying'`,
     ];
 
     if (job.mode === 'zip') {
@@ -585,6 +599,7 @@ class Updater {
     }
 
     lines.push(
+      `if ($ok) { Remove-Item -LiteralPath ${psq(path.join(this.updateDir, 'pending.json'))} -Force }`,
       `if (Test-Path ${psq(exe)}) { Start-Process -FilePath ${psq(exe)}; Note 'relaunched' }`,
       `Note 'updater done'`,
       `Start-Sleep -Milliseconds 400`,
@@ -595,21 +610,102 @@ class Updater {
     );
 
     const script = lines.join('\r\n');
-    fs.writeFileSync(path.join(this.updateDir, 'apply.log.ps1'), script, 'utf8');
+    const scriptPath = path.join(this.updateDir, 'apply.log.ps1');
+    // 带 BOM：PowerShell 5.1 用 -File 读「无 BOM 的 UTF-8」会按 ANSI(GBK) 解释，
+    // 用户名/安装路径里有中文时整段脚本会被读坏（以前用 -EncodedCommand 没这问题）。
+    fs.writeFileSync(scriptPath, '\ufeff' + script, 'utf8');
     if (opts.spawn === false) return script;
-    // -EncodedCommand 走 UTF-16LE base64：脚本里出现中文路径也不会被 GBK 解码搞坏
-    const b64 = Buffer.from(script, 'utf16le').toString('base64');
-    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    // 这里**不能**用 detached：某些安全软件 / 沙箱策略会直接拦掉「分离的控制台进程」，
-    // 表现为脚本一声不响地根本没跑（更新界面卡在「正在替换程序并重启」）。
-    // Windows 上父进程退出并不会杀掉普通子进程，所以用「普通子进程 + unref」同样能在
-    // 我们退出之后继续干活，兼容性还更好。
-    const child = spawn(ps, [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-WindowStyle', 'Hidden', '-EncodedCommand', b64,
-    ], { stdio: 'ignore', windowsHide: true });
-    child.unref();
-    return true;
+    const cmdPath = path.join(this.updateDir, 'apply.cmd');
+    this._writeLauncher(cmdPath, scriptPath);
+    return this._launch(cmdPath, scriptPath, opts);
+  }
+
+  /** 生成 .cmd 启动器：只负责把 PowerShell 拉起来，自身立刻退出 */
+  _writeLauncher(cmdPath, scriptPath) {
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows',
+      'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const cmd = [
+      '@echo off',
+      `start "" /b "${ps}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${scriptPath}"`,
+      'exit /b 0',
+    ].join('\r\n');
+    fs.writeFileSync(cmdPath, cmd + '\r\n', 'utf8');
+    return cmdPath;
+  }
+
+  /**
+   * 启动升级脚本，必须保证它比 ApkStart 活得久。
+   *
+   * 旧实现直接用 `spawn(powershell)` 把脚本挂成 App 的子进程 —— App 一退出，
+   * 系统会把这个子进程一起收走（作业对象/控制台归属），脚本刚写下第一行日志就没下文，
+   * 安装器根本没机会运行。用户看到的就是「点了重启并安装，一点反应都没有，版本还是旧的」。
+   *
+   * 现在按「脱离父子关系」的强弱分三级退让：
+   *   1. opts.launch（Electron 的 shell.openPath）：交给资源管理器启动，最干净；
+   *   2. explorer.exe apply.cmd：由已运行的 shell 接管，进程关系立刻断开；
+   *   3. 直接 spawn：兼容某些禁用了 shell 关联的精简系统，能用就用。
+   * 三级都失败就抛错 —— 宁可让用户看到「自动安装启动失败，请手动运行安装包」，
+   * 也不能假装成功。
+   */
+  _launch(cmdPath, scriptPath, opts = {}) {
+    const errors = [];
+    if (typeof opts.launch === 'function') {
+      try {
+        const r = opts.launch(cmdPath);
+        if (!r || r === 'ok') return { ok: true, via: 'shell' };
+        errors.push(`shell:${r}`);
+      } catch (e) { errors.push(`shell:${e.message}`); }
+    }
+    try {
+      const c = spawn('explorer.exe', [cmdPath], { stdio: 'ignore', windowsHide: true });
+      c.unref();
+      return { ok: true, via: 'explorer' };
+    } catch (e) { errors.push(`explorer:${e.message}`); }
+    try {
+      const ps = path.join(process.env.SystemRoot || 'C:\\Windows',
+        'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      const child = spawn(ps, [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-WindowStyle', 'Hidden', '-File', scriptPath,
+      ], { stdio: 'ignore', windowsHide: true });
+      child.unref();
+      return { ok: true, via: 'spawn' };
+    } catch (e) { errors.push(`spawn:${e.message}`); }
+    throw new Error(`无法启动升级脚本（${errors.join('；')}）`);
+  }
+
+
+  /**
+   * 上一次「重启并安装」到底跑没跑起来。
+   *
+   * 三种结果必须分开，给用户的建议完全不同：
+   *   none    → 没有待安装的活；
+   *   stalled → 脚本没跑起来（日志里连「等到 App 退出」都没有）—— 只能手动装；
+   *   failed  → 跑了但装失败（脚本自己会写 failed.json）。
+   * @returns {{state:'none'|'stalled'|'failed', version?:string, payload?:string}}
+   */
+  pendingApply() {
+    const pendingFile = path.join(this.updateDir, 'pending.json');
+    let pending = null;
+    try {
+      if (fs.existsSync(pendingFile)) pending = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
+    } catch (_) { pending = null; }
+    if (!pending || !pending.version) return { state: 'none' };
+    // 版本已经追上目标 = 上次其实装成功了，只是清理没做完
+    if (cmpVer(this.current, pending.version) >= 0) {
+      try { fs.rmSync(pendingFile, { force: true }); } catch (_) { /* ignore */ }
+      return { state: 'none' };
+    }
+    let log = '';
+    try { log = fs.readFileSync(path.join(this.updateDir, 'update.log'), 'utf8'); } catch (_) { log = ''; }
+    const alive = /app exited, applying|installer: backup first|run installer|after install/.test(log);
+    if (!alive) return { state: 'stalled', version: pending.version, payload: pending.payload || '' };
+    return { state: 'failed', version: pending.version, payload: pending.payload || '' };
+  }
+
+  /** 清掉「有待安装的活」凭条（手动安装走完、用户主动放弃时用） */
+  clearPending() {
+    try { fs.rmSync(path.join(this.updateDir, 'pending.json'), { force: true }); } catch (_) { /* ignore */ }
   }
 
   /** 打不开 UI 的场景（或没有可自动安装的资产）时，把发布页丢给浏览器 */

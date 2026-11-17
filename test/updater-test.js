@@ -447,6 +447,80 @@ async function main() {
     assert(!fs.existsSync(path.join(root, 'data', 'update', 'backup-9.9.9')), '成功后备份应被删除');
   }, 90000);
 
+  console.log('\n[升级脚本启动：必须比 App 活得久（0.6.15 用户现场）]');
+
+  /**
+   * 用户现场：点「重启并安装」后 update.log 只有一行 `updater start`，再无下文。
+   * 根因是 PowerShell 被挂成 App 的子进程，App 退出把它一起带走了。
+   * 所以这里钉死三件事：
+   *   1) 脚本落到磁盘时带 BOM（-File 读取时中文路径不会按 GBK 读坏）；
+   *   2) 生成 apply.cmd 启动器，交给 explorer / 调用方 launch 去拉起；
+   *   3) 脚本有心跳行，下次启动能把「根本没跑起来」和「跑了但装失败」分开。
+   */
+  await test('★ apply 写出带 BOM 的脚本 + .cmd 启动器（不再依赖子进程继承）', async () => {
+    const root = mkTmp();
+    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+    const u = mkUpdater(root);
+    const r = u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, {
+      launch: (cmdPath) => { eq(path.basename(cmdPath), 'apply.cmd', '应把 .cmd 启动器交给调用方'); return 'ok'; },
+    });
+    eq(r.ok, true, 'apply 应返回成功');
+    eq(r.via, 'shell', '有 launch 回调时应优先走它');
+    const ps1 = path.join(u.updateDir, 'apply.log.ps1');
+    const raw = fs.readFileSync(ps1, 'utf8');
+    eq(raw.charCodeAt(0), 0xfeff, '脚本必须以 UTF-8 BOM 开头');
+    assert(/app exited, applying/.test(raw), '脚本要有「等到 App 退出」的心跳行');
+    assert(/pending\.json/.test(raw), '成功后要清掉待安装凭条');
+    const cmd = fs.readFileSync(path.join(u.updateDir, 'apply.cmd'), 'utf8');
+    assert(/start "" \/b /.test(cmd), 'cmd 启动器要用 start /b 拉起 PowerShell');
+    assert(cmd.includes('apply.log.ps1'), 'cmd 启动器要指向 apply.log.ps1');
+  });
+
+  await test('★ pendingApply：脚本根本没跑起来 → stalled（这正是用户现场）', async () => {
+    const root = mkTmp();
+    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+    const u = mkUpdater(root);
+    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { launch: () => 'ok' });
+    // 现场日志：只有 updater start
+    fs.writeFileSync(path.join(u.updateDir, 'update.log'), '[18:55:53] updater start\r\n', 'utf8');
+    const p = u.pendingApply();
+    eq(p.state, 'stalled', '只有 updater start 时应判为「脚本没跑起来」');
+    eq(p.version, '9.9.9', '应带出目标版本');
+    assert(p.payload && p.payload.endsWith('Setup.exe'), '应带出安装包路径供手动安装');
+  });
+
+  await test('pendingApply：脚本跑过但装失败 → failed', async () => {
+    const root = mkTmp();
+    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+    const u = mkUpdater(root);
+    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { launch: () => 'ok' });
+    fs.writeFileSync(path.join(u.updateDir, 'update.log'),
+      '[18:55:53] updater start\r\n[18:55:55] app exited, applying\r\n[18:56:10] installer exit 1\r\n', 'utf8');
+    eq(u.pendingApply().state, 'failed', '有心跳但没装成功时应判 failed');
+  });
+
+  await test('pendingApply：版本已追平 → none 并清掉凭条', async () => {
+    const root = mkTmp();
+    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+    const u = mkUpdater(root);
+    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { launch: () => 'ok' });
+    // 已经升到 9.9.9 了
+    u.current = '9.9.9';
+    eq(u.pendingApply().state, 'none');
+    assert(!fs.existsSync(path.join(u.updateDir, 'pending.json')), '追平后凭条应被清理');
+  });
+
+  await test('launch 回调失败时会退到 explorer / spawn，三级都失败才抛错', async () => {
+    const root = mkTmp();
+    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+    const u = mkUpdater(root);
+    const r = u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, {
+      launch: () => 'no handler',
+    });
+    // explorer 与 spawn 都是 best-effort，能起来就行；这里只要求「不抛错且给了 via」
+    assert(r.ok === true && typeof r.via === 'string', '应当给出实际使用的启动方式');
+  });
+
   console.log(`\n更新器安全测试：${passed} 通过，${failed} 失败`);
   process.exitCode = failed ? 1 : 0;
 }

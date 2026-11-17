@@ -124,6 +124,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   // 在线更新（GitHub Releases）
   updateCheck: (opts) => invoke('app:updateCheck', opts || {}),
   updateApply: () => invoke('app:updateApply'),
+  updateRunPayload: () => invoke('app:updateRunPayload'),
   updateCancel: () => invoke('app:updateCancel'),
   updateOpenRelease: (url) => invoke('app:updateOpen', url),
   restartApp: () => invoke('app:restart'),

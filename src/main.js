@@ -891,6 +891,23 @@ function quitForUpdate() {
  * 而不是让用户对着一模一样的旧界面猜「到底更没更新」。读一次就删，不反复打扰。
  */
 function notifyUpdateFailure() {
+  // 先看「升级脚本到底跑没跑起来」：
+  //   stalled = 脚本连「等到 App 退出」都没写下来 —— 十有八九是启动方式被拦
+  //            （App 退出把子进程一起带走了 / 安全软件拦了 PowerShell）。
+  //            这种情况重试同一个按钮仍然没用，必须引导用户手动装。
+  try {
+    const p = typeof updater.pendingApply === 'function' ? updater.pendingApply() : { state: 'none' };
+    if (p.state === 'stalled') {
+      appLog(`previous update stalled at v${p.version}: apply script never ran`);
+      send('toast', {
+        type: 'warn',
+        sticky: true,
+        message: `上次更新到 ${p.version} 没装成：安装程序根本没被拉起来。`
+          + '安装包已经下好了，到「设置 → 软件更新」点「手动安装」即可（不会重新下载）。',
+      });
+      return;
+    }
+  } catch (_) { /* 凭条读坏了按老逻辑走 */ }
   try {
     const f = path.join(updater.updateDir, 'failed.json');
     if (!fs.existsSync(f)) return;
@@ -903,19 +920,44 @@ function notifyUpdateFailure() {
       sticky: true,
       message: `上次更新到 ${v || '新版本'} 没有装成功，已回到旧版本。`
         + '安装包已经下载好了，到「设置 → 软件更新」点一次即可重试（不会重新下载）；'
-        + '如果仍然失败，点「打开下载页」手动安装。',
+        + '如果仍然失败，点「手动安装」直接跑安装包。',
     });
   } catch (_) { /* 标记损坏无关紧要 */ }
 }
 
+/**
+ * 把「重启并安装」真正启动起来：生成升级脚本 → 脱离父子关系地拉起 → 退出 App。
+ *
+ * 单独抽出来是因为自动更新和手动点按钮必须走同一条路 —— 以前自动更新那条
+ * 在 updateBusy 还是 true 的时候调用 applyAutoUpdate，被守卫直接 return，
+ * 于是「下载完成、随时可以重启安装」之后再也不会自己动，用户只能干等。
+ */
+let applyingUpdate = false;
+function startApplyUpdate(job, label) {
+  if (!job || applyingUpdate) return false;
+  applyingUpdate = true;
+  notify('正在自动更新', `即将重启并安装 ApkStart ${label || job.version || ''}`.trim());
+  send('update:progress', { stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
+  try {
+    const r = updater.apply(job);
+    appLog(`update apply launched via ${r && r.via ? r.via : 'unknown'} v${job.version || ''}`);
+  } catch (e) {
+    // 脚本都拉不起来就别退出了：退出去只会留下一个没人管的半截更新
+    applyingUpdate = false;
+    appLog(`update apply launch failed: ${e.message}`);
+    send('update:progress', { stage: 'error', percent: 0, message: e.message });
+    notify('自动安装启动失败', `${e.message}；可在「设置 → 软件更新」点「手动安装」`);
+    return false;
+  }
+  quitForUpdate();
+  return true;
+}
+
 function applyAutoUpdate() {
-  if (!autoUpdateJob || updateBusy) return;
+  if (!autoUpdateJob || applyingUpdate) return false;
   const job = autoUpdateJob;
   autoUpdateJob = null;
-  notify('正在自动更新', `即将重启并安装 ApkStart ${autoUpdateTag}`);
-  send('update:progress', { stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
-  updater.apply(job);
-  quitForUpdate();
+  return startApplyUpdate(job, autoUpdateTag);
 }
 
 async function autoUpdateFlow(info) {
@@ -999,8 +1041,10 @@ async function runUpdate() {
       const job = autoUpdateJob;
       autoUpdateJob = null;
       sendProgress({ stage: 'apply', percent: 100, message: '已下载完成，正在替换程序并重启…' });
-      updater.apply(job);
-      quitForUpdate();
+      if (!startApplyUpdate(job, info.version || autoUpdateTag)) {
+        autoUpdateJob = job;   // 没启动成，载荷还留在本地，下次点「手动安装」直接用它
+        return { ok: false, code: 'apply-launch-failed', error: '自动安装没启动起来，请在「设置 → 软件更新」点「手动安装」' };
+      }
       return { ok: true, version: info.version || autoUpdateTag, mode: job.mode };
     }
     if (!info.asset) {
@@ -1025,9 +1069,10 @@ async function runUpdate() {
     sendProgress({ stage: 'download', percent: 0, message: '准备下载…' });
     const job = await updater.prepare(info);
     sendProgress({ stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
-    updater.apply(job);
-    // 给界面一点时间显示「即将重启」，然后走正常退出流程（before-quit 会把模拟器窗口藏好）
-    quitForUpdate();
+    if (!startApplyUpdate(job, info.version)) {
+      autoUpdateJob = job;
+      return { ok: false, code: 'apply-launch-failed', error: '自动安装没启动起来，请在「设置 → 软件更新」点「手动安装」' };
+    }
     return { ok: true, version: info.version, mode: job.mode };
   } catch (e) {
     sendProgress({ stage: 'error', percent: 0, message: e.message });
@@ -3796,6 +3841,51 @@ function registerIpc() {
   });
 
   ipcMain.handle('app:updateApply', () => runUpdate());
+
+  /**
+   * 手动安装：自动安装没拉起来时的兜底出口。
+   *
+   * 只做一件事 —— 把已经下好的安装包交给系统（弹出安装向导/UAC），用户点两下就装完。
+   * 不做静默安装、不碰文件锁，因此不受「子进程被 App 退出带走」这类问题影响。
+   */
+  ipcMain.handle('app:updateRunPayload', async () => {
+    try {
+      const pending = typeof updater.pendingApply === 'function'
+        ? updater.pendingApply() : { state: 'none' };
+      let payload = pending.payload && fs.existsSync(pending.payload) ? pending.payload : '';
+      if (!payload) {
+        // 凭条丢了就从更新目录里找最新的安装包（Setup.exe 才有可能手动装）
+        const dir = updater.updateDir;
+        const hits = [];
+        const walk = (d, depth) => {
+          if (depth > 2) return;
+          let names = [];
+          try { names = fs.readdirSync(d, { withFileTypes: true }); } catch (_) { return; }
+          for (const n of names) {
+            const p = path.join(d, n.name);
+            if (n.isDirectory()) walk(p, depth + 1);
+            else if (/^ApkStart-.*Setup\.exe$/i.test(n.name)) hits.push(p);
+          }
+        };
+        walk(dir, 0);
+        hits.sort((a, b) => {
+          try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch (_) { return 0; }
+        });
+        payload = hits[0] || '';
+      }
+      if (!payload || !fs.existsSync(payload)) {
+        return { ok: false, error: '没找到已下载的安装包，请先点「立即更新」下载' };
+      }
+      const err = await shell.openPath(payload);
+      if (err) return { ok: false, error: err };
+      // 用户手里已经有安装向导了，别再反复弹「上次没装成」
+      updater.clearPending();
+      appLog(`update manual install: ${path.basename(payload)}`);
+      return { ok: true, payload };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
 
   ipcMain.handle('app:updateCancel', () => { updateBusy = false; return { ok: true }; });
 

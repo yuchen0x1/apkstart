@@ -1645,6 +1645,29 @@ function bindUpdate() {
   const restart = $('btnUpdateRestart');
   if (restart) restart.addEventListener('click', applyNow);
 
+  // 手动安装：自动安装拉不起来时的兜底出口。
+  // 直接运行已经下好的安装包（弹安装向导），不依赖后台脚本，点了就一定有反应。
+  const manual = $('btnUpdateManual');
+  if (manual) {
+    manual.addEventListener('click', async () => {
+      manual.disabled = true;
+      try {
+        const r = await api.updateRunPayload().catch((e) => ({ ok: false, error: e.message }));
+        if (r && r.ok) {
+          toast({
+            title: '已启动安装向导',
+            body: '按提示完成安装即可。安装前建议先退出正在使用的安卓应用。',
+            type: 'info',
+          });
+        } else {
+          toast({ title: '手动安装失败', body: (r && r.error) || '没找到已下载的安装包', type: 'error' });
+        }
+      } finally {
+        manual.disabled = false;
+      }
+    });
+  }
+
   // 发布页：始终保留的手动出口（安装包还在上传、或想自己挑安装版/便携版时用）
   const page = $('btnUpdatePage');
   if (page) {

@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.6.15**（2026-11-17）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.6.16**（2026-11-17）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -44,14 +44,9 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 ## 最新更新
 
 <!-- latest:start -->
-### v0.6.15
+### v0.6.16
 
-- **多系统按需下载与一键切换（统一 Provider 架构）**：系统选择界面新增 LineageOS、Bliss OS、 Android-x86 卡片（保留 Google Play / Google APIs / 纯 AOSP 与自定义镜像）。镜像本体不内置到主程序、源码仓库或默认安装包，只有用户主动选择才下载；下载/校验/安装/启动进度接入现有「运行状态」区域，支持暂停/继续/取消/重试与断点续传。
-- **构建体积闸门** `build/check-no-images.js`：pack.js 与 CI 扫描安装包/仓库，禁止内置 ISO 与大型系统镜像。
-- 新增文档 [SYSTEMS.md](docs/SYSTEMS.md)、[DOWNLOAD-MANAGER.md](docs/DOWNLOAD-MANAGER.md)、[COMPATIBILITY.md](docs/COMPATIBILITY.md)。
-- **issue #5：无硬件加速的多核小内存机器开机崩溃（0xC0000005）**。现场 Xeon E5-2650 v3 / 20 核 / 可用 4.8GB / 纯软件模拟，原实现给虚拟机 8 个 TCG vCPU，8 份 TB 缓存线程在小内存上极易访问冲突。现在无加速且用户未手动指定时，自动把 vCPU 上限收紧到 4 核（有加速机器不受影响，手动指定核数仍优先）——与「无加速必须按没有加速选参数」的既有设计一致。
-- **崩溃止损更及时**：「多种软件后端同码崩溃」的计数现在把 `host`/`lavapipe`/`guest` 也算进 TCG 软件路径（老版本 emulator 候选里没有 swangle，第一组是 swiftshader_indirect、随后 host，旧逻辑漏算 host 会多白等一轮）。
-- **「关 Vulkan 重试」不再被误触发**：`androidboot.hardware.vulkan=ranchu` 是 guest 内核命令行的正常属性、每次启动都会打印，旧判断把它当成 Vulkan 崩溃证据；现在先剔除这类属性行，只看真正的 Vulkan 初始化日志。
+- **「重启并安装」点了没反应（用户现场：更新包已下好、按钮也变成「重启并安装」，点下去 App 退了但版本没变、也不会自动重开）**：- 根因：升级用的 PowerShell 脚本被当成 App 的子进程启动，App 一退出，系统会把这个子进程一起收走 —— 脚本刚写下第一行日志就死了，安装器根本没机会运行（现场 `update.log` 里只有一行 `updater start`，之后什么都没有）。现在脚本经 `.cmd` 启动器交给资源管理器拉起，和 App 不再有父子关系；实测父进程退出后脚本能继续跑完全流程。
 <!-- latest:end -->
 
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。
