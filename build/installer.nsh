@@ -4,6 +4,13 @@
 ;
 ; ApkStart 退出后仍可能留下 detached 的 qemu（为了下次秒开），
 ; 所以卸载环节必须自己兜底清一遍。
+;
+; 注意区分「用户主动卸载」和「覆盖安装（更新）」：后者绝不能动用户数据。
+; electron-builder 在覆盖安装时会用 `--updated` 参数调用旧卸载器
+; （app-builder-lib/templates/nsis/include/installUtil.nsh: always pass --updated flag）。
+
+!include "LogicLib.nsh"
+!include "FileFunc.nsh"
 
 ; 安装收尾：再兜一层桌面图标。
 ; electron-builder 的 createDesktopShortcut 走的是它自己的 CreateShortcuts 流程，
@@ -41,7 +48,18 @@
   ; 删除 ApkStart 自己产生的数据：应用 APK、运行时镜像、AVD、快照、日志、
   ; 更新缓存、默认共享目录和用户在设置中指定的其它目录。脚本先读取 settings.json，
   ; 再删数据目录，因此从 Windows「应用和功能」卸载也不会留下几 GB 残留。
-  IfFileExists "$INSTDIR\resources\app\build\uninstall-data.ps1" 0 +3
-    DetailPrint "正在清理 ApkStart 数据、应用和运行时…"
-    nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\app\build\uninstall-data.ps1" -DataDir "$APPDATA\apkstart"'
+  ;
+  ; **但覆盖安装（更新）时绝不能删**：electron-builder 更新时会先跑旧卸载器
+  ; （带 --updated），如果这里照删不误，用户每升一次版本就会丢掉模拟器里装的应用、
+  ; 聊天记录和设置，还得重新下 1.4GB 镜像 —— 0.6.12 → 0.6.13 的实测现场就是这样。
+  ${GetParameters} $R0
+  ${GetOptions} $R0 "--updated" $R1
+  ${If} ${Errors}
+    ${If} ${FileExists} "$INSTDIR\resources\app\build\uninstall-data.ps1"
+      DetailPrint "正在清理 ApkStart 数据、应用和运行时…"
+      nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\app\build\uninstall-data.ps1" -DataDir "$APPDATA\apkstart"'
+    ${EndIf}
+  ${Else}
+    DetailPrint "检测到覆盖安装：保留用户数据（应用、设置与运行时镜像）"
+  ${EndIf}
 !macroend

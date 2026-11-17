@@ -176,6 +176,24 @@ function fileSize(p) {
 }
 
 /**
+ * 这个镜像目录里有没有「压缩存放、还没展开」的系统镜像。
+ *
+ * 完整版（安装包内置运行时）把 system.img 以 .xz 带走，首次启动由
+ * materializeImages() 展开。判断「镜像在不在」如果只认 system.img，
+ * 就会把「已经随包带来、只是还没解压」误判成「没下载」——用户刚装完新版本
+ * 就被引导去 dl.google.com 重下 1.4GB（0.6.13 实测现场）。
+ */
+function packedImage(dir) {
+  for (const name of ['system.img.xz', 'system.img.gz']) {
+    const file = path.join(dir, name);
+    const size = fileSize(file);
+    // 太小的只可能是半截文件/占位，不当作可用镜像
+    if (size > 64 * 1024 * 1024) return { file, size };
+  }
+  return null;
+}
+
+/**
  * 环境探测结果的落盘缓存。
  *
  * `emulator -version` 与 `emulator -accel-check` 每次都要新起一个 emulator 进程，
@@ -546,12 +564,17 @@ class Provisioner {
         label: sysimg.label || this.imageProfile().shortLabel,
         // 当前跑的是不是自定义镜像：设置页与修复窗口据此显示镜像来源
         custom: !!sysimg.custom,
+        // 镜像随运行时提供、只是还没展开：界面据此显示「首次启动自动展开」，
+        // 而不是催用户再下一次 1.4GB。
+        pendingExtract: !!sysimg.pendingExtract,
         imageId: sysimg.id || '',
         required: false,
         note: sysimg.custom
           ? sysimg.note
           : (sysimg.ok
-            ? `Android ${sysimg.api}（${(sysimg.size / 1073741824).toFixed(2)} GB）`
+            ? (sysimg.pendingExtract
+              ? (sysimg.note || '已随运行时提供，首次启动自动展开')
+              : `Android ${sysimg.api}（${(sysimg.size / 1073741824).toFixed(2)} GB）`)
             : (sysimg.note || `未下载：${this.imageProfile().shortLabel}`)),
       },
       activeImage,
@@ -1167,6 +1190,18 @@ class Provisioner {
           armTranslation: { enabled: profile.armTranslation },
         };
       }
+      // 镜像压缩着、还没展开：算「已提供」，不能算「未下载」。
+      // 开机前 engine 会先 materializeImages() 展开，不需要联网。
+      const packed = packedImage(dir);
+      if (packed && fs.existsSync(kernel)) {
+        return {
+          ok: true, pendingExtract: true, dir, size: packed.size, api, tag, abi,
+          flavor: profile.id, label: profile.shortLabel,
+          googleServices: { gms: profile.gms, playStore: profile.playStore },
+          armTranslation: { enabled: profile.armTranslation },
+          note: `Android ${api}（随运行时提供，首次启动自动展开）`,
+        };
+      }
       if (!missing && fs.existsSync(dir)) {
         missing = { ok: false, dir, size, api, tag, abi, flavor: profile.id, note: size ? '镜像不完整' : '缺少 system.img' };
       }
@@ -1390,6 +1425,18 @@ class Provisioner {
         flavor: profile.id, label: profile.shortLabel,
         googleServices: { gms: profile.gms, playStore: profile.playStore },
         armTranslation: { enabled: profile.armTranslation },
+      };
+    }
+    // 同上：压缩存放的镜像（.xz / .gz）是「已提供、待展开」，不是「未下载」
+    const packed = packedImage(dir);
+    if (packed && fs.existsSync(path.join(dir, 'kernel-ranchu'))) {
+      return {
+        ok: true, pendingExtract: true, dir, size: packed.size, api: profile.api,
+        tag: profile.tag, abi: profile.abi,
+        flavor: profile.id, label: profile.shortLabel,
+        googleServices: { gms: profile.gms, playStore: profile.playStore },
+        armTranslation: { enabled: profile.armTranslation },
+        note: `Android ${profile.api}（随运行时提供，首次启动自动展开）`,
       };
     }
     return {

@@ -249,6 +249,50 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(whpx.ok && whpx.kind === 'whpx' && !whpx.suspect, 'WHPX 分支不该依赖 AEHD');
   });
 
+  await test('完整版只带压缩镜像（.img.xz）时算「已提供」，不许引导重下 1.4GB', () => {
+    const { Provisioner } = require('../src/core/provision');
+    const root = fs.mkdtempSync(path.join(TMP, 'img-'));
+    const dir = path.join(root, 'system-images', 'android-34', 'google_apis_playstore', 'x86_64');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'kernel-ranchu'), 'k');
+    // 稀疏文件：看起来 70MB，不真占盘
+    const fd = fs.openSync(path.join(dir, 'system.img.xz'), 'w');
+    fs.ftruncateSync(fd, 70 * 1024 * 1024);
+    fs.closeSync(fd);
+
+    const p = new Provisioner(root);
+    p.paths = () => ({
+      root,
+      sysImgRoot: path.join(root, 'system-images'),
+      sysImgDir: dir,
+      sysTag: 'google_apis_playstore',
+      sysApi: '34',
+      sysAbi: 'x86_64',
+    });
+    const info = p.systemImageInfo();
+    assert(info.ok === true, '压缩镜像不能判成「未下载」（否则又会去下 1.4GB）');
+    assert(info.pendingExtract === true, '要标出「待展开」，启动时才知道先解压');
+    assert(/自动展开/.test(info.note || ''), `note 要说清会自动展开：${info.note}`);
+    assert(p.playImageInfo().ok === true, '兼容档位同样要认压缩镜像');
+
+    // 半截文件（小于 64MB）不能当作可用镜像
+    fs.rmSync(path.join(dir, 'system.img.xz'));
+    const small = fs.openSync(path.join(dir, 'system.img.xz'), 'w');
+    fs.ftruncateSync(small, 8 * 1024 * 1024);
+    fs.closeSync(small);
+    assert(p.systemImageInfo().ok === false, '明显不全的压缩文件不能算镜像齐全');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  await test('覆盖安装（--updated）时卸载器不得删用户数据', () => {
+    const nsh = fs.readFileSync(path.join(__dirname, '..', 'build', 'installer.nsh'), 'utf8');
+    const block = nsh.slice(nsh.indexOf('!macro customUnInstall'));
+    const guard = block.indexOf('--updated');
+    const clean = block.indexOf('uninstall-data.ps1');
+    assert(guard > 0, '要识别 electron-builder 覆盖安装时传的 --updated');
+    assert(clean > guard, '数据清理必须在「用户主动卸载」分支里，否则每次更新都清空应用与镜像');
+  });
+
   await test('AEHD 服务没跑时按「无加速」选参数（540p + 10 分钟超时）', () => {
     const host = { totalMB: 16179, freeMB: 9728, cores: 12, tmp: 'C:/tmp' };
     const suspect = doctor.chooseProfile({
