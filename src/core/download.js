@@ -410,6 +410,24 @@ async function downloadParallel(url, dest, opt = {}) {
       res.resume();
       throw new Error(`分块请求被拒绝 HTTP ${res.statusCode}`);
     }
+    // 只检查 206 不够（上游 d0853aa）：单源并行分块也要校验 Content-Range，
+    // 否则错位/越界的响应仍按 c.pos 落盘 —— 文件长度对、内容整体错位，
+    // 最后表现为「校验失败」或运行时莫名崩溃。downloadMulti 早有这套校验，
+    // 这条单源路径（downloadAnyParallel / multi 的单源回退）之前漏了。
+    const cr = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(String(res.headers['content-range'] || ''));
+    if (!cr) {
+      res.resume();
+      throw new Error('分块响应缺少 Content-Range，无法确认数据位置');
+    }
+    const crStart = Number(cr[1]);
+    const crEnd = Number(cr[2]);
+    const crTotal = cr[3] === '*' ? 0 : Number(cr[3]);
+    if (crStart !== c.pos || (crTotal && crTotal !== total) || crEnd < crStart) {
+      res.destroy();
+      throw new Error(`分块范围不符（请求 ${c.pos}-${c.end}，返回 ${crStart}-${crEnd}/${cr[3]}）`);
+    }
+    // 服务器可能只返回请求范围的前一截：以声明的终点为界，剩下的下一轮接着取
+    const limit = Math.min(c.end, crEnd);
     await new Promise((resolve, reject) => {
       // 必须自己兜住「promise 永远不 settle」：res.destroy(err) 在某些情况下只发
       // close 不发 error，没有这个 guard 的话一整块会挂死，整个下载停在那里不动。
@@ -430,14 +448,19 @@ async function downloadParallel(url, dest, opt = {}) {
         idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（长时间无数据）')); }, idleMs);
       };
       res.on('data', (buf) => {
+        // 只写到 Content-Range 声明的范围内：服务器多给的数据一律丢弃，
+        // 否则会覆盖相邻分块已写好的字节（同样是「长度对、内容错」）。
+        const room = limit + 1 - c.pos;
+        if (room <= 0) { kick(); return; }
+        const n = Math.min(buf.length, room);
         try {
-          fs.writeSync(fd, buf, 0, buf.length, c.pos);
+          fs.writeSync(fd, buf, 0, n, c.pos);
         } catch (e) {
           res.destroy();
           return finish(e);
         }
-        c.pos += buf.length;
-        got += buf.length;
+        c.pos += n;
+        got += n;
         kick();
         tick();
       });

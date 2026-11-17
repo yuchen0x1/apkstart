@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.6.16**（2026-11-17）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.6.17**（2026-11-18）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -44,9 +44,16 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 ## 最新更新
 
 <!-- latest:start -->
-### v0.6.16
+### v0.6.17
 
-- **「重启并安装」点了没反应（用户现场：更新包已下好、按钮也变成「重启并安装」，点下去 App 退了但版本没变、也不会自动重开）**：- 根因：升级用的 PowerShell 脚本被当成 App 的子进程启动，App 一退出，系统会把这个子进程一起收走 —— 脚本刚写下第一行日志就死了，安装器根本没机会运行（现场 `update.log` 里只有一行 `updater start`，之后什么都没有）。现在脚本经 `.cmd` 启动器交给资源管理器拉起，和 App 不再有父子关系；实测父进程退出后脚本能继续跑完全流程。
+> 本版为「上游对齐专项」：把原项目 [RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart)0.4.x~0.5.8 期间修掉的 5 个真实故障与 2 个功能逐项移植，全部按本项目架构重写适配（不是 merge），手动配置行为与既有功能一律不变。
+
+- **中文输入法（上游 0.5.0 同款）**：随包内置 AOSP 谷歌拼音输入法（`assets/PinyinIME.apk`，含 x86_64 原生库，1.6MB），首次开机静默安装并设为默认。系统汉化之后没有输入法、在安卓里打不了中文的缺口补上了。幂等：已装就跳过；用户手动换过默认输入法也不强改；偶发 adb 抖动失败时下次开机自动重试；`engine.chineseIme` 可关。「预装精简」白名单（`NEVER_TOUCH`）同步加入拼音输入法，不会被精简掉。打包配置（electron-builder.yml / pack.js）带上 `assets/`。
+- **guest 内 Wi-Fi 网卡显式拉起**（上游 a0d3b8e）：config.ini 加 `hw.wifi=yes`。没有它 QEMU 用户态 NAT 一切正常但 guest 里没有 wlan0，表现为应用一直「网络错误，请稍后再试」。
+- **「允许 USB 调试」授权对话框卡开机 + 毒快照循环（上游 b7c4f06）**：冷启动时授权对话框没人点，程序会存下「未授权状态」的快速启动快照，之后每次恢复都卡满 240s×4 组参数，还误诊成显卡/虚拟化问题。
+- **应用「假已装」导致启动失败（上游 b7c4f06 后半）**：`isInstalled()` 不再只信 `pm path` —— 分片 APK 丢一片 PackageManager 仍谎报已装。改为 `pm path` 取全部分片路径，合并一条 shell 逐片 `[ -s file ]` 核对真实存在，缺片按「未安装」处理，交给既有的「启动失败自动重装」链路兜底。
+- **单源并行分块下载缺 Content-Range 校验（上游 d0853aa）**：`downloadParallel` 的 `fetchChunk` 只查 HTTP 206，服务器返回错位/越界数据时照样按请求位置落盘 ——「文件长度对、内容整体错位」，最后表现为校验失败或运行时莫名崩溃。现在与 `downloadMulti` 同强度：起点必须一致、总长必须一致、越界字节丢弃、只写响应声明范围内的字节，缺失 Content-Range 直接拒绝。
+- **APK 安装前磁盘预检（上游 f6a2a19）**：安装前按「安装包 ×1.8 + 2GB」估算真实写入量，与 `df -k /data` 的 Available 对比，不足直接拦下并给出「需要多少 / 只剩多少」（错误信息带 `INSTALL_FAILED_INSUFFICIENT_STORAGE`，界面翻译自动接手）。系统镜像下载早有同类预检，APK 安装链路此前是空白。`df` 读不到时跳过预检，绝不因工具性小问题挡安装。
 <!-- latest:end -->
 
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。

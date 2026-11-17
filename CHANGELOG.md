@@ -5,6 +5,61 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.17] — 2026-11-18
+
+> 本版为「上游对齐专项」：把原项目 [RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart)
+> 0.4.x~0.5.8 期间修掉的 5 个真实故障与 2 个功能逐项移植，全部按本项目架构重写适配
+> （不是 merge），手动配置行为与既有功能一律不变。
+
+### 新增
+- **中文输入法（上游 0.5.0 同款）**：随包内置 AOSP 谷歌拼音输入法（`assets/PinyinIME.apk`，
+  含 x86_64 原生库，1.6MB），首次开机静默安装并设为默认。系统汉化之后没有输入法、
+  在安卓里打不了中文的缺口补上了。幂等：已装就跳过；用户手动换过默认输入法也不强改；
+  偶发 adb 抖动失败时下次开机自动重试；`engine.chineseIme` 可关。
+  「预装精简」白名单（`NEVER_TOUCH`）同步加入拼音输入法，不会被精简掉。
+  打包配置（electron-builder.yml / pack.js）带上 `assets/`。
+- **guest 内 Wi-Fi 网卡显式拉起**（上游 a0d3b8e）：config.ini 加 `hw.wifi=yes`。
+  没有它 QEMU 用户态 NAT 一切正常但 guest 里没有 wlan0，
+  表现为应用一直「网络错误，请稍后再试」。
+
+### 修复
+- **「允许 USB 调试」授权对话框卡开机 + 毒快照循环（上游 b7c4f06）**：
+  冷启动时授权对话框没人点，程序会存下「未授权状态」的快速启动快照，之后每次恢复
+  都卡满 240s×4 组参数，还误诊成显卡/虚拟化问题。三处修复：
+  - `adb.js` 新增 `deviceState()`（`adb devices` 的 state 列能区分 authorized/unauthorized，
+    `get-state` 做不到）与 `isUnauthorizedError()`（按报错文本识别）；
+  - 开机探测命中 unauthorized 时：作废旧快照 → `forceColdBootOnNextStart()` 冷启动
+    重新注入 adb 公钥 → 重启 adb server → 返回 `fatal` 立即换参数组重试（只自愈一次，
+    防反复删快照死循环）；诊断码 `ADB_UNAUTHORIZED` 如实说明「是授权没完成」；
+  - 关机路径（`emulator.stop`）存快照前先验 guest 健康（authorized + boot_completed），
+    不健康不存，并在进程退出**后**作废 emulator 自动落盘的毒快照（顺序很重要，
+    早删会被它自己写回来）；
+  - unauthorized 导致的失败不把当前 GPU 记进「启动即崩」黑名单（那不是渲染后端的错）。
+- **应用「假已装」导致启动失败（上游 b7c4f06 后半）**：`isInstalled()` 不再只信
+  `pm path` —— 分片 APK 丢一片 PackageManager 仍谎报已装。改为 `pm path` 取全部分片路径，
+  合并一条 shell 逐片 `[ -s file ]` 核对真实存在，缺片按「未安装」处理，
+  交给既有的「启动失败自动重装」链路兜底。
+- **单源并行分块下载缺 Content-Range 校验（上游 d0853aa）**：`downloadParallel` 的
+  `fetchChunk` 只查 HTTP 206，服务器返回错位/越界数据时照样按请求位置落盘 ——
+  「文件长度对、内容整体错位」，最后表现为校验失败或运行时莫名崩溃。
+  现在与 `downloadMulti` 同强度：起点必须一致、总长必须一致、越界字节丢弃、
+  只写响应声明范围内的字节，缺失 Content-Range 直接拒绝。
+- **APK 安装前磁盘预检（上游 f6a2a19）**：安装前按「安装包 ×1.8 + 2GB」估算真实写入量，
+  与 `df -k /data` 的 Available 对比，不足直接拦下并给出「需要多少 / 只剩多少」
+  （错误信息带 `INSTALL_FAILED_INSUFFICIENT_STORAGE`，界面翻译自动接手）。
+  系统镜像下载早有同类预检，APK 安装链路此前是空白。`df` 读不到时跳过预检，
+  绝不因工具性小问题挡安装。
+- **运行时自动部署失败后进入 30 分钟冷却（上游 0.5.0）**：运行时整包 1.4GB，
+  断网/限流失败后老版本每次启动都会再试一次大下载。现在失败后 30 分钟内
+  自动路径不再重试（`deployFailedAt` 冷却），向导/设置里的手动安装不受影响。
+
+### 不移植说明
+- 上游 0.5.5 的「手动资源值按宿主 75% / 磁盘 80% 收敛」不采：「手动值永远优先，
+  不被自动降级覆盖」是本项目的明确契约（设置页文案 + 注释 + lowspec 测试三处钉死），
+  且本项目数据分区是稀疏文件、另有安装前磁盘预检兜底。
+- 上游 0.5.1 的「启动串行化」经核实本项目已有等价实现
+  （`ensure()` 的 `_ensurePromise` 复用 + `boot` 的 `vmStarting` 等待），无需移植。
+
 ## [0.6.16] — 2026-11-17
 
 ### 修复

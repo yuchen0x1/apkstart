@@ -310,7 +310,10 @@ function chooseProfile({
   }
   // 低配档只往下压，不会把上面的自动值抬高
   if (spec) memoryMB = Math.min(memoryMB, spec.memoryMB);
-  // 手动值永远最后生效、永远优先（下拉里最大 16GB，够跑任何安卓应用）
+  // 手动值永远最后生效、永远优先（下拉里最大 16GB，够跑任何安卓应用）。
+  // 注：上游 0.5.5 会把手动值再按宿主 75% 收敛，fork 不采 —— 「手动值不被自动
+  // 降级覆盖」是本 fork 的明确契约（UI 文案 + lowspec-test 钉死），自动值已有
+  // host.freeMB 下调与低配档兜底，手动就是用户说了算。
   if (overrides.memoryMB) memoryMB = clamp(Number(overrides.memoryMB) || memoryMB, 1536, 16384);
 
   // 核心：物理线程数的一半，2 核起、8 核封顶。
@@ -324,6 +327,7 @@ function chooseProfile({
   // 与本文件 200-202 行「无加速必须按没有加速选参数，否则拿 6 核跑 TCG 既慢又
   // 更容易崩」的立意一致。用户手动指定核数时仍然尊重手动值。
   if (!accelOk && !overrides.cores) cores = Math.min(cores, 4);
+  // 手动核数不做宿主收敛（同上：fork 契约是手动值永远优先）
   if (overrides.cores) cores = clamp(Number(overrides.cores) || cores, 1, 8);
   // 用户没手动指定核数时才由轻量模式收敛，手动值永远优先
   const lite = settings ? liteProfile({ host, engine }) : null;
@@ -337,6 +341,8 @@ function chooseProfile({
   // 用户看到的是「存储不足」却不知道去哪调。现在按磁盘余量给 4/8/16/24GB：
   // 镜像文件是稀疏分配的，24GB 不会立刻占掉 24GB 实际空间；实在紧张也只给 4GB。
   // 用户也可以在设置里指定（改大后下次开机就地扩容，不丢数据）。
+  // 注：手动值不做磁盘 80% 收敛（上游 diskLimits）—— fork 的分区是稀疏文件，
+  // 超额承诺不会立刻占满磁盘；真装不下时安装前磁盘预检（installer）会拦下并说明白。
   const wantGB = Number(engine.dataPartitionGB || 0);
   const autoDataMB = !disk || disk < 12288 ? 4096
     : (disk < 32768 ? 8192 : (disk < 61440 ? 16384 : 24576));

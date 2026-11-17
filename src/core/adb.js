@@ -159,6 +159,36 @@ function installTimeoutMs(bytes) {
   return Math.min(1200000, Math.max(240000, Math.round(60000 + mb * 120)));
 }
 
+/**
+ * `adb devices` 的 state 列能区分 authorized / unauthorized / offline，
+ * 而 get-state 不行（authorized 与 unauthorized 都返回 'device'）。
+ * 开机探测靠这个方法识别「授权对话框卡住」，快速自愈而不是干等超时。
+ */
+function parseDeviceState(text, serial) {
+  const lines = String(text || '').split(/\r?\n/).slice(1);
+  for (const line of lines) {
+    const m = /^(\S+)\s+(unauthorized|offline|recovery|sideload|no\s+permissions|device)\b/i.exec(line.trim());
+    if (!m) continue;
+    if (serial && m[1] !== serial) continue;
+    const st = m[2].toLowerCase().replace(/\s+/g, '');
+    if (st === 'device') return 'device';
+    if (st === 'unauthorized' || st === 'nopermissions') return 'unauthorized';
+    return st; // offline / recovery / sideload
+  }
+  return 'no-device';
+}
+
+/** 从「允许 USB 调试」对话框未确认导致的 shell 报错里识别出 unauthorized */
+function isUnauthorizedError(raw) {
+  return /\bunauthorized\b|no permissions|confirm.*(allow|debug)/i.test(String(raw || ''));
+}
+
+/** 从 `pm path <pkg>` 的输出里取出每个 APK（含 split 分片）的真实路径 */
+function parsePmPaths(text) {
+  return String(text || '').split(/\r?\n/).map((l) => l.trim())
+    .filter((l) => /^package:/.test(l)).map((l) => l.slice(8).trim()).filter(Boolean);
+}
+
 class AdbError extends Error {
   constructor(message, stderr, code) {
     super(message);
@@ -390,6 +420,20 @@ class AdbClient {
     }
   }
 
+  /**
+   * 本 serial 的设备状态：device / unauthorized / offline / no-device。
+   * isOnline() 用的 get-state 无法区分 authorized 与 unauthorized（两者都是 'device'），
+   * 开机探测靠这个方法来识别「授权对话框卡住」并快速自愈（上游 b7c4f06）。
+   */
+  async deviceState() {
+    try {
+      const { stdout } = await this.exec(['devices'], { withSerial: false, timeout: 8000 });
+      return parseDeviceState(stdout, this.serial);
+    } catch (_) {
+      return 'no-device';
+    }
+  }
+
   async devices() {
     const { stdout } = await this.exec(['devices', '-l'], { withSerial: false });
     return stdout.split('\n').slice(1)
@@ -511,13 +555,78 @@ class AdbClient {
   }
 
   async isInstalled(pkg) {
-    const out = await this.shell(`pm path ${shellQuote(pkg)}`);
-    return /package:/.test(out);
+    const out = await this.shell(`pm path ${shellQuote(pkg)}`).catch(() => '');
+    const paths = parsePmPaths(out);
+    if (!paths.length) return false;
+    // 不能只信 PackageManager：快照/数据不一致时 pm 会「假已装」（上游 b7c4f06），
+    // 分片 APK 只要丢了一片，启动必失败。合并成一条 shell 逐片核对文件真实存在，
+    // 省掉多次 adb 往返。
+    const checks = paths.map((p) => `[ -s ${shellQuote(p)} ]`).join(' && ');
+    const probe = await this.shell(`${checks} && echo __APKSTART_PRESENT__`, { timeout: 10000 }).catch(() => '');
+    return /__APKSTART_PRESENT__/.test(String(probe));
   }
 
   async listPackages() {
     const out = await this.shell('pm list packages -3');
     return out.split('\n').map((l) => l.replace('package:', '').trim()).filter(Boolean);
+  }
+
+  /**
+   * 保证 guest 里有一套能打中文的输入法（上游 0.5.0）。
+   *
+   * 系统镜像（Google Play/APIs 版）只带英文键盘，Gboard 的中文语言包要联网下载、
+   * 在模拟器里极不可靠。所以随包带一个 AOSP 谷歌拼音输入法
+   * （assets/PinyinIME.apk，含 x86_64 原生库），开机后静默装好并启用。
+   *
+   * 幂等：已安装就跳过；用户手动换掉默认输入法后不强行改回去（每次开机都执行
+   * ime enable + 默认输入法写入 —— 从旧快照恢复时 enabled 标记可能丢失）。
+   *
+   * @param {string} apkPath PinyinIME.apk 的绝对路径
+   * @param {object} [o] { setDefault } 是否设为默认输入法（默认 true）
+   * @returns {Promise<{ok:boolean, installed?:boolean, ime?:string, reason?:string}>}
+   */
+  async ensureChineseIme(apkPath, { setDefault = true } = {}) {
+    const IME_PKG = 'com.android.inputmethod.pinyin';
+    const IME_ID = `${IME_PKG}/.PinyinIME`;
+    // 组件名写死但校验存在：ime list -s 只列**已启用**的输入法，用它判断
+    // 「装没装」会在刚安装完时误判为「服务未注册」，于是永远走不到 ime enable。
+    // 正确做法是用包是否已安装来判断，再用 ime list -s 交叉确认生效。
+    const pkgInstalled = async () => {
+      const out = await this.shell(`pm list packages ${IME_PKG}`, { timeout: 10000 }).catch(() => '');
+      return String(out).indexOf(`package:${IME_PKG}`) >= 0;
+    };
+    const findEnabledIme = async () => {
+      const out = await this.shell('ime list -s', { timeout: 10000 }).catch(() => '');
+      return String(out).split('\n').map((s) => s.trim()).find((s) => s.indexOf(IME_PKG) === 0) || '';
+    };
+    try {
+      let installed = await pkgInstalled();
+      let justInstalled = false;
+      if (!installed) {
+        if (!apkPath || !fs.existsSync(apkPath)) {
+          return { ok: false, reason: '输入法 APK 缺失' };
+        }
+        await this.install(apkPath);
+        justInstalled = true;
+        // 装完等包管理器扫到这个包
+        for (let i = 0; i < 6; i += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          installed = await pkgInstalled();
+          if (installed) break;
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(800);
+        }
+      }
+      if (!installed) return { ok: false, justInstalled, reason: '输入法包未注册' };
+      // 启用 + 设为默认（secure settings 可写，不需要 root）
+      const cmds = [`ime enable ${IME_ID}`];
+      if (setDefault) cmds.push(`settings put secure default_input_method ${IME_ID}`);
+      await this.shell(cmds.join(' ; '), { timeout: 12000 }).catch(() => '');
+      const ime = await findEnabledIme();
+      return { ok: !!ime, installed: justInstalled, ime: ime || IME_ID };
+    } catch (e) {
+      return { ok: false, reason: e.message };
+    }
   }
 
   /** 从系统解析真正的启动 Activity（清单里解析不出来时的兜底） */
@@ -932,4 +1041,5 @@ class AdbClient {
 module.exports = {
   AdbClient, AdbError, parseStatList, friendlyInstallError, friendlyLaunchError,
   componentArg, parseResolvedActivity, shellQuote,
+  parseDeviceState, isUnauthorizedError, parsePmPaths,
 };

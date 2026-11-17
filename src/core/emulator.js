@@ -469,6 +469,10 @@ class EmulatorEngine {
       `disk.dataPartition.size=${dataMB}M`,
       'hw.gpu.enabled=yes',
       `hw.gpu.mode=${gpu}`,
+      // guest 内部的 Wi-Fi 网卡必须显式拉起（上游 a0d3b8e）：没有这行，
+      // QEMU 用户态 NAT 参数都正常，guest 里却没有 wlan0 —— dumpsys connectivity
+      // 显示 Active default network: none，应用里就是一直「网络错误，请稍后再试」。
+      'hw.wifi=yes',
       'hw.keyboard=yes',
       'hw.lcd.width=' + screen.w,
       'hw.lcd.height=' + screen.h,
@@ -1694,6 +1698,25 @@ class EmulatorEngine {
     this._snapTimer = null;
   }
 
+  /**
+   * guest 是否处于「可以安全存快照」的健康状态：adb authorized + boot 完成（上游 b7c4f06）。
+   * 冷启动时若「允许 USB 调试吗？」对话框还挂着，state 是 unauthorized —— 这时存下
+   * 内存 + 磁盘，guest 里就没有 host 的 adbkey.pub，下次恢复还是 unauthorized，
+   * 每轮探测的 shell 都抛异常，干等 240s 还被误诊成显卡/虚拟化问题。
+   */
+  async _adbGuestHealthy(adbPath) {
+    if (!adbPath) return false;
+    try {
+      const { AdbClient } = require('./adb');
+      const probe = new AdbClient({ adbPath, serial: this.serial });
+      const state = await probe.deviceState();
+      const out = await probe.shell('getprop sys.boot_completed', { timeout: 6000 }).catch(() => '');
+      return state === 'device' && String(out).trim() === '1';
+    } catch (_) {
+      return false;
+    }
+  }
+
   /** 优雅停止：慢机器先保存 quickboot 快照，再走控制台关机，最后强杀进程树 */
   async stop({ adbPath } = {}) {
     if (!this.proc) {
@@ -1702,7 +1725,16 @@ class EmulatorEngine {
     }
     this.cancelSnapshotSave();
     const serial = this.serial;
-    if (adbPath && this.snapshotWorthSaving !== false) {
+    // 关机前先判断 guest 是否健康（上游 b7c4f06）：不健康（adb 卡 unauthorized /
+    // 没开机完成）时存快照，只会把这些状态冻进内存镜像。`adb emu kill` 也会让
+    // emulator 自己按 quickboot 存一份同样有毒的状态，所以退出后必须作废。
+    // 没给 adbPath 就无从判断 —— 宁可保持原状（不存不删），也别误删好快照。
+    const assessed = !!adbPath;
+    const healthy = assessed ? await this._adbGuestHealthy(adbPath).catch(() => false) : true;
+    if (assessed && !healthy && this.snapshotWorthSaving !== false) {
+      this.log('关机时 guest 未授权/未就绪：将作废快照，下次冷启动重新注入调试授权');
+    }
+    if (adbPath && this.snapshotWorthSaving !== false && healthy) {
       // 关机前补存一次：空闲路径没来得及存（比如用户装完应用马上退出）时，
       // 下一次开机仍然能走快照恢复，而不是重新冷启动。
       // 3GB 内存写盘要几秒到二十几秒，超时给足，别让快照写一半就被 kill 掉。
@@ -1726,6 +1758,11 @@ class EmulatorEngine {
       await sleep(300);
     }
     await this.killAttempt();
+    // 进程已退出，这时再作废它可能在退出时自动存的毒快照。顺序很重要：必须放在
+    // emu kill + 端口关闭之后，否则它会把刚删的快照又写回来。
+    if (!healthy && this.snapshotWorthSaving !== false) {
+      try { this.invalidateSnapshot(); } catch (_) { /* ignore */ }
+    }
     return true;
   }
 
@@ -1791,6 +1828,9 @@ class EmulatorEngine {
    */
   _noteGpuFailure(plan) {
     try {
+      // 授权对话框卡住不是渲染后端的问题，别把当前 GPU 记进「启动即崩」黑名单
+      // （上游 b7c4f06），否则下次启动会无缘无故跳过这台机器本来能用的后端。
+      if (this.lastDiagnosis && this.lastDiagnosis.code === 'ADB_UNAUTHORIZED') return;
       const gpu = plan && plan.gpu;
       if (!gpu) return;
       // 软件渲染是兜底项，它已经是最慢/最稳的选择，没有更差的替代品可退

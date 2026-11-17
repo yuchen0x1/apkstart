@@ -427,6 +427,10 @@ async function toggleDisplayMode() {
 
 /** 首次运行把 adb / emulator / 系统镜像一次装完，不再分 1~5 步 */
 let deploying = false;
+// 自动部署失败后的冷却（上游 0.5.0）：运行时整包 1.4GB，失败（断网/限流/磁盘满）后
+// 若不冷却，每次启动都会再试一次大下载。30 分钟内只走手动安装，不自动重试。
+let deployFailedAt = 0;
+const DEPLOY_COOLDOWN_MS = 30 * 60 * 1000;
 // 引导向导打开期间暂停后台自动部署：用户正在选「装到哪个盘」，
 // 后台却已经往默认目录（C 盘）开下，选择就失去意义了。向导关闭后重新安排。
 let wizardOpen = false;
@@ -455,6 +459,9 @@ function scheduleAutoDeploy(delay = 20000) {
 async function autoDeploy({ force = false } = {}) {
   // 向导打开期间拦截的是「后台定时」的自动部署；向导自己点「开始安装」走 force=true
   if (!force && wizardOpen) return { ok: false, error: 'wizard' };
+  if (!force && Date.now() - deployFailedAt < DEPLOY_COOLDOWN_MS) {
+    return { ok: false, error: 'cooldown' };
+  }
   if (deploying || !store.getSettings().autoDeploy) return { ok: false, error: 'skipped' };
   deploying = true;
   const progress = (p) => send('provision:progress', { ...p, component: p.component || 'all' });
@@ -491,8 +498,11 @@ async function autoDeploy({ force = false } = {}) {
       await runtime.provisioner.installSystemImage(progress);
     }
     const after = await runtime.provisioner.checkEnv();
-    return { ok: !!(after.adb.ok && after.emulator.ok && after.sysimg.ok) };
+    const ok = !!(after.adb.ok && after.emulator.ok && after.sysimg.ok);
+    deployFailedAt = ok ? 0 : Date.now();
+    return { ok };
   } catch (e) {
+    deployFailedAt = Date.now();
     return { ok: false, error: e.message };
   } finally {
     deploying = false;

@@ -11,7 +11,7 @@ const { spawn, execFile } = require('child_process');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
-const { AdbClient } = require('./adb');
+const { AdbClient, isUnauthorizedError } = require('./adb');
 const { parseVolumeGet } = require('./android');
 const store = require('./store');
 const { Provisioner } = require('./provision');
@@ -73,6 +73,7 @@ class Runtime {
     this._watchdog = null;
     this._freeformReady = false;
     this._guestDefaultsReady = false;
+    this._chineseImeReady = false; // 中文输入法本进程装好即置位（失败允许下次 prepare 重试）
     this._client = null;
     this._bootLog = [];
     this._activeApps = new Set();  // 容器会话：当前打开的应用窗口
@@ -319,6 +320,7 @@ class Runtime {
       let probeStart = Date.now();
       let errStreak = 0;
       let lastHeal = 0;
+      let authHealed = false; // unauthorized 只自愈一次，避免反复删快照冷启动死循环
       const probe = async ({ serial }) => {
         if (!this.emulator.running()) return 'fatal';
         if (!this._probeClient || this._probeClient.serial !== serial) {
@@ -333,9 +335,40 @@ class Runtime {
           errStreak = 0;
           if (booted && pmReady) return 'ok';
           return booted ? 'pending' : 'booting';
-        } catch (_) {
+        } catch (e) {
           errStreak += 1;
-          // adb 传输会偶发地卡在 offline / unauthorized（另一个 adb server 抢了端口、
+          // adb shell 报错可能是「还没开机」也可能是「授权对话框卡住」（上游 b7c4f06）。
+          // 后者每轮 shell 都抛异常，只按普通 offline 处理会按 240s×4 组参数干等，
+          // 最后报「运行时未能完成开机」误导用户去查显卡/虚拟化。这里先按报错文本、
+          // 再按 devices 的 state 列（get-state 分不清 authorized）双重确认 unauthorized，
+          // 命中就作废旧快照冷启动：冷启动会重新注入 adb 公钥，授权问题随之消失。
+          const raw = String((e && (e.raw || e.stderr || e.message)) || '');
+          let unauthorized = isUnauthorizedError(raw);
+          if (!unauthorized) {
+            const st2 = await c.deviceState().catch(() => '');
+            unauthorized = st2 === 'unauthorized';
+          }
+          if (unauthorized) {
+            // 给 start() 一个准确的诊断，别让它掉进 UNKNOWN 再被记成显卡/加速问题
+            this.emulator.lastDiagnosis = {
+              code: 'ADB_UNAUTHORIZED',
+              title: '安卓调试授权未完成（授权对话框）',
+              hint: '系统卡在「允许 USB 调试？」对话框，已自动作废旧快照并冷启动一次让运行时'
+                + '重新注入 adb 公钥。若反复出现，请删除 %USERPROFILE%\\.android\\adbkey* 后重试。',
+            };
+            if (!authHealed) {
+              authHealed = true;
+              onLog('adb 卡在「允许 USB 调试」授权对话框：作废旧快照并强制冷启动，重新注入调试授权…');
+              try { this.emulator.invalidateSnapshot(); } catch (_) { /* ignore */ }
+              this.emulator.forceColdBootOnNextStart();
+              await this.emulator.resetAdbServer().catch(() => {});
+              this._probeClient = null;
+            }
+            // 返回 fatal 让 start() 立刻换一轮（新 spawn 不加载快照），不再空等
+            return 'fatal';
+          }
+          // 其它 adb 传输异常：沿用原来的重启 server 自愈。
+          // adb 传输会偶发地卡在 offline（另一个 adb server 抢了端口、
           // 或者握手被打断），这时每一轮 shell 都报错，probe 永远 pending ——
           // 上层只会看到「开机超时」，白白等到 240 秒。连错 6 轮就重启一次 server 自愈。
           const now = Date.now();
@@ -685,6 +718,30 @@ class Runtime {
       }
     } catch (e) {
       this.log(`首次开机收尾失败（不影响使用）：${e.message}`);
+    }
+    // 中文输入法（上游 0.5.0）：系统镜像只带英文键盘，Gboard 中文语言包要联网下载、
+    // 在模拟器里极不可靠。随包带 AOSP 谷歌拼音输入法（assets/PinyinIME.apk），
+    // 开机后静默装好并启用 —— 系统汉化之后没有输入法，用户在安卓里打不了中文。
+    // 幂等且可重试：装好置位一次；偶发 adb 抖动失败时下次 prepare() 接着试。
+    // 可在设置里关掉（engine.chineseIme=false）；自定义镜像 / attach 模式同样适用
+    // （输入法只装进 guest，不碰镜像本体）。
+    if (this.settings.engine.chineseIme !== false && !this._chineseImeReady) {
+      try {
+        const imeApk = path.join(this.appRoot, 'assets', 'PinyinIME.apk');
+        // eslint-disable-next-line no-await-in-loop
+        const r = await client.ensureChineseIme(imeApk, {
+          setDefault: this.settings.engine.chineseImeDefault !== false,
+        });
+        // 只有真的成功了才置位，失败允许下次重试
+        if (r && r.ok) {
+          this._chineseImeReady = true;
+          this.log(r.installed ? '中文输入法：已安装并启用' : '中文输入法：已就绪');
+        } else {
+          this.log(`中文输入法未就绪（${(r && r.reason) || 'unknown'}），下次启动自动重试`);
+        }
+      } catch (e) {
+        this.log(`中文输入法安装跳过：${e.message}`);
+      }
     }
     this.startWatchdog();
   }

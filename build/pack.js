@@ -76,7 +76,8 @@ for (const rel of ['d3dcompiler_47.dll']) {
 // 2. 应用本体
 console.log('复制应用…');
 const appDir = path.join(OUT, 'resources', 'app');
-for (const item of ['package.json', 'src', 'LICENSE']) {
+// assets/ 里是随包分发的资源：PinyinIME.apk（中文输入法），开机时由引擎静默安装
+for (const item of ['package.json', 'src', 'LICENSE', 'assets']) {
   const src = path.join(ROOT, item);
   if (fs.existsSync(src)) copy(src, path.join(appDir, item));
 }

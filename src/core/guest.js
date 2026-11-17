@@ -109,6 +109,7 @@ const NEVER_TOUCH = [
   'com.google.android.apps.messaging',
   'com.google.android.contacts',
   'com.google.android.inputmethod.latin',
+  'com.android.inputmethod.pinyin', // 随包安装的谷歌拼音输入法（中文输入全靠它），不许精简
   'com.google.android.webview',
   'com.android.shell',
   'com.android.providers.settings',

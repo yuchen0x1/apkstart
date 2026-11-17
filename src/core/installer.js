@@ -197,6 +197,34 @@ class Installer {
     const existing = store.getApp(meta.package);
     // 装完之后旧 quickboot 快照里的磁盘状态就过期了，留着会导致「装好的应用重启后又不见了」
     try { this.runtime.emulator?.invalidateSnapshot(); } catch (_) { /* ignore */ }
+
+    // 安装前磁盘预检（上游 f6a2a19）：几十 GB 的大包装到一半才报
+    // INSTALL_INSUFFICIENT_STORAGE，用户看到的仍是一句干巴巴的「失败」。
+    // 按「安装包 ×1.8 + 2GB」估算实际写入量（解压 + dexopt 膨胀），不足就提前拦下说明白。
+    // 系统镜像下载早有同类预检（system-task-manager），APK 安装链路之前漏了。
+    try {
+      const apkBytes = bundle
+        ? bundle.files.reduce((n, f) => n + (fs.statSync(f).size || 0), 0)
+        : (fs.statSync(filePath).size || 0);
+      if (apkBytes > 0) {
+        const needBytes = Math.round(apkBytes * 1.8) + 2 * 1024 * 1024 * 1024;
+        const df = await client.shell('df -k /data').catch(() => '');
+        // df 输出：Filesystem 1K-blocks Used Available Use% Mounted on —— 取 Available 列
+        const m = /\s(\d+)\s+\d+\s+(\d+)\s+\d+%\s+\/data\s*$/m.exec(String(df));
+        if (m) {
+          const availBytes = Number(m[2]) * 1024;
+          if (availBytes > 0 && availBytes < needBytes) {
+            throw new Error(`安装失败：安卓数据分区空间不足（安装包约 ${(apkBytes / 1073741824).toFixed(1)}GB，`
+              + `预计需要 ${(needBytes / 1073741824).toFixed(1)}GB，/data 仅剩 ${(availBytes / 1073741824).toFixed(1)}GB）。`
+              + ' INSTALL_FAILED_INSUFFICIENT_STORAGE');
+          }
+        }
+      }
+    } catch (e) {
+      // 只有我们自己抛的「空间不足」才往外抛；df 拿不到这类工具性小问题直接放行，不挡安装
+      if (/INSUFFICIENT_STORAGE/.test(String(e && e.message))) throw e;
+    }
+
     onProgress({ stage: 'install', message: existing ? '正在更新应用…' : '正在安装应用…' });
     try {
       if (bundle) await client.installMultiple(bundle.files);
