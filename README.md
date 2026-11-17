@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.6.14**（2026-11-17）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.6.15**（2026-11-17）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -44,11 +44,14 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 ## 最新更新
 
 <!-- latest:start -->
-### v0.6.14
+### v0.6.15
 
-- **首次启动的引导向导补齐了关键设置**：原来只问「装到哪个盘」，现在下载完成后会继续逐项引导 5 步——虚拟机资源（内存 / CPU / 资源策略）、硬件加速（一键开启）、画面与存储（画质 / 数据分区 / 渲染后端）、系统镜像与语言、完成确认。- 每一步都是**真实可用的设置控件**，改完立即保存；每页还有「去设置页细调」，关掉设置会自动回到刚才那一步，不用从头走一遍。- 最后一步显示本次选择摘要，点「完成设置并重启」会保存引导状态后**真正重启应用**（以前 `app:restart` 只调用 `app.quit()`，界面写着重启、实际只是退出）。
-- **安卓数据分区的默认容量从 6 GB 提高到按磁盘余量给 4 / 8 / 16 / 24 GB**：系统自身要占 3~4 GB，旧默认装两三个应用、游戏更新一次就满。镜像是稀疏文件， 24 GB 不会立刻占掉 24 GB 磁盘；磁盘紧张时仍只给 4 GB，设置里也能手动指定。
-- 引导页的资源策略与画质不能在同一次设置写入里提交：主进程会用资源预设覆盖画质，导致用户刚选的分辨率被悄悄改回「自动」。现在分两次写入。
+- **多系统按需下载与一键切换（统一 Provider 架构）**：系统选择界面新增 LineageOS、Bliss OS、 Android-x86 卡片（保留 Google Play / Google APIs / 纯 AOSP 与自定义镜像）。镜像本体不内置到主程序、源码仓库或默认安装包，只有用户主动选择才下载；下载/校验/安装/启动进度接入现有「运行状态」区域，支持暂停/继续/取消/重试与断点续传。
+- **构建体积闸门** `build/check-no-images.js`：pack.js 与 CI 扫描安装包/仓库，禁止内置 ISO 与大型系统镜像。
+- 新增文档 [SYSTEMS.md](docs/SYSTEMS.md)、[DOWNLOAD-MANAGER.md](docs/DOWNLOAD-MANAGER.md)、[COMPATIBILITY.md](docs/COMPATIBILITY.md)。
+- **issue #5：无硬件加速的多核小内存机器开机崩溃（0xC0000005）**。现场 Xeon E5-2650 v3 / 20 核 / 可用 4.8GB / 纯软件模拟，原实现给虚拟机 8 个 TCG vCPU，8 份 TB 缓存线程在小内存上极易访问冲突。现在无加速且用户未手动指定时，自动把 vCPU 上限收紧到 4 核（有加速机器不受影响，手动指定核数仍优先）——与「无加速必须按没有加速选参数」的既有设计一致。
+- **崩溃止损更及时**：「多种软件后端同码崩溃」的计数现在把 `host`/`lavapipe`/`guest` 也算进 TCG 软件路径（老版本 emulator 候选里没有 swangle，第一组是 swiftshader_indirect、随后 host，旧逻辑漏算 host 会多白等一轮）。
+- **「关 Vulkan 重试」不再被误触发**：`androidboot.hardware.vulkan=ranchu` 是 guest 内核命令行的正常属性、每次启动都会打印，旧判断把它当成 Vulkan 崩溃证据；现在先剔除这类属性行，只看真正的 Vulkan 初始化日志。
 <!-- latest:end -->
 
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。
@@ -78,6 +81,29 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 </p>
 
 <p align="center"><em>左：学习类应用（搜索、信息流、底部导航均正常）；右：短视频应用（视频流、弹幕、直播入口均正常）</em></p>
+
+## 多系统按需下载与一键切换
+
+除了内置的 Google Play / Google APIs / 纯 AOSP，ApkStart 还支持 **LineageOS、Bliss OS、Android-x86**
+和自定义镜像，全部通过统一的 Provider 架构管理。
+
+- **不内置、不预下载**：三个系统的镜像本体绝不在主程序、源码仓库或默认安装包里。下载主程序时不会额外下载它们；
+  只有在「设置 → 安卓系统 → 选择系统」里主动选择，才会触发对应镜像的下载与安装。已下载的不重复下载，不用的不占磁盘。
+- **真实进度**：下载 / 校验 / 建盘 / 安装 / 启动的进度全部显示在「设置 → 运行状态 → 系统任务」区域，
+  含真实速度、已下载/总大小、剩余时间、当前阶段，支持暂停/继续/取消/重试。
+- **一键切换**：选中已安装系统即真实停旧启新，各系统独立 userdata，切换不清空其它系统数据。
+
+三个系统的真实接入状态（详见 [docs/SYSTEMS.md](docs/SYSTEMS.md)）：
+
+| 系统 | 后端 | 状态 |
+|---|---|---|
+| Android-x86 9.0-r2 | QEMU | ✅ 官方 ISO + SHA-256，可下载安装（Windows 真机启动需用户环境验证） |
+| Bliss OS 16.9.7 | QEMU | ⚠️ 官方 SourceForge 归档快照，可下载安装，无 OTA/支持 |
+| LineageOS | Android Emulator | ⛔ 官方无预构建镜像，提供导入自建 AVD 镜像能力，显示真实状态 |
+
+> LineageOS 没有官方预构建模拟器镜像，ApkStart 不会伪造下载地址；Bliss OS 官网已声明
+> "No current official ISO"。虚拟磁盘启动不等于 Android 启动成功——只有 ADB 就绪且
+> `sys.boot_completed=1` 才标记运行中。兼容性详见 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
 ## 能做什么
 

@@ -5,6 +5,40 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.15] — 2026-11-17
+
+### 新增
+- **多系统按需下载与一键切换（统一 Provider 架构）**：系统选择界面新增 LineageOS、Bliss OS、
+  Android-x86 卡片（保留 Google Play / Google APIs / 纯 AOSP 与自定义镜像）。镜像本体不内置到主程序、
+  源码仓库或默认安装包，只有用户主动选择才下载；下载/校验/安装/启动进度接入现有「运行状态」区域，
+  支持暂停/继续/取消/重试与断点续传。新增 `system-catalog`（远程目录+缓存回退+内置索引）、
+  `system-task-manager`（统一任务/持久化/去重）、`system-manager`（统一切换）、
+  `system-providers/`（7 个 Provider）与独立 QEMU 后端（q35/WHPX/virtio/ADB）。
+  - Android-x86 9.0-r2、Bliss OS 16.9.7 使用官方 SourceForge ISO + 官方 SHA-256，真实可下载安装。
+  - LineageOS 官方无预构建模拟器镜像：显示真实状态并提供自建 AVD 镜像导入，绝不伪造下载地址。
+  - Bliss OS 为官方归档快照（官网 "No current official ISO"），UI 明确标注。
+  - 各系统独立数据目录 `%APPDATA%\apkstart\runtime\systems\<id>\`，下载缓存与已装系统分离。
+- **构建体积闸门** `build/check-no-images.js`：pack.js 与 CI 扫描安装包/仓库，禁止内置 ISO 与大型系统镜像。
+- 新增文档 [SYSTEMS.md](docs/SYSTEMS.md)、[DOWNLOAD-MANAGER.md](docs/DOWNLOAD-MANAGER.md)、[COMPATIBILITY.md](docs/COMPATIBILITY.md)。
+
+> 真机启动说明：单元测试/目录/Provider/任务/构建闸门均已在 Node 环境通过；GB 级 ISO 下载与
+> Windows 图形界面启动需在用户真实 VT-x/WHPX 环境验证，相关条目标记为未验证，不做虚假声明。
+> 官方源在线探针可用 `npm run test:iso-source` 随时复验（真实网络，不进 CI）。
+
+### 修复
+- **issue #5：无硬件加速的多核小内存机器开机崩溃（0xC0000005）**。现场 Xeon E5-2650 v3 /
+  20 核 / 可用 4.8GB / 纯软件模拟，原实现给虚拟机 8 个 TCG vCPU，8 份 TB 缓存线程在小内存上
+  极易访问冲突。现在无加速且用户未手动指定时，自动把 vCPU 上限收紧到 4 核（有加速机器不受影响，
+  手动指定核数仍优先）——与「无加速必须按没有加速选参数」的既有设计一致。
+- **崩溃止损更及时**：「多种软件后端同码崩溃」的计数现在把 `host`/`lavapipe`/`guest` 也算进
+  TCG 软件路径（老版本 emulator 候选里没有 swangle，第一组是 swiftshader_indirect、随后 host，
+  旧逻辑漏算 host 会多白等一轮）。
+- **「关 Vulkan 重试」不再被误触发**：`androidboot.hardware.vulkan=ranchu` 是 guest 内核命令行
+  的正常属性、每次启动都会打印，旧判断把它当成 Vulkan 崩溃证据；现在先剔除这类属性行，
+  只看真正的 Vulkan 初始化日志。
+- **诊断不再跨轮串味**：进程崩溃的轮次改为先分析本轮日志，只有本轮没有可识别错误时才沿用
+  上一轮结论，避免第 2 轮的真实错误（磁盘写满/内存不足/镜像损坏）被第 1 轮的崩溃结论盖掉。
+
 ## [0.6.14] — 2026-11-17
 
 ### 新增

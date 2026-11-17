@@ -412,6 +412,16 @@
             </div>
             <div id="envCheck" class="env-check" hidden></div>
 
+            <!-- 多系统下载/安装/启动任务：复用运行状态区的现有视觉风格，真实进度 -->
+            <div id="sysTaskWrap" class="sys-task-wrap" hidden>
+              <div class="sys-task-head">
+                <span class="sys-task-title">系统任务</span>
+                <span class="sub" style="flex:1">下载 / 校验 / 安装 / 启动的真实进度</span>
+                <button class="btn ghost sm" id="btnSysTaskRefresh">刷新</button>
+              </div>
+              <div id="sysTaskList" class="sys-task-list"></div>
+            </div>
+
             <!-- 部署实时日志：测速 / 下载 / 解压 / 换源每一步都落一行，看得见「在流动、在干活」 -->
             <div id="deployLogWrap" class="deploy-log-wrap" hidden>
               <div class="deploy-log-head">
@@ -716,8 +726,19 @@
         <!-- ================= 安卓系统 ================= -->
         <section class="set-sec" data-sec="android">
           <div class="set-sec-meta" hidden><h2>安卓系统</h2><p>系统镜像、语言、预装应用与安卓内部设置</p></div>
+
+          <!-- 多系统选择：统一卡片 + 详情面板。镜像按需下载，不选择不占用磁盘。 -->
+          <div class="group" id="systemPickerGroup">
+            <div class="group-title">选择系统 <span class="sub" id="sysCatalogTime" style="font-weight:400">目录更新时间：读取中…</span></div>
+            <div class="field">
+              <span class="sub">只有在这里主动选择 LineageOS / Bliss OS / Android-x86 时，才会下载对应镜像；不选择、不使用就不占用额外磁盘空间。下载与安装进度显示在「运行状态」分区。</span>
+            </div>
+            <div class="sys-cards" id="sysCards"><div class="sys-loading">正在读取系统目录…</div></div>
+            <div class="sys-detail" id="sysDetail" hidden></div>
+          </div>
+
           <div class="group">
-            <div class="group-title">系统镜像</div>
+            <div class="group-title">内置系统档位</div>
             <div class="field">
               <label>系统类型</label>
               <select id="setImageFlavor">

@@ -96,6 +96,26 @@ contextBridge.exposeInMainWorld('apkstart', {
   imageRemove: (id) => invoke('image:remove', id),
   imageReveal: (id) => invoke('image:reveal', id),
 
+  // 多系统（LineageOS / Bliss OS / Android-x86 / 内置档位）按需下载与切换
+  systemList: () => invoke('system:list'),
+  systemDetail: (id) => invoke('system:detail', id),
+  systemCatalogRefresh: () => invoke('system:catalogRefresh'),
+  systemInstall: (id) => invoke('system:install', id),
+  systemSwitch: (payload) => invoke('system:switch', payload || {}),
+  systemStop: () => invoke('system:stop'),
+  systemPause: (taskId) => invoke('system:pause', taskId),
+  systemResume: (taskId) => invoke('system:resume', taskId),
+  systemCancel: (taskId) => invoke('system:cancel', taskId),
+  systemRetry: (taskId) => invoke('system:retry', taskId),
+  systemTasks: () => invoke('system:tasks'),
+  systemStatus: () => invoke('system:status'),
+  systemOpenDir: (payload) => invoke('system:openDir', payload || {}),
+  systemBackup: (payload) => invoke('system:backup', payload || {}),
+  systemRestore: (payload) => invoke('system:restore', payload || {}),
+  systemRemove: (id) => invoke('system:remove', id),
+  systemImportLineage: () => invoke('system:importLineage'),
+  systemDiskUsage: () => invoke('system:diskUsage'),
+
   selfCheck: () => invoke('doctor:selfCheck'),
   clearLocks: () => invoke('app:clearLocks'),
   removeSelf: () => invoke('app:removeSelf'),
@@ -162,7 +182,7 @@ contextBridge.exposeInMainWorld('apkstart', {
     const allowed = [
       'install:start', 'install:progress', 'install:done', 'install:error',
       'app:launched', 'runtime:log', 'toast', 'ui:navigate', 'provision:progress',
-      'update:progress', 'update:state',
+      'update:progress', 'update:state', 'system:task', 'system:log',
     ];
     if (!allowed.includes(channel)) return () => {};
     const handler = (_e, payload) => cb(payload);

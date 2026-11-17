@@ -16,6 +16,16 @@
 │         adb.js（设备操作）  sharer.js（文件互通，三方哈希合并）│
 │         compat.js（安装前兼容性） backup.js（备份/恢复）      │
 ├─────────────────────────────────────────────────────────────┤
+│ 多系统层 system-manager（统一切换/生命周期）                  │
+│         system-task-manager（统一任务/进度/持久化/去重）      │
+│         system-catalog（远程目录 + 缓存回退 + 内置索引）      │
+│         system-providers/（7 个 Provider，统一接口）          │
+│           ├ emulator-provider  google-play/apis/aosp         │
+│           ├ lineage-provider   无预构建→导入能力              │
+│           ├ qemu-iso-provider  → bliss / android-x86          │
+│           │   └ qemu-backend   q35/WHPX/virtio/adb            │
+│           └ custom-provider    → images.js                    │
+├─────────────────────────────────────────────────────────────┤
 │ 离线解析  zip.js → axml.js / arsc.js → apk.js                │
 │           png.js / shortcut.js（图标与快捷方式）             │
 ├─────────────────────────────────────────────────────────────┤
@@ -26,6 +36,11 @@
 > 自定义镜像（第三方 x86_64 模拟器系统镜像）走独立的适配层，不改写默认镜像：
 > `images.js`（可插拔 provider + 导入索引）、`image-manifest.js`（清单校验）、
 > `image-inspect.js`（字节体检）。详见 [CUSTOM-IMAGES.md](CUSTOM-IMAGES.md)。
+
+> 多系统（LineageOS / Bliss OS / Android-x86）统一走 `system-providers/`：每个 Provider 只负责
+> 自身系统逻辑，`system-manager` 负责协调切换，`system-task-manager` 负责进度与持久化，
+> `system-catalog` 负责远程元数据。镜像本体永不内置，按需下载。详见
+> [SYSTEMS.md](SYSTEMS.md)、[DOWNLOAD-MANAGER.md](DOWNLOAD-MANAGER.md)、[COMPATIBILITY.md](COMPATIBILITY.md)。
 
 ## 三条边界
 

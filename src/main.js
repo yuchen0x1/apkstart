@@ -48,6 +48,9 @@ const { NotifyBridge } = require('./core/notify');
 const { AndroidSettings } = require('./core/android');
 const { Updater } = require('./core/updater');
 const guest = require('./core/guest');
+// 多系统按需下载/安装/切换：统一目录、Provider、任务管理器、系统管理器
+const { SystemCatalog } = require('./core/system-catalog');
+const { SystemManager } = require('./core/system-manager');
 
 // Windows 下窗口被遮挡时 capturePage 会拿到旧帧，自动化截图需要禁用遮挡计算
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
@@ -1563,6 +1566,38 @@ function installIpcGuards() {
 
 function registerIpc() {
   installIpcGuards();
+
+  // ---- 多系统管理（懒加载单例）：统一目录 + Provider + 任务管理器 ----
+  let _systemManager = null;
+  const getSystemManager = () => {
+    if (_systemManager) return _systemManager;
+    const catalog = new SystemCatalog({ appRoot: APP_ROOT });
+    const doctor = require('./core/doctor');
+    const switchFlavor = async (flavor) => {
+      const profile = runtime.provisioner.imageProfile(String(flavor || ''));
+      if (runtime.vmRunning) {
+        await runtime.stop();
+        if (runtime.vmRunning) return { ok: false, error: '当前安卓运行时未能停止，未切换系统' };
+      }
+      store.saveSettings({ runtime: {
+        systemImageFlavor: profile.id,
+        compatImage: profile.id === 'google_apis_playstore',
+      } });
+      appLog(`[system] built-in flavor -> ${profile.id}; AVD=${profile.avd}`);
+      return { ok: true, profile };
+    };
+    _systemManager = new SystemManager({
+      store, catalog, doctor,
+      provisioner: runtime.provisioner,
+      backendEngine: runtime,
+      switchFlavor,
+      settingsFn: () => store.getSettings(),
+      onEvent: (task) => send('system:task', task),
+      onLog: (m) => { appLog('[system] ' + m); send('system:log', String(m)); },
+    });
+    return _systemManager;
+  };
+
   ipcMain.handle('app:info', () => ({
     version: app.getVersion(),
     isDev: IS_DEV,
@@ -1827,6 +1862,166 @@ function registerIpc() {
     } catch (e) {
       return { ok: false, error: e.message };
     }
+  });
+
+  // ==================== 多系统 Provider 架构 IPC ====================
+  /** 系统卡片列表（含可用性/安装状态/目录更新时间） */
+  ipcMain.handle('system:list', async () => {
+    try { return { ok: true, ...await getSystemManager().listSystems() }; }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 单系统详情（版本历史、兼容性、日志、下载信息） */
+  ipcMain.handle('system:detail', async (_e, systemId) => {
+    try {
+      const d = await getSystemManager().getSystemDetail(String(systemId || ''));
+      return d ? { ok: true, detail: d } : { ok: false, error: '未知系统' };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 强制刷新远程目录 */
+  ipcMain.handle('system:catalogRefresh', async () => {
+    try {
+      const mgr = getSystemManager();
+      const r = await mgr.catalog.load({ force: true });
+      return { ok: true, source: r.source, stale: r.stale, error: r.error || '', updatedAt: r.catalog.updatedAt };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 触发下载+安装流水线，立即返回 taskId */
+  ipcMain.handle('system:install', async (_e, systemId) => {
+    try { return await getSystemManager().installSystem(String(systemId || '')); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 统一切换系统（真实停旧启新 + Android 就绪检查） */
+  ipcMain.handle('system:switch', async (_e, payload) => {
+    try {
+      const p = payload || {};
+      return await getSystemManager().switchTo(String(p.systemId || ''), {
+        lowspec: !!p.lowspec, timeoutMs: Number(p.timeoutMs) || 0,
+      });
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  ipcMain.handle('system:stop', async () => {
+    try { return await getSystemManager().stopCurrent(); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 任务控制 */
+  ipcMain.handle('system:pause', async (_e, taskId) => {
+    try { return getSystemManager().taskManager.pause(String(taskId || '')); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('system:resume', async (_e, taskId) => {
+    try {
+      const mgr = getSystemManager();
+      const t = mgr.taskManager.getTask(String(taskId || ''));
+      if (!t) return { ok: false, error: '任务不存在' };
+      if (t.status !== 'paused') return { ok: false, error: '仅暂停的任务可继续' };
+      // 继续 = 以同一 Provider/目标重新执行流水线（断点由 downloadMulti 保留）
+      const p = mgr.getProvider(t.systemId);
+      const r = mgr.taskManager.retry(t.taskId);
+      if (!r.ok) return r;
+      const info = await p.getDownloadInfo().catch(() => null);
+      mgr.taskManager.runPipeline({
+        task: t, provider: p, version: t.systemVersion || (info && info.version),
+        doctor: mgr.doctor,
+        diskRequiredMB: info ? Math.round(info.fileSize / 1048576) + 2048 : 0,
+        skipStart: true,
+      }).catch(() => {});
+      return { ok: true, taskId: t.taskId };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('system:cancel', async (_e, taskId) => {
+    try { return getSystemManager().taskManager.cancel(String(taskId || '')); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('system:retry', async (_e, taskId) => {
+    try {
+      const mgr = getSystemManager();
+      const p = mgr.taskManager.getTask(String(taskId || ''));
+      if (!p) return { ok: false, error: '任务不存在' };
+      const r = mgr.taskManager.retry(p.taskId);
+      if (!r.ok) return r;
+      const provider = mgr.getProvider(p.systemId);
+      const info = await provider.getDownloadInfo().catch(() => null);
+      mgr.taskManager.runPipeline({
+        task: p, provider, version: p.systemVersion || (info && info.version),
+        doctor: mgr.doctor,
+        diskRequiredMB: info ? Math.round(info.fileSize / 1048576) + 2048 : 0,
+        skipStart: true,
+      }).catch(() => {});
+      return { ok: true, taskId: p.taskId };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  ipcMain.handle('system:tasks', async () => {
+    try { return { ok: true, tasks: getSystemManager().taskManager.listTasks(50) }; }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('system:status', async () => {
+    try { return { ok: true, ...await getSystemManager().getStatus() }; }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 打开某系统的下载/数据目录 */
+  ipcMain.handle('system:openDir', async (_e, payload) => {
+    try {
+      const p = payload || {};
+      const mgr = getSystemManager();
+      const provider = mgr.getProvider(String(p.systemId || ''));
+      if (!provider) return { ok: false, error: '未知系统' };
+      const which = p.which === 'downloads' ? provider.dir('downloads')
+        : p.which === 'data' ? provider.dataDir : provider.dataDir;
+      await shell.openPath(which);
+      return { ok: true, path: which };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 备份/恢复/删除 */
+  ipcMain.handle('system:backup', async (_e, payload) => {
+    try {
+      const p = payload || {};
+      const r = await dialog.showSaveDialog(mainWindow, {
+        title: '备份系统数据', defaultPath: `apkstart-${p.systemId}-backup.qcow2`,
+      });
+      if (r.canceled || !r.filePath) return { ok: false, cancelled: true };
+      return await getSystemManager().backup(String(p.systemId || ''), path.dirname(r.filePath));
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('system:restore', async (_e, payload) => {
+    try {
+      const p = payload || {};
+      const r = await dialog.showOpenDialog(mainWindow, {
+        title: '选择备份所在目录', properties: ['openDirectory'],
+      });
+      if (r.canceled || !r.filePaths || !r.filePaths[0]) return { ok: false, cancelled: true };
+      return await getSystemManager().restore(String(p.systemId || ''), r.filePaths[0]);
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('system:remove', async (_e, systemId) => {
+    try { return await getSystemManager().removeSystem(String(systemId || '')); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 导入 LineageOS 自建 AVD 镜像目录 */
+  ipcMain.handle('system:importLineage', async () => {
+    try {
+      const r = await dialog.showOpenDialog(mainWindow, {
+        title: '选择 LineageOS AVD 系统镜像目录', properties: ['openDirectory'],
+      });
+      if (r.canceled || !r.filePaths || !r.filePaths[0]) return { ok: false, cancelled: true };
+      const p = getSystemManager().getProvider('lineageos');
+      return await p.importFrom(r.filePaths[0], { copy: true });
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  /** 各系统占用空间 */
+  ipcMain.handle('system:diskUsage', async () => {
+    try { return { ok: true, rows: await getSystemManager().diskUsage() }; }
+    catch (e) { return { ok: false, error: e.message }; }
   });
 
   /**

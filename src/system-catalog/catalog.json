@@ -1,0 +1,142 @@
+{
+  "schema": 1,
+  "updatedAt": "2026-11-17T00:00:00Z",
+  "note": "ApkStart 远程系统目录：仅元数据，绝不包含系统镜像本体。URL 与 SHA-256 均来自官方来源核实；无官方预构建的条目 status=unavailable，不伪造下载地址。",
+  "systems": [
+    {
+      "id": "lineageos",
+      "name": "LineageOS",
+      "brand": "LineageOS",
+      "versions": [
+        {
+          "version": "21.0 (lineage-21.0)",
+          "androidVersion": "14",
+          "androidApi": 34,
+          "architecture": "x86_64",
+          "imageType": "emulator-system-image",
+          "imageFormat": "avd-sysimg",
+          "downloadUrl": "",
+          "mirrors": [],
+          "fileSize": 0,
+          "sha256": "",
+          "releaseDate": "2023-12-01",
+          "license": "Apache-2.0 / GPL (LineageOS)",
+          "source": "https://wiki.lineageos.org/emulator/",
+          "installationMethod": "manual-build-import",
+          "bootBackend": "AndroidEmulatorBackend",
+          "minimumRequirements": {
+            "vt": true,
+            "diskMB": 4096,
+            "note": "官方不提供预构建模拟器镜像；需在 Linux 用 repo 同步源码、breakfast sdk_phone_x86_64、mka emu_img_zip 后导入。"
+          },
+          "compatibility": {
+            "windows": true,
+            "note": "导入的 AVD 镜像可用 Windows 版 Android Emulator 启动；构建过程需 Linux 开发环境。"
+          },
+          "verified": false,
+          "bootTested": false,
+          "status": "unavailable",
+          "statusReason": "官方无预构建模拟器镜像，需自行编译后导入。普通手机 ROM 不可当作模拟器镜像。",
+          "buildTarget": "sdk_phone_x86_64",
+          "exportCommand": "mka emu_img_zip",
+          "avdTag": "lineage",
+          "changelog": "见 https://wiki.lineageos.org/emulator/ 的 tested branches 列表（lineage-16.0 至 lineage-24.0）。"
+        }
+      ]
+    },
+    {
+      "id": "bliss-os",
+      "name": "Bliss OS",
+      "brand": "BlissLabs",
+      "versions": [
+        {
+          "version": "16.9.7 (20241011)",
+          "androidVersion": "13",
+          "androidApi": 33,
+          "architecture": "x86_64",
+          "imageType": "live-installer-iso",
+          "imageFormat": "iso9660",
+          "downloadUrl": "https://downloads.sourceforge.net/project/blissos-x86/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso",
+          "mirrors": [
+            "https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso/download",
+            "https://master.dl.sourceforge.net/project/blissos-x86/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso?viasf=1"
+          ],
+          "fileSize": 2429550592,
+          "sha256": "17137711fb42236640ac6fe4421fcb3bd15710065fcf75c20807c018f42e3751",
+          "sha256Source": "https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso.sha256",
+          "releaseDate": "2024-10-11",
+          "license": "Apache-2.0 (Android) / 部分组件 GPL",
+          "source": "https://blissos.org/download",
+          "installationMethod": "iso-to-qcow2-first-boot",
+          "bootBackend": "QemuBackend",
+          "minimumRequirements": {
+            "vt": true,
+            "whpxRecommended": true,
+            "diskMB": 6144,
+            "note": "q35 + UEFI(OVMF) + virtio；Windows 需 WHPX 硬件加速，纯 TCG 软件模拟会非常慢。需 ISO 安装到 qcow2 后才能从虚拟磁盘启动；ADB 默认可能未开启，需在 guest 内启用网络 ADB（端口 5555）。"
+          },
+          "compatibility": {
+            "windows": true,
+            "note": "官方 QEMU 文档标注为 work-in-progress，且说明 Bliss 14 在 Windows QEMU 上因缺少软件渲染无法工作。这是归档快照，不再获得官方支持或 OTA。"
+          },
+          "verified": true,
+          "bootTested": false,
+          "status": "available-archive",
+          "statusReason": "blissos.org 官方声明 'No current official ISO'，此为 SourceForge 官方归档快照（无 OTA/无支持）。可下载、可校验、可安装；Windows 真机启动未在本环境验证。",
+          "changelog": "https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS16/Gapps/Generic/"
+        }
+      ]
+    },
+    {
+      "id": "android-x86",
+      "name": "Android-x86",
+      "brand": "Android-x86 Project",
+      "versions": [
+        {
+          "version": "9.0-r2",
+          "androidVersion": "9",
+          "androidApi": 28,
+          "architecture": "x86_64",
+          "imageType": "live-installer-iso",
+          "imageFormat": "iso9660",
+          "downloadUrl": "https://downloads.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso",
+          "mirrors": [
+            "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download",
+            "https://master.dl.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso?viasf=1",
+            "https://nchc.dl.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso",
+            "https://phoenixnap.dl.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso"
+          ],
+          "fileSize": 965738496,
+          "sha256": "f7eb8fc56f29ad5432335dc054183acf086c539f3990f0b6e9ff58bd6df4604e",
+          "sha256Source": "https://sourceforge.net/projects/android-x86/files/Release%209.0/",
+          "releaseDate": "2022-03-14",
+          "license": "Apache-2.0 (Android) / 部分组件 GPL",
+          "source": "https://www.android-x86.org/",
+          "installationMethod": "iso-to-qcow2-first-boot",
+          "bootBackend": "QemuBackend",
+          "minimumRequirements": {
+            "vt": true,
+            "whpxRecommended": true,
+            "diskMB": 4096,
+            "note": "q35 + UEFI/legacy + virtio；Windows 需 WHPX。安装到 qcow2 后从虚拟磁盘启动；ADB 需在 guest 内启用网络 ADB（端口 5555）。"
+          },
+          "compatibility": {
+            "windows": true,
+            "note": "9.0-r2 为官方最新稳定版。Windows 真机启动未在本环境验证。"
+          },
+          "verified": true,
+          "bootTested": false,
+          "status": "available",
+          "statusReason": "官方最新稳定 ISO，有官方 SHA-256。首次安装需在 QEMU 内完成安装器交互；Windows 真机启动未在本环境验证。",
+          "changelog": "https://www.android-x86.org/"
+        }
+      ]
+    }
+  ],
+  "builtinSystems": [
+    { "id": "google-play", "name": "Google Play", "bootBackend": "AndroidEmulatorBackend", "status": "builtin" },
+    { "id": "google-apis", "name": "Google APIs", "bootBackend": "AndroidEmulatorBackend", "status": "builtin" },
+    { "id": "aosp", "name": "纯 AOSP", "bootBackend": "AndroidEmulatorBackend", "status": "builtin" },
+    { "id": "custom", "name": "自定义镜像", "bootBackend": "AndroidEmulatorBackend", "status": "builtin" }
+  ]
+}

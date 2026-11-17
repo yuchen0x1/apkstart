@@ -528,6 +528,55 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(!normal.includes('-Vulkan'), '正常轮不该关 Vulkan');
   });
 
+  await test('issue #5：无加速的多核小内存机器收紧 TCG 核数', () => {
+    // 现场：Xeon E5-2650 v3 / 20 核 / 8GB 内存(可用 4.8GB) / 无加速 → 原实现给 8 核 TCG，
+    // 8 份 TB 缓存线程在 4.8GB 可用内存上极易 0xC0000005。无加速时上限应收紧到 4 核。
+    const host = { totalMB: 8089, freeMB: 4915, cores: 20, tmp: '' };
+    const noAccel = { ok: false, kind: 'none' };
+    const p = doctor.chooseProfile({ host, accel: noAccel, diskMB: 0, settings: { engine: { resourceMode: 'balanced' } } });
+    assert(p.cores <= 4, `无加速 20 核机器不该给 ${p.cores} 核 TCG（应 ≤4）`);
+    // 手动指定核数仍优先
+    const manual = doctor.chooseProfile({ host, accel: noAccel, diskMB: 0, overrides: { cores: 6 }, settings: { engine: {} } });
+    assert(manual.cores === 6, '手动指定核数应尊重用户，不被自动收紧覆盖');
+    // 有加速机器不收紧，仍是 8 核
+    const accel = doctor.chooseProfile({ host, accel: { ok: true, kind: 'whpx' }, diskMB: 0, settings: { engine: {} } });
+    assert(accel.cores === 8, '有硬件加速时不应收紧核数');
+  });
+
+  await test('issue #5：止损把 host/lavapipe 的 TCG 同码崩溃也算进去', () => {
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    const d = doctor.diagnose(['emulator exit 3221225477']);
+    emu.lastExitCode = 3221225477;
+    // 老版本 emulator 候选里没有 swangle，首轮 swiftshader_indirect、次轮 host 同码崩溃；
+    // 旧正则漏掉 host，导致要多白等一轮。
+    emu.attempts = [
+      { gpu: 'swiftshader_indirect', accel: 'off', exitCode: 3221225477 },
+      { gpu: 'host', accel: 'off', exitCode: 3221225477 },
+    ];
+    assert(emu._softwareTcgCrashed({ gpu: 'lavapipe', accel: 'off' }, d) === true,
+      'swiftshader_indirect + host 同码崩溃应触发止损');
+    // 有加速的 host 不算
+    emu.attempts = [{ gpu: 'host', accel: 'on', exitCode: 3221225477 }];
+    assert(emu._softwareTcgCrashed({ gpu: 'software', accel: 'off' }, d) === false,
+      '硬件加速的 host 崩溃不算 TCG 止损');
+  });
+
+  await test('issue #5：androidboot 的 vulkan 属性行不再被当成 Vulkan 崩溃', () => {
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    const variants = [{ gpu: 'swangle', label: 'swangle' }, { gpu: 'host', label: 'host' }];
+    const d = doctor.diagnose(['emulator exit 3221225477']);
+    // 现场日志里 androidboot.hardware.vulkan=ranchu 是正常启动必有的 guest 属性，
+    // 单独出现时不应触发「关 Vulkan」；真正 Selecting Vulkan device 才算痕迹。
+    const onlyBootProp = ['androidboot.hardware.vulkan=ranchu', 'emulator exit 3221225477'];
+    assert(emu._preferNoVulkan(variants, 0, d, onlyBootProp) === false,
+      'guest 内核属性行不该触发关 Vulkan');
+    const realTrace = ['Selecting Vulkan device: Intel UHD 730', 'emulator exit 3221225477'];
+    assert(emu._preferNoVulkan(variants, 0, d, realTrace) === true,
+      '真正初始化 Vulkan 的日志仍应触发关 Vulkan');
+  });
+
   await test('CPU 指令集：QEMU 的无害警告不许当成结论（#15 误诊回归）', () => {
     const warn = ["WARNING: host doesn't support requested feature: CPUID.01H:ECX.avx [bit 28]"];
     assert(doctor.diagnose(warn).code !== 'CPU_FEATURE',

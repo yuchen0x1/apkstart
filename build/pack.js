@@ -132,3 +132,17 @@ console.log(
 );
 console.log('压缩：node build/zip.js dist/ApkStart-win64-portable <输出.zip>');
 console.log(`运行 ${path.join(OUT, 'ApkStart.exe')} 即可使用。`);
+
+// 7. 体积闸门：确保安装包里没有混入 LineageOS / Bliss OS / Android-x86 等大型系统镜像。
+//    这些系统只能通过远程目录按需下载，绝不进主程序/默认安装包。
+try {
+  const checker = require('./check-no-images');
+  const bad = checker.scanDir(OUT, { base: OUT });
+  if (!checker.report(bad)) {
+    console.error('构建失败：安装包含有禁止内置的系统镜像。');
+    process.exit(2);
+  }
+} catch (e) {
+  console.error('体积闸门执行失败：' + e.message);
+  process.exit(2);
+}

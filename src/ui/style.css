@@ -1137,3 +1137,70 @@ kbd {
 .rs-line.bad { color: #a32d2d; }
 .rs-line.run { color: var(--brand); }
 .repair-spacer { flex: 1; }
+
+/* ==================== 多系统选择卡片 + 详情页 ==================== */
+.sys-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; margin-top: 6px; }
+.sys-loading, .sys-empty { grid-column: 1 / -1; padding: 18px; color: var(--muted); font-size: 12.5px; text-align: center; }
+.sys-card {
+  position: relative; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--panel); padding: 12px; cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .1s;
+}
+.sys-card:hover { border-color: var(--brand); box-shadow: var(--shadow-sm); }
+.sys-card.selected { border-color: var(--brand); box-shadow: 0 0 0 2px var(--brand-soft); }
+.sys-card.sel-running { background: linear-gradient(180deg, var(--panel), var(--brand-soft)); }
+.sys-card-head { display: flex; align-items: center; gap: 9px; }
+.sys-logo {
+  width: 34px; height: 34px; border-radius: 9px; flex: none; display: flex; align-items: center; justify-content: center;
+  font-size: 15px; font-weight: 700; color: #fff; background: linear-gradient(135deg, #7d8590, #4b5563);
+}
+.sys-logo.google { background: linear-gradient(135deg, #4285f4, #34a853); }
+.sys-logo.aosp { background: linear-gradient(135deg, #3ddc84, #0f9d58); }
+.sys-logo.lineage { background: linear-gradient(135deg, #4a90d9, #2b5d99); }
+.sys-logo.bliss { background: linear-gradient(135deg, #7b5cff, #4a2fd0); }
+.sys-logo.androidx86 { background: linear-gradient(135deg, #3ddc84, #1b8f5a); }
+.sys-logo.custom { background: linear-gradient(135deg, #ff6900, #e85d00); }
+.sys-name { font-size: 14px; font-weight: 650; color: var(--text); line-height: 1.2; }
+.sys-brand { font-size: 11px; color: var(--faint); margin-top: 2px; }
+.sys-badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+.sys-badge {
+  font-size: 10.5px; line-height: 1; padding: 4px 7px; border-radius: 20px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+}
+.sys-badge.ok { background: #eaf7f0; border-color: #c7ecd8; color: #0f6e56; }
+.sys-badge.warn { background: #fff7e8; border-color: #ffe0a8; color: #8a5a00; }
+.sys-badge.err { background: #fdecec; border-color: #f5c6c6; color: #a32d2d; }
+.sys-badge.run { background: var(--brand-soft); border-color: #ffd4b8; color: var(--brand-dark); }
+.sys-card-action { margin-top: 11px; display: flex; gap: 6px; align-items: center; }
+.sys-card-action .btn { flex: 1; }
+.sys-card-flag { position: absolute; top: 10px; right: 10px; font-size: 10px; color: var(--brand-dark); font-weight: 600; }
+.sys-detail {
+  margin-top: 12px; padding: 13px; border-radius: var(--r-md); border: 1px solid var(--line); background: var(--panel-2);
+}
+.sys-detail h3 { margin: 0 0 8px; font-size: 14px; color: var(--text); }
+.sys-detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px 14px; font-size: 12px; color: var(--muted); }
+.sys-detail-grid b { color: var(--text); font-weight: 600; }
+.sys-detail-note { margin-top: 9px; font-size: 11.5px; line-height: 1.7; color: var(--muted); }
+.sys-detail-note.warn { color: #8a5a00; }
+.sys-detail-act { margin-top: 11px; display: flex; flex-wrap: wrap; gap: 7px; }
+
+/* ==================== 系统任务进度（运行状态区） ==================== */
+.sys-task-wrap { margin: 12px 0 4px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); overflow: hidden; }
+.sys-task-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.sys-task-title { font-size: 12.5px; font-weight: 650; color: var(--text); }
+.sys-task-list { padding: 6px 12px 10px; }
+.sys-task-empty { padding: 12px 0; font-size: 11.5px; color: var(--faint); text-align: center; }
+.sys-task-item { padding: 9px 0; border-bottom: 1px dashed var(--line); }
+.sys-task-item:last-child { border-bottom: 0; }
+.sys-task-top { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.sys-task-sys { font-weight: 650; color: var(--text); }
+.sys-task-ver { color: var(--faint); font-size: 11px; }
+.sys-task-status { margin-left: auto; font-size: 11px; color: var(--muted); }
+.sys-task-status.running { color: var(--brand-dark); }
+.sys-task-status.ok { color: #0f6e56; }
+.sys-task-status.err { color: #a32d2d; }
+.sys-task-step { margin: 4px 0 6px; font-size: 11.5px; color: var(--muted); }
+.sys-task-bar { height: 7px; border-radius: 6px; background: #eceef2; overflow: hidden; }
+.sys-task-bar i { display: block; height: 100%; width: 0; border-radius: 6px; background: linear-gradient(90deg, var(--brand), #ff944d); transition: width .3s ease; }
+.sys-task-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 11px; color: var(--muted); }
+.sys-task-meta b { color: var(--text); font-weight: 600; }
+.sys-task-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }

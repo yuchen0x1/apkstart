@@ -1471,7 +1471,13 @@ class EmulatorEngine {
         }
 
         const attemptLines = this._attemptLines(logStart, 80);
-        let d = fatal ? (this.lastDiagnosis || doctor.diagnose(attemptLines)) : doctor.diagnose(attemptLines);
+        // issue #5：fatal 轮也不能直接复用上一轮的 lastDiagnosis。原写法
+        // `lastDiagnosis || diagnose(attemptLines)` 会让第 2 轮无论日志写了什么都沿用
+        // 第 1 轮的 ACCESS_VIOLATION —— 若第 2 轮其实是 DISK_FULL / MEMORY / IMAGE，
+        // 就会被错判并错过停机保护，白等十几分钟。改为先看本轮日志；只有本轮确实
+        // 一条可识别错误都没有（UNKNOWN）时，才退回上一轮结论 / 加速兜底。
+        let d = doctor.diagnose(attemptLines);
+        if (fatal && (!d || d.code === 'UNKNOWN') && this.lastDiagnosis) d = this.lastDiagnosis;
         // 进程没崩、只是等到超时：结论就该是「太慢」，不能被日志里的 CPUID 警告
         // 或 UNKNOWN 抢走。否则用户拿着「CPU 缺少指令集」去换镜像，永远修不好。
         if (!fatal && ['UNKNOWN', 'CPU_FEATURE'].includes(d.code)) {
@@ -1734,15 +1740,22 @@ class EmulatorEngine {
     if (!d) return false;
     // 只认「进程真的崩了」的结论；端口占用 / 超时这类不能被算进崩溃次数
     if (!['ACCESS_VIOLATION', 'GPU_INIT', 'TCG_CRASH'].includes(d.code)) return false;
-    if (!plan || plan.accel !== 'off' || !/software|swiftshader|swangle/i.test(plan.gpu || '')) return false;
+    if (!plan || plan.accel !== 'off' || !this._isTcgGpu(plan.gpu)) return false;
     // 不能只认 ACCESS_VIOLATION：日志里只要带 Vulkan / ANGLE 字样，同一场崩溃就可能被
     // 判成 GPU_INIT（用户实测：4 组参数 4 次全崩，报告却还写着「已自动换用其他渲染后端」）。
-    // 判据回到事实本身 ——「关加速的软件后端 + 同一个非 0 退出码」出现两次，就说明换后端无效。
+    // 判据回到事实本身 ——「关加速的软件路径 + 同一个非 0 退出码」出现两次，就说明换后端无效。
+    // issue #5：host / lavapipe / guest 同样是 accel=off 下的 TCG 呈现路径（老版本 emulator
+    // 的候选里 swangle 根本不存在，第一组就是 swiftshader_indirect，随后 host/lavapipe）。
+    // 旧正则只数 software/swiftshader/swangle，host 轮同码崩溃被漏算，导致多白等一轮。
     const exit = this.lastExitCode;
     if (!exit) return false;
     return this.attempts.filter((a) => a && a.accel === 'off'
-      && /software|swiftshader|swangle/i.test(a.gpu || '')
-      && a.exitCode === exit).length >= 2;
+      && this._isTcgGpu(a.gpu) && a.exitCode === exit).length >= 2;
+  }
+
+  /** 是否属于「关加速后的软件/TCG 呈现路径」。统一给止损与去重使用，避免正则各写各的漏项。 */
+  _isTcgGpu(gpu) {
+    return /software|swiftshader|swangle|lavapipe|host|guest/i.test(gpu || '');
   }
 
   /**
@@ -1758,7 +1771,15 @@ class EmulatorEngine {
     if (!next || next.noVulkan) return false;
     if (!d || !['GPU_INIT', 'ACCESS_VIOLATION'].includes(d.code)) return false;
     const text = String((lines || []).join('\n'));
-    if (!/vulkan|guest angle/i.test(text)) return false;
+    // issue #5：不能用裸 /vulkan/ 判断 —— androidboot.hardware.vulkan=ranchu 是 guest
+    // 内核命令行的固定属性，正常启动也会打印，会把它当成「崩在 Vulkan」（歪打正着地
+    // 关了 Vulkan，但判断依据本身是错的）。先把这类 androidboot.* 属性行剔掉，
+    // 再看剩下的日志里有没有真正的 Vulkan / Guest Angle 初始化痕迹。
+    const meaningful = String((lines || []))
+      .split(/\r?\n/)
+      .filter((line) => !/androidboot\.hardware\.vulkan|androidboot\.[^\s]*vulkan/i.test(line))
+      .join('\n');
+    if (!/vulkan|guest angle/i.test(meaningful)) return false;
     next.noVulkan = true;
     next.label = `${next.gpu} / 关 Vulkan`;
     return true;

@@ -125,6 +125,11 @@ const DEFAULT_SETTINGS = {
     // Gitee 的 releases 接口对公开仓库也要求 access_token（无 token 直接 404），
     // 想用 Gitee 作为更新源就在这里填一个只读 token；留空则只用 GitHub + 镜像。
     giteeToken: '',
+    // 多系统（Provider 架构）：当前选择的系统 id、远程目录地址、系统安装模式。
+    // 系统镜像本体永远不写进设置，只在用户主动选择时按需下载到 systems/<id>/。
+    selectedSystemId: 'google-play',
+    systemCatalogUrl: '',       // 空 = 官方默认 raw.githubusercontent.com/.../system-catalog/catalog.json
+    systemInstallMode: 'auto',  // auto = 能自动装就自动装；guided = 引导用户在虚拟机窗口完成安装
   },
   sharedDir: path.join(os.homedir(), 'ApkStartShared'),
   deviceSharedDir: '/sdcard/ApkStartShared',

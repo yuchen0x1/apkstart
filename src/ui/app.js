@@ -3087,9 +3087,322 @@ async function init() {
   refreshAndroid();
   selfCheck();
   await bindWizard();
+  bindSystems();
   setInterval(refreshStatus, 6000);
   setInterval(refreshApps, 15000);
   setInterval(selfCheck, 60000);
+}
+
+/* ==================== 多系统选择 + 运行状态任务（Provider 架构） ==================== */
+
+const sysUI = {
+  data: null,          // system:list 的结果
+  selected: '',        // 当前展开详情的 systemId
+  tasks: [],           // 近期任务
+  logs: [],
+  bound: false,
+  loading: false,
+};
+
+const SYS_LOGO = {
+  'google-play': 'google', 'google-apis': 'google', aosp: 'aosp',
+  lineageos: 'lineage', 'bliss-os': 'bliss', 'android-x86': 'androidx86', custom: 'custom',
+};
+
+function fmtSpeed(bps) {
+  if (!bps || bps <= 0) return '—';
+  if (bps >= 1048576) return (bps / 1048576).toFixed(1) + ' MB/s';
+  return Math.round(bps / 1024) + ' KB/s';
+}
+function fmtEta(sec) {
+  if (sec == null || !isFinite(sec) || sec < 0) return '—';
+  if (sec < 60) return `约 ${Math.ceil(sec)} 秒`;
+  if (sec < 3600) return `约 ${Math.ceil(sec / 60)} 分钟`;
+  return `约 ${(sec / 3600).toFixed(1)} 小时`;
+}
+const SYS_STATUS_LABEL = {
+  waiting: '等待中', preparing: '准备中', downloading: '下载中', verifying: '文件校验中',
+  extracting: '解压中', installing: '安装中', initializing: '初始化中', starting: '启动中',
+  completed: '已完成', failed: '失败', paused: '已暂停', cancelled: '已取消',
+};
+const ACTIVE_TASK_STATUS = ['waiting', 'preparing', 'downloading', 'verifying', 'extracting', 'installing', 'initializing', 'starting'];
+
+/** 根据真实状态计算卡片主按钮文案与动作（绝不显示点了也完不成的按钮） */
+function sysPrimaryAction(s) {
+  const l = s.local || {};
+  const av = s.availability || {};
+  const activeTask = (sysUI.tasks || []).find((t) => t.systemId === s.id && ACTIVE_TASK_STATUS.includes(t.status));
+  const builtin = ['google-play', 'google-apis', 'aosp'].includes(s.id);
+  if (s.id === 'custom') return { label: '管理镜像', act: 'custom', cls: 'ghost' };
+  if (activeTask) {
+    return {
+      label: ACTIVE_TASK_STATUS.includes(activeTask.status) && ['downloading'].includes(activeTask.status)
+        ? '查看下载进度' : '查看进度',
+      act: 'progress', cls: 'ghost',
+    };
+  }
+  if (builtin) {
+    if (s.current && l.running) return { label: '正在运行', act: 'none', cls: 'ghost', disabled: true };
+    return { label: '切换到此系统', act: 'switch', cls: 'primary' };
+  }
+  if (s.id === 'lineageos' && av.status === 'unavailable' && !l.downloaded) {
+    return { label: '导入自建镜像', act: 'import', cls: 'ghost' };
+  }
+  if (av.available === false && !l.downloaded) {
+    return { label: '查看原因', act: 'detail', cls: 'ghost' };
+  }
+  if (l.installed) {
+    if (s.current && l.running) return { label: '正在运行', act: 'none', cls: 'ghost', disabled: true };
+    return { label: '启动系统', act: 'switch', cls: 'primary' };
+  }
+  if (l.downloaded) return { label: '安装系统', act: 'install', cls: 'primary' };
+  const failed = (sysUI.tasks || []).some((t) => t.systemId === s.id && t.status === 'failed');
+  if (failed) return { label: '重试下载', act: 'install', cls: 'primary' };
+  return { label: '下载并安装', act: 'install', cls: 'primary' };
+}
+
+function sysStatusBadges(s) {
+  const l = s.local || {};
+  const av = s.availability || {};
+  const out = [];
+  if (s.current && l.running) out.push('<span class="sys-badge run">● 运行中</span>');
+  else if (l.installed) out.push('<span class="sys-badge ok">已安装</span>');
+  else if (l.downloaded) out.push('<span class="sys-badge warn">已下载未安装</span>');
+  else out.push('<span class="sys-badge">未下载</span>');
+  if (av.status === 'unavailable') out.push('<span class="sys-badge err">无预构建镜像</span>');
+  else if (av.archive) out.push('<span class="sys-badge warn">归档快照</span>');
+  else if (av.available) out.push('<span class="sys-badge ok">可下载</span>');
+  const v = s.version && s.version.version;
+  if (v) out.push(`<span class="sys-badge">${esc(v)}</span>`);
+  return out.join('');
+}
+
+function renderSysCards() {
+  const box = $('sysCards');
+  if (!box || !sysUI.data) return;
+  const systems = sysUI.data.systems || [];
+  if (!systems.length) { box.innerHTML = '<div class="sys-empty">暂无系统目录</div>'; return; }
+  box.innerHTML = systems.map((s) => {
+    const a = sysPrimaryAction(s);
+    const logo = SYS_LOGO[s.id] || 'custom';
+    const ver = (s.versions && s.versions[0]) || {};
+    const meta = [
+      ver.androidVersion ? 'Android ' + esc(ver.androidVersion) : '',
+      ver.architecture ? esc(ver.architecture) : '',
+      ver.fileSize ? fmtSize(ver.fileSize) : '',
+    ].filter(Boolean).join(' · ');
+    return `<div class="sys-card ${sysUI.selected === s.id ? 'selected' : ''} ${s.current && s.local && s.local.running ? 'sel-running' : ''}" data-sys="${esc(s.id)}">
+      ${s.current ? '<span class="sys-card-flag">当前</span>' : ''}
+      <div class="sys-card-head">
+        <div class="sys-logo ${logo}">${esc(initialOf(s.name))}</div>
+        <div><div class="sys-name">${esc(s.name)}</div><div class="sys-brand">${esc(s.brand || '')}</div></div>
+      </div>
+      <div class="sys-badges">${sysStatusBadges(s)}</div>
+      ${meta ? `<div class="sys-detail-note" style="margin-top:8px">${meta}</div>` : ''}
+      <div class="sys-card-action">
+        <button class="btn ${a.cls} sm" data-act="${a.act}" ${a.disabled ? 'disabled' : ''}>${esc(a.label)}</button>
+      </div>
+    </div>`;
+  }).join('');
+  const ci = sysUI.data.catalogInfo || {};
+  const t = $('sysCatalogTime');
+  if (t) {
+    const when = ci.cachedAt ? relTime(new Date(ci.cachedAt).getTime()) : '';
+    t.textContent = '目录更新时间：' + (when || (ci.source === 'built-in' ? '内置索引' : '未知'))
+      + (ci.stale ? '（离线缓存）' : '') + (ci.error ? ' · 远程不可用' : '');
+  }
+}
+
+function renderSysDetail() {
+  const box = $('sysDetail');
+  if (!box) return;
+  if (!sysUI.selected) { box.hidden = true; return; }
+  const s = (sysUI.data && sysUI.data.systems || []).find((x) => x.id === sysUI.selected);
+  if (!s) { box.hidden = true; return; }
+  box.hidden = false;
+  const v = (s.versions && s.versions[0]) || {};
+  const av = s.availability || {};
+  const l = s.local || {};
+  const reason = av.reason || (v.statusReason || '');
+  const rows = [
+    ['系统', s.name],
+    ['版本', v.version || '—'],
+    ['Android 基础', v.androidVersion ? 'Android ' + v.androidVersion + (v.androidApi ? ` (API ${v.androidApi})` : '') : '—'],
+    ['架构', v.architecture || '—'],
+    ['下载大小', v.fileSize ? fmtSize(v.fileSize) : '—'],
+    ['启动后端', s.bootBackend || '—'],
+    ['安装状态', l.installed ? '已安装' : (l.downloaded ? '已下载' : '未下载')],
+    ['兼容性', v.source ? '见官方来源' : '—'],
+  ];
+  const logs = sysUI.logs.filter((x) => x.sid === s.id).slice(-20).map((x) => esc(x.msg)).join('<br>');
+  box.innerHTML = `<h3>${esc(s.name)} · 详情</h3>
+    <div class="sys-detail-grid">${rows.map(([k, val]) => `<div><b>${esc(k)}：</b>${esc(val)}</div>`).join('')}</div>
+    ${reason ? `<div class="sys-detail-note ${av.available === false ? 'warn' : ''}">${esc(reason)}</div>` : ''}
+    <div class="sys-detail-act">
+      ${s.id === 'lineageos' ? '<button class="btn ghost sm" data-dact="import">导入自建 AVD 镜像</button>' : ''}
+      <button class="btn ghost sm" data-dact="openDir">打开数据目录</button>
+      ${l.installed ? '<button class="btn ghost sm" data-dact="backup">备份数据</button><button class="btn ghost sm" data-dact="remove">删除系统</button>' : ''}
+      <button class="btn ghost sm" data-dact="refresh">刷新目录</button>
+    </div>
+    ${logs ? `<div class="sys-detail-note"><b>最近日志：</b><br>${logs}</div>` : ''}`;
+}
+
+function renderSysTasks() {
+  const wrap = $('sysTaskWrap');
+  const list = $('sysTaskList');
+  if (!wrap || !list) return;
+  const tasks = sysUI.tasks || [];
+  if (!tasks.length) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  list.innerHTML = tasks.map((t) => {
+    const name = (sysUI.data && (sysUI.data.systems || []).find((s) => s.id === t.systemId)) || {};
+    const running = ACTIVE_TASK_STATUS.includes(t.status);
+    const statusCls = t.status === 'failed' ? 'err' : t.status === 'completed' ? 'ok' : running ? 'running' : '';
+    const meta = [
+      `<span>下载：<b>${esc(fmtSize(t.downloadedBytes))}${t.totalBytes ? ' / ' + esc(fmtSize(t.totalBytes)) : ''}</b></span>`,
+      `<span>速度：<b>${esc(fmtSpeed(t.speed))}</b></span>`,
+      `<span>剩余：<b>${esc(fmtEta(t.eta))}</b></span>`,
+      `<span>阶段：<b>${esc(SYS_STATUS_LABEL[t.status] || t.status)}</b></span>`,
+    ].join('');
+    const actions = [];
+    if (t.status === 'paused') actions.push('<button class="btn ghost sm" data-tact="resume" data-tid="' + esc(t.taskId) + '">继续</button>');
+    if (running || t.status === 'preparing') actions.push('<button class="btn ghost sm" data-tact="pause" data-tid="' + esc(t.taskId) + '">暂停</button>');
+    actions.push('<button class="btn ghost sm" data-tact="cancel" data-tid="' + esc(t.taskId) + '">取消</button>');
+    if (t.status === 'failed') actions.push('<button class="btn ghost sm" data-tact="retry" data-tid="' + esc(t.taskId) + '">重试</button>');
+    actions.push('<button class="btn ghost sm" data-tact="openDir" data-tid="' + esc(t.taskId) + '" data-sid="' + esc(t.systemId) + '">打开目录</button>');
+    return `<div class="sys-task-item" data-task="${esc(t.taskId)}">
+      <div class="sys-task-top">
+        <span class="sys-task-sys">${esc(name.name || t.systemId)}</span>
+        <span class="sys-task-ver">${esc(t.systemVersion || '')}</span>
+        <span class="sys-task-status ${statusCls}">${esc(SYS_STATUS_LABEL[t.status] || t.status)}</span>
+      </div>
+      <div class="sys-task-step">${esc(t.currentStep || '')}${t.error ? ' · ' + esc(t.error) : ''}</div>
+      <div class="sys-task-bar"><i style="width:${Math.round(t.progress || 0)}%"></i></div>
+      <div class="sys-task-meta">${meta}</div>
+      <div class="sys-task-actions">${actions.join('')}</div>
+    </div>`;
+  }).join('');
+}
+
+async function loadSystems() {
+  if (sysUI.loading) return;
+  sysUI.loading = true;
+  try {
+    const r = await api.systemList();
+    if (r && r.ok) sysUI.data = r;
+    const tr = await api.systemTasks().catch(() => null);
+    if (tr && tr.ok) sysUI.tasks = tr.tasks || [];
+    renderSysCards();
+    renderSysDetail();
+    renderSysTasks();
+  } catch (e) {
+    const box = $('sysCards');
+    if (box) box.innerHTML = '<div class="sys-empty">读取系统目录失败：' + esc(e && e.message || e) + '</div>';
+  } finally {
+    sysUI.loading = false;
+  }
+}
+
+async function sysDoAction(systemId, act) {
+  let r;
+  if (act === 'download' || act === 'install') {
+    r = await api.systemInstall(systemId);
+    if (r && r.ok) toast({ title: '开始下载', body: r.reused ? '已有进行中的任务，正在跟踪进度' : '请在「运行状态」查看真实进度', type: 'info' });
+  } else if (act === 'switch') {
+    r = await api.systemSwitch({ systemId });
+    if (r && r.ok) toast({ title: '已切换', body: r.androidReady === false ? '虚拟机已启动，但 Android 尚未就绪' : `${r.systemId || systemId} 已进入可用状态`, type: r.androidReady === false ? 'warn' : 'ok' });
+    else toast({ title: '切换失败', body: (r && r.error) || '未知错误', type: 'error' });
+  } else if (act === 'import') {
+    r = await api.systemImportLineage();
+    if (r && r.ok) toast({ title: '导入成功', body: 'LineageOS AVD 镜像已纳入管理', type: 'ok' });
+    else if (r && !r.cancelled) toast({ title: '导入失败', body: r.error || '未知错误', type: 'error' });
+  } else if (act === 'detail' || act === 'openDir') {
+    sysUI.selected = systemId; renderSysDetail();
+    if (act === 'openDir') api.systemOpenDir({ systemId, which: 'data' });
+  } else if (act === 'custom') {
+    // 自定义镜像仍走原有的 image:* 入口（设置 → 高级）
+    toast({ title: '自定义镜像', body: '请在「设置 → 高级 → 自定义系统镜像」导入并启用', type: 'info' });
+  } else if (act === 'progress') {
+    const wrap = $('sysTaskWrap');
+    if (wrap) { wrap.hidden = false; wrap.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+  }
+  await loadSystems();
+  return r;
+}
+
+async function sysTaskAction(tid, act) {
+  let r;
+  if (act === 'pause') r = await api.systemPause(tid);
+  else if (act === 'resume') r = await api.systemResume(tid);
+  else if (act === 'cancel') r = await api.systemCancel(tid);
+  else if (act === 'retry') r = await api.systemRetry(tid);
+  else if (act === 'openDir') {
+    const t = sysUI.tasks.find((x) => x.taskId === tid) || {};
+    r = await api.systemOpenDir({ systemId: t.systemId, which: 'downloads' });
+  }
+  if (r && r.ok === false && r.error) toast({ title: '操作失败', body: r.error, type: 'error' });
+  await loadSystems();
+}
+
+function bindSystems() {
+  if (sysUI.bound) return;
+  sysUI.bound = true;
+  const cards = $('sysCards');
+  if (cards) {
+    cards.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-act]');
+      const card = e.target.closest('.sys-card');
+      if (!card) return;
+      const id = card.getAttribute('data-sys');
+      if (btn && !btn.disabled) { e.stopPropagation(); sysDoAction(id, btn.getAttribute('data-act')); return; }
+      sysUI.selected = id; renderSysCards(); renderSysDetail();
+    });
+  }
+  const detail = $('sysDetail');
+  if (detail) {
+    detail.addEventListener('click', async (e) => {
+      const b = e.target.closest('button[data-dact]');
+      if (!b || !sysUI.selected) return;
+      const act = b.getAttribute('data-dact');
+      const id = sysUI.selected;
+      if (act === 'import') sysDoAction(id, 'import');
+      else if (act === 'openDir') api.systemOpenDir({ systemId: id, which: 'data' });
+      else if (act === 'refresh') { await api.systemCatalogRefresh(); await loadSystems(); toast({ title: '目录已刷新', type: 'ok' }); }
+      else if (act === 'backup') { const r = await api.systemBackup({ systemId: id }); if (r && r.ok) toast({ title: '备份完成', type: 'ok' }); }
+      else if (act === 'remove') {
+        const r = await api.systemRemove(id);
+        if (r && r.ok) { toast({ title: '已删除', body: id + ' 的系统文件已移除', type: 'ok' }); await loadSystems(); }
+        else toast({ title: '删除失败', body: (r && r.error) || '未知错误', type: 'error' });
+      }
+    });
+  }
+  const taskList = $('sysTaskList');
+  if (taskList) taskList.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-tact]');
+    if (!b) return;
+    sysTaskAction(b.getAttribute('data-tid'), b.getAttribute('data-tact'));
+  });
+  const rf = $('btnSysTaskRefresh');
+  if (rf) rf.addEventListener('click', loadSystems);
+
+  if (api.on) {
+    api.on('system:task', (task) => {
+      if (!task || !task.taskId) return;
+      const i = sysUI.tasks.findIndex((t) => t.taskId === task.taskId);
+      if (i >= 0) sysUI.tasks[i] = task; else sysUI.tasks.unshift(task);
+      if (sysUI.tasks.length > 12) sysUI.tasks.length = 12;
+      renderSysCards();
+      renderSysTasks();
+    });
+    api.on('system:log', (msg) => {
+      const m = String(msg || '');
+      const sid = (sysUI.data && (sysUI.data.currentSystemId)) || '';
+      sysUI.logs.push({ sid, msg: m });
+      if (sysUI.logs.length > 200) sysUI.logs.shift();
+    });
+  }
+  loadSystems();
+  setInterval(loadSystems, 12000);
 }
 
 /* ---------------- 环境自检 ---------------- */

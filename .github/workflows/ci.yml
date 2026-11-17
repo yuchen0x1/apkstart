@@ -32,6 +32,10 @@ jobs:
       - name: 运行测试
         run: npm test
 
+      # 确保大型 Android 系统镜像没有混进 git 仓库/默认安装包（必须走远程目录按需下载）
+      - name: 系统镜像体积闸门
+        run: node build/check-no-images.js --git
+
       # 直接驱动 agent.ps1 内嵌 C# 的钩子回调，防止键位映射被改坏
       - name: 鼠标钩子逻辑冒烟测试
         shell: powershell

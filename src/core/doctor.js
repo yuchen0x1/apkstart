@@ -317,6 +317,13 @@ function chooseProfile({
   // 旧实现硬封顶 4 核，24 线程的机器也只有 4 核 —— 安卓侧多开应用时明显偏紧。
   // 8 核封顶：安卓的调度器超过 8 个 vCPU 基本吃不到收益，反而更容易被宿主机抢时间片。
   let cores = clamp(Math.floor(host.cores / 2), 2, 8);
+  // issue #5：纯软件模拟（TCG）时，8 个 vCPU 就是 8 份 TB 缓存线程，
+  // 在「核多但内存小」的机器（实测 Xeon E5-2650 v3 / 20 核 / 可用 4.8GB）
+  // 上极易 0xC0000005 崩溃。TCG 没有 host 那边的并行加速收益，核越多反而越
+  // 吃内存、越容易踩到模拟器的线程/scheduler 边界。无加速时把上限收紧到 4 核，
+  // 与本文件 200-202 行「无加速必须按没有加速选参数，否则拿 6 核跑 TCG 既慢又
+  // 更容易崩」的立意一致。用户手动指定核数时仍然尊重手动值。
+  if (!accelOk && !overrides.cores) cores = Math.min(cores, 4);
   if (overrides.cores) cores = clamp(Number(overrides.cores) || cores, 1, 8);
   // 用户没手动指定核数时才由轻量模式收敛，手动值永远优先
   const lite = settings ? liteProfile({ host, engine }) : null;
