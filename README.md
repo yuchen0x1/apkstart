@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.6.10**（2026-11-16）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.6.11**（2026-11-17）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -44,10 +44,9 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 ## 最新更新
 
 <!-- latest:start -->
-### v0.6.10
+### v0.6.11
 
-- **检测到新版本却只能去仓库手动下载**：发版时 Release 先建出来、安装包后上传（完整版要构建十几分钟），这段时间检查更新会拿到「有新版本、但没有可下载的安装包」，旧实现把主按钮退化成「打开下载页」并把用户直接甩到浏览器 —— 明明「一键更新」就在眼前却点不动。
-- **下载完成后的状态不清楚**：后台已经把包装好时，按钮会退回「立即更新」，看着像白下了。现在会显示「v0.6.10 已下载完成，随时可以重启安装」+「重启并安装」按钮，重新检查更新也不会把这个状态冲掉。
+- 增加按系统/浏览器语言自动选择中文或 English 的界面语言能力，支持手动选择和持久化。
 <!-- latest:end -->
 
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。
