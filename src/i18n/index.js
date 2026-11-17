@@ -85,8 +85,16 @@ function fillEn(value, values) {
 function resolve(pref, systemLocale) {
   const want = IDS.includes(pref) ? pref : 'auto';
   if (want !== 'auto') return want;
-  const loc = String(systemLocale || '').toLowerCase();
-  return loc.startsWith('zh') || !loc ? 'zh-CN' : 'en-US';
+  const locales = Array.isArray(systemLocale) ? systemLocale : [systemLocale];
+  let sawLocale = false;
+  for (const value of locales) {
+    const loc = String(value || '').toLowerCase();
+    if (loc) sawLocale = true;
+    // The catalog has one Chinese entry; zh-TW/zh-HK therefore map to it too.
+    if (loc.startsWith('zh')) return 'zh-CN';
+    if (loc.startsWith('en')) return 'en-US';
+  }
+  return sawLocale ? 'en-US' : 'zh-CN';
 }
 
 function setLanguage(lang) {

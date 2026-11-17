@@ -74,6 +74,9 @@ test('语言解析：auto 跟随系统，显式设置优先', () => {
   assert.strictEqual(i18n.resolve('zh-CN', 'en-US'), 'zh-CN');
   assert.strictEqual(i18n.resolve('en-US', 'zh-CN'), 'en-US');
   assert.strictEqual(i18n.resolve('garbage', 'en-US'), 'en-US');
+  assert.strictEqual(i18n.resolve('auto', ['fr-FR', 'en-GB']), 'en-US');
+  assert.strictEqual(i18n.resolve('auto', ['zh-TW', 'en-US']), 'zh-CN');
+  assert.strictEqual(i18n.resolve('auto', ['fr-FR']), 'en-US');
 });
 
 test('主界面静态文案 100% 有英文（漏一条就是中英混排）', () => {
