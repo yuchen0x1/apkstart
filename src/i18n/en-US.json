@@ -225,6 +225,8 @@
   "安卓声音": "Android audio",
   "安卓数据分区（应用与游戏装这里）": "Android data partition (apps and games live here)",
   "安卓数据已重置": "Android data reset",
+  "安卓桌面": "Android desktop",
+  "回到安卓桌面并展开所有已装应用": "Go to the Android home screen and open the app drawer",
   "安卓数据目录已更新": "Android data folder updated",
   "安卓数据目录（应用、游戏与快速启动快照）": "Android data folder (apps, games and quick-boot snapshots)",
   "安卓数据（应用、存档、快照）：": "Android data (apps, saves, snapshots):",
