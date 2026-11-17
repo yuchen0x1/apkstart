@@ -74,10 +74,34 @@ function signature({ facts = {}, diagnosis = {}, version = '' } = {}) {
   return crypto.createHash('sha1').update(key).digest('hex').slice(0, 12);
 }
 
+/** 日志里的 ANSI 颜色码：报告是纯文本，留着只会白占字符预算 */
+const ANSI = /\u001b\[[0-9;]*m/g;
+/**
+ * 单行压缩上限。
+ *
+ * 一条 `androidboot.qemu.adb.pubkey=` 就有 700 字符、在日志里还会出现两次，
+ * 而 clipLog 的总预算只有 2200 —— 真正有用的错误行就是这么被挤出去的
+ * （用户拿到的报告里日志末尾全是 boot properties，最后一行恰好停在 veritymode，
+ * 真正的 `emulator exit 1` 反而看不见）。
+ */
+const LINE_MAX = 240;
+
+/** 剥 ANSI + 省略密钥长串 + 截断超长行，三步都只为「别把错误行挤出预算」 */
+function shrinkLine(line) {
+  let s = String(line).replace(ANSI, '').replace(/\s+$/, '');
+  s = s.replace(/\b([\w.-]*(?:pubkey|api[_-]?key|token|secret|password))\s*=\s*[A-Za-z0-9+/=._-]{24,}/gi,
+    '$1=…（已省略）');
+  if (s.length > LINE_MAX) {
+    const cut = s.length - LINE_MAX;
+    s = `${s.slice(0, LINE_MAX)}…（本行还有 ${cut} 字符）`;
+  }
+  return s;
+}
+
 /** 把日志裁到「够定位」的长度，别把 300 行全塞进 issue */
 function clipLog(lines, maxLines = 60, maxChars = 2200) {
   const arr = (Array.isArray(lines) ? lines : String(lines || '').split(/\r?\n/))
-    .map((s) => String(s).replace(/\s+$/, ''))
+    .map(shrinkLine)
     .filter((s) => s && !/^正在开机… \d+s$/.test(s));
   const tail = arr.slice(-maxLines);
   let text = tail.join('\n');
@@ -201,5 +225,5 @@ function buildBundle(ctx = {}) {
 
 module.exports = {
   contact, redact, signature, buildSummary, issueUrl, mailtoUrl, buildBundle,
-  clipLog, MAX_ISSUE_BODY,
+  clipLog, shrinkLine, MAX_ISSUE_BODY,
 };

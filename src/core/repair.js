@@ -38,7 +38,16 @@ function buildFacts(raw = {}) {
     arch: String(raw.arch || ''),
     osRelease,
     osMajor: Number((/(\d+)\./.exec(osRelease) || [])[1] || 0),
-    accel: { ok: !!accel.ok, kind: accel.kind || '', note: accel.note || '' },
+    accel: {
+      ok: !!accel.ok,
+      kind: accel.kind || '',
+      note: accel.note || '',
+      // suspect：驱动文件在、-accel-check 也说可用，但服务根本没跑。
+      // 这种机器「检查通过、开机即退」，所有 f.accel.ok 的判断都必须带上它，
+      // 否则修复窗口会以为「已经好了」，连修复按钮都不给（用户实测现场）。
+      suspect: !!accel.suspect,
+      advice: accel.advice || '',
+    },
     emulatorVersion: String(raw.emulatorVersion || ''),
     image: {
       api: image.api || '',
@@ -61,13 +70,26 @@ function buildFacts(raw = {}) {
   };
 }
 
+/**
+ * 「加速真的能用吗」。
+ * 不能只看 accel.ok：AEHD 驱动装着、检测也说可用，但服务没跑时同样开不了机
+ * （ACCEL_UNUSABLE）。所有面向用户的判断都走这一个入口，避免两处说法不一致。
+ */
+function accelUsable(f) {
+  return !!(f && f.accel && f.accel.ok && !f.accel.suspect);
+}
+
 /** 「这台电脑是什么」—— 所有解释的第一句都用它，避免每段各写一遍 */
 function machineSentence(f) {
   const cpu = f.cpuModel || '未识别的 CPU';
   const mem = f.totalMB ? `${f.cores} 核 / ${gb(f.totalMB)} 内存` : `${f.cores} 核`;
-  if (f.accel.ok) {
+  if (accelUsable(f)) {
     const kind = f.accel.kind === 'whpx' ? 'WHPX' : (f.accel.kind === 'aehd' ? 'AEHD' : '硬件加速');
     return `这台电脑是 ${cpu}（${mem}），${kind} 已启用。`;
+  }
+  if (f.accel && f.accel.ok && f.accel.suspect) {
+    const kind = f.accel.kind === 'whpx' ? 'WHPX' : 'AEHD';
+    return `这台电脑是 ${cpu}（${mem}），${kind} 驱动装好了但服务没在运行——检查能过，真正开机时却会直接退出。`;
   }
   return `这台电脑是 ${cpu}（${mem}），没有可用的硬件加速，安卓只能跑在纯软件模拟上。`;
 }
@@ -87,13 +109,15 @@ function buildChecks(f) {
   }
   out.push({
     label: '硬件加速',
-    value: f.accel.ok
+    value: accelUsable(f)
       ? `${f.accel.kind === 'whpx' ? 'WHPX' : 'AEHD'} 已启用`
-      : '不可用（纯软件模拟，开机会慢很多）',
-    state: f.accel.ok ? 'ok' : 'warn',
+      : ((f.accel.ok && f.accel.suspect)
+        ? `${f.accel.kind === 'whpx' ? 'WHPX' : 'AEHD'} 驱动在，但服务未运行（检查能过，开机会直接退出）`
+        : '不可用（纯软件模拟，开机会慢很多）'),
+    state: accelUsable(f) ? 'ok' : ((f.accel.ok && f.accel.suspect) ? 'bad' : 'warn'),
   });
   if (f.vm) {
-    out.push({ label: '运行环境', value: `虚拟机 / 云电脑${f.vendor ? `（${f.vendor}）` : ''}`, state: f.accel.ok ? 'warn' : 'bad' });
+    out.push({ label: '运行环境', value: `虚拟机 / 云电脑${f.vendor ? `（${f.vendor}）` : ''}`, state: accelUsable(f) ? 'warn' : 'bad' });
   }
   if (f.image.custom) {
     // 用户自己换了镜像以后，「跑不起来怪谁」就多了一种可能：镜像不对。
@@ -153,7 +177,7 @@ function blocker(f) {
 
 /** 虚拟机里没开嵌套虚拟化 —— 这不是用户操作问题，必须说清楚 */
 function vmNote(f) {
-  if (!f.vm || f.accel.ok) return '';
+  if (!f.vm || accelUsable(f)) return '';
   return `而且这台机器本身就在虚拟机里${f.vendor ? `（${f.vendor}）` : ''}：虚拟机默认不把 VT-x / AMD-V 透传给里面的系统，`
     + '所以 WHPX 和 AEHD 都装不上。这不是你操作的问题，需要在宿主机的虚拟化设置里开启「嵌套虚拟化」，或换实体机。';
 }
@@ -166,9 +190,11 @@ const IMAGE_MYTH = '换 Android 12 镜像解决不了这一类问题：真正执
 const PLANS = {
   TIMEOUT: (f) => ({
     level: LEVEL.SLOW,
-    headline: f.accel.ok
+    headline: accelUsable(f)
       ? '模拟器在这段时间内没开完机，最可能是渲染卡住或首次冷启动太慢。'
-      : '这台机器没有硬件加速，纯软件模拟开 Android 14 常常要 8~15 分钟，之前只等了 4 分钟。',
+      : (f.accel.ok && f.accel.suspect
+        ? 'AEHD 驱动在、服务却没跑：模拟器检查通过，真正开机时直接退出。'
+        : '这台机器没有硬件加速，纯软件模拟开 Android 14 常常要 8~15 分钟，之前只等了 4 分钟。'),
     why: [
       machineSentence(f),
       '安卓不是原生跑在 Windows 上的：它运行在一台模拟出来的 x86 虚拟机里。有硬件加速时，开机像打开一个普通程序（20~60 秒）；'
@@ -178,8 +204,8 @@ const PLANS = {
     ],
     actions: [
       { id: 'low-spec', label: '低配模式再试一次（等 15 分钟）', kind: KIND.AUTO, hint: '540×960 / 2 核 / 2 GB，不存快照' },
-      ...(f.accel.ok ? [] : [{ id: 'accel', label: '尝试开启硬件加速', kind: KIND.AUTO, hint: '会弹出管理员授权窗口' }]),
-      ...(f.accel.ok ? [{ id: 'gpu-software', label: '改用软件渲染后重试', kind: KIND.AUTO, hint: '排除显卡驱动把渲染卡住' }] : []),
+      ...(accelUsable(f) ? [] : [{ id: 'accel', label: '尝试开启硬件加速', kind: KIND.AUTO, hint: '会弹出管理员授权窗口' }]),
+      ...(accelUsable(f) ? [{ id: 'gpu-software', label: '改用软件渲染后重试', kind: KIND.AUTO, hint: '排除显卡驱动把渲染卡住' }] : []),
     ],
     retry: { lowspec: true, timeoutMs: 900000 },
   }),
@@ -197,6 +223,30 @@ const PLANS = {
     actions: [
       { id: 'accel', label: '一键开启硬件加速', kind: KIND.AUTO, hint: '开启「虚拟机平台」或安装 AEHD 驱动' },
       { id: 'low-spec', label: '低配模式再试一次', kind: KIND.AUTO, hint: '先保证能开机，性能以后再说' },
+    ],
+    retry: { lowspec: true, timeoutMs: 900000 },
+  }),
+
+  /**
+   * 检测说有加速、模拟器却没接管：日志停在 Userspace boot properties、退出码 1、
+   * 一条错误都不留（ACCEL_UNUSABLE）。修复动作必须排在最前面 —— `sc start aehd`
+   * 常常不用重启就能解决；换渲染后端/换镜像是无效动作，这里一个都不列。
+   */
+  ACCEL_UNUSABLE: (f) => ({
+    level: LEVEL.SLOW,
+    headline: '硬件加速装是装了，但模拟器没能接管它 —— 所以连一条错误都没留下。',
+    why: [
+      machineSentence(f),
+      '这次日志停在「Userspace boot properties」最后一行就结束了：模拟器还没走到创建虚拟机、'
+        + '接管加速器那一步就退出了。所以换渲染后端、换系统镜像都不会有用 —— 那两件事发生在更后面。',
+      '最常见的原因是 AEHD 驱动服务没在跑（Windows 更新、Hyper-V / 内存完整性抢占、或上次异常关机），'
+        + '其次是驱动版本比模拟器旧。前一种用管理员权限执行一次 sc start aehd 就能修好，不需要重启。',
+      vmNote(f),
+    ].filter(Boolean),
+    actions: [
+      { id: 'accel', label: '自动修复硬件加速', kind: KIND.AUTO, hint: '启动 AEHD 服务，或改用 WHPX（可能需重启）' },
+      { id: 'low-spec', label: '先用软件模拟开起来', kind: KIND.AUTO, hint: '540×960 / 2 核 / 2 GB，可能要等 10 分钟以上' },
+      { id: 'report', label: '导出诊断报告', kind: KIND.MANUAL },
     ],
     retry: { lowspec: true, timeoutMs: 900000 },
   }),
@@ -385,7 +435,7 @@ const PLANS = {
     ],
     actions: [
       { id: 'low-spec', label: '低配模式再试一次', kind: KIND.AUTO },
-      ...(f.accel.ok ? [{ id: 'gpu-software', label: '改用软件渲染', kind: KIND.AUTO }] : [{ id: 'accel', label: '尝试开启硬件加速', kind: KIND.AUTO }]),
+      ...(accelUsable(f) ? [{ id: 'gpu-software', label: '改用软件渲染', kind: KIND.AUTO }] : [{ id: 'accel', label: '尝试开启硬件加速', kind: KIND.AUTO }]),
       { id: 'report', label: '导出诊断报告', kind: KIND.MANUAL },
     ],
     retry: { lowspec: true, timeoutMs: 900000 },
@@ -393,6 +443,96 @@ const PLANS = {
 };
 
 const FALLBACK = PLANS.UNKNOWN;
+
+/**
+ * 哪些结论值得「程序自己动手」。
+ *
+ * 进这张表只有两个条件：
+ *  1) 不需要用户做决定 —— 不删用户数据、不卸载东西、不改用户能感知的偏好；
+ *  2) 做完有实质可能变好 —— 纯软件模拟崩溃这类「修了也没用」的不进，白等一轮只会更糟。
+ *
+ * retry：修完是否值得再开一次机（有些修法要重启才生效，重试等于白等）。
+ * lowspec：重试时是否降级参数（内存不够/超时这类，只能靠降配）。
+ * waitMore：重试时是否放宽等待时间（软件模拟开机本来就慢）。
+ */
+const SELF_HEAL = {
+  AVD_LOCK: { actions: ['clear-locks'], retry: true, what: '清理上次残留的锁文件' },
+  PORT_BUSY: { actions: ['clear-locks'], retry: true, what: '结束残留进程，换一对空闲端口' },
+  // 先校验补齐文件（不动系统、不弹授权），补不齐才轮到装 VC++ 运行库（会弹授权）
+  DLL: { actions: ['redeploy', 'vc-redist'], retry: true, what: '校验运行时文件，缺运行库就补上' },
+  IMAGE: { actions: ['redeploy'], retry: true, what: '校验并补齐运行时与镜像文件' },
+  DISK_FULL: { actions: ['cleanup-safe'], retry: true, what: '清理临时文件与旧日志' },
+  GPU_INIT: { actions: ['gpu-software'], retry: true, what: '改用软件渲染' },
+  ACCESS_VIOLATION: { actions: ['gpu-software'], retry: true, what: '改用软件渲染' },
+  MEMORY: { actions: [], retry: true, lowspec: true, what: '把配置降到 2 GB / 2 核' },
+  TIMEOUT: { actions: [], retry: true, lowspec: true, waitMore: true, what: '降低配置并放宽等待时间' },
+  UNKNOWN: { actions: [], retry: true, lowspec: true, waitMore: true, what: '换成最保守的参数' },
+  // 加速类由 engine.autoRepairAccel 单独处理（要管理员授权，不是「悄悄做」的动作）
+};
+
+/**
+ * 一句话人话结论。
+ * 面向用户的入口（toast、报错框、设置页提示）只该显示这一句 ——
+ * 诊断码、退出码、ACCEL_UNUSABLE 这些是给作者看的，不该糊到用户脸上。
+ */
+const PLAIN = {
+  UNKNOWN: '模拟器没能完成开机，日志里没有明确原因。',
+  TIMEOUT: '安卓没能在等待时间内开完机。',
+  ACCEL: '这台电脑用不上硬件加速，安卓只能慢慢跑。',
+  ACCEL_UNUSABLE: '硬件加速驱动装好了，开机时却没能启动起来。',
+  TCG_CRASH: '纯软件模拟在开机时崩溃了。',
+  CPU_FEATURE: '这台电脑的 CPU 缺少模拟器必需的指令。',
+  GPU_INIT: '显卡渲染没能初始化，模拟器跟着退出了。',
+  ACCESS_VIOLATION: '模拟器刚启动就崩溃了（崩在显卡渲染那一层）。',
+  MEMORY: '内存不够，模拟器拿不到开机需要的空间。',
+  DISK_FULL: '磁盘空间不足，模拟器写不下数据。',
+  IMAGE: '系统镜像或用户数据不完整。',
+  AVD_LOCK: '上次没有正常退出，模拟器以为还有一台在运行。',
+  DLL: '缺少运行库文件，模拟器起不来。',
+  PORT_BUSY: '模拟器要用的端口被别的程序占了。',
+  NON_ASCII: '安装路径里有中文或特殊字符，模拟器找不到自己的文件。',
+  SPAWN_ERROR: '模拟器连启动都没拉起来。',
+};
+
+/** 这条结论程序能不能自己修（不需要用户点任何按钮） */
+function selfHeal(code) {
+  const p = SELF_HEAL[code];
+  return p ? { ...p, code } : null;
+}
+
+/**
+ * 面向用户的「人话版失败说明」。
+ * @param {{diagnosis?:object, facts?:object, autoRepair?:object}} o
+ *   autoRepair = { code, tried: ['清理了锁文件'], retried: true, ok }
+ * @returns {{code,summary,did,next,text}} text 可直接塞进 toast / 报错框
+ */
+function explainFailure({ diagnosis, facts, autoRepair } = {}) {
+  const f = facts && facts.cpuModel !== undefined ? facts : buildFacts(facts || {});
+  const code = (diagnosis && diagnosis.code) || (autoRepair && autoRepair.code) || 'UNKNOWN';
+  const summary = PLAIN[code] || (diagnosis && diagnosis.title) || '模拟器没能完成开机。';
+  const base = (PLANS[code] || FALLBACK)(f);
+  const tried = (autoRepair && autoRepair.tried) || [];
+  const retried = !!(autoRepair && autoRepair.retried);
+  let did = '';
+  if (tried.length || retried) {
+    did = `程序已经自动${tried.join('、') || '按保守参数重试'}`
+      + `${retried ? '，并重新开了一次机' : ''}，但还是没能起来。`;
+  }
+  const nextAct = (() => {
+    // 已经自动做过的动作不再推荐：让用户再点一遍刚失败的事，只会多一次失望
+    const used = (autoRepair && autoRepair.actions) || [];
+    const rest = (base.actions || []).filter((a) => !used.includes(a.id));
+    return rest.find((a) => a.kind === KIND.AUTO || a.kind === KIND.CONFIRM) || rest[0] || null;
+  })();
+  const next = nextAct ? nextAct.label : '导出诊断报告（发给作者定位）';
+  return {
+    code,
+    summary,
+    did,
+    next,
+    text: [summary, did, next ? `下一步：${next}。` : ''].filter(Boolean).join('\n'),
+  };
+}
 
 /**
  * 生成修复方案。
@@ -450,4 +590,7 @@ function buildPlan({ diagnosis, facts, attempts = [] } = {}) {
   };
 }
 
-module.exports = { buildFacts, buildPlan, buildChecks, machineSentence, blocker, KIND, LEVEL };
+module.exports = {
+  buildFacts, buildPlan, buildChecks, machineSentence, accelUsable, blocker,
+  selfHeal, explainFailure, PLAIN, KIND, LEVEL,
+};

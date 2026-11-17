@@ -149,7 +149,13 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(doctor.diagnose(['random line']).code === 'UNKNOWN');
     // 现场日志（User 0.6.7）：Vulkan 不兼容 + Guest Angle 不支持，必须归到图形后端
     assert(doctor.diagnose(['ERROR | Failed to create Vulkan instance. Error VK_ERROR_INCOMPATIBLE_DRIVER.']).code === 'GPU_INIT');
-    assert(doctor.diagnose(['INFO | Platform does not support Guest Angle']).code === 'GPU_INIT');
+    // "Platform does not support Guest Angle" 是 INFO（换宿主 ANGLE 渲染），不是致命错误：
+    // 曾经把它算进 GPU_INIT，结果一条无害提示压住了真正的 0xC0000005 崩溃（用户实测）。
+    assert(doctor.diagnose(['INFO | Platform does not support Guest Angle']).code !== 'GPU_INIT',
+      'Guest Angle 提示不能单独判成显卡初始化失败');
+    assert(doctor.notes(['INFO | Platform does not support Guest Angle']).some((t) => /提示不是错误/.test(t)),
+      '应在「无害噪音」里解释一句，免得用户去换显卡');
+    assert(doctor.diagnose(['Failed to create Vulkan instance. Error VK_ERROR_INCOMPATIBLE_DRIVER.']).code === 'GPU_INIT');
     assert(doctor.diagnose(['UpdateLayeredWindowIndirect failed']).code === 'GPU_INIT');
   });
 
@@ -164,18 +170,253 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       '不能把所有访问冲突都说成渲染后端崩溃');
   });
 
+  await test('加速器没接管：有加速 + 非零退出码 + 没有 operational 行 → ACCEL_UNUSABLE', () => {
+    // 现场（用户报告 0.6.11）：日志停在 Userspace boot properties 最后一行
+    // androidboot.veritymode=enforcing，后面一条 ERROR 都没有，退出码 1，
+    // 旧实现只能落到 UNKNOWN，让用户去换镜像/换渲染后端（两条路都是白折腾）。
+    const bootProps = [
+      'INFO         | Userspace boot properties:',
+      'INFO         |   androidboot.hardware=ranchu',
+      'INFO         |   androidboot.veritymode=enforcing',
+    ];
+    const d = doctor.earlyAccelExit({
+      accel: { ok: true, kind: 'aehd' }, logLines: bootProps, exitCode: 1,
+    });
+    assert(d && d.code === 'ACCEL_UNUSABLE', `应判为 ACCEL_UNUSABLE，实际 ${d && d.code}`);
+    assert(/AEHD/.test(d.title), `标题要点名是哪种加速：${d.title}`);
+    assert(/WHPX/.test(d.hint) && /sc query aehd/.test(d.hint), '要给出可照做的两步');
+    assert(/换渲染后端/.test(d.hint), '要明确说换渲染后端/换镜像无效');
+
+    // 加速器真的挂上了：不许抢结论（问题在别处）
+    assert(doctor.earlyAccelExit({
+      accel: { ok: true, kind: 'aehd' },
+      logLines: [...bootProps, 'AEHD is operational'],
+      exitCode: 1,
+    }) === null, 'accelerator operational 之后退出，不能判成驱动没接管');
+
+    // 没有加速归 noAccelDiagnosis 管；exitCode 为 null 是超时，也不归它管
+    assert(doctor.earlyAccelExit({ accel: { ok: false }, logLines: bootProps, exitCode: 1 }) === null);
+    assert(doctor.earlyAccelExit({ accel: { ok: true, kind: 'aehd' }, logLines: bootProps, exitCode: null }) === null);
+  });
+
+  await test('某一轮在拉起前就抛异常：也要留下一条 attempt（不能只剩 UNKNOWN 一轮）', () => {
+    const d = doctor.spawnErrorDiagnosis('EPERM: operation not permitted, open apkstart.avd\\config.ini');
+    assert(d.code === 'SPAWN_ERROR');
+    assert(/config\.ini/.test(d.hint), '原始错误要写进 hint，否则作者也看不出是哪一步');
+    assert(/白名单/.test(d.hint), '要给出可执行动作');
+
+    // 真正的回归点：异常轮必须落成一条 attempt，而不是让 start() 直接 reject。
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    emu.attempts = [];
+    emu._log = [];
+    const got = emu._recordSpawnError({
+      plan: { label: 'swangle / 硬件加速', gpu: 'swangle', accel: 'on', memoryMB: 4096, cores: 6 },
+      logStart: 0,
+      error: new Error('EPERM: operation not permitted, open config.ini'),
+    });
+    assert(emu.attempts.length === 1, `异常轮应留下 1 条记录，实际 ${emu.attempts.length}`);
+    assert(emu.attempts[0].plan === 'swangle / 硬件加速', '记录里要带本轮参数名');
+    assert(/4096MB/.test(emu.attempts[0].params), '记录里要带实跑参数');
+    assert(got.code === 'SPAWN_ERROR' && emu.lastDiagnosis.code === 'SPAWN_ERROR', '诊断要同步到引擎状态');
+    // 异常消息里若带可识别特征（比如 DLL 缺失），应优先用那条结论
+    const dll = emu._recordSpawnError({
+      plan: { label: 'host / 硬件加速', gpu: 'host', accel: 'on' },
+      logStart: 0,
+      error: new Error('The code execution cannot proceed because VCRUNTIME140.dll was not found'),
+    });
+    assert(dll.code === 'DLL', `DLL 缺失应判为 DLL，实际 ${dll.code}`);
+  });
+
+  await test('加速探测：AEHD 驱动在但服务没跑 → 标 suspect 并给修法（不能只报「已启用」）', async () => {
+    const { Provisioner } = require('../src/core/provision');
+    const p = new Provisioner(path.join(__dirname, '..'));
+    // 0xffffffa1 是经典现场：BIOS 虚拟化没开，或与 Hyper-V / 内存完整性冲突
+    p.aehdService = async () => ({ name: 'aehd', state: 'STOPPED', code: 1, running: false, exitCode: 0xffffffa1 });
+    const stopped = await p._accelResult('aehd');
+    assert(stopped.ok && stopped.suspect === true, '不能因为服务没跑就把结论翻成「无加速」');
+    assert(/服务未运行/.test(stopped.note), `要说清是服务没跑：${stopped.note}`);
+    assert(/0xffffffa1/.test(stopped.note), '退出码要写成十六进制（用户能拿去搜）');
+    assert(/WHPX/.test(stopped.advice), '要指向 WHPX');
+
+    p.aehdService = async () => ({ name: 'aehd', state: 'RUNNING', code: 4, running: true, exitCode: 0 });
+    const running = await p._accelResult('aehd');
+    assert(running.ok && !running.suspect, '服务在跑时不该误报可疑');
+
+    // WHPX 分支不该去碰 AEHD 的服务状态
+    p.aehdService = async () => { throw new Error('不该被调用'); };
+    const whpx = await p._accelResult('whpx');
+    assert(whpx.ok && whpx.kind === 'whpx' && !whpx.suspect, 'WHPX 分支不该依赖 AEHD');
+  });
+
+  await test('AEHD 服务没跑时按「无加速」选参数（540p + 10 分钟超时）', () => {
+    const host = { totalMB: 16179, freeMB: 9728, cores: 12, tmp: 'C:/tmp' };
+    const suspect = doctor.chooseProfile({
+      host, accel: { ok: true, kind: 'aehd', suspect: true }, emulatorVersion: '37.1.9', diskMB: 50000,
+    });
+    const normal = doctor.chooseProfile({
+      host, accel: { ok: true, kind: 'aehd' }, emulatorVersion: '37.1.9', diskMB: 50000,
+    });
+    assert(doctor.accelUsable({ ok: true, kind: 'aehd', suspect: true }) === false, 'suspect 不算可用');
+    assert(doctor.accelUsable({ ok: true, kind: 'aehd' }) === true);
+    // 软件模拟下先把「能不能开起来」放第一位：降分辨率、软件渲染、给足 10 分钟
+    assert(suspect.lcd.w === 540 && suspect.lcd.h === 960,
+      `服务没跑时应降分辨率，实际 ${suspect.lcd.w}x${suspect.lcd.h}`);
+    assert(suspect.bootTimeoutMs >= 600000, '按软件模拟要给足开机时间');
+    assert(normal.lcd.w === 720, '正常加速时保持高分辨率');
+    assert(suspect.tierReasons.some((t) => /服务未运行/.test(t)), '降级原因要写清是服务没跑');
+  });
+
+  await test('加速没接管 → 全自动修复：只修一次，修好才自动重试，要重启就不白试', async () => {
+    const { Runtime } = require('../src/core/engine');
+    const rt = new Runtime(path.join(__dirname, '..'));
+    let calls = 0;
+    rt.onAccelRepair = async () => { calls += 1; return { ok: true, note: 'AEHD 驱动服务已启动，硬件加速当场生效' }; };
+
+    const first = await rt.autoRepairAccel({ diagnosis: { code: 'ACCEL_UNUSABLE' } });
+    assert(first && first.ok, '修复成功应允许自动重试');
+    assert(calls === 1, `应只弹一次授权，实际 ${calls}`);
+
+    // 同一次运行里再失败，不能再弹一次 UAC / 再修一轮（防无限循环）
+    const second = await rt.autoRepairAccel({ diagnosis: { code: 'ACCEL_UNUSABLE' } });
+    assert(second && !second.ok && calls === 1, '同一进程内只允许自动修复一次');
+
+    // 非加速类结论不许动系统设置（换镜像/显卡崩溃时去开虚拟化纯属瞎折腾）
+    const other = new Runtime(path.join(__dirname, '..'));
+    other.onAccelRepair = async () => { throw new Error('不该被调用'); };
+    assert(await other.autoRepairAccel({ diagnosis: { code: 'IMAGE' } }) === null);
+
+    // 需要重启才生效：不重试（重试只会以同样方式失败，白等几分钟）
+    const reboot = new Runtime(path.join(__dirname, '..'));
+    reboot.onAccelRepair = async () => ({ ok: true, restartNeeded: true, note: '已开启虚拟机平台，请重启' });
+    const r = await reboot.autoRepairAccel({ diagnosis: { code: 'ACCEL' } });
+    assert(r && !r.ok && r.restartNeeded === true, '要重启时不该让引擎立刻重试');
+    assert(/重启/.test(r.reason), '要把「需要重启」原样传给用户');
+  });
+
+  await test('自动修复成功后自动重来一遍开机（用户不用再点一次）', async () => {
+    const { Runtime } = require('../src/core/engine');
+    const rt = new Runtime(path.join(__dirname, '..'));
+    let boots = 0;
+    // 把会碰真实 adb / 运行时的入口都收掉，只留「失败 → 修复 → 重试」这条链
+    rt.client = () => ({ isOnline: async () => false, devices: async () => [] });
+    rt.adoptExisting = async () => null;
+    rt.killOrphanEmulators = async () => {};
+    rt.provisioner.materializeImages = async () => ({ ok: true });
+    rt.provisioner.checkEnv = async () => ({ adb: { ok: true }, emulator: { ok: true }, sysimg: { ok: true } });
+    rt.provisioner.invalidateEnvCache = () => {};
+    rt.emulator.running = () => false;
+    rt.onAccelRepair = async () => ({ ok: true, note: 'AEHD 驱动服务已启动，硬件加速当场生效' });
+    rt.boot = async () => {
+      boots += 1;
+      if (boots === 1) {
+        return { ok: false, error: '运行时多次尝试仍未能启动', diagnosis: { code: 'ACCEL_UNUSABLE' } };
+      }
+      return { ok: true, client: {}, engine: 'emulator', profile: { gpu: 'swangle' }, network: null };
+    };
+    const r = await rt._ensureInner({});
+    assert(boots === 2, `修复后应自动重试一次，实际 boot 了 ${boots} 次`);
+    assert(r.ok && r.autoRepaired === 'accel', '应把「自动修复过」带回上层');
+  });
+
+  await test('自动修复扩到其他错误：清锁、补文件、换渲染都直接做，不用用户点按钮', async () => {
+    const { Runtime } = require('../src/core/engine');
+    const rt = new Runtime(path.join(__dirname, '..'));
+    const called = [];
+    rt.onAutoRepair = async (action) => { called.push(action); return { ok: true, detail: `${action} done` }; };
+    const r = await rt.autoRepair({ diagnosis: { code: 'AVD_LOCK' } });
+    assert(r && r.ok && r.retry, '清完锁应该允许自动重试');
+    assert(JSON.stringify(called) === '["clear-locks"]', `应只跑清锁，实际 ${JSON.stringify(called)}`);
+    assert(r.tried.length === 1, '已做的事要带回去给修复窗口显示');
+    assert(rt.autoRepairLog.length === 1, '要留痕，否则用户以为程序什么都没试');
+
+    // 同一个结论只修一次：修完没好，说明不是这个地方的问题，再清一遍纯属浪费时间
+    const again = await rt.autoRepair({ diagnosis: { code: 'AVD_LOCK' } });
+    assert(again && !again.retry && called.length === 1, '同一结论不该自动修第二次');
+  });
+
+  await test('自动修复的动作失败就不重试（同样的参数再开一次只会白等）', async () => {
+    const { Runtime } = require('../src/core/engine');
+    const rt = new Runtime(path.join(__dirname, '..'));
+    rt.onAutoRepair = async () => ({ ok: false, detail: '没有可安全清理的临时文件' });
+    const r = await rt.autoRepair({ diagnosis: { code: 'DISK_FULL' } });
+    assert(r && !r.retry, '清理失败时不该再开机一次');
+    assert(/没有可安全清理/.test(r.reason), `失败原因要原样带给用户：${r.reason}`);
+  });
+
+  await test('自动链里永远不出现会动数据的动作', async () => {
+    const { Runtime } = require('../src/core/engine');
+    const rt = new Runtime(path.join(__dirname, '..'));
+    const called = [];
+    rt.onAutoRepair = async (a) => { called.push(a); return { ok: true, detail: 'ok' }; };
+    for (const code of ['IMAGE', 'DLL', 'DISK_FULL', 'GPU_INIT', 'ACCESS_VIOLATION']) {
+      // eslint-disable-next-line no-await-in-loop
+      await rt.autoRepair({ diagnosis: { code } });
+    }
+    const danger = ['wipe-data', 'reinstall-image', 'cleanup-disk'];
+    assert(!called.some((a) => danger.includes(a)),
+      `自动链里出现了会丢数据的动作：${JSON.stringify(called)}`);
+  });
+
+  await test('修完按结论降配/放宽等待再开机（否则等于没修）', async () => {
+    const { Runtime } = require('../src/core/engine');
+    const rt = new Runtime(path.join(__dirname, '..'));
+    const seen = [];
+    rt.client = () => ({ isOnline: async () => false, devices: async () => [] });
+    rt.adoptExisting = async () => null;
+    rt.killOrphanEmulators = async () => {};
+    rt.provisioner.materializeImages = async () => ({ ok: true });
+    rt.provisioner.checkEnv = async () => ({ adb: { ok: true }, emulator: { ok: true }, sysimg: { ok: true } });
+    rt.emulator.running = () => false;
+    rt.onAutoRepair = async () => ({ ok: true, detail: '按保守参数' });
+    rt.boot = async (o) => {
+      seen.push({ lowspec: o.lowspec, timeoutMs: o.timeoutMs });
+      return seen.length === 1
+        ? { ok: false, error: '运行时多次尝试仍未能启动', diagnosis: { code: 'TIMEOUT' } }
+        : { ok: true, client: {}, engine: 'emulator', profile: {}, network: null };
+    };
+    const r = await rt._ensureInner({});
+    assert(seen.length === 2, `应自动重试一次，实际 ${seen.length}`);
+    assert(seen[1].lowspec === true, '超时类要降配再试，否则还是按 4 分钟等');
+    assert(seen[1].timeoutMs >= 900000, '软件模拟要给足等待时间');
+    assert(r.ok && r.autoRepaired === 'TIMEOUT', `应把修过的问题带回上层，实际 ${r.autoRepaired}`);
+  });
+
+  await test('软件模拟全崩溃时，自动修复去开硬件加速（而不是再换一次渲染后端）', async () => {
+    const { Runtime } = require('../src/core/engine');
+    const rt = new Runtime(path.join(__dirname, '..'));
+    let called = 0;
+    rt.onAccelRepair = async () => { called += 1; return { ok: true, note: 'WHPX 已开启' }; };
+    const r = await rt.autoRepair({ diagnosis: { code: 'TCG_CRASH' } });
+    assert(called === 1, 'TCG 崩溃时的唯一真修复是开加速，应调用加速修复');
+    assert(r && r.retry, '加速可用后应允许重试');
+  });
+
   await test('多种软件后端都崩在 0xC0000005：判定 TCG 问题并停止等价重试', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     const d = doctor.diagnose(['emulator exit 3221225477']);
     const swangle = { gpu: 'swangle', accel: 'off' };
-    emu.attempts = [{ diagnosis: 'ACCESS_VIOLATION', gpu: 'swiftshader', accel: 'off' }];
+    emu.lastExitCode = 3221225477;
+    emu.attempts = [{ diagnosis: 'ACCESS_VIOLATION', gpu: 'swiftshader', accel: 'off', exitCode: 3221225477 }];
     assert(emu._softwareTcgCrashed(swangle, d) === false, '只有一次崩溃时还应继续重试');
-    emu.attempts.push({ diagnosis: 'ACCESS_VIOLATION', gpu: 'swangle', accel: 'off' });
+    emu.attempts.push({ diagnosis: 'ACCESS_VIOLATION', gpu: 'swangle', accel: 'off', exitCode: 3221225477 });
     assert(emu._softwareTcgCrashed(swangle, d) === true, '两个软件后端同码崩溃后应止损');
     assert(emu._softwareTcgCrashed({ gpu: 'host', accel: 'on' }, d) === false, '硬件加速崩溃不算 TCG 问题');
     assert(emu._softwareTcgCrashed(swangle, doctor.diagnose(['Address already in use'])) === false,
       '端口占用不能被算进崩溃次数');
+
+    // 回归现场（0.6.11 报告）：日志里带着一句无害的 "Platform does not support Guest Angle"，
+    // 崩溃被误判成 GPU_INIT，止损逻辑只认 ACCESS_VIOLATION → 4 组参数白跑完。
+    const gpuInit = doctor.diagnose(['VK_ERROR_INCOMPATIBLE_DRIVER', 'emulator exit 3221225477']);
+    assert(gpuInit.code === 'ACCESS_VIOLATION', `有崩溃行时应优先判崩溃，实际 ${gpuInit.code}`);
+    emu.attempts = [
+      { diagnosis: 'GPU_INIT', gpu: 'software', accel: 'off', exitCode: 3221225477 },
+      { diagnosis: 'GPU_INIT', gpu: 'software', accel: 'off', exitCode: 3221225477 },
+    ];
+    assert(emu._softwareTcgCrashed(swangle, gpuInit) === true,
+      '诊断被 GPU_INIT 抢走时，同样要按「同码崩溃两次」止损');
+
     const advice = doctor.tcgCrashDiagnosis();
     assert(advice.code === 'TCG_CRASH' && /WHPX/.test(advice.hint) && /AEHD/.test(advice.hint),
       '止损结论要给出启用硬件加速的具体步骤');
@@ -183,6 +424,64 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/一键开启硬件加速/.test(doctor.noAccelDiagnosis().hint)
       && /一键开启硬件加速/.test(doctor.diagnose(['acceleration not available']).hint),
       '无加速类结论也要指向同一个一键入口');
+  });
+
+  await test('存快照把模拟器写崩过一次后：本机不再保存（上游 #46）', async () => {
+    const store = require('../src/core/store');
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    emu._emuVersion = '37.4.1.0';
+    emu.profile = { gpu: 'software' };
+    emu.proc = { killed: false };
+    // 现场：adb 返回成功，但进程随后 0xC0000005 消失（#46 在真机上复现过）
+    emu._saveViaAdb = async () => { emu.proc = null; return true; };
+    assert(await emu.saveSnapshotNow('adb.exe') === false, '写崩了不能算保存成功');
+    const saved = store.getSettings().engine.snapshotUnsafe;
+    assert(/^37\.4\.1\.0\|software$/.test(String(saved)), `应记下不安全的组合：${saved}`);
+
+    // 第二次直接跳过，不再触发 save（否则每次用都会崩一次）
+    let called = 0;
+    emu.proc = { killed: false };
+    emu._saveViaAdb = async () => { called += 1; return true; };
+    assert(await emu.saveSnapshotNow('adb.exe') === false, '命中记忆位时应跳过快照');
+    assert(called === 0, `命中记忆位后不该再执行 save（实际 ${called} 次）`);
+
+    // 升级运行时后重新给一次机会（新版可能已修）
+    let called2 = 0;
+    emu._emuVersion = '37.5.0';
+    emu._saveViaAdb = async () => { called2 += 1; return true; };
+    emu.proc = { killed: false };
+    await emu.saveSnapshotNow('adb.exe');
+    assert(called2 === 1, '换运行时版本后应重新尝试一次');
+    store.saveSettings({ engine: { snapshotUnsafe: '' } });
+  });
+
+  await test('崩在 Vulkan：下一轮自动关掉 Vulkan（不继续换呈现后端）', () => {
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    const variants = [
+      { gpu: 'swangle', label: 'swangle / 硬件加速' },
+      { gpu: 'host', label: 'host / 硬件加速' },
+      { gpu: 'software', label: '关闭加速的软件模拟' },
+    ];
+    const lines = [
+      'INFO | Selecting Vulkan device: Intel(R) UHD Graphics 730',
+      'INFO | Platform does not support Guest Angle',
+      'emulator exit 3221225477',
+    ];
+    const d = doctor.diagnose(lines);
+    assert(emu._preferNoVulkan(variants, 0, d, lines) === true, '有 Vulkan 痕迹时应改下一轮');
+    assert(variants[1].noVulkan === true && /关 Vulkan/.test(variants[1].label), '下一轮要带 noVulkan');
+    assert(emu._preferNoVulkan(variants, 0, d, lines) === false, '已经改过就不该重复改');
+    // 没有 Vulkan 痕迹 / 非崩溃结论：不动下一轮
+    const plain = [{ gpu: 'swangle', label: 'swangle' }, { gpu: 'host', label: 'host' }];
+    assert(emu._preferNoVulkan(plain, 0, d, ['emulator exit 3221225477']) === false);
+    assert(emu._preferNoVulkan(plain, 0, doctor.diagnose(['Address already in use']), lines) === false);
+    // 参数层：-feature -Vulkan 真的会传给 emulator
+    const args = emu.buildArgs({ gpu: 'swangle', memoryMB: 2048, cores: 2, noVulkan: true });
+    assert(args.includes('-feature') && args.includes('-Vulkan'), `参数里缺 -feature -Vulkan：${args.join(' ')}`);
+    const normal = emu.buildArgs({ gpu: 'swangle', memoryMB: 2048, cores: 2 });
+    assert(!normal.includes('-Vulkan'), '正常轮不该关 Vulkan');
   });
 
   await test('CPU 指令集：QEMU 的无害警告不许当成结论（#15 误诊回归）', () => {
@@ -1562,6 +1861,51 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       assert(ranged === 1, `只应补下 1 个块，实际请求 ${ranged} 块`);
       assert(Buffer.compare(fs.readFileSync(out), data) === 0, '续传后的文件必须与源完全一致');
       assert(!fs.existsSync(`${out}.chunks.json`), '完成后要清掉边车文件');
+    } finally {
+      s1.close(); s2.close();
+      fs.rmSync(out, { force: true });
+      fs.rmSync(`${out}.chunks.json`, { force: true });
+    }
+  });
+
+  await test('并行下载：服务器返回错位的 Content-Range 必须失败，不能拼出错位文件（上游 #91）', async () => {
+    const http = require('http');
+    const { downloadMulti } = require('../src/core/download');
+    const MB = 1024 * 1024;
+    const total = 3 * MB;
+    const data = Buffer.alloc(total);
+    for (let i = 0; i < total; i += 1) data[i] = (i * 7) % 251;
+    // 现场（#91）：探测请求 0-0 正常，真正取块时服务器不管要哪段都从 0 开始返回
+    // → 旧实现照单全收，文件长度刚好对上、内容整体错位，最后表现为「校验失败/莫名崩溃」
+    const bad = (req, res) => {
+      const r = /bytes=(\d+)-(\d+)/.exec(req.headers.range || '');
+      if (!r) { res.writeHead(200, { 'Content-Length': total }); res.end(data); return; }
+      const a = Number(r[1]);
+      const b = Number(r[2]);
+      // 只有探测（bytes=0-0）给正确范围；真正取块时不管要哪段都从 0 开始返回
+      if (a === 0 && b === 0) {
+        res.writeHead(206, { 'Content-Range': `bytes 0-0/${total}`, 'Content-Length': 1 });
+        res.end(data.slice(0, 1));
+        return;
+      }
+      res.writeHead(206, { 'Content-Range': `bytes 0-${total - 1}/${total}`, 'Content-Length': total });
+      res.end(data);
+    };
+    const mk = () => new Promise((resolve) => {
+      const srv = http.createServer(bad);
+      srv.listen(0, '127.0.0.1', () => resolve(srv));
+    });
+    const s1 = await mk();
+    const s2 = await mk();
+    const urls = [`http://127.0.0.1:${s1.address().port}/f`, `http://127.0.0.1:${s2.address().port}/f`];
+    const out = path.join(TMP, 'bad-range.bin');
+    try {
+      let err = null;
+      try {
+        await downloadMulti(urls, out, { connections: 3, minChunk: MB, retries: 1 });
+      } catch (e) { err = e; }
+      assert(err, '错位的 Content-Range 必须让下载失败，不能当成成功');
+      assert(/Content-Range|范围不符/.test(err.message), `错误信息要指向范围不符：${err.message}`);
     } finally {
       s1.close(); s2.close();
       fs.rmSync(out, { force: true });

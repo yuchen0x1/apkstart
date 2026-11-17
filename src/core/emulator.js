@@ -648,7 +648,7 @@ class EmulatorEngine {
   buildArgs({
     headless = true, accel = 'auto', port = 5554,
     gpu = 'software', memoryMB = 2048, cores = 2,
-    snapshot = true, wipe = false, lcd = null,
+    snapshot = true, wipe = false, lcd = null, noVulkan = false,
   } = {}) {
     const args = [
       '-avd', this.avdName,
@@ -730,6 +730,10 @@ class EmulatorEngine {
     // ANDROID_I_WANT_MY_TCG）。绝不传 `-accel on` —— 上游实测 37.x 在部分
     // Windows/显卡组合下会因此以 0xC0000005 崩溃；不传参数走官方默认路径即可。
     if (accel === 'off') args.push('-accel', 'off');
+    // 关掉 guest Vulkan 通道。英特尔核显 + 旧驱动在 Vulkan 初始化时会让 qemu 直接
+    // 0xC0000005；-gpu 换的只是呈现方式，Vulkan 通道还是同一份代码，所以换后端绕不过。
+    // 只在「上一轮崩在 Vulkan」时临时加，不影响正常机器（正常机器仍用 Vulkan）。
+    if (noVulkan) args.push('-feature', '-Vulkan');
     return args;
   }
 
@@ -741,6 +745,7 @@ class EmulatorEngine {
       headless, accel: plan.accel, port: plan.port, gpu: plan.gpu,
       memoryMB: plan.memoryMB, cores: plan.cores,
       snapshot: plan.snapshot, wipe: plan.wipe, lcd: plan.lcd,
+      noVulkan: plan.noVulkan,
     });
     this._logWrite(logFile, `\n--- ${new Date().toISOString()} ${plan.label} ---\n${loc.emulatorExe} ${args.join(' ')}\n`);
 
@@ -933,6 +938,30 @@ class EmulatorEngine {
       const timer = setTimeout(() => fin(false), ms);
       proc.once('exit', onExit);
     });
+  }
+
+  /**
+   * 把「某一轮在拉起模拟器时抛的异常」记成一条 attempt。
+   *
+   * 单独抽出来有两个原因：
+   *   1. 必须和正常失败分支写同样结构的记录，否则报告里缺 plan / params，
+   *      作者只看得到一句异常消息；
+   *   2. 可单测 —— start() 整条流程要真起模拟器，纯 Node 测试里跑不动。
+   */
+  _recordSpawnError({ plan = {}, logStart = 0, error, onLog = () => {} } = {}) {
+    const msg = String((error && error.message) || error || '未知错误').replace(/\s+/g, ' ').slice(0, 300);
+    this.log(`启动异常（${plan.label || '未知参数'}）：${msg}`);
+    onLog(`启动异常（${msg}），换一组参数重试…`);
+    // 异常消息本身也可能带可识别特征（DLL 缺失 / 路径含中文 / AVD 锁）
+    const fromLog = doctor.diagnose([...this._attemptLines(logStart, 60), msg]);
+    const d = fromLog.code === 'UNKNOWN' ? doctor.spawnErrorDiagnosis(msg) : fromLog;
+    this.attempts.push({
+      plan: plan.label || '未知参数', diagnosis: d.code, exitCode: this.lastExitCode,
+      params: doctor.describeAttempt(plan), gpu: plan.gpu, accel: plan.accel,
+      error: msg,
+    });
+    this.lastDiagnosis = d;
+    return d;
   }
 
   /**
@@ -1279,198 +1308,244 @@ class EmulatorEngine {
       const logStart = this._log.length;
       onLog(`启动运行时（第 ${i + 1}/${variants.length} 次：${plan.label}）…`);
 
-      // eslint-disable-next-line no-await-in-loop
-      const avd = this.ensureAvd({
-        ...plan,
-        // forceWipe 也要参与「删旧快照」：重置数据后旧快照必然加载失败
-        // （实测报 Failed to load snapshot 后退回冷启动），必须先清掉再重建。
-        wipe: plan.wipe || !!this.wipePending || forceWipe,
-      });
-      // 埋点：上层（main）用它在拉起模拟器**之前**打开黑窗压制。
-      // 控制台窗口在 spawn 之后几十毫秒就冒出来，事后再补一次扫描必然闪一下，
-      // 所以这里必须先把它打开、再拉起进程。
-      if (this.onBeforeSpawn) {
+      try {
+        const avd = this.ensureAvd({
+          ...plan,
+          // forceWipe 也要参与「删旧快照」：重置数据后旧快照必然加载失败
+          // （实测报 Failed to load snapshot 后退回冷启动），必须先清掉再重建。
+          wipe: plan.wipe || !!this.wipePending || forceWipe,
+        });
+        // 埋点：上层（main）用它在拉起模拟器**之前**打开黑窗压制。
+        // 控制台窗口在 spawn 之后几十毫秒就冒出来，事后再补一次扫描必然闪一下，
+        // 所以这里必须先把它打开、再拉起进程。
+        if (this.onBeforeSpawn) {
+          // eslint-disable-next-line no-await-in-loop
+          try { await this.onBeforeSpawn(); } catch (_) { /* ignore */ }
+        }
         // eslint-disable-next-line no-await-in-loop
-        try { await this.onBeforeSpawn(); } catch (_) { /* ignore */ }
-      }
-      // eslint-disable-next-line no-await-in-loop
-      this.spawnOnce({ ...plan, wipe: plan.wipe || avd.wipePending || forceWipe }, { headless, onLog, logFile });
-      // _coldBoot 只对这次 spawn 生效，避免之后每次开机都退化成长时间冷启动
-      this._coldBoot = false;
-      // 参数错误 / DLL 缺失会立刻退出
-      // eslint-disable-next-line no-await-in-loop
-      const dead = await this._waitSpawnSettled(2200);
-      if (dead || !this.proc) {
-        let d = doctor.diagnose(this._attemptLines(logStart, 60));
+        this.spawnOnce({ ...plan, wipe: plan.wipe || avd.wipePending || forceWipe }, { headless, onLog, logFile });
+        // _coldBoot 只对这次 spawn 生效，避免之后每次开机都退化成长时间冷启动
+        this._coldBoot = false;
+        // 参数错误 / DLL 缺失会立刻退出
+        // eslint-disable-next-line no-await-in-loop
+        const dead = await this._waitSpawnSettled(2200);
+        if (dead || !this.proc) {
+          const earlyLines = this._attemptLines(logStart, 60);
+          let d = doctor.diagnose(earlyLines);
+          // 检测说有加速、日志里却连「accelerator ... operational」都没有就退了：
+          // 这不是渲染/镜像问题，是驱动没接管。旧逻辑在这里只能给 UNKNOWN
+          // （日志里一条错误都没有，所有正则都落空），用户拿着报告也无从下手。
+          const early = doctor.earlyAccelExit({
+            accel: accelInfo, logLines: earlyLines, exitCode: this.lastExitCode,
+          });
+          if (early && ['UNKNOWN', 'ACCEL'].includes(d.code)) d = early;
+          this.attempts.push({
+            plan: plan.label, diagnosis: d.code, exitCode: this.lastExitCode,
+            // 实际参数：失败后用户/作者都要能看出「这一轮到底用了多保守的配置」，
+            // 只看 label（gpu / 加速方式）是不够的。
+            params: doctor.describeAttempt(plan),
+            gpu: plan.gpu, accel: plan.accel,
+          });
+          this.lastDiagnosis = d;
+          lastError = `${d.title}：${d.hint}`;
+          // 崩在 Vulkan：下一轮改成「同后端 + 关 Vulkan」，比继续换后端更有针对性
+          if (this._preferNoVulkan(variants, i, d, earlyLines)) {
+            onLog('日志里有 Vulkan 初始化痕迹，下一轮关掉 Vulkan 再试…');
+          }
+          // 磁盘写满不是「换组参数就能好」的问题：继续重试只会反复失败，
+          // 而且历史上最后那组参数带 wipe，会把用户数据一起抹掉。直接收工、如实报错。
+          if (d.code === 'DISK_FULL') {
+            onLog('磁盘空间不足，已停止重试（不会动你的应用与存档）。');
+            this._persistFailure({
+              profile, profileText: doctor.describeProfile(profile),
+              tuning: doctor.describeTuning(profile), why: 'disk-full',
+            });
+            return { ok: false, error: lastError, needsSpace: true, attempts: this.attempts, exitCode: this.lastExitCode };
+          }
+          // 加速/镜像类结论可能是缓存里的旧数据，作废掉，下次启动重新探测
+          if (['ACCEL', 'GPU_INIT', 'GPU_MODE', 'IMAGE', 'DLL', 'ACCESS_VIOLATION'].includes(d.code)) {
+            try { this.provisioner.invalidateEnvCache(); } catch (_) { /* ignore */ }
+          }
+          if (this._softwareTcgCrashed(plan, d)) {
+            d = doctor.tcgCrashDiagnosis();
+            this.lastDiagnosis = d;
+            lastError = `${d.title}：${d.hint}`;
+            onLog(`${d.title}，停止重试等价的软件后端。`);
+            break;
+          }
+          onLog(`${d.title}，自动换一组参数重试…`);
+          this._noteGpuFailure(plan);
+          continue;
+        }
+
+        if (!probe) {
+          // The visible-window path may have selected a fallback plan (for example
+          // swangle after host rendering fails). Keep the plan that actually got
+          // spawned so status/doctor:profile can distinguish the running VM from
+          // the next-start profile shown in Settings.
+          this.profile = plan;
+          return { ok: true, serial: this.serial, port, accel: accelInfo, logFile, profile, attempts: this.attempts };
+        }
+
+        const started = Date.now();
+        const timeout = plan.bootTimeoutMs || 240000;
+        let ok = false;
+        let fatal = false;
+        let sawBooting = false;
+        // 快照恢复往往几秒内就能起，固定 3 秒一次意味着平均要多等 1.5 秒才「发现」
+        // 它已经好了。这里从 200ms 起步逐步放宽到 1.2 秒：开机早期能立刻抓到，
+        // 长引导过程也不会把 CPU 花在轮询上。
+        let interval = 200;
+        let lastNotice = 0;
+        // eslint-disable-next-line no-await-in-loop
+        while (Date.now() - started < timeout) {
+          if (!this.proc) { fatal = true; break; }
+          let state = 'pending';
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            state = await probe({ serial: this.serial, port, adbPort });
+          } catch (_) { state = 'pending'; }
+          if (state === 'ok') { ok = true; break; }
+          if (state === 'fatal') { fatal = true; break; }
+          // 只要 adb 能执行 shell，说明内核已经在引导，日志里的普通 Vulkan/EGL 信息不算失败
+          if (state === 'booting') sawBooting = true;
+          // 45 秒仍完全没连上，且日志出现明确致命错误 → 提前换方案，不干等 4 分钟
+          if (!sawBooting && Date.now() - started > 45000) {
+            const d = doctor.diagnose(this._attemptLines(logStart, 80));
+            if (['GPU_INIT', 'ACCEL', 'GPU_MODE', 'IMAGE', 'DLL', 'MEMORY', 'ACCESS_VIOLATION'].includes(d.code)) {
+              this.lastDiagnosis = d;
+              try { this.provisioner.invalidateEnvCache(); } catch (_) { /* ignore */ }
+              fatal = true;
+              break;
+            }
+          }
+          // 每 15 秒一条进度：以前用「取模」判断，自适应间隔下会连着打两三条重复的
+          if (Date.now() - lastNotice > 15000) {
+            lastNotice = Date.now();
+            onLog(`正在开机… ${Math.round((Date.now() - started) / 1000)}s`);
+          }
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(interval);
+          interval = Math.min(1200, Math.round(interval * 1.6));
+        }
+
+        if (ok) {
+          const bootMs = Date.now() - started;
+          // `profile` is the desired auto profile, while `plan` is the concrete
+          // attempt that reached Android. A visible launch can fall back from
+          // host to swangle/software without changing the user's settings; keep
+          // the concrete plan for runtime status and diagnostics.
+          this.profile = plan;
+          // 这一次真的起来了：清掉上次的失败记录，避免以后「诊断」翻出旧账
+          this._clearFailure();
+          // 一定要存 quickboot 快照：模拟器进程会随 ApkStart 退出而结束（Electron 的
+          // job 对象会连带杀掉子进程），下次打开有没有快照直接决定是 25 秒还是 7 秒。
+          // 装完新应用时 installer 会作废快照，避免"重启后应用消失"。
+          this.snapshotWorthSaving = true;
+          onLog(`运行时就绪（${Math.round(bootMs / 1000)}s，${plan.label}）`);
+          // 开机成功不等于能用：顺手体检网络。虚拟机没网时，需要联网的页面会一直黑屏，
+          // 用户只会说「这个应用黑屏」，很难联想到是网络。这里主动查一次并说清楚。
+          let network = null;
+          try { network = await this.checkNetwork(); } catch (_) { /* 体检失败不算启动失败 */ }
+          // 没网时先自动修一次 Wi-Fi 关联（清撞车的保存网络 + 点一下重新关联），
+          // 修好了用户就完全无感；修不好才提示，且不再劝用户「重置数据」——
+          // 那会白丢已装应用，而真正的病根只是一份写坏的 wifi 配置。
+          if (network && !network.ok) {
+            onLog('检测到虚拟机网络异常，正在自动修复 Wi-Fi 关联…');
+            const rep = await this.repairWifi('', onLog).catch(() => null);
+            if (rep && rep.ok) {
+              onLog('虚拟机网络已恢复');
+              network = await this.checkNetwork().catch(() => network);
+            } else if (rep) {
+              onLog(`Wi-Fi 自动修复未成功（${rep.reason || 'unknown'}）`);
+            }
+          }
+          if (network && !network.ok) {
+            onLog('⚠ 安卓虚拟机当前没有网络：需要联网的应用打开后会一直黑屏。'
+              + '可在「设置 → 修复网络」重置安卓数据来修（应用清单会保留，点开时会自动重装）。');
+          }
+          return {
+            ok: true, serial: this.serial, port, accel: accelInfo, logFile,
+            profile, attempts: this.attempts, bootMs, quickBoot: true, network,
+          };
+        }
+
+        const attemptLines = this._attemptLines(logStart, 80);
+        let d = fatal ? (this.lastDiagnosis || doctor.diagnose(attemptLines)) : doctor.diagnose(attemptLines);
+        // 进程没崩、只是等到超时：结论就该是「太慢」，不能被日志里的 CPUID 警告
+        // 或 UNKNOWN 抢走。否则用户拿着「CPU 缺少指令集」去换镜像，永远修不好。
+        if (!fatal && ['UNKNOWN', 'CPU_FEATURE'].includes(d.code)) {
+          d = doctor.timeoutDiagnosis({
+            accelOk: !!(accelInfo && accelInfo.ok),
+            seconds: Math.round((Date.now() - started) / 1000),
+          });
+        }
+        // 进程死了却没有任何可识别的错误行，而本机号称有加速：落到「加速器没接管」。
+        // 用户报的那份报告正好走这条路径（日志停在 Userspace boot properties，退出码 1）。
+        if (fatal && d.code === 'UNKNOWN') {
+          const early = doctor.earlyAccelExit({
+            accel: accelInfo, logLines: attemptLines, exitCode: this.lastExitCode,
+          });
+          if (early) d = early;
+        }
         this.attempts.push({
-          plan: plan.label, diagnosis: d.code, exitCode: this.lastExitCode,
-          // 实际参数：失败后用户/作者都要能看出「这一轮到底用了多保守的配置」，
-          // 只看 label（gpu / 加速方式）是不够的。
+          plan: plan.label, diagnosis: d.code, timeout: !fatal, exitCode: this.lastExitCode,
           params: doctor.describeAttempt(plan),
           gpu: plan.gpu, accel: plan.accel,
         });
-        this.lastDiagnosis = d;
-        lastError = `${d.title}：${d.hint}`;
-        // 磁盘写满不是「换组参数就能好」的问题：继续重试只会反复失败，
-        // 而且历史上最后那组参数带 wipe，会把用户数据一起抹掉。直接收工、如实报错。
-        if (d.code === 'DISK_FULL') {
-          onLog('磁盘空间不足，已停止重试（不会动你的应用与存档）。');
-          this._persistFailure({
-            profile, profileText: doctor.describeProfile(profile),
-            tuning: doctor.describeTuning(profile), why: 'disk-full',
-          });
-          return { ok: false, error: lastError, needsSpace: true, attempts: this.attempts, exitCode: this.lastExitCode };
-        }
-        // 加速/镜像类结论可能是缓存里的旧数据，作废掉，下次启动重新探测
-        if (['ACCEL', 'GPU_INIT', 'GPU_MODE', 'IMAGE', 'DLL', 'ACCESS_VIOLATION'].includes(d.code)) {
-          try { this.provisioner.invalidateEnvCache(); } catch (_) { /* ignore */ }
-        }
-        if (this._softwareTcgCrashed(plan, d)) {
+        const tcgCrash = this._softwareTcgCrashed(plan, d);
+        if (tcgCrash) {
           d = doctor.tcgCrashDiagnosis();
           this.lastDiagnosis = d;
           lastError = `${d.title}：${d.hint}`;
           onLog(`${d.title}，停止重试等价的软件后端。`);
-          break;
-        }
-        onLog(`${d.title}，自动换一组参数重试…`);
-        this._noteGpuFailure(plan);
-        continue;
-      }
-
-      if (!probe) {
-        // The visible-window path may have selected a fallback plan (for example
-        // swangle after host rendering fails). Keep the plan that actually got
-        // spawned so status/doctor:profile can distinguish the running VM from
-        // the next-start profile shown in Settings.
-        this.profile = plan;
-        return { ok: true, serial: this.serial, port, accel: accelInfo, logFile, profile, attempts: this.attempts };
-      }
-
-      const started = Date.now();
-      const timeout = plan.bootTimeoutMs || 240000;
-      let ok = false;
-      let fatal = false;
-      let sawBooting = false;
-      // 快照恢复往往几秒内就能起，固定 3 秒一次意味着平均要多等 1.5 秒才「发现」
-      // 它已经好了。这里从 200ms 起步逐步放宽到 1.2 秒：开机早期能立刻抓到，
-      // 长引导过程也不会把 CPU 花在轮询上。
-      let interval = 200;
-      let lastNotice = 0;
-      // eslint-disable-next-line no-await-in-loop
-      while (Date.now() - started < timeout) {
-        if (!this.proc) { fatal = true; break; }
-        let state = 'pending';
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          state = await probe({ serial: this.serial, port, adbPort });
-        } catch (_) { state = 'pending'; }
-        if (state === 'ok') { ok = true; break; }
-        if (state === 'fatal') { fatal = true; break; }
-        // 只要 adb 能执行 shell，说明内核已经在引导，日志里的普通 Vulkan/EGL 信息不算失败
-        if (state === 'booting') sawBooting = true;
-        // 45 秒仍完全没连上，且日志出现明确致命错误 → 提前换方案，不干等 4 分钟
-        if (!sawBooting && Date.now() - started > 45000) {
-          const d = doctor.diagnose(this._attemptLines(logStart, 80));
-          if (['GPU_INIT', 'ACCEL', 'GPU_MODE', 'IMAGE', 'DLL', 'MEMORY', 'ACCESS_VIOLATION'].includes(d.code)) {
-            this.lastDiagnosis = d;
-            try { this.provisioner.invalidateEnvCache(); } catch (_) { /* ignore */ }
-            fatal = true;
-            break;
+        } else {
+          this.lastDiagnosis = d;
+          lastError = `${d.title}：${d.hint}`;
+          onLog(`${lastError}，自动换一组参数重试…`);
+          this._noteGpuFailure(plan);
+          // 同上：崩在 Vulkan 时优先关 Vulkan，而不是继续换呈现后端
+          if (this._preferNoVulkan(variants, i, d, attemptLines)) {
+            onLog('日志里有 Vulkan 初始化痕迹，下一轮关掉 Vulkan 再试…');
           }
-        }
-        // 每 15 秒一条进度：以前用「取模」判断，自适应间隔下会连着打两三条重复的
-        if (Date.now() - lastNotice > 15000) {
-          lastNotice = Date.now();
-          onLog(`正在开机… ${Math.round((Date.now() - started) / 1000)}s`);
         }
         // eslint-disable-next-line no-await-in-loop
-        await sleep(interval);
-        interval = Math.min(1200, Math.round(interval * 1.6));
-      }
-
-      if (ok) {
-        const bootMs = Date.now() - started;
-        // `profile` is the desired auto profile, while `plan` is the concrete
-        // attempt that reached Android. A visible launch can fall back from
-        // host to swangle/software without changing the user's settings; keep
-        // the concrete plan for runtime status and diagnostics.
-        this.profile = plan;
-        // 这一次真的起来了：清掉上次的失败记录，避免以后「诊断」翻出旧账
-        this._clearFailure();
-        // 一定要存 quickboot 快照：模拟器进程会随 ApkStart 退出而结束（Electron 的
-        // job 对象会连带杀掉子进程），下次打开有没有快照直接决定是 25 秒还是 7 秒。
-        // 装完新应用时 installer 会作废快照，避免"重启后应用消失"。
-        this.snapshotWorthSaving = true;
-        onLog(`运行时就绪（${Math.round(bootMs / 1000)}s，${plan.label}）`);
-        // 开机成功不等于能用：顺手体检网络。虚拟机没网时，需要联网的页面会一直黑屏，
-        // 用户只会说「这个应用黑屏」，很难联想到是网络。这里主动查一次并说清楚。
-        let network = null;
-        try { network = await this.checkNetwork(); } catch (_) { /* 体检失败不算启动失败 */ }
-        // 没网时先自动修一次 Wi-Fi 关联（清撞车的保存网络 + 点一下重新关联），
-        // 修好了用户就完全无感；修不好才提示，且不再劝用户「重置数据」——
-        // 那会白丢已装应用，而真正的病根只是一份写坏的 wifi 配置。
-        if (network && !network.ok) {
-          onLog('检测到虚拟机网络异常，正在自动修复 Wi-Fi 关联…');
-          const rep = await this.repairWifi('', onLog).catch(() => null);
-          if (rep && rep.ok) {
-            onLog('虚拟机网络已恢复');
-            network = await this.checkNetwork().catch(() => network);
-          } else if (rep) {
-            onLog(`Wi-Fi 自动修复未成功（${rep.reason || 'unknown'}）`);
-          }
-        }
-        if (network && !network.ok) {
-          onLog('⚠ 安卓虚拟机当前没有网络：需要联网的应用打开后会一直黑屏。'
-            + '可在「设置 → 修复网络」重置安卓数据来修（应用清单会保留，点开时会自动重装）。');
-        }
-        return {
-          ok: true, serial: this.serial, port, accel: accelInfo, logFile,
-          profile, attempts: this.attempts, bootMs, quickBoot: true, network,
-        };
-      }
-
-      const attemptLines = this._attemptLines(logStart, 80);
-      let d = fatal ? (this.lastDiagnosis || doctor.diagnose(attemptLines)) : doctor.diagnose(attemptLines);
-      // 进程没崩、只是等到超时：结论就该是「太慢」，不能被日志里的 CPUID 警告
-      // 或 UNKNOWN 抢走。否则用户拿着「CPU 缺少指令集」去换镜像，永远修不好。
-      if (!fatal && ['UNKNOWN', 'CPU_FEATURE'].includes(d.code)) {
-        d = doctor.timeoutDiagnosis({
-          accelOk: !!(accelInfo && accelInfo.ok),
-          seconds: Math.round((Date.now() - started) / 1000),
-        });
-      }
-      this.attempts.push({
-        plan: plan.label, diagnosis: d.code, timeout: !fatal, exitCode: this.lastExitCode,
-        params: doctor.describeAttempt(plan),
-        gpu: plan.gpu, accel: plan.accel,
-      });
-      const tcgCrash = this._softwareTcgCrashed(plan, d);
-      if (tcgCrash) {
-        d = doctor.tcgCrashDiagnosis();
-        this.lastDiagnosis = d;
+        await this.killAttempt();
+        if (tcgCrash) break;
+      } catch (e) {
+        // 这一轮连模拟器都没拉起来：AVD 目录不可写、运行时文件被杀软删掉、参数构造失败…
+        // 旧实现让异常直接冒到上层 —— start() 整个 reject，重试循环停在第 1 轮，
+        // 报告里只剩一条 attempt，却仍然写着「已自动按多种参数组合重试」（用户实测现场）。
+        // 现在把它也记成一次失败的尝试，继续下一组参数。
+        const d = this._recordSpawnError({ plan, logStart, error: e, onLog });
         lastError = `${d.title}：${d.hint}`;
-        onLog(`${d.title}，停止重试等价的软件后端。`);
-      } else {
-        this.lastDiagnosis = d;
-        lastError = `${d.title}：${d.hint}`;
-        onLog(`${lastError}，自动换一组参数重试…`);
-        this._noteGpuFailure(plan);
+        // 异常轮也可能留下 detached 的 qemu，下一轮会被 AVD 锁挡死
+        // eslint-disable-next-line no-await-in-loop
+        await this.killAttempt().catch(() => {});
+        continue;
       }
-      // eslint-disable-next-line no-await-in-loop
-      await this.killAttempt();
-      if (tcgCrash) break;
     }
 
     // 全部组合都失败、而且本机根本没有加速：给一句能照做的结论，
     // 别再让用户对着「UNKNOWN + 已自动重试」猜（issue #20/#6/#15/#31）。
     let d = this.lastDiagnosis || doctor.diagnose(this.recentLog(120));
     if ((!d || d.code === 'UNKNOWN') && accelInfo && !accelInfo.ok) d = doctor.noAccelDiagnosis();
+    // 兜底：有加速、却没有任何一条能解释退出的日志 —— 结论就是「驱动没接管」。
+    // 不能让用户对着一句 UNKNOWN 去换镜像、换渲染后端（这两条路都是白折腾）。
+    if (!d || d.code === 'UNKNOWN') {
+      d = doctor.earlyAccelExit({
+        accel: accelInfo, logLines: this.recentLog(300), exitCode: this.lastExitCode,
+      }) || d;
+    }
     this.lastDiagnosis = d;
     const report = doctor.writeReport({
       dataDir: store.DATA_DIR, profile, logLines: this.recentLog(300),
       extra: {
         attempts: this.attempts,
         diagnosis: d,
+        // 加速探测的原始结论：AEHD「装了但服务没跑」时这里带 suspect 标记，
+        // 报告里能直接看出「程序当时以为有加速」，而不是反复怀疑显卡。
+        accel: accelInfo || null,
         // 日志里那些「看着像错误、其实无害」的行，报告里主动解释一句，
         // 省得用户拿 "host doesn't support requested feature" 去查错方向。
         notes: doctor.notes(this.recentLog(300)),
@@ -1544,11 +1619,40 @@ class EmulatorEngine {
    */
   async saveSnapshotNow(adbPath, { timeout = 45000 } = {}) {
     if (!adbPath) return false;
+    // 「存快照把模拟器写崩」的记忆位（上游 #46）：在一台已稳定跑了几分钟的模拟器上，
+    // 只执行 `adb emu avd snapshot save`，60 秒后进程就 0xC0000005 消失。
+    // 学过一次就不再试 —— 用户宁可下次冷启动多等 20 秒，也不要应用窗口用的过程中突然没了。
+    const unsafe = this._snapshotUnsafe();
+    if (unsafe) {
+      this.log(`跳过快照保存：上次在本机用 ${unsafe} 存快照把模拟器写崩了（上游 #46）`);
+      return false;
+    }
+    const alive = this.running();
     const ok = await this._saveViaAdb(adbPath, { timeout });
+    if (alive && !this.running()) {
+      this._noteSnapshotUnsafe();
+      this.log('快照保存导致模拟器退出，已记录：本机后续不再保存快照');
+      return false;
+    }
     // emulator 的 save 命令可能在写盘中途就回 OK，这里按文件完整性再确认一次，
     // 只有 snapshot.pb 真正落盘才算数（否则下次加载会失败并白等几秒）。
     if (!ok) return false;
     return this.hasSnapshot();
+  }
+
+  /** 「这台机器 + 这个运行时版本上，存快照会把模拟器写崩」的记忆位（空串=可以存） */
+  _snapshotUnsafe() {
+    const key = String((this.settings.engine || {}).snapshotUnsafe || '');
+    if (!key || !key.includes('|')) return '';
+    const [ver, gpu] = key.split('|');
+    // 升级运行时后重新给一次机会：新版 emulator 可能已经修了这个崩溃
+    if (ver !== (this._emuVersion || '')) return '';
+    return gpu || 'unknown';
+  }
+
+  _noteSnapshotUnsafe() {
+    const gpu = (this.profile && this.profile.gpu) || 'unknown';
+    try { store.saveSettings({ engine: { snapshotUnsafe: `${this._emuVersion || ''}|${gpu}` } }); } catch (_) { /* ignore */ }
   }
 
   /**
@@ -1596,7 +1700,9 @@ class EmulatorEngine {
       // 关机前补存一次：空闲路径没来得及存（比如用户装完应用马上退出）时，
       // 下一次开机仍然能走快照恢复，而不是重新冷启动。
       // 3GB 内存写盘要几秒到二十几秒，超时给足，别让快照写一半就被 kill 掉。
-      await this._saveViaAdb(adbPath, { timeout: 60000 });
+      // 走 saveSnapshotNow 而不是直接 _saveViaAdb：那里有「本机存快照会把模拟器写崩」
+      // 的记忆位（上游 #46），关机路径不该绕过它再崩一次。
+      await this.saveSnapshotNow(adbPath, { timeout: 60000 }).catch(() => false);
     }
     if (adbPath) {
       await new Promise((resolve) => {
@@ -1625,10 +1731,37 @@ class EmulatorEngine {
    * 以 0xC0000005 退出——病根在 TCG/模拟器本身，继续换后端只会白等十几分钟。
    */
   _softwareTcgCrashed(plan, d) {
-    if (!d || d.code !== 'ACCESS_VIOLATION') return false;
+    if (!d) return false;
+    // 只认「进程真的崩了」的结论；端口占用 / 超时这类不能被算进崩溃次数
+    if (!['ACCESS_VIOLATION', 'GPU_INIT', 'TCG_CRASH'].includes(d.code)) return false;
     if (!plan || plan.accel !== 'off' || !/software|swiftshader|swangle/i.test(plan.gpu || '')) return false;
-    return this.attempts.filter((a) => a.diagnosis === 'ACCESS_VIOLATION'
-      && a.accel === 'off' && /software|swiftshader|swangle/i.test(a.gpu || '')).length >= 2;
+    // 不能只认 ACCESS_VIOLATION：日志里只要带 Vulkan / ANGLE 字样，同一场崩溃就可能被
+    // 判成 GPU_INIT（用户实测：4 组参数 4 次全崩，报告却还写着「已自动换用其他渲染后端」）。
+    // 判据回到事实本身 ——「关加速的软件后端 + 同一个非 0 退出码」出现两次，就说明换后端无效。
+    const exit = this.lastExitCode;
+    if (!exit) return false;
+    return this.attempts.filter((a) => a && a.accel === 'off'
+      && /software|swiftshader|swangle/i.test(a.gpu || '')
+      && a.exitCode === exit).length >= 2;
+  }
+
+  /**
+   * 崩溃且日志里有 Vulkan 痕迹时，把下一轮改成「关掉 Vulkan 再试」。
+   *
+   * 英特尔核显（UHD 730/770 这类）+ 旧驱动在 emulator 37.x 上会在 Vulkan 初始化阶段
+   * 让 qemu 直接 0xC0000005。此时换 -gpu 只是换呈现方式，Vulkan 通道照样会崩
+   * （实测现场：swangle / software / host 三种后端全崩在同一退出码）。
+   * `-feature -Vulkan` 关掉 guest Vulkan 通道通常能直接开机，代价只是少数游戏退回 GLES。
+   */
+  _preferNoVulkan(variants, index, d, lines) {
+    const next = variants && variants[index + 1];
+    if (!next || next.noVulkan) return false;
+    if (!d || !['GPU_INIT', 'ACCESS_VIOLATION'].includes(d.code)) return false;
+    const text = String((lines || []).join('\n'));
+    if (!/vulkan|guest angle/i.test(text)) return false;
+    next.noVulkan = true;
+    next.label = `${next.gpu} / 关 Vulkan`;
+    return true;
   }
 
   /**

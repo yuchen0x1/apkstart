@@ -450,10 +450,25 @@ class Updater {
         `}`,
         `Note ("backup " + $files.Count + " files")`,
         // 2) 覆盖（程序文件可能被杀软短暂占用，重试）
+        `$probe = Join-Path $dst ${psq(path.basename(exe))}`,
+        `$srcExe = Join-Path $src ${psq(path.basename(exe))}`,
+        `$asarSrc = Join-Path $src 'resources\\app.asar'`,
+        `$asarDst = Join-Path $dst 'resources\\app.asar'`,
         `for ($i = 1; $i -le 12; $i++) {`,
         `  Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force`,
-        `  $probe = Join-Path $dst ${psq(path.basename(exe))}`,
-        `  if ((Test-Path -LiteralPath $probe) -and ((Get-Item -LiteralPath $probe).Length -gt 0)) { $ok = $true; Note "copy pass $i ok"; break }`,
+        `  $ok = $false`,
+        `  if ((Test-Path -LiteralPath $probe) -and ((Get-Item -LiteralPath $probe).Length -gt 0)) {`,
+        `    $ok = $true`,
+        // 关键：旧版 exe 一直都在，只看「存在且非空」会把「根本没复制成功」当成成功，
+        // 于是重启的还是旧版本、又检测到更新 —— 用户看到的就是「更新完又提示更新」的死循环
+        // （上游 #98 的现场）。所以必须拿解压目录里的新文件逐项比对大小。
+        `    if ((Test-Path -LiteralPath $srcExe) -and ((Get-Item -LiteralPath $srcExe).Length -ne (Get-Item -LiteralPath $probe).Length)) { $ok = $false }`,
+        `    if ($ok -and (Test-Path -LiteralPath $asarSrc)) {`,
+        `      if (-not (Test-Path -LiteralPath $asarDst)) { $ok = $false }`,
+        `      elseif ((Get-Item -LiteralPath $asarSrc).Length -ne (Get-Item -LiteralPath $asarDst).Length) { $ok = $false }`,
+        `    }`,
+        `  }`,
+        `  if ($ok) { Note "copy pass $i ok"; break }`,
         `  Note "copy pass $i failed, retry"; Start-Sleep -Milliseconds 700`,
         `}`,
         // 3) 失败 → 回滚到备份，并把载荷留在原处供排查
@@ -461,6 +476,9 @@ class Updater {
         `  Note 'copy failed, rolling back'`,
         `  if (Test-Path -LiteralPath $bak) { Copy-Item -Path (Join-Path $bak '*') -Destination $dst -Recurse -Force; Note 'rollback done' }`,
         `  Remove-Item -LiteralPath $src -Recurse -Force`,
+        // 回滚后必须把旧版本拉起来：否则用户看到的是「更新完程序自己关了，再也没打开」，
+        // 手动打开还是旧版、又提示更新（#98 的完整现场）。
+        `  if (Test-Path -LiteralPath $probe) { Start-Process -FilePath $probe; Note 'relaunched (rolled back)' }`,
         `  exit 1`,
         `}`,
         // 4) 成功：清掉备份与解压目录（新版本里已删除的文件不会被清理，保留无害）

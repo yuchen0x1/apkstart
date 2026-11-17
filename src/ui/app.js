@@ -464,8 +464,8 @@ async function deployAll() {
     // 一次调用把 adb / 引擎 / 系统镜像全装完，进度统一显示在唯一那一行
     const r = await api.autoDeploy();
     if (!r || !r.ok) {
-      appendDeployLog({ stage: 'error', message: `部署失败：${(r && r.error) || '请检查网络后重试'}` });
-      toast({ title: '准备失败', body: (r && r.error) || '请检查网络后重试', type: 'error', sticky: true });
+      appendDeployLog({ stage: 'error', message: `部署失败：${(r && (r.message || r.error)) || '请检查网络后重试'}` });
+      toast({ title: '准备失败', body: (r && (r.message || r.error)) || '请检查网络后重试', type: 'error', sticky: true });
       return;
     }
     appendDeployLog({ stage: 'done', message: '运行时组件部署完成' });
@@ -542,8 +542,15 @@ async function markInstalled() {
 /* ---------------- 安装 ---------------- */
 
 /** 把安装失败翻译成「下一步该做什么」，只对最常见的几种做提示，其它原样显示 */
-function friendlyInstallErrorText(msg) {
+function friendlyInstallErrorText(msg, filePath) {
   const s = String(msg || '未知错误');
+  // 文件名是 a.apk.1 / a.apk.tmp 这种下载残留，又解析不出来 → 通常就是没下完。
+  // 直接说「不是有效的 APK」会让人以为是文件选错了，白折腾一遍重新拖。
+  if (filePath && /\.[a-z]+\.(\d{1,3}|tmp|temp|part|partial|download|crdownload|filepart)$/i.test(String(filePath))
+    && /EOCD|过小|不是有效的|截断|越界|损坏|中央目录/.test(s)) {
+    return `${s}\n文件名末尾的 .1 / .tmp 是下载工具留下的临时后缀，这个安装包可能还没下载完。`
+      + '等下载完成（或重新下载一份完整的）再装。';
+  }
   if (/INSUFFICIENT_STORAGE|not enough space|空间不足|ENOSPC/i.test(s)) {
     return `${s}\n安卓数据分区不够用：设置 → 性能与资源占用 → 安卓数据分区调大后点「立即扩容」。`;
   }
@@ -2622,16 +2629,20 @@ function bindEvents() {
     dragDepth = Math.max(0, dragDepth - 1);
     if (dragDepth === 0) $('dropzone').classList.remove('on');
   });
-  window.addEventListener('drop', (e) => {
+  window.addEventListener('drop', async (e) => {
     e.preventDefault();
     dragDepth = 0;
     $('dropzone').classList.remove('on');
     const files = [...(e.dataTransfer?.files || [])];
     const paths = files
       .map((f) => { try { return api.pathForFile(f); } catch (_) { return null; } })
-      .filter((p) => p && /\.apk$/i.test(p));
-    if (paths.length) installFiles(paths);
-    else toast({ title: '只能拖入 .apk 文件', type: 'error' });
+      .filter(Boolean);
+    // 判定交给主进程（core/filetype）：下载工具留下的 a.apk.1 / a.apk.tmp 也算安装包，
+    // 这里不再自己写一份正则，免得两边规则慢慢跑偏。
+    const kinds = await Promise.all(paths.map((p) => api.fileKind(p).catch(() => null)));
+    const accepted = paths.filter((_, i) => kinds[i] && kinds[i].kind);
+    if (accepted.length) installFiles(accepted);
+    else toast({ title: '只能拖入 .apk / .xapk / .apks 文件', type: 'error' });
   });
 
   // 主进程事件
@@ -2639,7 +2650,7 @@ function bindEvents() {
     // 报错了就别再让「正在安装…」那条一直转圈（可能来自双击 APK 的另一条链路）
     if (installToast) { try { installToast.dismiss(); } catch (_) { /* ignore */ } installToast = null; }
     const name = p && p.file ? String(p.file).split(/[\\/]/).pop() : '';
-    const body = friendlyInstallErrorText((p && p.message) || '未知错误');
+    const body = friendlyInstallErrorText((p && p.message) || '未知错误', p && p.file);
     toast({
       title: name ? `安装失败：${name}` : '安装失败',
       body,
@@ -2971,8 +2982,16 @@ async function refreshAccelStatus() {
   const r = await api.accelStatus().catch(() => null);
   const a = r && r.accel;
   if (!r || !a) { el.textContent = '无法检测硬件加速状态'; return; }
+  const kindName = a.kind === 'whpx' ? 'WHPX' : (a.kind === 'aehd' ? 'AEHD' : '硬件加速');
+  // suspect：驱动文件在、检查也过，但服务根本没跑。这种状态在本机「点开应用直接退出」，
+  // 设置页必须提前说清楚，不能只显示一个绿色的「已启用」。
+  if (a.ok && a.suspect) {
+    el.textContent = `已启用 · ${kindName}（驱动服务未运行，可能开不了机）`;
+    el.title = [a.note, a.advice].filter(Boolean).join('\n');
+    return;
+  }
   el.textContent = a.ok
-    ? `已启用 · ${a.kind === 'whpx' ? 'WHPX' : (a.kind === 'aehd' ? 'AEHD' : '硬件加速')}`
+    ? `已启用 · ${kindName}`
     : '未启用 · 当前是纯软件模拟（开机慢，可能直接崩）';
 }
 
@@ -3087,7 +3106,8 @@ async function openRepair(started) {
   }
   const plan = await api.repairPlan().catch(() => null);
   if (!plan) {
-    if (started && started.error) toast({ title: '开机未完成', body: started.error, type: 'error', sticky: true });
+    const msg = started && (started.message || started.error);
+    if (msg) toast({ title: '开机未完成', body: msg, type: 'error', sticky: true });
     return;
   }
   renderRepairPlan(plan);
@@ -3108,6 +3128,16 @@ function renderRepairPlan(plan) {
       <span class="rc-label">${esc(c.label)}</span>
       <span class="rc-value">${esc(c.value)}</span>
     </div>`).join('');
+  // 程序已经自动做过什么：不写出来的话，用户会以为「什么都没试」，重复点一遍白等
+  const autoEl = $('repairAuto');
+  if (autoEl) {
+    const tried = plan.autoTried || [];
+    autoEl.hidden = !tried.length;
+    autoEl.textContent = tried.length
+      ? `启动失败后程序已经自动处理：${tried.join('、')}。`
+        + '如果这次仍没起来，说明问题不在这里，点下面的动作即可。'
+      : '';
+  }
   renderRepairActions(plan);
   // 报告是自动生成的（脱敏、只落本机）：说清楚它已经在哪、什么时候发出去由用户决定
   const draft = $('repairDraft');

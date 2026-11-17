@@ -207,6 +207,27 @@ async function main() {
     assert(!/\$dst = ''/.test(script), '路径应为非空字面量');
   });
 
+  await test('便携版替换脚本语法可解析（新加的大小比对不能把脚本写坏）', async () => {
+    const root = mkTmp();
+    const payload = path.join(root, 'payload');
+    fs.mkdirSync(path.join(payload, 'resources'), { recursive: true });
+    fs.writeFileSync(path.join(payload, 'ApkStart.exe'), 'MZ');
+    fs.writeFileSync(path.join(payload, 'resources', 'app.asar'), 'asar');
+    const u = mkUpdater(root);
+    const script = u.apply({ mode: 'zip', payload, version: '1.2.3' }, { spawn: false });
+    // 上游 #98：复制后必须比对真正落地的新文件，不能只看「exe 存在」
+    assert(/\$srcExe/.test(script) && /\.Length -ne/.test(script), '要按大小核对新文件是否真的复制成功');
+    assert(/app\.asar/.test(script), '只要 exe 换了、界面代码没换，版本仍然对不上');
+    assert(/relaunched \(rolled back\)/.test(script), '复制失败回滚后要把旧版本拉起来');
+    const file = path.join(root, 'apply-check.ps1');
+    fs.writeFileSync(file, script, 'utf8');
+    const r = spawnSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      `$err = $null; [void][System.Management.Automation.Language.Parser]::ParseInput(([IO.File]::ReadAllText('${file.replace(/'/g, "''")}', [Text.Encoding]::UTF8)), [ref]$null, [ref]$err); if ($err -and $err.Count) { exit 1 }`,
+    ], { encoding: 'utf8', timeout: 30000 });
+    assert(r.status === 0, `脚本语法错误：${r.stdout || ''}${r.stderr || ''}`);
+  });
+
   await test('分片包拼装后大小不符 → 中止（不会装上一个损坏的包）', async () => {
     const root = mkTmp();
     const u = mkUpdater(root);

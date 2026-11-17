@@ -9,6 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const store = require('./store');
 const { parseApk } = require('./apk');
+const filetype = require('./filetype');
 const { ZipFile } = require('./zip');
 const { iconToIco, writeShortcut, removeShortcut, safeFileName } = require('./shortcut');
 const { shellQuote } = require('./adb');
@@ -154,7 +155,8 @@ class Installer {
     onProgress({ stage: 'parse', message: '正在解析 APK…' });
     let meta = cachedMeta;
     let bundle = null;
-    if (/\.(apks|xapk)$/i.test(filePath)) {
+    const kind = filetype.installKind(filePath);
+    if (kind === 'apks' || kind === 'xapk') {
       bundle = await parseBundle(filePath);
       meta = bundle.meta;
     } else if (!meta) {

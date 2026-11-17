@@ -152,9 +152,22 @@ const PACK_STALL_SPEED_BPS = 256 * 1024;    //   → 中断整包，换官方源
 
 function run(cmd, args, { timeout = 60000, cwd, windowsHide = true } = {}) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { timeout, cwd, windowsHide, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ ok: !err, code: err ? (err.code ?? 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || ''), error: err });
+    // spawn 本身也可能抛（不只看 callback 里的 err）：Windows 安全软件把 exe 拉黑时
+    // execFile 会同步抛 EPERM，`sc query aehd` 这类系统命令在被策略拦截时也会。
+    // 以前这会把整条探测链（加速检测 / 版本检测）一起打断，设置页直接空白。
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(v); } };
+    const fail = (err) => fin({
+      ok: false, code: (err && err.code) || 1, stdout: '', stderr: String((err && err.message) || ''), error: err,
     });
+    try {
+      const cp = execFile(cmd, args, { timeout, cwd, windowsHide, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+        fin({ ok: !err, code: err ? (err.code ?? 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || ''), error: err });
+      });
+      if (cp && typeof cp.on === 'function') cp.on('error', fail);
+    } catch (e) {
+      fail(e);
+    }
   });
 }
 
@@ -173,6 +186,9 @@ function fileSize(p) {
  */
 const ENV_CACHE_TTL = 6 * 60 * 60 * 1000;
 const ENV_CACHE_NEG_TTL = 10 * 60 * 1000; // 加速「不可用」只信 10 分钟：用户可能刚去开了虚拟化
+// 加速结论的结构版本：旧缓存里没有 aehd 服务状态 / suspect 标记，
+// 升级后必须重新探测一次，否则旧结论会把「驱动在、服务没跑」这个真问题盖住 6 小时。
+const ACCEL_CACHE_VER = 2;
 
 function envCacheFile() {
   return path.join(store.DATA_DIR, 'cache', 'env.json');
@@ -1166,9 +1182,11 @@ class Provisioner {
    * 硬件加速状态。
    * emulator 在 Windows 上支持两种加速：WHPX（系统功能，需重启）与 AEHD（Google 自家驱动，装完即用）。
    */
-  async emulatorAccel() {
-    // 状态轮询每几秒一次，而 -accel-check 要拉起一个 emulator 进程，必须缓存
-    if (this._cache.accel && this._cache.accelAt && Date.now() - this._cache.accelAt < 30000) {
+  async emulatorAccel({ force = false } = {}) {
+    // 状态轮询每几秒一次，而 -accel-check 要拉起一个 emulator 进程，必须缓存。
+    // force：刚做过修复（启动 AEHD 服务 / 开了 WHPX 功能）时必须绕开缓存复测，
+    // 否则会拿着 30 秒前的旧结论说「还是不可用」，白让用户再试一次。
+    if (!force && this._cache.accel && this._cache.accelAt && Date.now() - this._cache.accelAt < 30000) {
       return this._cache.accel;
     }
     const p = this.paths();
@@ -1178,8 +1196,8 @@ class Provisioner {
 
     // 落盘缓存：冷启动时不再为这一项拉起 emulator 进程。
     // 「不可用」结论只信 10 分钟 —— 用户可能刚去开了虚拟化/装了 AEHD，要能立刻反映。
-    const cached = this.envCacheGet(exe);
-    if (cached && cached.accel) {
+    const cached = force ? null : this.envCacheGet(exe);
+    if (cached && cached.accel && cached.accel.v === ACCEL_CACHE_VER) {
       const ttl = cached.accel.ok ? ENV_CACHE_TTL : ENV_CACHE_NEG_TTL;
       if (Date.now() - (cached.accelAt || 0) < ttl) {
         this._cache.accel = cached.accel;
@@ -1199,14 +1217,14 @@ class Provisioner {
     let result;
     if (usable) {
       const kind = hasAehdFile && /aehd/i.test(text) ? 'aehd' : 'whpx';
-      result = { ok: true, kind, note: kind === 'whpx' ? 'WHPX 硬件加速已启用' : 'AEHD 硬件加速已启用' };
+      result = await this._accelResult(kind);
     } else if (/can't find the emulator-check|corrupted tools installation/i.test(text) && hasAehdFile) {
       // 部分精简运行时包会漏掉 emulator-check.exe，导致 -accel-check 无法给出结论。
       // 此时只要 AEHD 驱动已安装，就按「可用」处理：启动时 emulator 自己会挂载驱动，
       // 避免被误判成无加速而强行 -accel off（软件模拟在部分机器上会直接崩溃）。
-      result = { ok: true, kind: 'aehd', note: 'AEHD 硬件加速已启用（emulator-check 缺失，按驱动判定）' };
+      result = await this._accelResult('aehd', 'AEHD 硬件加速已启用（emulator-check 缺失，按驱动判定）');
     } else if (hasAehdFile && /aehd/i.test(text) && !/ERROR_ACCESS_DENIED/i.test(text)) {
-      result = { ok: true, kind: 'aehd', note: 'AEHD 硬件加速已启用' };
+      result = await this._accelResult('aehd', 'AEHD 硬件加速已启用（仅凭驱动文件判定）');
     } else if (hv.dll && /whpx/i.test(text) && !/error|denied/i.test(text)) {
       result = { ok: true, kind: 'whpx', note: 'WHPX 硬件加速已启用' };
     } else {
@@ -1219,9 +1237,67 @@ class Provisioner {
         note: '未启用硬件加速：将回退软件模拟（能跑但很慢）。建议安装 AEHD 驱动或开启「虚拟机平台」',
       };
     }
+    result.v = ACCEL_CACHE_VER;
     this._cache.accel = result;
     this._cache.accelAt = Date.now();
     this.envCacheSet(exe, { accel: result, accelAt: Date.now() });
+    return result;
+  }
+
+  /**
+   * AEHD 驱动服务到底在不在跑。
+   *
+   * 为什么不能只看 `aehd.sys` 是否存在：AEHD 与 Hyper-V / 内存完整性 / Credential Guard
+   * 冲突时，驱动文件齐全、`-accel-check` 也可能给出「可用」，但服务根本没启动。
+   * 这种机器的现场是：检测说有加速 → 点开应用 → emulator 打印完 Userspace boot properties
+   * 就以退出码 1 静默退出（日志里一条 ERROR 都没有），最后只能报 UNKNOWN。
+   *
+   * 只查服务状态（毫秒级、不需要管理员）。sc 在中文系统上输出是 GBK，但状态名
+   * RUNNING / STOPPED 是 ASCII，按「: 4  RUNNING」这种形态解析不受编码影响。
+   */
+  async aehdService() {
+    if (process.platform !== 'win32') return null;
+    for (const name of ['aehd', 'gvm']) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await run('sc.exe', ['query', name], { timeout: 6000 });
+      const text = `${r.stdout || ''}${r.stderr || ''}`;
+      // 服务不存在（1060）时换下一个名字
+      if (/1060|does not exist|指定的服务/i.test(text)) continue;
+      // sc 本身起不来（极简系统 / 被安全软件拦）：没有结论就不要硬造结论
+      if (!/SERVICE_NAME|STATE|状态/i.test(text)) continue;
+      const m = /:\s*(\d+)\s+(RUNNING|STOPPED|START_PENDING|STOP_PENDING|PAUSED|CONTINUE_PENDING)/i.exec(text);
+      const exit = /WIN32_EXIT_CODE\s*:\s*(\d+)/i.exec(text);
+      return {
+        name,
+        state: m ? m[2].toUpperCase() : 'UNKNOWN',
+        code: m ? Number(m[1]) : 0,
+        running: m ? m[2].toUpperCase() === 'RUNNING' : false,
+        exitCode: exit ? Number(exit[1]) : null,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * 组装加速结论。
+   *
+   * AEHD「装了但服务没在跑」时仍然返回 ok:true —— 不能因此让用户白换成软件模拟
+   * （部分机器上 TCG 反而必崩），但必须打上 suspect 标记并说清怎么修，
+   * 让启动失败时的诊断能直接落到 ACCEL_UNUSABLE，而不是一句 UNKNOWN。
+   */
+  async _accelResult(kind, note = '') {
+    const base = note || (kind === 'whpx' ? 'WHPX 硬件加速已启用' : 'AEHD 硬件加速已启用');
+    if (kind !== 'aehd') return { ok: true, kind, note: base };
+    const svc = await this.aehdService();
+    const result = { ok: true, kind, aehd: svc || null, note: base };
+    if (svc && !svc.running) {
+      result.suspect = true;
+      result.note = `AEHD 驱动已安装但服务未运行（${svc.state}`
+        + `${svc.exitCode ? `，退出码 0x${(Number(svc.exitCode) >>> 0).toString(16)}` : ''}）`;
+      result.advice = '请在「设置 → 性能与资源」点「一键开启硬件加速」改用 WHPX（Windows 虚拟机平台），'
+        + '完成后重启电脑。AEHD 与 Hyper-V / 内存完整性 / Credential Guard 冲突时服务起不来，'
+        + '而模拟器的检查阶段看不出这一点 —— 表现就是「说有加速，点开却直接退出」。';
+    }
     return result;
   }
 

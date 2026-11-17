@@ -325,5 +325,46 @@ test('音量百分比换算：0-15 档映射到 0-100', () => {
   const maxed = parseVolumeGet('volume: 15/15');
   assert(Math.round((maxed.cur / maxed.max) * 100) === 100, '满档应为 100%');
 });
+/* ---------------- filetype.js：安装包后缀判定 ---------------- */
+console.log('[filetype.js]');
+{
+  const ft = require('../src/core/filetype');
+
+  test('认标准后缀：.apk / .xapk / .apks（大小写不敏感）', () => {
+    assert(ft.installKind('C:\\dl\\抖音.apk') === 'apk', '.apk');
+    assert(ft.installKind('C:\\dl\\Game.XAPK') === 'xapk', '.XAPK');
+    assert(ft.installKind('/home/u/a.apks') === 'apks', '.apks');
+    assert(ft.isSingleApk('a.apk') && !ft.isSingleApk('a.xapk'), '.xapk 不是单 APK');
+  });
+
+  test('认下载残留后缀：a.apk.1 / a.apk.2（QQ、迅雷的同名策略）', () => {
+    assert(ft.installKind('C:\\Users\\u\\Downloads\\抖音.apk.1') === 'apk', 'a.apk.1');
+    assert(ft.installKind('a.apk.2') === 'apk', 'a.apk.2');
+    assert(ft.installKind('a.APK.1') === 'apk', '大小写混合');
+    assert(ft.installKind('a.xapk.1') === 'xapk', 'a.xapk.1');
+    assert(ft.installKind('a.apks.3') === 'apks', 'a.apks.3');
+    assert(ft.installKind('a.apk.12') === 'apk', '两位数字后缀');
+  });
+
+  test('认下载中的临时后缀：.tmp / .crdownload / .part', () => {
+    assert(ft.installKind('a.apk.tmp') === 'apk', '.tmp');
+    assert(ft.installKind('a.apk.crdownload') === 'apk', 'Chrome');
+    assert(ft.installKind('a.apk.part') === 'apk', 'Firefox');
+    assert(ft.installKind('a.apk.1.tmp') === 'apk', '两层叠加');
+  });
+
+  test('不误伤：其它后缀、无扩展名、改了名的备份都不算安装包', () => {
+    for (const p of ['a.txt', 'a.zip', 'a.apk.bak', 'a.apk1', 'apk', '.apk', '', 'a.1']) {
+      assert(!ft.isInstallable(p), `不应认成安装包：${JSON.stringify(p)}`);
+    }
+  });
+
+  test('displayName 去掉残留后缀（界面上不该出现「抖音.apk.1」）', () => {
+    assert(ft.displayName('C:\\dl\\抖音.apk.1') === '抖音.apk', '数字后缀');
+    assert(ft.displayName('C:\\dl\\抖音.apk.1.tmp') === '抖音.apk', '两层');
+    assert(ft.displayName('C:\\dl\\抖音.apk') === '抖音.apk', '本来就没有后缀');
+  });
+}
+
 console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
 process.exit(failed ? 1 : 0);

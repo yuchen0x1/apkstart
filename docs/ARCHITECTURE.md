@@ -46,7 +46,7 @@
 Explorer 双击 .apk
   → HKCU\Software\Classes\ApkStart.apk\shell\open\command
   → ApkStart.exe "C:\...\xxx.apk"
-  → main.js parseArgs → runInstall
+  → main.js parseArgs（filetype.js 判后缀，.apk.1 这类下载残留也认）→ runInstall
       1. apk.js：离线解析（zip → manifest AXML → arsc 还原 label/icon）
       2. engine.ensure()：运行时未就绪则自动拉起/探测
       3. adb install -r -g -t
@@ -88,6 +88,18 @@ Explorer 双击 .apk
 - 运行时探测并行进行，4s 超时，失败自动降级。
 - QEMU 空闲看门狗：无前台应用且超过设定分钟数才回收，有应用在跑永不回收。
 - 设置/应用清单写入采用 tmp+rename 原子写。
+- 硬件加速类开机失败（`ACCEL` / `ACCEL_UNUSABLE`）会**自动修复一次**：
+  先用管理员权限 `sc start aehd` 拉起驱动服务（多数情况不用重启），失败再提交开启
+  WHPX（需重启）；当场生效就自动重试开机。判断依据不是「检测说可用」，而是
+  「检测可用 **且** 服务真的在跑、日志里出现了 `accelerator ... operational`」——
+  AEHD 与 Hyper-V / 内存完整性冲突时，前者会骗过检测，后者才是真相。
+  后台预热不触发提权，避免静默启动弹 UAC。
+- 开机失败后的**自愈表**（`repair.SELF_HEAL`）只收「不需要用户做决定」的动作：
+  清锁 / 结束孤儿进程、校验补齐组件、切软件渲染、清临时文件、降配重试。
+  执行完自动重来一遍开机；同一结论只修一次、一次运行最多修两类，动作失败即停止
+  重试。删数据、重下镜像、清缓存这类**永远不自动做**，只在修复窗口等用户确认。
+- 面向用户的失败文案由 `repair.explainFailure()` 统一产出（结论 / 已自动做了什么 /
+  下一步），诊断码与退出码只进报告，不糊到用户脸上。
 
 ## 应用级容器模型（性能）
 

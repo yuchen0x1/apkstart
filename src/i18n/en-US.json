@@ -176,7 +176,7 @@
   "只接受能在 QEMU 里直接启动的 x\u0001_\u0001 模拟器系统镜像：必须同时有 system.img、vendor.img、kernel-ranchu、ramdisk.img，可选附带一份 apkstart-image.json 说明 API、ABI、镜像类型、来源、Google 服务、ARM 转译与校验值。手机的 recovery、fastboot 卡刷包与 arm\u0001 手机固件都不能当模拟器镜像；MIUI 没有 x\u0001_\u0001 模拟器版本，导入时会明确告诉你不可用，不会显示成已接入。切换镜像使用独立的安卓数据目录，默认镜像里已装的应用与存档不受影响。": "Only x\u0001_\u0001 emulator system images that QEMU can boot directly are accepted: system.img, vendor.img, kernel-ranchu and ramdisk.img are all required, and an optional apkstart-image.json can declare the API, ABI, image type, source, Google services, ARM translation and checksums. Phone recovery images, fastboot ROMs and arm\u0001 phone firmware cannot be used as emulator images; MIUI has no x\u0001_\u0001 emulator build, so importing one tells you plainly that it is unsupported instead of pretending it worked. Switching images uses a separate Android data directory, so apps and saves in the default image are untouched.",
   "只支持 .apk / .xapk / .apks 文件": "Only .apk / .xapk / .apks files are supported",
   "只用官方源（dl.google.com，国内通常最快）": "Official source only (dl.google.com, usually fastest in China)",
-  "只能拖入 .apk 文件": "Only .apk files can be dropped here",
+  "只能拖入 .apk / .xapk / .apks 文件": "Only .apk / .xapk / .apks files can be dropped here",
   "可以回到上一步换一个位置重试；也可以关闭向导，在「设置 → 运行状态」里查看详细原因与手动修复。": "You can go back and try another location, or close the wizard and check Settings → Status for details and manual fixes.",
   "可以自动修复": "Can be fixed automatically",
   "可在应用卡片右键创建桌面快捷方式。": "Right-click an app card to create a desktop shortcut.",

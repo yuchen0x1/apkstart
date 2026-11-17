@@ -236,6 +236,18 @@ async function download(url, dest, opt = {}) {
       throw new Error(`下载失败 HTTP ${res.statusCode}: ${url}`);
     }
 
+    // 断点续传的起点必须就是本地已有长度：服务器从别的位置开始返回时，
+    // 追加写入会得到「大小对、内容错」的文件（上游 issue #91 的同类问题）。
+    if (res.statusCode === 206) {
+      const cr = /bytes\s+(\d+)-/i.exec(String(res.headers['content-range'] || ''));
+      if (cr && Number(cr[1]) !== existing) {
+        res.resume();
+        fs.rmSync(dest, { force: true });
+        if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
+        throw new Error(`续传位置不符（本地 ${existing} 字节，服务器从 ${cr[1]} 开始），已重置下载`);
+      }
+    }
+
     const total = res.statusCode === 206
       ? existing + (Number(res.headers['content-length']) || 0)
       : Number(res.headers['content-length']) || 0;
@@ -617,6 +629,24 @@ async function downloadMulti(urls, dest, opt = {}) {
       res.resume();
       throw new Error(`分块被拒绝 HTTP ${res.statusCode}`);
     }
+    // 只检查 206 不够（上游 issue #91）：服务器返回一个错位/越界的 Content-Range 时，
+    // 下面的 fs.writeSync 仍按 c.pos 写 —— 文件长度刚好对上，内容却整体错位，
+    // 最后表现为「镜像/安装包校验失败」或运行时莫名崩溃，极难定位。
+    // 所以起点必须与请求一致，总长必须与整包一致；终点以两者交集为界。
+    const cr = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(String(res.headers['content-range'] || ''));
+    if (!cr) {
+      res.resume();
+      throw new Error('分块响应缺少 Content-Range，无法确认数据位置');
+    }
+    const crStart = Number(cr[1]);
+    const crEnd = Number(cr[2]);
+    const crTotal = cr[3] === '*' ? 0 : Number(cr[3]);
+    if (crStart !== c.pos || (crTotal && crTotal !== total) || crEnd < crStart) {
+      res.destroy();
+      throw new Error(`分块范围不符（请求 ${c.pos}-${c.end}，返回 ${crStart}-${crEnd}/${cr[3]}）`);
+    }
+    // 服务器可能只返回了请求范围的前一截：写到 crEnd 为止，剩下的下一轮接着取
+    const limit = Math.min(c.end, crEnd);
     const startPos = c.pos;
     const startedAt = Date.now();
     // 同一条连接 destroy 之后仍可能再收到已缓冲的包，会重复触发换源、把源跳过头，
@@ -643,14 +673,19 @@ async function downloadMulti(urls, dest, opt = {}) {
         idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（无数据超时）')); }, idleMs);
       };
       res.on('data', (buf) => {
+        // 只写到 Content-Range 声明的范围内：服务器多给的数据一律丢弃，
+        // 否则会覆盖相邻分块已写好的字节（同样是「长度对、内容错」）。
+        const room = limit + 1 - c.pos;
+        if (room <= 0) { kick(); return; }
+        const n = Math.min(buf.length, room);
         try {
-          fs.writeSync(fd, buf, 0, buf.length, c.pos);
+          fs.writeSync(fd, buf, 0, n, c.pos);
         } catch (e) {
           res.destroy();
           return finish(e);
         }
-        c.pos += buf.length;
-        got += buf.length;
+        c.pos += n;
+        got += n;
         kick();
         tick(false);
         // 还没下完就慢到不可接受 → 换源（c.pos 已前进，下次从断点继续）

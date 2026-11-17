@@ -194,10 +194,21 @@ function liteProfile({ host = hostInfo(), engine = {} } = {}) {
  */
 const TIER_SCORE = { tinyRam: 3, weakRam: 2, tinyCpu: 3, weakCpu: 1, noAccel: 3, tightDisk: 1 };
 
+/**
+ * 加速到底能不能用。
+ *
+ * `suspect`：驱动文件在、`-accel-check` 也说可用，但服务根本没跑 —— 这种机器必须
+ * 按「没有加速」来选参数（否则会拿 4GB / 6 核去跑 TCG，既慢又更容易崩），
+ * 但诊断上仍要能认出它是「加速没接管」（见 earlyAccelExit）。
+ */
+function accelUsable(accel) {
+  return !!(accel && accel.ok && !accel.suspect);
+}
+
 function machineTier({ host = hostInfo(), accel = null, diskMB = 0 } = {}) {
   const totalMB = Number(host.totalMB) || 0;
   const cores = Number(host.cores) || 0;
-  const accelOk = !!(accel && accel.ok);
+  const accelOk = accelUsable(accel);
   const reasons = [];
   let score = 0;
   if (totalMB) {
@@ -212,7 +223,9 @@ function machineTier({ host = hostInfo(), accel = null, diskMB = 0 } = {}) {
   }
   if (!accelOk) {
     score += TIER_SCORE.noAccel;
-    reasons.push('没有可用的硬件虚拟化（WHPX / AEHD 都不可用），只能走软件模拟');
+    reasons.push(accel && accel.ok && accel.suspect
+      ? 'AEHD 驱动在但服务未运行，等同于没有硬件加速'
+      : '没有可用的硬件虚拟化（WHPX / AEHD 都不可用），只能走软件模拟');
   }
   if (diskMB && diskMB < 8192) {
     score += TIER_SCORE.tightDisk;
@@ -274,7 +287,7 @@ function chooseProfile({
   host = hostInfo(), accel, emulatorVersion = '', diskMB = 0,
   port = 5554, adbPort = 5044, overrides = {}, settings = null,
 } = {}) {
-  const accelOk = !!(accel && accel.ok);
+  const accelOk = accelUsable(accel);
   const engine = (settings && settings.engine) || {};
   const disk = diskMB || freeDiskMB(host.tmp);
 
@@ -564,12 +577,15 @@ const RULES = [
   },
   {
     code: 'GPU_INIT',
-    // 只匹配「失败」语境：正常日志里也会出现 Vulkan/EGL/ANGLE 字样，不能误判为致命错误
-    re: /Failed to initialize GL emulation|Could not initialize (OpenGL|emulated framebuffer)|Failed to create .*GLES|EGL_(BAD|NOT_INITIALIZED|CONTEXT_LOST)|Failed to (load|initialize) .*vulkan|Failed to create Vulkan instance|vulkan.*(failed|error)|Platform does not support Guest Angle|UpdateLayeredWindowIndirect failed|emuglConfig_init.*failed|initOpenglesEmulation.*failed|No OpenGL ES (driver|renderer)|ANGLE.*(fail|error)/i,
+    // 只匹配「失败」语境：正常日志里也会出现 Vulkan/EGL/ANGLE 字样，不能误判为致命错误。
+    // 特别注意：`Platform does not support Guest Angle` 是一条 INFO（换宿主 ANGLE 渲染而已），
+    // 曾经被算进这里，结果一条无害提示把「所有后端都崩在 0xC0000005」压成了 GPU_INIT，
+    // 自动重试还继续换后端。它现在只在 notes() 里做解释。
+    re: /Failed to initialize GL emulation|Could not initialize (OpenGL|emulated framebuffer)|Failed to create .*GLES|EGL_(BAD|NOT_INITIALIZED|CONTEXT_LOST)|Failed to (load|initialize) .*vulkan|Failed to create Vulkan instance|vulkan.*(failed|error)|UpdateLayeredWindowIndirect failed|emuglConfig_init.*failed|initOpenglesEmulation.*failed|No OpenGL ES (driver|renderer)|ANGLE.*(fail|error)/i,
     title: '显卡渲染后端初始化失败',
-    hint: '日志里出现了 GL / Vulkan / ANGLE 初始化失败（本机现场：VK_ERROR_INCOMPATIBLE_DRIVER、'
-      + 'Platform does not support Guest Angle）。已自动切换软件渲染重试；'
-      + '若仍黑屏，这是宿主渲染层的问题，安卓侧画面本身是好的。',
+    hint: '日志里出现了 GL / Vulkan / ANGLE 初始化失败（常见是 VK_ERROR_INCOMPATIBLE_DRIVER）。'
+      + '已自动切换软件渲染重试；若仍黑屏，这是宿主渲染层的问题，安卓侧画面本身是好的。'
+      + '英特尔核显可以先更新显卡驱动，或在「设置 → 渲染后端」手动选 software。',
   },
   {
     code: 'GPU_MODE',
@@ -659,9 +675,25 @@ const RULES = [
   },
 ];
 
+/** 把日志压成可做正则匹配的文本（去 ANSI + 截断超长行）。
+ *
+ *  为什么不能直接 join 再 slice：一条 `androidboot.qemu.adb.pubkey=` 就有 700 字符、
+ *  在日志里还出现两次，24000 字符的窗口被它吃掉近 1/3，真正有用的
+ *  `emulator exit 3221225477` 反而被切掉 —— 用户实测现场就是这样被判成 GPU_INIT
+ *  （日志里只剩一句无害的 "Platform does not support Guest Angle"），
+ *  然后 4 组参数全跑完、报告还写着「已自动换用其他渲染后端重试」。
+ */
+function compactLog(lines, maxLine = 300) {
+  const arr = Array.isArray(lines) ? lines : String(lines || '').split(/\r?\n/);
+  return arr.map((l) => {
+    const s = String(l).replace(/\u001b\[[0-9;]*m/g, '');
+    return s.length > maxLine ? `${s.slice(0, maxLine)}…` : s;
+  }).join('\n');
+}
+
 /** 把日志翻译成 {code,title,hint}，供 UI 展示与自动重试决策 */
 function diagnose(lines) {
-  const text = (Array.isArray(lines) ? lines.join('\n') : String(lines || '')).slice(-24000);
+  const text = compactLog(lines).slice(-24000);
   for (const r of RULES) {
     if (r.re.test(text)) return { code: r.code, title: r.title, hint: r.hint };
   }
@@ -678,11 +710,15 @@ function diagnose(lines) {
  * 修复窗口和诊断报告都该主动说明「这是警告，不是原因」。
  */
 function notes(lines) {
-  const text = (Array.isArray(lines) ? lines.join('\n') : String(lines || '')).slice(-24000);
+  const text = compactLog(lines).slice(-24000);
   const out = [];
   if (/host doesn't support requested feature/i.test(text)) {
     out.push('日志里的 "host doesn\'t support requested feature" 是 QEMU 的警告：'
       + '模拟器想启用某个 CPU 特性（例如 AVX）而宿主没提供，它会自己降级，不影响开机。');
+  }
+  if (/Platform does not support Guest Angle/i.test(text)) {
+    out.push('"Platform does not support Guest Angle" 是提示不是错误：这台机器用宿主侧的 ANGLE 渲染，'
+      + '模拟器会换一条等效路径，不影响开机。');
   }
   if (/does not have the requested snapshot|Failed to load snapshot/i.test(text)) {
     out.push('"Failed to load snapshot" 说明快速启动快照失效，程序会自动改为冷启动，不是故障。');
@@ -750,6 +786,73 @@ function tcgCrashDiagnosis() {
       + '程序会自动开启 WHPX 或安装 AEHD（会弹管理员授权，完成后重启电脑）；'
       + '若提示 BIOS 虚拟化未开，需先重启进 BIOS 打开 AMD SVM / Intel VT-x。'
       + '仍失败再更新运行时引擎并导出诊断报告。',
+  };
+}
+
+/**
+ * 加速器「检查通过、真正起 VM 时却没接管」的专用结论。
+ *
+ * 现场特征（用户 report 里的原样）：
+ *   日志停在 `Userspace boot properties` 的最后一行 `androidboot.veritymode=enforcing`，
+ *   后面既没有 `Windows Hypervisor Platform accelerator is operational` / `AEHD ... operational`，
+ *   也没有任何 ERROR 行，退出码 1。所有基于错误文本的规则都落空，只剩 UNKNOWN，
+ *   而文案仍在说「已自动按多种参数组合重试」—— 用户完全不知道该做什么。
+ *
+ * 真实原因基本落在这三件事上（按概率）：
+ *   1. AEHD 与 Hyper-V / 内存完整性 / Credential Guard 冲突，服务起不来，
+ *      但 `aehd.sys` 文件还在，检测阶段照样报「可用」；
+ *   2. AEHD 驱动版本比 emulator 旧（37.x 要 2.2）；
+ *   3. 运行时目录里的 qemu 组件被杀软拦掉 / 版本不匹配。
+ * 换渲染后端、换系统镜像都无效 —— 连 VM 都没创建起来。
+ */
+const ACCEL_READY_RE = /(hypervisor platform accelerator is operational|aehd[^\n]*operational|kvm[^\n]*operational|haxm[^\n]*operational)/i;
+
+function accelUnusableDiagnosis(kind = '') {
+  const name = kind === 'whpx' ? 'WHPX' : (kind === 'aehd' ? 'AEHD' : '硬件加速');
+  return {
+    code: 'ACCEL_UNUSABLE',
+    title: `检测到 ${name}，但模拟器没能接管它`,
+    hint: '这台机器的驱动/服务状态让模拟器「检查通过」，真正创建虚拟机时却直接退出，'
+      + '所以日志里连一条错误都没有。按顺序试：'
+      + '①「设置 → 性能与资源」点「一键开启硬件加速」，优先启用 WHPX（Windows 虚拟机平台）——'
+      + 'AEHD 与 Hyper-V / 内存完整性 / Credential Guard 冲突时就是这个现象；'
+      + '② 管理员命令行执行 sc query aehd：STATE 不是 RUNNING（或退出码 0xffffffa1）说明驱动没在跑，'
+      + '重装运行时自带的 AEHD 驱动后重启；'
+      + '③ 仍不行就更新运行时引擎（新版 emulator 对 AEHD 版本要求更严）。'
+      + '换渲染后端、换系统镜像都无效：这次根本没走到渲染和安卓镜像那一步。',
+  };
+}
+
+/**
+ * 是不是「加速器没接管就退出」。只在调用方已经确认进程死掉时用。
+ * @param {{accel?:object, logLines?:string[], exitCode?:number|null}} ctx
+ * @returns {object|null} 命中返回诊断，否则 null
+ */
+function earlyAccelExit({ accel, logLines = [], exitCode = null } = {}) {
+  // 没检测到加速时走 noAccelDiagnosis() 那条路，这里不抢结论
+  if (!accel || !accel.ok) return null;
+  // exitCode 为 null = 进程还活着（等到超时）：那是「太慢」，不是「起不来」
+  if (exitCode == null || Number(exitCode) === 0) return null;
+  const text = (Array.isArray(logLines) ? logLines.join('\n') : String(logLines || '')).slice(-24000);
+  // 加速器已经挂上了（日志里有 operational 行）：问题在别处，别把用户引到驱动上
+  if (ACCEL_READY_RE.test(text)) return null;
+  return accelUnusableDiagnosis(accel.kind);
+}
+
+/**
+ * 某一轮**在拉起模拟器之前**就抛了异常（AVD 目录不可写、运行时文件被杀软删掉、参数构造失败…）。
+ * 旧实现让异常直接冒到上层：start() 整个 reject，重试循环停在第 1 轮，
+ * 报告里只剩一条 attempt，却仍然写着「已自动按多种参数组合重试」。
+ */
+function spawnErrorDiagnosis(message) {
+  const msg = String(message || '').trim().slice(0, 300);
+  return {
+    code: 'SPAWN_ERROR',
+    title: '拉起模拟器时出错（还没开始引导安卓）',
+    hint: `具体错误：${msg || '未知'}\n`
+      + '这类错误出在准备阶段（AVD 目录、运行时文件、权限），不在显卡或系统镜像：'
+      + '先确认「运行时」页的组件校验通过；必要时把 ApkStart 目录加入杀毒软件白名单，'
+      + '并把安卓数据目录换到有写权限、空间充足的盘。',
   };
 }
 
@@ -919,9 +1022,11 @@ function vcRedistOk() {
 module.exports = {
   hostInfo, hostBranding, systemVendor, looksVirtual, freeDiskMB, isAsciiPath, shortPath, lcdFor, orientLcd, liteProfile,
   versionNumbers, gpuCandidates, machineTier, lowSpecProfile, chooseProfile, planVariants,
+  accelUsable,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey, imageIdentity,
   diagnose, notes, timeoutDiagnosis, noAccelDiagnosis, tcgCrashDiagnosis,
+  accelUnusableDiagnosis, earlyAccelExit, spawnErrorDiagnosis,
   describeProfile, describeTuning, describeManual, describeAttempt,
   writeReport, vcRedistOk,
 };

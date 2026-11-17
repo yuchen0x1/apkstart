@@ -63,6 +63,34 @@ test('日志裁剪：只留末尾、有上限', () => {
   assert(out.includes('line 499'), '没保留末尾');
 });
 
+test('日志裁剪：剥 ANSI、省略密钥长串，末尾的退出行不会被挤掉', () => {
+  // 真实现场：一条 androidboot.qemu.adb.pubkey 约 700 字符，日志里还会出现两次，
+  // 2200 字符的预算被它吃掉近 1/3 —— 用户报告里最后一行恰好落在 veritymode，
+  // 真正有用的 `emulator exit 1` 反而看不见了。
+  const pub = `\u001b[0;39mINFO         |   androidboot.qemu.adb.pubkey=${'A'.repeat(700)}`;
+  const lines = [
+    pub,
+    '\u001b[0;39mINFO         | Userspace boot properties:',
+    '\u001b[0;39mINFO         |   androidboot.veritymode=enforcing',
+    pub,
+    '\u001b[33mWARNING      | No adb private key exists',
+    'emulator exit 1（启动参数或环境错误）',
+  ];
+  const out = report.clipLog(lines);
+  assert(!/\u001b\[/.test(out), 'ANSI 颜色码没剥掉');
+  assert(out.includes('emulator exit 1'), '末尾的退出行被长行挤掉了');
+  assert(!/A{100}/.test(out), 'pubkey 没有省略');
+  assert(out.length <= 2300, `字符数没截住：${out.length}`);
+});
+
+test('单行压缩：密钥省略、超长行标注省略了多少字符', () => {
+  const line = report.shrinkLine(`androidboot.qemu.adb.pubkey=${'B'.repeat(300)}`);
+  assert(/pubkey=…/.test(line), `pubkey 应被省略：${line.slice(0, 40)}`);
+  const long = report.shrinkLine('x'.repeat(400));
+  assert(long.length <= 280, `超长行没截断：${long.length}`);
+  assert(/本行还有 \d+ 字符/.test(long), '要标注省略了多少');
+});
+
 test('issue 地址：仓库正确、标题正文编码、总长可控', () => {
   const summary = report.buildSummary({ facts, diagnosis, attempts, exitCode: 3221225501, logLines: ['a'.repeat(100)] });
   const url = report.issueUrl({ summary, repo: 'yuchen0x1/apkstart', version: '0.6.1' });

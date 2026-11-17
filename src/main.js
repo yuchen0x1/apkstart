@@ -14,6 +14,7 @@ const { Runtime } = require('./core/engine');
 const { Installer } = require('./core/installer');
 const { Sharer } = require('./core/sharer');
 const { parseApk } = require('./core/apk');
+const filetype = require('./core/filetype');
 const compat = require('./core/compat');
 const backup = require('./core/backup');
 const repair = require('./core/repair');
@@ -260,7 +261,8 @@ function parseArgs(argv) {
       const v = args.slice(i + 1).find((x) => x && /^[a-zA-Z][\w]*(\.[\w]+)+$/.test(x));
       if (v) { out.launch = v; out.silent = true; }
     } else if (a === '--silent' || a === '--autostart') out.silent = true;
-    else if (/\.(apk|xapk|apks)$/i.test(a) && !a.startsWith('--')) out.apk = a;
+    // 认下载残留后缀：拖到 exe 上的 a.apk.1 也要能装（见 core/filetype.js）
+    else if (filetype.isInstallable(a) && !a.startsWith('--')) out.apk = a;
   }
   return out;
 }
@@ -541,6 +543,40 @@ function enableWindowsFeature(feature) {
 }
 
 /**
+ * 以管理员权限把 AEHD 驱动服务拉起来（sc start aehd）。
+ *
+ * 这是「检测说有加速、真正开机却直接退出」（ACCEL_UNUSABLE）最常见的一种修法，
+ * 而且**不需要重启**：驱动与内核都对，只是服务没在跑（Windows 更新后没自启、
+ * 上次异常关机、或被 Hyper-V / 内存完整性挤掉）。这一步成功就是当场可用。
+ *
+ * 起不来（1067 / 0xffffffa1）通常意味着 BIOS 虚拟化没开，或与 Hyper-V 冲突 ——
+ * 那就只能换 WHPX，由调用方继续处理。
+ */
+function startAehdService(name = 'aehd') {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve({ ok: false, error: '仅支持 Windows' });
+    const inner = '$p = Start-Process -FilePath "$env:SystemRoot\\System32\\sc.exe" '
+      + `-ArgumentList @('start','${name}') -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode`;
+    const ps = `try { ${inner} } catch { exit 2 }`;
+    const { spawn } = require('child_process');
+    const proc = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    if (proc.stderr) proc.stderr.on('data', (d) => { stderr += String(d); });
+    proc.on('exit', (code) => resolve({
+      ok: code === 0,
+      code,
+      error: code === 0 ? '' : (
+        code === 2 || /cancel|declined|取消|0x800704c7/i.test(stderr)
+          ? '已取消管理员授权（需要在弹窗点「是」才能启动驱动服务）'
+          : `启动 AEHD 服务失败（退出码 ${code}）：多半是与 Hyper-V / 内存完整性冲突，或 BIOS 虚拟化没开`
+      ),
+    }));
+    proc.on('error', () => resolve({ ok: false, error: '无法启动 PowerShell' }));
+  });
+}
+
+/**
  * BIOS 里的 CPU 虚拟化（AMD SVM / Intel VT-x）是否真的开了。
  * WHPX/AEHD 都依赖它；Windows 功能打开得再全，BIOS 没开照样起不来。
  * 只在用户点「一键开启」时查一次，不拖慢日常状态刷新。
@@ -767,7 +803,7 @@ let lastInstallErr = { msg: '', at: 0 };
 const APK_META_CACHE = new Map();
 
 function parseApkCached(filePath) {
-  if (!/\.apk$/i.test(filePath)) return null;
+  if (!filetype.isSingleApk(filePath)) return null;
   const key = path.resolve(filePath).toLowerCase();
   const st = fs.statSync(filePath);
   const hit = APK_META_CACHE.get(key);
@@ -1052,6 +1088,25 @@ async function runLaunch(pkg) {
   }
 }
 
+/**
+ * 模块级的「人话失败说明」。
+ * runLaunchInner 不在 registerIpc 作用域里，拿不到那边的 lastDiagnosis()，
+ * 这里直接读运行时上的结论（内存里的优先，进程重启过就翻 last-failure.json）。
+ */
+function plainRuntimeFailure() {
+  try {
+    const emu = runtime && runtime.emulator;
+    if (!emu) return '';
+    const d = emu.lastDiagnosis
+      || (typeof emu.lastFailure === 'function' && (emu.lastFailure() || {}).diagnosis)
+      || null;
+    if (!d) return '';
+    return repair.explainFailure({ diagnosis: d }).text || '';
+  } catch (_) {
+    return '';
+  }
+}
+
 async function runLaunchInner(pkg) {
   const t0 = Date.now();
   const mark = (s) => appLog(`launch ${pkg} ${s} +${Date.now() - t0}ms`);
@@ -1114,6 +1169,11 @@ async function runLaunchInner(pkg) {
       onLog: (m) => {
         send('runtime:log', m);
         appLog(`  rt ${m}`);
+        // 自动修复硬件加速会弹管理员授权（UAC）。用户这时只看到一个系统弹窗，
+        // 不知道是谁弹的、该不该点 —— 必须在应用启动窗口里同步说清楚。
+        if (/自动修复|硬件加速已修复|自动修复没能立即生效/.test(String(m || '')) && appWin.isOpen) {
+          appWin.setState({ ready: false, tip: m });
+        }
         // 首次打开大型 APK 时，安装本身可能持续几十秒；把这段真实状态
         // 传到应用窗口，避免用户把安装等待误认为启动卡死。
         if (/应用尚未安装|正在自动安装|正在安装应用/.test(String(m || '')) && appWin.isOpen) {
@@ -1295,8 +1355,14 @@ async function runLaunchInner(pkg) {
     // 下次点应用还是走同一条隐藏 → embed 的路径。
     if (winAgent) armAgent(winAgent).catch(() => {});
     showWindow();
-    send('toast', { type: 'error', message: `启动失败：${e.message}` });
-    return { ok: false, error: e.message };
+    // 运行时起不来时，用户该看到的是人话（哪坏了 + 程序做了什么 + 下一步点哪），
+    // 而不是 installer 里那句「运行时多次尝试仍未能启动」。
+    const technical = String((e && e.message) || '');
+    const plain = /运行时|未能启动|开不完|启动失败|device offline|no devices|模拟器/i.test(technical)
+      ? plainRuntimeFailure() : '';
+    const msg = plain || technical;
+    send('toast', { type: 'error', message: `启动失败：${msg}`, sticky: !!plain });
+    return { ok: false, error: msg, technical };
   }
 }
 
@@ -1510,7 +1576,12 @@ function registerIpc() {
   ipcMain.handle('apk:pick', async () => {
     const r = await dialog.showOpenDialog(mainWindow, {
       title: '选择要安装的 APK',
-      filters: [{ name: 'Android 应用', extensions: ['apk', 'apks', 'xapk'] }],
+      filters: [
+        { name: 'Android 应用', extensions: ['apk', 'apks', 'xapk'] },
+        // 下载工具留在文件名上的 .1 / .tmp 之类的后缀在系统过滤器里匹配不到，
+        // 给一条「所有文件」出口，用户手动挑 a.apk.1 也能装。
+        { name: '所有文件', extensions: ['*'] },
+      ],
       properties: ['openFile', 'multiSelections'],
     });
     if (r.canceled) return [];
@@ -1520,11 +1591,20 @@ function registerIpc() {
   ipcMain.handle('apk:parse', async (_e, filePath) => parseApk(filePath));
 
   /**
+   * 这个路径算不算安装包（含 a.apk.1 这类下载残留后缀）。
+   * 渲染层在沙箱里拿不到 core/filetype，拖放判定走这里，保证两边规则一致。
+   */
+  ipcMain.handle('apk:kind', (_e, filePath) => ({
+    kind: filetype.installKind(filePath),
+    name: filetype.displayName(filePath),
+  }));
+
+  /**
    * 安装前兼容性分析：解析 APK + 对照当前运行时环境给出结论。
    * 只做判断，不改动任何文件，装不装由用户在界面上决定。
    */
   ipcMain.handle('apk:compat', async (_e, filePath) => {
-    if (typeof filePath !== 'string' || !/\.(apk|xapk|apks)$/i.test(filePath)) {
+    if (typeof filePath !== 'string' || !filetype.isInstallable(filePath)) {
       throw new Error('只支持 .apk / .xapk / .apks 文件');
     }
     if (!fs.existsSync(filePath)) throw new Error('文件不存在或已被移动');
@@ -1881,6 +1961,16 @@ function registerIpc() {
       exitCode: r.exitCode == null ? null : r.exitCode,
       report: r.report || '',
     };
+    // 人话版结论：toast / 报错框只显示这一句；诊断码、退出码仍留在 diagnosis 里给报告用。
+    // 用户不需要知道 ACCEL_UNUSABLE 是什么，只需要知道「哪坏了、程序做了什么、下一步点哪」。
+    try {
+      const plan = await buildRepairPlan();
+      if (plan) {
+        out.message = plan.headline || '';
+        out.nextStep = (plan.actions && plan.actions[0] && plan.actions[0].label) || '';
+        out.autoTried = plan.autoTried || [];
+      }
+    } catch (_) { /* 文案算不出来不影响诊断本身 */ }
     // 失败即自动落一份脱敏报告：用户不用再翻 %APPDATA% 找文件，
     // 作者也能在用户点「上报」时拿到完整上下文。重复签名 24 小时内不重复写。
     try {
@@ -1949,15 +2039,79 @@ function registerIpc() {
     const attempts = (runtime.emulator.attempts && runtime.emulator.attempts.length
       ? runtime.emulator.attempts
       : ((lf && lf.attempts) || [])) || [];
-    return repair.buildPlan({ diagnosis: lastDiagnosis(), facts: await repairFacts(), attempts });
+    const plan = repair.buildPlan({ diagnosis: lastDiagnosis(), facts: await repairFacts(), attempts });
+    // 「程序已经自己修过什么」必须如实摊在修复窗口里：
+    // 否则用户看到的是「又失败了」，而实际上锁已经清过、渲染也换过了，重复点等于白等。
+    plan.autoTried = (runtime.autoRepairLog || []).slice(-6);
+    return plan;
+  }
+
+  /** 给用户看的一句话（不带诊断码、不带退出码）；算不出来就返回空串，调用方退回原文 */
+  function plainFailureText() {
+    try {
+      const d = lastDiagnosis();
+      if (!d) return '';
+      return repair.explainFailure({ diagnosis: d }).text || '';
+    } catch (_) {
+      return '';
+    }
   }
 
   /**
    * 执行一条修复动作。原则：能自动做的直接做，会动数据的必须弹原生确认框，
    * 只能人工处理的如实返回「需要在设置里改」，不假装修好了。
+   * @param {string} id 动作 id
+   * @param {{auto?:boolean}} opts auto=true 表示这是开机失败后的自动修复路径：
+   *   绝不允许弹确认框、绝不允许动用户数据（弹窗会把「自动」变成「卡住等你点」）。
    */
-  async function runRepairAction(id) {
+  async function runRepairAction(id, { auto = false } = {}) {
+    // 自动路径不替用户做「会丢东西」的决定：这些动作只能在修复窗口里点了才做
+    if (auto && ['wipe-data', 'reinstall-image', 'cleanup-disk'].includes(id)) {
+      return { ok: false, detail: '这一步会动数据，需要你自己确认后才能做' };
+    }
     switch (id) {
+      /**
+       * 只删「删了也不会少任何东西」的文件：运行时自己的临时目录、下载残留。
+       * 数据分区、已装应用、系统镜像、其他 AVD 一律不碰 —— 这是全自动路径，
+       * 必须保证用户完全无感。腾不出空间就如实说，别假装清过了。
+       */
+      case 'cleanup-safe': {
+        const p = runtime.provisioner.paths();
+        let files = 0;
+        let freed = 0;
+        const drop = (f) => {
+          try {
+            const st = fs.statSync(f);
+            const size = st.isDirectory() ? 0 : st.size;
+            fs.rmSync(f, { recursive: true, force: true });
+            files += 1;
+            freed += size;
+          } catch (_) { /* 被占用：跳过，不纠缠 */ }
+        };
+        const walk = (dir, depth = 0) => {
+          let names = [];
+          try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+          for (const d of names) {
+            const f = path.join(dir, d.name);
+            if (d.isDirectory()) {
+              if (depth < 2) walk(f, depth + 1);
+              continue;
+            }
+            if (/\.(part|tmp|crdownload|download|partial)$/i.test(d.name)) drop(f);
+          }
+        };
+        walk(p.tmp);
+        // 运行时根目录下的半截下载（旧版本把 zip 直接下在 root）
+        let rootNames = [];
+        try { rootNames = fs.readdirSync(p.root); } catch (_) { /* ignore */ }
+        for (const name of rootNames) {
+          if (/\.(part|tmp|crdownload|download|partial)$/i.test(name)) drop(path.join(p.root, name));
+        }
+        if (!files) {
+          return { ok: false, detail: '没有可安全清理的临时文件（磁盘满需要手动清理，或把数据目录换到别的盘）' };
+        }
+        return { ok: true, detail: `清掉 ${files} 个临时文件，释放约 ${Math.round(freed / 1048576)} MB` };
+      }
       case 'clear-locks': {
         const avdHome = runtime.provisioner.paths().avdHome;
         let removed = 0;
@@ -2033,7 +2187,13 @@ function registerIpc() {
       }
       case 'redeploy': {
         const r = await autoDeploy({ force: false }).catch((e) => ({ ok: false, error: e.message }));
-        return { ok: !!(r && r.ok), detail: (r && r.error) || '运行时组件已校验补齐' };
+        const err = String((r && r.error) || '');
+        // autoDeploy 的 'skipped' / 'wizard' 是「这次没做」，不是「做了但失败」：
+        // 原样透出去会变成「自动修复未生效：skipped」，用户完全看不懂。
+        const detail = err === 'wizard' ? '安装向导正开着，关掉后才能补齐文件'
+          : (err === 'skipped' ? '自动部署已在设置里关闭，这次不补齐文件'
+            : (err || '运行时组件已校验补齐'));
+        return { ok: !!(r && r.ok), detail };
       }
       case 'low-spec':
         return { ok: true, detail: '低配参数已就绪，马上重新开机' };
@@ -2601,36 +2761,73 @@ function registerIpc() {
   });
 
   /**
-   * 自动开启虚拟化：用户无需手动去「Windows 功能」面板。
-   * 优先启用系统自带的「虚拟机平台」（WHPX）功能；若该 DLL 都不存在（老系统），
-   * 退而安装并启用 Google 的 AEHD 驱动。两种方式都需要管理员提权。
+   * 自动开启/修复硬件加速：用户无需手动去「Windows 功能」面板。
+   *
+   * 三条路，按「能不能当场生效」排序：
+   *   1. AEHD 装了但服务没在跑（ACCEL_UNUSABLE 的根因）→ `sc start aehd`，不用重启；
+   *   2. 系统带虚拟机平台组件 → 开启 WHPX 功能（需重启，Google 现在的推荐路径）；
+   *   3. 老系统没有该组件 → 安装 Google 的 AEHD 驱动。
+   * 全部需要管理员提权；BIOS 里虚拟化没开时直接说明，不让用户白点一次 UAC、白重启一次。
    */
   async function enableVirtualizationImpl() {
     try {
       const accel = await runtime.provisioner.emulatorAccel();
-      if (accel.ok) return { ok: true, already: true, accel, note: '硬件加速已可用，无需额外操作' };
+      // 注意 must 同时看 suspect：驱动文件在、-accel-check 也说可用，但服务没跑时
+      // 旧实现会直接返回「已可用，无需操作」—— 用户于是永远修不好（实测现场）。
+      if (accel.ok && !accel.suspect) return { ok: true, already: true, accel, note: '硬件加速已可用，无需额外操作' };
+
+      // 1) 先试最省事的：把 AEHD 服务拉起来（不重启、当场生效）
+      let aehdErr = '';
+      if (accel.ok && accel.suspect) {
+        const svc = accel.aehd || await runtime.provisioner.aehdService().catch(() => null);
+        if (svc && !svc.running) {
+          const started = await startAehdService(svc.name);
+          if (started.ok) {
+            runtime.provisioner.invalidateEnvCache();
+            const after = await runtime.provisioner.emulatorAccel({ force: true });
+            if (after.ok && !after.suspect) {
+              return { ok: true, accel: after, note: 'AEHD 驱动服务已启动，硬件加速当场生效' };
+            }
+            // 服务起来了但仍报可疑：多半是驱动版本太旧 / 与 Hyper-V 冲突，继续走 WHPX
+            aehdErr = '驱动服务已启动，但模拟器仍未报告可用';
+          } else {
+            aehdErr = started.error || '驱动服务未能启动';
+          }
+        }
+      }
 
       const firmware = await virtualizationFirmwareEnabled();
+      // BIOS 里的虚拟化没开时，开 WHPX / 装 AEHD 都不会生效 —— 提前说清楚。
+      if (firmware === false) {
+        return {
+          ok: false,
+          firmwareEnabled: false,
+          accel,
+          error: aehdErr ? `${aehdErr}；另外 BIOS 里的 CPU 虚拟化（Intel VT-x / AMD SVM）没有开启`
+            : 'BIOS 里的 CPU 虚拟化（Intel VT-x / AMD SVM）没有开启',
+          note: '开系统功能或装驱动都不会生效：请重启进 BIOS 打开它，回到 Windows 后再试一次。',
+        };
+      }
+
       const hv = await runtime.provisioner.hypervisor();
       if (hv.dll) {
         // 系统带 WinHvPlatform.dll：开启「虚拟机平台」功能（可能需要重启）
         const r = await enableWindowsFeature('VirtualMachinePlatform');
         const r2 = await enableWindowsFeature('HypervisorPlatform').catch(() => ({ ok: false }));
         const ok = r.ok || r2.ok;
-        const after = await runtime.provisioner.emulatorAccel();
+        // 复测必须绕开缓存：`-accel-check` 与落盘缓存都还留着修复前的结论
+        runtime.provisioner.invalidateEnvCache();
+        const after = await runtime.provisioner.emulatorAccel({ force: true });
         return {
           ok,
           restartNeeded: r.restart || r2.restart,
           firmwareEnabled: firmware,
           accel: after,
           note: ok
-            ? (firmware === false
-              ? '系统功能已提交开启，但 BIOS 里虚拟化（AMD SVM / Intel VT-x）还没打开：'
-                + '请先重启进 BIOS 开启它，回到 Windows 后再重启一次。'
-              : ((r.restart || r2.restart)
-                ? '已开启「虚拟机平台」，请重启电脑后生效'
-                : '「虚拟机平台」已开启，硬件加速即时生效'))
-            : (r.error || r2.error || '无法开启系统虚拟化功能'),
+            ? ((r.restart || r2.restart)
+              ? '已开启「虚拟机平台」，请重启电脑后生效'
+              : '「虚拟机平台」已开启，硬件加速即时生效')
+            : (r.error || r2.error || aehdErr || '无法开启系统虚拟化功能'),
         };
       }
 
@@ -2650,19 +2847,31 @@ function registerIpc() {
         ))));
         proc.on('error', (e) => reject(e));
       });
-      const after = await runtime.provisioner.emulatorAccel();
+      // 装完驱动必须清缓存再复测：否则拿到的还是安装前的「不可用」
+      runtime.provisioner.invalidateEnvCache();
+      const after = await runtime.provisioner.emulatorAccel({ force: true });
       return {
-        ok: after.ok,
+        ok: after.ok && !after.suspect,
         accel: after,
         firmwareEnabled: firmware,
-        note: after.ok ? 'AEHD 硬件加速已启用'
-          : (firmware === false ? 'BIOS 里虚拟化（SVM / VT-x）未开启，AEHD 驱动无法运行' : after.note),
+        note: after.ok && !after.suspect
+          ? 'AEHD 硬件加速已启用'
+          : (after.suspect
+            ? `AEHD 驱动已安装，但服务没有随安装启动（${after.note}）：请重启电脑后再试一次`
+            : (firmware === false ? 'BIOS 里虚拟化（SVM / VT-x）未开启，AEHD 驱动无法运行' : after.note)),
       };
     } catch (e) {
       return { ok: false, error: e.message };
     }
   }
   ipcMain.handle('provision:enableVirtualization', () => enableVirtualizationImpl());
+
+  // 启动失败时的全自动修复入口：Runtime 判定 ACCEL / ACCEL_UNUSABLE 后会回调它，
+  // 修好（AEHD 服务拉起来 / WHPX 已生效）就自动重试一次开机，用户不必去点「一键修复」。
+  if (runtime) runtime.onAccelRepair = () => enableVirtualizationImpl();
+  // 非加速类（锁文件、组件缺失、渲染崩溃、磁盘满）自动修复的动作执行器。
+  // auto:true 保证这条路径里不会蹦出确认框，也不会动用户数据。
+  if (runtime) runtime.onAutoRepair = (action) => runRepairAction(action, { auto: true });
 
   /** 设置页「硬件加速」状态：只读、带缓存，不触发任何提权或安装 */
   ipcMain.handle('provision:accelStatus', async () => {
@@ -3094,7 +3303,12 @@ function registerIpc() {
       const exeDir = path.dirname(process.execPath);
       // electron-builder NSIS 默认生成的是「Uninstall ApkStart.exe」，旧版只找
       // uninstaller.exe，导致安装版被误判成便携版、卸载按钮实际什么也没做（#51）。
-      const uninstallerName = fs.readdirSync(exeDir).find((name) => /^Uninstall .*\.exe$/i.test(name));
+      // 再兜一层 uninstall.exe / uninst.exe：自定义打包或第三方重打包会改这个名字，
+      // 找不到就等于把安装版当便携版处理（会直接删目录，卸载向导却不出现）。
+      let entries = [];
+      try { entries = fs.readdirSync(exeDir); } catch (_) { entries = []; }
+      const uninstallerName = entries.find((name) => /^Uninstall .*\.exe$/i.test(name))
+        || entries.find((name) => /^(uninstall|uninst)[^\\/]*\.exe$/i.test(name));
       const uninstaller = uninstallerName ? path.join(exeDir, uninstallerName) : '';
       const { spawn } = require('child_process');
       const os = require('os');

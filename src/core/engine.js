@@ -17,12 +17,22 @@ const store = require('./store');
 const { Provisioner } = require('./provision');
 const { EmulatorEngine } = require('./emulator');
 const doctor = require('./doctor');
+const repair = require('./repair');
 const container = require('./container');
 const guest = require('./guest');
 const platform = require('./platform');
 
 const LOG_DIR = path.join(store.DATA_DIR, 'logs');
 const MONITOR_PORT = 5556;
+
+/** 自动修复动作的中文说法（日志 / 启动窗口提示要用它，别把动作 id 露给用户） */
+const AUTO_ACTION_TEXT = {
+  'clear-locks': '清理上次残留的锁文件',
+  redeploy: '校验并补齐运行时文件',
+  'vc-redist': '安装 VC++ 运行库（会弹出授权窗口）',
+  'cleanup-safe': '清理运行时临时文件',
+  'gpu-software': '改用软件渲染',
+};
 const EMU_PORT = 5554;
 const EMU_SERIAL = `emulator-${EMU_PORT}`;
 
@@ -66,6 +76,14 @@ class Runtime {
     this._client = null;
     this._bootLog = [];
     this._activeApps = new Set();  // 容器会话：当前打开的应用窗口
+    this._accelRepairTried = false; // 全自动修复加速：一次运行只试一次，避免无限循环
+    this.onAccelRepair = null;      // 由 main 注入（会弹管理员授权的 enableVirtualization）
+    // 全自动修复（非加速类）：清锁、补文件、换渲染后端……都由 main 注入的动作执行器落地。
+    // 只放「不需要用户做决定」的动作进来 —— 删数据、重下 1.5GB 镜像这类必须用户点同意。
+    this.onAutoRepair = null;
+    this._autoRepairCount = 0;
+    this._autoRepairedCodes = new Set();
+    this.autoRepairLog = [];        // 已经自动做过什么（给修复窗口如实展示）
     this.emuSerial = EMU_SERIAL;   // 端口是动态挑的，serial 跟着变
     store.ensureDirs();
     if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -287,6 +305,10 @@ class Runtime {
     const accel = env && env.accel ? env.accel : await this.provisioner.emulatorAccel();
     if (!accel.ok) {
       onLog('未检测到硬件加速：将自动回退软件模拟（首次开机会明显变慢，无需手动设置）');
+    } else if (accel.suspect) {
+      // AEHD 驱动在、检查也过，但服务没跑：这种机器「检查通过、开机即退」。
+      // 参数按软件模拟给（见 doctor.accelUsable），失败后引擎会自动尝试修复。
+      onLog('AEHD 驱动已安装但服务没在运行：本次可能开不了机，失败后会自动尝试修复');
     }
 
     this.vmStarting = true;
@@ -394,7 +416,8 @@ class Runtime {
       try {
         const env = await this.provisioner.checkEnv();
         if (!(env.adb.ok && env.emulator.ok && env.sysimg.ok)) return { ok: false, skipped: 'not-ready' };
-        const r = await this.ensure({ onLog: (m) => onLog(`预热：${m}`) });
+        // 预热是后台静默行为：autoRepair:false，别因为一次预热就弹管理员授权
+        const r = await this.ensure({ onLog: (m) => onLog(`预热：${m}`), autoRepair: false });
         if (r && r.ok) {
           // 预热期间用户可能已经点开了应用：这时不能把它摁到 idle 优先级
           if (this._activeApps.size === 0) await this.emulator.setPriority('idle').catch(() => {});
@@ -967,16 +990,134 @@ class Runtime {
    * 幂等入口：预热与用户点击可能同时发生，共用一个 Promise，
    * 避免两边各判断一次「没在线」后各自拉起一台模拟器（AVD 锁冲突 + 双倍内存）。
    */
-  async ensure({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
+  async ensure({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0, autoRepair = true } = {}) {
     if (this._ensurePromise) return this._ensurePromise;
-    const p = this._ensureInner({ onLog, lcdOrientation, lowspec, timeoutMs });
+    const p = this._ensureInner({ onLog, lcdOrientation, lowspec, timeoutMs, autoRepair });
     this._ensurePromise = p;
     const clear = () => { if (this._ensurePromise === p) this._ensurePromise = null; };
     p.then(clear, clear);
     return p;
   }
 
-  async _ensureInner({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
+  /**
+   * 加速类启动失败后的**全自动修复**。
+   *
+   * 现场（ACCEL_UNUSABLE）：检测说有 AEHD、日志停在 Userspace boot properties、
+   * 退出码 1、一条错误都没有。旧行为只是把报告丢给用户让他自己去看；
+   * 实际上「AEHD 服务没在跑」这种情况 `sc start aehd` 就能修好，而且不需要重启。
+   *
+   * 这里只做三件事：判断该不该修、调用注入的修复回调（main 的
+   * enableVirtualizationImpl，会弹一次管理员授权）、决定能不能立刻重试。
+   * @returns {Promise<{ok:boolean,note?:string,reason?:string,restartNeeded?:boolean}|null>}
+   */
+  async autoRepairAccel({ diagnosis, onLog = () => {} } = {}) {
+    const code = diagnosis && diagnosis.code;
+    // 只有加速类结论才动系统设置：别的失败（镜像损坏、显卡崩溃）去开虚拟化纯属瞎折腾。
+    // TCG_CRASH（多个软件后端同码崩溃）的唯一真修复也是把加速开起来，所以并进来。
+    if (!['ACCEL', 'ACCEL_UNUSABLE', 'TCG_CRASH'].includes(code)) return null;
+    if (this._accelRepairTried) return { ok: false, reason: '本次运行已经自动修复过一次，仍未生效' };
+    this._accelRepairTried = true;
+    if (typeof this.onAccelRepair !== 'function') return null;
+    onLog('检测到硬件加速没能生效，正在自动修复（如弹出授权窗口请点「是」）…');
+    let r = null;
+    try { r = await this.onAccelRepair(); } catch (e) { r = { ok: false, error: e.message }; }
+    // 修复动过系统功能 / 驱动服务：环境结论必须重新探测，否则重试还是拿旧值
+    try { this.provisioner.invalidateEnvCache(); } catch (_) { /* ignore */ }
+    if (r && r.ok && !r.restartNeeded) {
+      onLog(`硬件加速已修复：${r.note || '已生效'}，正在重新启动安卓…`);
+      return { ok: true, note: r.note || '' };
+    }
+    const reason = (r && (r.error || r.note)) || '系统没有可用的修复手段';
+    // 需要重启才生效的不再白试一次：重试只会以同样方式失败，白白多等几分钟
+    onLog(`自动修复没能立即生效：${reason}`);
+    return { ok: false, reason, restartNeeded: !!(r && r.restartNeeded) };
+  }
+
+  /**
+   * 全自动修复入口：加速类 → autoRepairAccel（要授权），其余按 repair.SELF_HEAL 表执行。
+   *
+   * 为什么要扩到加速以外：开机失败的绝大多数原因是「上一次没退干净」（锁文件、残留
+   * qemu 占端口）、「文件缺了一块」（运行库/组件被杀软删）、「这台机器只能用软件渲染」。
+   * 这三种都不需要用户做任何决定，程序自己清一下、补一下、换一下就能过 ——
+   * 以前却要用户先看到失败窗口、再自己点「一键修复」，等于把自动化又还给了用户。
+   *
+   * 不自动化的一律不进 SELF_HEAL：删用户数据（wipe-data）、重下 1.5GB 镜像
+   * （reinstall-image）、需要重启才生效的（TCG_CRASH 开 WHPX）—— 这些必须用户点头，
+   * 替用户决定只会让「修一下」变成「数据没了」。
+   *
+   * @returns {Promise<{code:string,ok:boolean,retry:boolean,lowspec?:boolean,
+   *   waitMore?:boolean,tried:string[],reason?:string}|null>}
+   *   ok=true 表示「值得再开一次机」；tried 是给用户看的「已经自动做了什么」。
+   */
+  async autoRepair({ diagnosis, onLog = () => {} } = {}) {
+    const code = diagnosis && diagnosis.code;
+    if (!code) return null;
+    // 加速类有独立的授权链路，交给原来的实现（它自己管「只弹一次」）。
+    // TCG_CRASH：软件模拟本身崩了，唯一的真修复是把硬件加速开起来，同样走这条线。
+    if (['ACCEL', 'ACCEL_UNUSABLE', 'TCG_CRASH'].includes(code)) {
+      const r = await this.autoRepairAccel({ diagnosis, onLog });
+      if (!r) return null;
+      return {
+        code, ok: !!r.ok, retry: !!r.ok, tried: r.note ? [r.note] : [],
+        actions: ['accel'], reason: r.reason, restartNeeded: r.restartNeeded,
+      };
+    }
+    const plan = repair.selfHeal(code);
+    if (!plan) return null;                       // 结构性跑不了（CPU 太老等），不白试
+    const wantActions = (plan.actions || []).length > 0;
+    // 动作执行器由 main 注入。没注入时（例如被别处单独 new 出来做探测）
+    // 就如实返回「修不了」，绝不能什么都不做却报「已按保守参数重试」。
+    if (wantActions && typeof this.onAutoRepair !== 'function') return null;
+    if (this._autoRepairedCodes.has(code)) {
+      return { code, ok: false, retry: false, tried: [], reason: '本次运行已经自动修复过这个问题' };
+    }
+    // 一次运行最多自动修两个不同的问题：再往下就是环境本身坏了，多修只会多等
+    if (this._autoRepairCount >= 2) {
+      return { code, ok: false, retry: false, tried: [], reason: '本次运行已经自动修复过两次' };
+    }
+    this._autoRepairedCodes.add(code);
+    this._autoRepairCount += 1;
+
+    const tried = [];
+    const failed = [];
+    for (const action of plan.actions || []) {
+      // 先说要做什么：装运行库会弹 UAC，日志和启动窗口里必须有上下文，
+      // 否则用户只看到一个系统弹窗，不知道是谁弹的、该不该点。
+      onLog(`正在自动修复：${AUTO_ACTION_TEXT[action] || plan.what || action}…`);
+      // eslint-disable-next-line no-await-in-loop
+      let r = null;
+      try { r = await this.onAutoRepair(action); } catch (e) { r = { ok: false, detail: e.message }; }
+      if (r && r.ok) {
+        tried.push(r.detail || action);
+        onLog(`已自动修复：${r.detail || action}`);
+      } else if (r && r.detail) {
+        failed.push(r.detail);
+        onLog(`自动修复未生效：${r.detail}`);
+      }
+    }
+    // 没有动作可做（内存不够/超时只能降配）也算「修过」：这一轮就是用保守参数重开的
+    if (!wantActions && plan.what) tried.push(plan.what);
+    this.autoRepairLog.push(...tried);
+
+    const reason = failed.join('；');
+    // 动作全部失败时不再重试：同样的参数、同样的问题，再开一次只会白等几分钟
+    const ok = !!plan.retry && ((plan.actions || []).length === 0 || tried.length > 0);
+    onLog(ok
+      ? `自动修复完成（${tried.join('、') || '按保守参数'}），正在重新启动安卓…`
+      : `自动修复没能解决：${reason || '这台机器的情况需要人工处理'}`);
+    // 「已经做过的动作」也要把降配算进去：这一轮就是用低配参数重开的，
+    // 再让用户点一次「低配模式再试一次」等于让他重复一遍刚失败的事。
+    const usedActions = (plan.actions || []).slice();
+    if (plan.lowspec) usedActions.push('low-spec');
+    return {
+      code, ok, retry: ok, lowspec: !!plan.lowspec, waitMore: !!plan.waitMore,
+      tried, actions: usedActions, reason,
+    };
+  }
+
+  async _ensureInner({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0, autoRepair = true } = {}) {
+    // 每轮启动的「自动做过什么」独立记账：上一轮修过的东西不该出现在这一轮的修复窗口里
+    this.autoRepairLog = [];
     const client = this.client();
     if (await client.isOnline()) {
       await this.prepare(client);
@@ -1045,9 +1186,45 @@ class Runtime {
       try {
         const r = await this.boot({ onLog, lcdOrientation, lowspec, timeoutMs });
         if (r.ok) return { ok: true, client: r.client, engine: 'emulator', profile: r.profile, network: r.network || null };
+        // 全自动修复：先把「不需要用户做决定」的毛病自己处理掉（清锁、补文件、
+        // 换软件渲染、降配），再自动重来一遍。加速类会弹一次管理员授权，
+        // 预热/后台启动传 autoRepair:false —— 不能因为一次静默预热就弹授权框吓人一跳。
+        const diagnosis = r.diagnosis || this.emulator.lastDiagnosis;
+        const healed = autoRepair ? await this.autoRepair({ diagnosis, onLog }) : null;
+        if (healed && healed.retry) {
+          // 修复窗口要如实写「重开过一次」：只写「清过锁」会让用户以为程序没再试
+          this.autoRepairLog.push('重新开了一次机');
+          const again = await this.boot({
+            onLog,
+            lcdOrientation,
+            lowspec: lowspec || !!healed.lowspec,
+            // 软件模拟/超时类放宽等待：修完还是按原来的 4 分钟等，等于白修
+            timeoutMs: Math.max(timeoutMs || 0, healed.waitMore ? 900000 : 0),
+          });
+          const autoRepair = { ...healed, retried: true };
+          if (again.ok) {
+            return {
+              ok: true, client: again.client, engine: 'emulator',
+              // 加速类对外仍叫 accel（老调用方/测试认这个名字），其余直接用诊断码
+              profile: again.profile, network: again.network || null,
+              autoRepaired: ['ACCEL', 'ACCEL_UNUSABLE'].includes(healed.code) ? 'accel' : healed.code,
+              autoRepair,
+            };
+          }
+          return {
+            ok: false, error: again.error, env,
+            diagnosis: again.diagnosis, report: again.report, attempts: again.attempts, exitCode: again.exitCode,
+            autoRepair,
+          };
+        }
         return {
-          ok: false, error: r.error, env,
+          ok: false,
+          // 修过但没成：把「已经自动试过什么、为什么没用」写进错误里，
+          // 用户拿着这句话就知道该重启还是该进 BIOS，而不是只看一句「起不来」。
+          error: healed && healed.reason ? `${r.error}\n\n（已自动尝试修复：${healed.reason}）` : r.error,
+          env,
           diagnosis: r.diagnosis, report: r.report, attempts: r.attempts, exitCode: r.exitCode,
+          autoRepair: healed || null,
         };
       } catch (e) {
         return { ok: false, error: e.message, env };
