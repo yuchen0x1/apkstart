@@ -5,6 +5,21 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.6.18] — 2026-11-18
+
+### 修复
+- **设置页顶栏「返回引导」和「关闭设置 ×」点不了**：主窗口标题栏有一条贯穿顶部、
+  44px 高的拖动区（`-webkit-app-region: drag`）。设置页全屏覆盖后这条拖动区
+  **不会被覆盖层抵消**（drag/no-drag 按元素矩形累加/挖除，与绘制层级无关），
+  顶栏两颗 y<44px 的按钮，真实鼠标点击被 Windows 当成「拖动窗口」吃掉——
+  表现就是按钮看得见、点不了。修复：`.set-side-head` 整行声明 `no-drag`
+  把自己从拖动区里挖掉；内容区顶部保留拖动，设置页开着时窗口照样能拖动。
+- **头部间距**：「设置」标题与「返回引导」按钮之间补 8px 间距（原来贴在一起）。
+- **新增点击探针工具** `test/ui-click-probe.js`（手工跑，不进 npm test）：注入
+  真实 OS 级鼠标点击（PowerShell SendInput）+ 对比 DOM 命中，专抓「按钮看得见、
+  点不了」这类只有真实事件才能暴露的回归。CI / 无人值守环境注入真实点击不可
+  重复，因此不进自动化套件。
+
 ## [0.6.17] — 2026-11-18
 
 > 本版为「上游对齐专项」：把原项目 [RoutineMiku/apkstart](https://github.com/RoutineMiku/apkstart)

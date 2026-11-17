@@ -404,8 +404,15 @@ body {
   border-right: 1px solid var(--line);
 }
 .set-side-head {
-  display: flex; align-items: center;
+  display: flex; align-items: center; gap: 8px;
   padding: 16px 14px 8px 18px;
+  /* 设置页盖住了主窗口 44px 的标题栏拖动区（.titlebar 的 app-region: drag）。
+     覆盖层**不会抵消**下层声明的 drag——drag/no-drag 按元素矩形累加/挖除，
+     不看绘制层级。于是顶栏「返回引导 / 关闭设置」这两颗 y<44px 的按钮，
+     真实鼠标点击会被 Windows 当成「拖动窗口」吃掉（表现：按钮看得见、点不了）。
+     这一行 no-drag 把头部从拖动区里挖掉；内容区顶部保留拖动，
+     设置页开着时窗口照样能拖动。 */
+  -webkit-app-region: no-drag;
 }
 .set-side-head h2 { margin: 0; font-size: 15.5px; font-weight: 650; }
 .set-side-head .icon-btn { margin-left: auto; }
