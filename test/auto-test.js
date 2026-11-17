@@ -54,8 +54,8 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     // accel 关闭时的保底参数必须是软件渲染，否则 TCG 下无 GPU 可用
     const lastResort = doctor.planVariants(p).find((v) => v.lastResort);
     assert(lastResort && /software|swiftshader/.test(lastResort.gpu), '保底方案必须用软件渲染');
-    // 数据分区默认按磁盘余量给 4/6/8GB（不再写死 16G），且可以被设置覆盖
-    assert(p.dataMB >= 4096 && p.dataMB <= 8192, `数据分区应在 4~8GB，实际 ${p.dataMB}`);
+    // 数据分区默认按磁盘余量给 4/8/16/24GB（不再写死 6G），且可以被设置覆盖
+    assert(p.dataMB >= 4096 && p.dataMB <= 24576, `数据分区应在 4~24GB，实际 ${p.dataMB}`);
     const big = doctor.chooseProfile({
       host, accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 200000,
       settings: { engine: { dataPartitionGB: 24 } }, overrides: {},
@@ -2194,7 +2194,11 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(p.dataMB === 12 * 1024, `应为 12GB，实际 ${p.dataMB}MB`);
     store.saveSettings({ engine: { dataPartitionGB: 0 } });
     const auto = doctor.autoProfile({ settings: store.getSettings(), accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 50000 });
-    assert(auto.dataMB === 6144, `磁盘充裕时自动应 6GB，实际 ${auto.dataMB}`);
+    assert(auto.dataMB === 16384, `磁盘 50GB 时自动应 16GB，实际 ${auto.dataMB}`);
+    const roomy = doctor.autoProfile({ settings: store.getSettings(), accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 90000 });
+    assert(roomy.dataMB === 24576, `磁盘 90GB 时自动应 24GB，实际 ${roomy.dataMB}`);
+    const tight = doctor.autoProfile({ settings: store.getSettings(), accel: { ok: true }, emulatorVersion: '37.3.8.0', diskMB: 9000 });
+    assert(tight.dataMB === 4096, `磁盘紧张时仍应只给 4GB，实际 ${tight.dataMB}`);
   });
 
   await test('快照指纹不含数据分区大小（扩容不该作废快照、更不该清数据）', () => {
@@ -2350,6 +2354,27 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(parseResolvedActivity('com.phoenix.read', out)
       === 'com.phoenix.read/com.dragon.read.pages.splash.SplashActivity', '应跳过空行取到最后一行组件');
     assert(parseResolvedActivity('com.other', out) === '', '别的包名不能拿来用');
+  });
+
+  await test('首启引导：关键设置都在引导里，且「完成并重启」是真的重启', () => {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'ui', 'index.html'), 'utf8');
+    const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'ui', 'app.js'), 'utf8');
+    const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+    for (const id of [
+      'wizardPage4', 'wizardPage5', 'wizardPage6', 'wizardPage7', 'wizardPage8',
+      'wizMemory', 'wizCores', 'wizResourceMode', 'wizAccelText', 'wizEnableAccel',
+      'wizRenderSize', 'wizDataGB', 'wizGpuMode', 'wizImageFlavor', 'wizLanguage',
+      'wizGuestZh', 'wizSummary', 'btnBackToWizard',
+    ]) {
+      assert(html.includes(`id="${id}"`), `引导缺控件 ${id}`);
+    }
+    assert(/WIZARD_PAGES = 8/.test(app), '引导页数要覆盖新增的设置步骤');
+    assert(/wizardFinish\(\{ restart: true \}\)/.test(app), '最后一步要调用重启');
+    assert(/await api\.setSettings\(\{ wizardDone/.test(app), '必须先保存「引导已完成」再重启');
+    assert(/app\.relaunch\(/.test(main), 'app:restart 以前只退出，不算重启');
+    // 跳到设置页细调后必须能回到同一步（否则用户会被迫从头走一遍）
+    assert(/wizard\.suspended = wizard\.page/.test(app), '跳设置前要记住当前步');
+    assert(/wizard\.suspended\)/.test(app) && /wizardShowPage\(page\)/.test(app), '关设置要回到原步骤');
   });
 
   console.log(results.join('\n'));

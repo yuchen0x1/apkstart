@@ -921,5 +921,22 @@
   "安装包还没上传完": "Installer not uploaded yet",
   "安装包还没上传完，稍后再试一次": "The installer is still uploading — try again in a minute",
   "安装包还在上传，完成后会自动下载安装；也可以先点「打开下载页」手动下载": "The installer is still uploading; it will download and install automatically once ready. You can also grab it from the download page now.",
-  "\u0001 已下载完成，随时可以重启安装（正在用的安卓应用会被一起关掉）": "Version \u0001 downloaded. Restart to install now — running Android apps will be closed."
+  "\u0001 已下载完成，随时可以重启安装（正在用的安卓应用会被一起关掉）": "Version \u0001 downloaded. Restart to install now — running Android apps will be closed.",  "给安卓分配多少内存和 CPU？": "How much RAM and CPU should Android get?",
+  "自动会按本机内存与核心数计算；选流畅适合看视频、玩游戏。以后都能在「设置 → 性能与资源」里改。": "Auto uses your machine RAM and core count. Choose Smooth for video and games. You can change this later in Settings → Performance & Resources.",
+  "去设置页细调": "Fine-tune in Settings",
+  "让安卓跑得动的关键：硬件加速": "The key to a responsive Android: hardware acceleration",
+  "没有硬件加速时，安卓只能靠 CPU 硬算，首次开机可能要十几分钟。点下面的按钮会自动开启 Windows 虚拟机平台或安装 AEHD 驱动；会弹一次管理员授权，完成后按提示重启即可。": "Without hardware acceleration Android has to be emulated by the CPU and first boot can take over ten minutes. The button below enables Windows Hypervisor Platform or installs the AEHD driver; you will see one administrator prompt, then restart when asked.",
+  "画面清晰度和应用能装多少": "Display sharpness and how many apps fit",
+  "自动（按磁盘空间推荐）": "Auto (recommended by free disk space)",
+  "\u0001 GB（推荐）": "\u0001 GB (recommended)",
+  "数据分区是稀疏文件：选 \u0001 GB 不会马上吃掉 \u0001 GB 磁盘，只按实际写入增长。空间紧张时可选 \u0001 GB，之后在设置里点「立即扩容」，已装应用和存档都保留。": "The data partition is a sparse file: picking \u0001 GB does not immediately use \u0001 GB of disk, it grows as you write. If space is tight choose \u0001 GB and later click Grow now in Settings; installed apps and data are kept.",
+  "系统镜像与语言": "System image and language",
+  "兼容模式能运行 ARM 应用并带 Play 商店；其它档位使用独立 AVD，切换不会删除已有应用。": "Compatibility mode runs ARM apps and includes Play Store; other profiles use separate AVDs, and switching never deletes your apps.",
+  "跟随系统": "Follow system",
+  "安卓系统界面语言可在首次开机后一键切换，已装应用与存档保留。": "Android system language can be switched with one click after first boot; installed apps and data are kept.",
+  "把安卓系统切换为简体中文": "Switch Android system to Simplified Chinese",
+  "✅ 设置完成": "✅ Setup complete",
+  "点「完成并重启」后，应用会按刚才的设置重新启动。所有改动以后都能在「设置」里随时调整。": "Click Finish & Restart to relaunch ApkStart with these settings. Everything can be changed later in Settings.",
+  "返回引导": "Back to guide",
+  "配置要求：Windows \u0001/\u0001 \u0001 位，建议 \u0001 GB 内存、\u0001 核 CPU、至少 \u0001 GB 可用空间（运行时 + 数据分区）。没开硬件加速也能用，但首次开机会慢很多。": "Requirements: Windows \u0001/\u0001 \u0001-bit, \u0001 GB RAM, \u0001-core CPU and at least \u0001 GB free space (runtime + data partition). It also works without hardware acceleration, but first boot is much slower."
 }

@@ -3605,7 +3605,15 @@ function registerIpc() {
   ipcMain.handle('app:updateCancel', () => { updateBusy = false; return { ok: true }; });
 
   ipcMain.handle('app:restart', () => {
-    setTimeout(() => { quitting = true; app.quit(); }, 200);
+    // 以前只 app.quit()：界面上写着「重启应用」，实际是直接退出，
+    // 用户还得自己去开始菜单点开（首启引导的最后一步因此形同虚设）。
+    // Electron 的 relaunch 必须在 quit 之前调用，且要把原有命令行参数带回去
+    // （例如 --launch <pkg> / --smoke），否则重启后会丢掉待打开的应用。
+    setTimeout(() => {
+      quitting = true;
+      try { app.relaunch({ args: process.argv.slice(1) }); } catch (_) { /* 开发模式下也允许只退出 */ }
+      app.quit();
+    }, 200);
     return { ok: true };
   });
 }

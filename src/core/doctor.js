@@ -325,11 +325,14 @@ function chooseProfile({
   // 那种情况下低配档也不越过用户。
   if (spec && lite && !overrides.cores) cores = Math.min(cores, spec.cores);
 
-  // /data 容量：应用本体、游戏资源包和它们的「更新包」都占这里，4GB 太容易满
-  // （表现就是应用内更新时提示「磁盘空间不足」）。默认按磁盘余量给 6/8GB，
-  // 用户也可以直接在设置里指定（改大后下次开机就地扩容，不丢数据）。
+  // /data 容量：应用本体、游戏资源包和它们的「更新包」都占这里。
+  // 旧默认只有 6GB：系统自身就吃掉 3~4GB，装两三个应用/游戏再更新一次就满，
+  // 用户看到的是「存储不足」却不知道去哪调。现在按磁盘余量给 4/8/16/24GB：
+  // 镜像文件是稀疏分配的，24GB 不会立刻占掉 24GB 实际空间；实在紧张也只给 4GB。
+  // 用户也可以在设置里指定（改大后下次开机就地扩容，不丢数据）。
   const wantGB = Number(engine.dataPartitionGB || 0);
-  const autoDataMB = disk && disk < 12288 ? 4096 : 6144;
+  const autoDataMB = !disk || disk < 12288 ? 4096
+    : (disk < 32768 ? 8192 : (disk < 61440 ? 16384 : 24576));
   const dataMB = wantGB > 0 ? clamp(Math.round(wantGB * 1024), 2048, 65536) : autoDataMB;
 
   const gpus = gpuCandidates(emulatorVersion);

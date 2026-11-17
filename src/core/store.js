@@ -57,7 +57,8 @@ const DEFAULT_SETTINGS = {
     // 指定的固定档，选中后不再自动降级 —— 手动配置永远优先。
     resourceMode: 'balanced',
     // 数据分区容量（GB）：应用、游戏缓存和它们的更新包都装在这里。
-    // 0 = 自动（按磁盘剩余给 6/8GB）。改大后在下次开安卓时**就地扩容**，不丢已装应用。
+    // 0 = 自动（按磁盘剩余给 4/8/16/24GB，由 doctor.chooseProfile 推导）。
+    // 改大后在下次开安卓时**就地扩容**，不丢已装应用。
     dataPartitionGB: 0,
     // 渲染分辨率：越低越流畅、越省电；auto = 按加速状态选 720x1280 / 540x960
     renderSize: 'auto',

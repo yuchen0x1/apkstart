@@ -111,6 +111,7 @@
           <li><b>要下载什么</b>：adb 工具、Android 运行时引擎、Android 14 系统镜像（合计约 1.6&nbsp;GB）。镜像就是安卓系统本身，这个体积压不下去了；不用整个下完才能用，装完这次以后不再下载。</li>
           <li><b>要多久</b>：会先实测多个下载源、谁快用谁——GitHub 整包被限速时会自动改走官方源分组件下载（官方源实测可达每秒数 MB），通常 3~8 分钟。</li>
           <li><b>装在哪里</b>：下一步选择。<span class="wizard-warn">默认会推荐剩余空间最大的非系统盘，避免把 C 盘塞满。</span>以后随时可以在「设置 → 系统集成」里改。</li>
+          <li><b>配置要求</b>：Windows 10/11 64 位，建议 8 GB 内存、4 核 CPU、至少 30 GB 可用空间（运行时 + 数据分区）。没开硬件加速也能用，但首次开机会慢很多。</li>
         </ul>
       </section>
       <!-- 第 2 页：位置与源 -->
@@ -152,6 +153,131 @@
           <p class="sub">可以回到上一步换一个位置重试；也可以关闭向导，在「设置 → 运行状态」里查看详细原因与手动修复。</p>
         </div>
       </section>
+      <!-- 第 4 页：虚拟机资源 -->
+      <section class="wizard-page" id="wizardPage4" hidden>
+        <p class="wizard-lead">给安卓分配多少内存和 CPU？</p>
+        <div class="field two">
+          <div>
+            <label>内存</label>
+            <select id="wizMemory">
+              <option value="0">自动（推荐）</option>
+              <option value="2048">2 GB</option>
+              <option value="3072">3 GB</option>
+              <option value="4096">4 GB</option>
+              <option value="6144">6 GB</option>
+              <option value="8192">8 GB</option>
+              <option value="12288">12 GB</option>
+              <option value="16384">16 GB</option>
+            </select>
+          </div>
+          <div>
+            <label>CPU 核心</label>
+            <select id="wizCores">
+              <option value="0">自动（推荐）</option>
+              <option value="2">2 核</option>
+              <option value="4">4 核</option>
+              <option value="6">6 核</option>
+              <option value="8">8 核</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>资源策略</label>
+          <select id="wizResourceMode">
+            <option value="save">省资源 · 固定 2 核 / 540p（老机器、挂机）</option>
+            <option value="balanced">均衡 · 自动识别低配机器并降级（推荐）</option>
+            <option value="smooth">流畅 · 全核 / 与前台同优先级（视频、游戏）</option>
+          </select>
+          <span class="sub">自动会按本机内存与核心数计算；选流畅适合看视频、玩游戏。以后都能在「设置 → 性能与资源」里改。</span>
+        </div>
+        <div class="wiz-jump"><button class="btn ghost sm" data-wizsec="performance">去设置页细调</button></div>
+      </section>
+      <!-- 第 5 页：硬件加速 -->
+      <section class="wizard-page" id="wizardPage5" hidden>
+        <p class="wizard-lead">让安卓跑得动的关键：硬件加速</p>
+        <div class="field">
+          <span class="inline-note" id="wizAccelText">正在检测…</span>
+          <span class="sub">没有硬件加速时，安卓只能靠 CPU 硬算，首次开机可能要十几分钟。点下面的按钮会自动开启 Windows 虚拟机平台或安装 AEHD 驱动；会弹一次管理员授权，完成后按提示重启即可。</span>
+          <div class="row" style="margin-top:10px">
+            <button class="btn primary sm" id="wizEnableAccel">一键开启硬件加速</button>
+          </div>
+        </div>
+        <div class="wiz-jump"><button class="btn ghost sm" data-wizsec="performance">去设置页细调</button></div>
+      </section>
+      <!-- 第 6 页：画面与存储 -->
+      <section class="wizard-page" id="wizardPage6" hidden>
+        <p class="wizard-lead">画面清晰度和应用能装多少</p>
+        <div class="field two">
+          <div>
+            <label>画质（安卓内部渲染分辨率）</label>
+            <select id="wizRenderSize">
+              <option value="auto">自动（按加速状态）</option>
+              <option value="540x960">流畅 · 540 × 960</option>
+              <option value="720x1280">均衡 · 720 × 1280</option>
+              <option value="1080x1920">高清 · 1080 × 1920</option>
+            </select>
+          </div>
+          <div>
+            <label>安卓数据分区（应用与游戏装这里）</label>
+            <select id="wizDataGB">
+              <option value="0">自动（按磁盘空间推荐）</option>
+              <option value="4">4 GB</option>
+              <option value="6">6 GB</option>
+              <option value="8">8 GB</option>
+              <option value="12">12 GB</option>
+              <option value="16">16 GB</option>
+              <option value="24">24 GB（推荐）</option>
+              <option value="32">32 GB</option>
+              <option value="48">48 GB</option>
+              <option value="64">64 GB</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>渲染后端</label>
+          <select id="wizGpuMode">
+            <option value="auto">自动（低配机器用软件渲染）</option>
+            <option value="host">显卡加速 · host（最跟手）</option>
+            <option value="swangle">ANGLE 软件渲染 · swangle（合成最稳）</option>
+            <option value="software">纯软件渲染 · software（最省显存）</option>
+            <option value="lavapipe">lavapipe 软件 Vulkan</option>
+          </select>
+        </div>
+        <span class="sub">数据分区是稀疏文件：选 24 GB 不会马上吃掉 24 GB 磁盘，只按实际写入增长。空间紧张时可选 8 GB，之后在设置里点「立即扩容」，已装应用和存档都保留。</span>
+        <div class="wiz-jump"><button class="btn ghost sm" data-wizsec="performance">去设置页细调</button></div>
+      </section>
+      <!-- 第 7 页：系统镜像与语言 -->
+      <section class="wizard-page" id="wizardPage7" hidden>
+        <p class="wizard-lead">系统镜像与语言</p>
+        <div class="field">
+          <label>系统镜像</label>
+          <select id="wizImageFlavor">
+            <option value="google_apis_playstore">Google Play · 兼容模式（推荐）</option>
+            <option value="google_apis">Google APIs · 无 Play 商店</option>
+            <option value="default">纯 AOSP · 无 Google（实验）</option>
+          </select>
+          <span class="sub">兼容模式能运行 ARM 应用并带 Play 商店；其它档位使用独立 AVD，切换不会删除已有应用。</span>
+        </div>
+        <div class="field">
+          <label>界面语言</label>
+          <select id="wizLanguage">
+            <option value="auto">跟随系统</option>
+            <option value="zh-CN">简体中文</option>
+            <option value="en-US">English</option>
+          </select>
+          <span class="sub">安卓系统界面语言可在首次开机后一键切换，已装应用与存档保留。</span>
+          <div class="row" style="margin-top:10px">
+            <button class="btn ghost sm" id="wizGuestZh">把安卓系统切换为简体中文</button>
+          </div>
+        </div>
+        <div class="wiz-jump"><button class="btn ghost sm" data-wizsec="android">去设置页细调</button></div>
+      </section>
+      <!-- 第 8 页：完成 -->
+      <section class="wizard-page" id="wizardPage8" hidden>
+        <p class="wizard-lead ok">✅ 设置完成</p>
+        <div class="inline-note" id="wizSummary"></div>
+        <span class="sub">点「完成并重启」后，应用会按刚才的设置重新启动。所有改动以后都能在「设置」里随时调整。</span>
+      </section>
     </div>
     <footer class="wizard-foot">
       <button class="btn ghost sm" id="wizardSkip">跳过引导</button>
@@ -168,6 +294,7 @@
     <aside class="set-side">
       <div class="set-side-head">
         <h2>设置</h2>
+        <button class="btn ghost sm" id="btnBackToWizard" hidden>返回引导</button>
         <button class="icon-btn" id="btnCloseSettings" aria-label="关闭设置">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6 6 18"/></svg>
         </button>
@@ -433,6 +560,9 @@
                   <option value="12">12 GB</option>
                   <option value="16">16 GB</option>
                   <option value="24">24 GB</option>
+                  <option value="32">32 GB</option>
+                  <option value="48">48 GB</option>
+                  <option value="64">64 GB</option>
                 </select>
               </div>
             </div>

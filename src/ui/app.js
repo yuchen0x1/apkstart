@@ -1432,6 +1432,18 @@ async function openSettings() {
 
 function closeSettings() {
   $('settingsMask').classList.remove('on');
+  // 从首次引导跳进设置细调：关掉设置就回到刚才那一步，不用从头再来
+  if (wizard.suspended) {
+    const page = wizard.suspended;
+    wizard.suspended = 0;
+    const back = $('btnBackToWizard');
+    if (back) back.hidden = true;
+    const mask = document.getElementById('wizardMask');
+    if (mask) {
+      mask.classList.add('on');
+      wizardShowPage(page);
+    }
+  }
 }
 
 /* ---------------- 软件更新 ---------------- */
@@ -2691,6 +2703,7 @@ function bindEvents() {
 
 const wizard = {
   page: 1,
+  suspended: 0,          // 跳进设置页细调时记住引导停在第几步
   drives: [],
   selectedDrive: '',
   recommendedDrive: '',
@@ -2721,36 +2734,138 @@ function wizardUpdateProgress(p) {
   if (text && p.message) text.textContent = p.message;
 }
 
+const WIZARD_PAGES = 8;
+const WIZARD_TITLES = {
+  1: '欢迎使用 ApkStart', 2: '选择安装位置', 3: '正在准备运行时',
+  4: '虚拟机资源', 5: '硬件加速', 6: '画面与存储', 7: '系统镜像与语言', 8: '设置完成',
+};
+
 function wizardShowPage(n) {
   wizard.page = n;
-  for (let i = 1; i <= 3; i += 1) {
+  for (let i = 1; i <= WIZARD_PAGES; i += 1) {
     const el = document.getElementById(`wizardPage${i}`);
     if (el) el.hidden = i !== n;
   }
   const step = document.getElementById('wizardStep');
-  const titles = { 1: '欢迎使用 ApkStart', 2: '选择安装位置', 3: '正在准备运行时' };
-  if (step) step.textContent = `第 ${n} 步 / 共 3 步`;
+  if (step) step.textContent = `第 ${n} 步 / 共 ${WIZARD_PAGES} 步`;
   const title = document.getElementById('wizardTitle');
-  if (title) title.textContent = titles[n] || 'ApkStart';
+  if (title) title.textContent = WIZARD_TITLES[n] || 'ApkStart';
   const back = document.getElementById('wizardBack');
   const next = document.getElementById('wizardNext');
   const closeBtn = document.getElementById('wizardCloseBtn');
   if (back) back.hidden = n === 1;
-  if (closeBtn) closeBtn.hidden = n !== 3;
+  // 部署中不允许「×」：以前能把向导关掉、后台却还在下载，用户以为程序没反应
+  if (closeBtn) closeBtn.hidden = n !== 3 || wizard.deploying;
+  const skip = document.getElementById('wizardSkip');
+  if (skip) {
+    skip.hidden = n === 3 && wizard.deploying;
+    skip.textContent = n === WIZARD_PAGES ? '完成，稍后重启' : '跳过引导';
+  }
   if (next) {
     next.hidden = false;
-    next.textContent = n === 1 ? '下一步' : n === 2 ? '开始安装' : '完成';
     next.disabled = false;
+    if (n === 1) next.textContent = '下一步';
+    else if (n === 2) next.textContent = '开始安装';
+    else if (n === WIZARD_PAGES) next.textContent = '完成设置并重启';
+    else if (n >= 4) next.textContent = '下一步';
+    else next.textContent = '下一步：设置';
   }
-  const skip = document.getElementById('wizardSkip');
-  if (skip) skip.hidden = n === 3 && wizard.deploying;
-  // 第 3 页完成/失败态下「完成」才可点；部署中不允许点
-  if (n === 3 && wizard.deploying && next) next.disabled = true;
-  if (n === 3 && !wizard.deploying && next) {
+  // 第 3 页：部署中不允许点；失败态只能「返回修改」，成功才继续到设置页
+  if (n === 3 && next) {
     const okBox = document.getElementById('wizardDone');
-    next.disabled = !(okBox && !okBox.hidden);
-    next.textContent = okBox && !okBox.hidden ? '开始使用' : '返回修改';
+    if (wizard.deploying) next.disabled = true;
+    else {
+      next.disabled = !(okBox && !okBox.hidden);
+      next.textContent = okBox && !okBox.hidden ? '下一步：设置' : '返回修改';
+    }
   }
+  if (n === 4) wizardSetupConfigPage();
+}
+
+/** 把当前设置回填到引导里的控件；每次进设置页都刷新，避免用户在外面改过又被覆盖 */
+async function wizardFillConfig() {
+  const s = await api.getSettings().catch(() => null) || state.settings || {};
+  const eng = s.engine || {};
+  const rt = s.runtime || {};
+  const put = (id, v) => { const el = document.getElementById(id); if (el) el.value = String(v == null ? '' : v); };
+  put('wizMemory', eng.memoryMB || 0);
+  put('wizCores', eng.cores || 0);
+  put('wizResourceMode', eng.resourceMode || 'balanced');
+  put('wizRenderSize', eng.renderSize || 'auto');
+  // 引导页默认给出推荐值，而不是「自动」那个 6GB 的老默认
+  put('wizDataGB', eng.dataPartitionGB || 0);
+  // 没手动指定过就按最大剩余空间给推荐值。必须在 getSettings 返回后再算，
+  // 否则会被这次异步回填覆盖掉（用户看到「自动」、最终却存了旧值）。
+  const data = document.getElementById('wizDataGB');
+  if (data && !Number(data.value)) {
+    // 推荐值要按「本次安装的那个盘」算，不是随便拿剩余最大的盘（可能根本没往那儿装）
+    const picked = (wizard.drives || []).find((d) => d.drive === wizard.selectedDrive);
+    const free = picked ? (Number(picked.free) || 0)
+      : (wizard.drives || []).reduce((max, d) => Math.max(max, Number(d.free) || 0), 0);
+    const gb = !free || free < 12 * 1073741824 ? 4
+      : free < 32 * 1073741824 ? 8
+        : free < 60 * 1073741824 ? 16 : 24;
+    data.value = String(gb);
+  }
+  put('wizGpuMode', eng.gpuMode || 'auto');
+  put('wizImageFlavor', rt.systemImageFlavor || 'google_apis_playstore');
+  put('wizLanguage', s.language || 'auto');
+  const accelText = document.getElementById('wizAccelText');
+  if (accelText) {
+    const a = await api.accelStatus().catch(() => null);
+    accelText.textContent = !a ? '暂时无法检测，可在设置页查看'
+      : (a.ok
+        ? (a.suspect ? `已启用 · ${a.kind === 'whpx' ? 'WHPX' : 'AEHD'}（驱动服务未运行，可能开不了机）`
+          : `已启用 · ${a.kind === 'whpx' ? 'WHPX' : (a.kind === 'aehd' ? 'AEHD' : '硬件加速')}`)
+        : '未启用 · 当前是纯软件模拟（开机慢，可能直接崩）');
+  }
+}
+
+/** 进入资源页时用当前设置 + 磁盘余量回填控件 */
+function wizardSetupConfigPage() {
+  wizardFillConfig().catch(() => {});
+}
+
+/** 引导页里改的设置立即落盘（不弹 toast，下一步有总结页统一确认） */
+function wizardCollectConfig() {
+  const val = (id) => {
+    const el = document.getElementById(id);
+    return el ? el.value : '';
+  };
+  const mode = val('wizResourceMode') || 'balanced';
+  const patch = {
+    engine: {
+      memoryMB: Number(val('wizMemory')) || 0,
+      cores: Number(val('wizCores')) || 0,
+      renderSize: val('wizRenderSize') || 'auto',
+      dataPartitionGB: Number(val('wizDataGB')) || 0,
+      gpuMode: val('wizGpuMode') || 'auto',
+    },
+    language: val('wizLanguage') || 'auto',
+  };
+  // 手动填了内存/核心就关掉自动；两项都留空时自动标记不该被误改
+  patch.engine.autoMemory = !patch.engine.memoryMB && !patch.engine.cores;
+  // 资源策略必须在另一个 patch 里先写：store.saveSettings 会用预设覆盖 renderSize，
+  // 放一起会把用户刚选的画质悄悄改回「自动」。
+  return api.setSettings({ engine: { resourceMode: mode } })
+    .then(() => api.setSettings(patch))
+    .then((s) => { state.settings = s; })
+    .catch(() => {});
+}
+
+function wizardShowSummary() {
+  const el = document.getElementById('wizSummary');
+  if (!el) return;
+  const t = (id) => {
+    const node = document.getElementById(id);
+    return node && node.selectedOptions.length ? node.selectedOptions[0].textContent.trim() : '自动';
+  };
+  el.innerHTML = ''
+    + `<div>内存 / CPU：${esc(t('wizMemory'))} · ${esc(t('wizCores'))}</div>`
+    + `<div>数据分区：${esc(t('wizDataGB'))}</div>`
+    + `<div>画质 / 渲染：${esc(t('wizRenderSize'))} · ${esc(t('wizGpuMode'))}</div>`
+    + `<div>系统镜像：${esc(t('wizImageFlavor'))}</div>`
+    + `<div>界面语言：${esc(t('wizLanguage'))}</div>`;
 }
 
 function wizardDirsPreview() {
@@ -2829,8 +2944,18 @@ async function wizardStartDeploy() {
   wizardShowPage(3);
 }
 
-function wizardFinish() {
-  api.setSettings({ wizardDone: true, wizardVersion: wizard.version }).then((s) => { state.settings = s; }).catch(() => {});
+async function wizardFinish({ restart = false } = {}) {
+  wizard.suspended = 0;
+  const back = $('btnBackToWizard');
+  if (back) back.hidden = true;
+  // 必须等「引导已完成」落盘后再让主进程退出，否则重启后又会弹一遍引导
+  await api.setSettings({ wizardDone: true, wizardVersion: wizard.version })
+    .then((s) => { state.settings = s; }).catch(() => {});
+  if (restart) {
+    // 主进程会先 app.relaunch() 再退出；这里不要再关窗口，免得用户看到「闪一下就没了」
+    await api.restartApp().catch(() => {});
+    return;
+  }
   api.wizardClose().catch(() => {});
   const mask = document.getElementById('wizardMask');
   if (mask) mask.classList.remove('on');
@@ -2863,14 +2988,72 @@ async function openWizard() {
 
 async function bindWizard() {
   if (!document.getElementById('wizardMask')) return;
-  document.getElementById('wizardSkip').addEventListener('click', wizardFinish);
-  document.getElementById('wizardCloseBtn').addEventListener('click', wizardFinish);
-  document.getElementById('wizardBack').addEventListener('click', () => wizardShowPage(wizard.page === 3 ? 2 : 1));
+  document.getElementById('wizardSkip').addEventListener('click', () => wizardFinish());
+  document.getElementById('wizardCloseBtn').addEventListener('click', () => wizardFinish());
+  document.getElementById('wizardBack').addEventListener('click', () => wizardShowPage(Math.max(1, wizard.page - 1)));
   document.getElementById('wizardNext').addEventListener('click', () => {
-    if (wizard.page === 1) wizardShowPage(2);
-    else if (wizard.page === 2) wizardStartDeploy();
-    else wizardFinish();   // 完成态才可点（wizardShowPage 已控制 disabled）
+    const page = wizard.page;
+    if (page === 1) wizardShowPage(2);
+    else if (page === 2) wizardStartDeploy();
+    else if (page === 3) {
+      // 只有部署成功才进设置页；失败时「返回修改」回到选盘那一步
+      const done = document.getElementById('wizardDone');
+      if (done && !done.hidden) {
+        wizardFillConfig().catch(() => {});
+        wizardShowPage(4);
+      } else wizardShowPage(2);
+    } else if (page < WIZARD_PAGES) {
+      wizardCollectConfig().then(() => {
+        if (page === WIZARD_PAGES - 1) wizardShowSummary();
+        wizardShowPage(page + 1);
+      });
+    } else {
+      wizardCollectConfig().then(() => wizardFinish({ restart: true }));
+    }
   });
+
+  // 每一步都能跳到设置面板细调，关掉设置后回到同一步
+  document.querySelectorAll('[data-wizsec]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const sec = btn.getAttribute('data-wizsec') || 'performance';
+      wizard.suspended = wizard.page;
+      const mask = document.getElementById('wizardMask');
+      if (mask) mask.classList.remove('on');
+      const back = $('btnBackToWizard');
+      if (back) back.hidden = false;
+      openSettings().then(() => openSettingsSection(sec)).catch(() => {});
+    });
+  });
+  $('btnBackToWizard')?.addEventListener('click', () => closeSettings());
+
+  // 镜像档位要走带校验的专用入口（直接写 systemImageFlavor 会绕过 AVD 切换）
+  document.getElementById('wizImageFlavor')?.addEventListener('change', async (e) => {
+    const wanted = e.target.value;
+    const r = await api.setImageFlavor(wanted).catch((err) => ({ ok: false, error: err.message }));
+    if (r && r.ok) {
+      state.settings = await api.getSettings().catch(() => state.settings);
+      toast({ title: '系统镜像已选择', body: '使用独立 AVD，下次开机生效；其它档位的数据不会删除', type: 'ok' });
+    } else {
+      e.target.value = (state.settings && state.settings.runtime && state.settings.runtime.systemImageFlavor) || 'google_apis_playstore';
+      toast({ title: '切换失败', body: (r && r.error) || '请稍后在设置里重试', type: 'error' });
+    }
+  });
+  document.getElementById('wizEnableAccel')?.addEventListener('click', async () => {
+    const t = toast({ title: '正在开启硬件加速…', body: '如弹出管理员授权请点「是」', sticky: true, spinner: true });
+    const r = await api.enableVirtualization().catch((e) => ({ ok: false, note: e.message }));
+    t.update(r && r.ok
+      ? { title: '硬件加速已就绪', body: r.note || '可以继续下一步', type: 'ok' }
+      : { title: '还没能自动开启', body: (r && r.note) || '可以在设置里查看原因', type: 'warn' });
+    wizardFillConfig().catch(() => {});
+  });
+  document.getElementById('wizGuestZh')?.addEventListener('click', async () => {
+    const t = toast({ title: '正在切换安卓系统语言…', body: '安卓会重启一次，约半分钟', sticky: true, spinner: true });
+    const r = await api.guestLocalize('zh-CN').catch((e) => ({ ok: false, error: e.message }));
+    t.update(r && r.ok
+      ? { title: '已提交简体中文', body: r.active ? '系统界面已切换完成' : '下次开机后生效', type: 'ok' }
+      : { title: '切换失败', body: (r && r.error) || '可在设置里重试', type: 'warn' });
+  });
+
   document.getElementById('btnOpenWizard')?.addEventListener('click', () => {
     closeSettings();
     openWizard();
