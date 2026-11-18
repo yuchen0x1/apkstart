@@ -9,6 +9,16 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 > 本节记录下一版候选变更；尚未对应正式发布版本。
 
+## [0.7.1] — 2026-11-18
+
+> Linux 复测后的稳定性补丁：更新边界和故障提示在跨平台环境下更准确。
+
+### 修复
+
+- Linux 不再尝试启动 Windows 专用的更新脚本。
+- ADB 授权故障提示按 Windows 与 Linux/macOS 分别给出密钥修复路径。
+- Linux 测试环境缺少 PowerShell 时，不再误报 Windows 专用检查失败。
+
 ## [0.7.0] — 2026-11-18
 
 > Linux 成为受支持的第二个平台。本版同时发布 Windows 与 Linux 版本。
@@ -548,6 +558,7 @@ Windows 10/11 x64 与 Linux x86_64；macOS 暂不支持。Windows 安装版内�
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
+[0.7.1]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.7.1
 [0.7.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.7.0
 [0.6.6]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.6
 [0.6.5]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.5

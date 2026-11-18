@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.7.0**（2026-11-18）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.7.1**（2026-11-18）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -44,16 +44,13 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 ## 最新更新
 
 <!-- latest:start -->
-### v0.7.0
+### v0.7.1
 
-> 本版为「Linux 支持专项」：Linux 成为受支持的第二个平台（AppImage / deb）。完整实测报告见 `docs/PLATFORM-LINUX-VALIDATION.md`。
+> Linux 复测后的稳定性补丁：更新边界和故障提示在跨平台环境下更准确。
 
-- **首启向导第 1 页可切换界面语言（中文/英文/跟随系统）**：选完立即生效（现场重翻，无需重启）；语言选择此前埋在第 7 页。同时修复翻译层「英→中切不回去」的问题 ——渲染层现在会记住每个节点的中文原文，切换语言双向可用（设置页的语言切换同样受益）。
-- **Linux 版（AppImage / deb，x86_64）**：electron-builder 新增 Linux target； Linux 包不带 Windows 运行时整包（emulator/aehd 均为 Windows 二进制），首次启动由应用内「自动部署」从 Google 官方源分组件下载 Linux 版运行时（platform-tools / emulator / 系统镜像，`dl.google.com` 国内实测 10~70MB/s）。实测全链路：下载 → 部署 → KVM 加速开机（31 秒就绪）→ 安装 APK 成功。
-- **运行时下载按宿主分叉**：`provision` 的下载源/解析器按 host-os 分叉 —— `platform-tools-latest-<host>.zip`、`emulator-<host>_64-*.zip`（repository2-3.xml 动态解析）、系统镜像 zip 为宿主无关；AEHD / 运行时整包 / QEMU 安装器为 Windows 专有并加显式守卫。
-- **KVM 加速**：Linux 的硬件加速走 `/dev/kvm`（`platform.acceleration()` 已有检测）， `emulatorAccel()` 新增 Linux 分支解析 `-accel-check` 输出，权限/驱动问题给出「把用户加入 kvm 组」等可照做的提示。
-- **zip 解压恢复 unix 权限位与符号链接**：自研解压器此前不恢复 mode（Windows 无此概念），Linux 包解出来的 adb/emulator 全是不可执行 —— 现在按中央目录的 external attributes 恢复，并对符号链接条目做 zip-slip 防护后落地。
-- **缺系统库诊断**：Linux 上 emulator 起不来时 `ldd` 点名缺失库，并映射成 Ubuntu/Debian 的 `apt install` 包名（libpulse→libpulse0 等 15 项）。
+- **Linux 不再误触发 Windows 更新器**：非 Windows 平台会在启动更新脚本前明确拒绝，不会调用 Windows 专用的启动回调。
+- **ADB 授权故障提示平台化**：Linux/macOS 使用 `$HOME/.android/adbkey*` 的修复路径， Windows 继续使用 `%USERPROFILE%\\.android\\adbkey*`，避免用户照着错误路径排障。
+- **跨平台回归测试**：Linux 没有 PowerShell 时会安全跳过仅 Windows 的语法/执行检查，同时保留 Windows 更新脚本的完整校验。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

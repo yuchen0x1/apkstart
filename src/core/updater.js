@@ -653,6 +653,9 @@ class Updater {
    * 也不能假装成功。
    */
   _launch(cmdPath, scriptPath, opts = {}) {
+    if (process.platform !== 'win32') {
+      throw new Error('Windows 更新脚本仅支持 Windows 平台');
+    }
     const errors = [];
     if (typeof opts.launch === 'function') {
       try {

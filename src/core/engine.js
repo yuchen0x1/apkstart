@@ -36,6 +36,11 @@ const AUTO_ACTION_TEXT = {
 const EMU_PORT = 5554;
 const EMU_SERIAL = `emulator-${EMU_PORT}`;
 
+// 给用户的 adb 授权修复提示必须跟宿主系统一致；Linux/macOS 没有 %USERPROFILE%。
+function adbKeyHint() {
+  return process.platform === 'win32' ? '%USERPROFILE%\\.android\\adbkey*' : '$HOME/.android/adbkey*';
+}
+
 /** TCP 端口是否有人监听（用来判断上次留下的模拟器还在不在） */
 function portAlive(port, timeout = 150) {
   return new Promise((resolve) => {
@@ -353,7 +358,7 @@ class Runtime {
               code: 'ADB_UNAUTHORIZED',
               title: '安卓调试授权未完成（授权对话框）',
               hint: '系统卡在「允许 USB 调试？」对话框，已自动作废旧快照并冷启动一次让运行时'
-                + '重新注入 adb 公钥。若反复出现，请删除 %USERPROFILE%\\.android\\adbkey* 后重试。',
+                + `重新注入 adb 公钥。若反复出现，请删除 ${adbKeyHint()} 后重试。`,
             };
             if (!authHealed) {
               authHealed = true;
@@ -1671,4 +1676,4 @@ class Runtime {
   get bootLog() { return this._bootLog.slice(-60); }
 }
 
-module.exports = { Runtime, MONITOR_PORT };
+module.exports = { Runtime, MONITOR_PORT, adbKeyHint };

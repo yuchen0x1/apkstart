@@ -5,6 +5,19 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.7.1] — 2026-11-18
+
+> Linux 复测后的稳定性补丁：更新边界和故障提示在跨平台环境下更准确。
+
+### 修复
+
+- **Linux 不再误触发 Windows 更新器**：非 Windows 平台会在启动更新脚本前明确拒绝，
+  不会调用 Windows 专用的启动回调。
+- **ADB 授权故障提示平台化**：Linux/macOS 使用 `$HOME/.android/adbkey*` 的修复路径，
+  Windows 继续使用 `%USERPROFILE%\\.android\\adbkey*`，避免用户照着错误路径排障。
+- **跨平台回归测试**：Linux 没有 PowerShell 时会安全跳过仅 Windows 的语法/执行检查，
+  同时保留 Windows 更新脚本的完整校验。
+
 ## [0.7.0] — 2026-11-18
 
 > 本版为「Linux 支持专项」：Linux 成为受支持的第二个平台（AppImage / deb）。
@@ -947,6 +960,7 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
+[0.7.1]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.7.1
 [0.6.6]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.6
 [0.6.5]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.5
 [0.6.4]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.4

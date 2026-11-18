@@ -25,6 +25,7 @@ const doctor = require('../src/core/doctor');
 const layers = require('../src/core/layers');
 const pointer = require('../src/core/pointer');
 const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src/core/adb');
+const { adbKeyHint } = require('../src/core/engine');
 
 (async () => {
   console.log('\n[doctor.js 自动参数]');
@@ -1053,6 +1054,12 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/_consoleAlive\(\)/.test(stop) && /旧模拟器仍在线/.test(stop),
       '重启前必须等控制台端口释放，避免 ensure 重新接管旧实例');
     assert(/_activeApps\.clear\(\)/.test(stop), '重启系统后要清理旧容器会话状态');
+  });
+
+  await test('ADB 授权故障提示使用当前平台的密钥路径', () => {
+    const hint = adbKeyHint();
+    if (process.platform === 'win32') assert(hint === '%USERPROFILE%\\.android\\adbkey*', hint);
+    else assert(hint === '$HOME/.android/adbkey*', hint);
   });
 
   // 上游 #41：模拟器窗口比例由 hw.lcd 在开机时锁死（wm size 只改逻辑分辨率，

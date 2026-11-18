@@ -221,7 +221,16 @@ async function main() {
     assert(/relaunched \(rolled back\)/.test(script), '复制失败回滚后要把旧版本拉起来');
     const file = path.join(root, 'apply-check.ps1');
     fs.writeFileSync(file, script, 'utf8');
-    const r = spawnSync('powershell.exe', [
+    const powershell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+    const probe = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'], {
+      encoding: 'utf8', timeout: 30000,
+    });
+    if (probe.error && probe.error.code === 'ENOENT') {
+      console.log('  跳过：当前环境未提供 ' + powershell + ' 语法解析器');
+      return;
+    }
+    assert(!probe.error, '无法启动 ' + powershell + ': ' + (probe.error ? probe.error.message : ''));
+    const r = spawnSync(powershell, [
       '-NoProfile', '-NonInteractive', '-Command',
       `$err = $null; [void][System.Management.Automation.Language.Parser]::ParseInput(([IO.File]::ReadAllText('${file.replace(/'/g, "''")}', [Text.Encoding]::UTF8)), [ref]$null, [ref]$err); if ($err -and $err.Count) { exit 1 }`,
     ], { encoding: 'utf8', timeout: 30000 });
@@ -471,11 +480,19 @@ async function main() {
     const root = mkTmp();
     const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
     const u = mkUpdater(root);
-    const r = u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, {
-      launch: (cmdPath) => { eq(path.basename(cmdPath), 'apply.cmd', '应把 .cmd 启动器交给调用方'); return 'ok'; },
-    });
+    let r;
+    if (process.platform === 'win32') {
+      r = u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, {
+        launch: (cmdPath) => { eq(path.basename(cmdPath), 'apply.cmd', '应把 .cmd 启动器交给调用方'); return 'ok'; },
+      });
+    } else {
+      // Linux 只验证 Windows 脚本的落盘内容；真正的启动器由 Windows 专属路径负责。
+      u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false });
+      u._writeLauncher(path.join(u.updateDir, 'apply.cmd'), path.join(u.updateDir, 'apply.log.ps1'));
+      r = { ok: true, via: 'test' };
+    }
     eq(r.ok, true, 'apply 应返回成功');
-    eq(r.via, 'shell', '有 launch 回调时应优先走它');
+    if (process.platform === 'win32') eq(r.via, 'shell', '有 launch 回调时应优先走它');
     const ps1 = path.join(u.updateDir, 'apply.log.ps1');
     const raw = fs.readFileSync(ps1, 'utf8');
     eq(raw.charCodeAt(0), 0xfeff, '脚本必须以 UTF-8 BOM 开头');
@@ -490,7 +507,7 @@ async function main() {
     const root = mkTmp();
     const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
     const u = mkUpdater(root);
-    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { launch: () => 'ok' });
+    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false });
     // 现场日志：只有 updater start
     fs.writeFileSync(path.join(u.updateDir, 'update.log'), '[18:55:53] updater start\r\n', 'utf8');
     const p = u.pendingApply();
@@ -503,7 +520,7 @@ async function main() {
     const root = mkTmp();
     const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
     const u = mkUpdater(root);
-    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { launch: () => 'ok' });
+    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false });
     fs.writeFileSync(path.join(u.updateDir, 'update.log'),
       '[18:55:53] updater start\r\n[18:55:55] app exited, applying\r\n[18:56:10] installer exit 1\r\n', 'utf8');
     eq(u.pendingApply().state, 'failed', '有心跳但没装成功时应判 failed');
@@ -513,14 +530,30 @@ async function main() {
     const root = mkTmp();
     const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
     const u = mkUpdater(root);
-    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { launch: () => 'ok' });
+    u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false });
     // 已经升到 9.9.9 了
     u.current = '9.9.9';
     eq(u.pendingApply().state, 'none');
     assert(!fs.existsSync(path.join(u.updateDir, 'pending.json')), '追平后凭条应被清理');
   });
 
+  await test('非 Windows 不尝试启动 Windows 更新器', async () => {
+    if (process.platform === 'win32') return;
+    const root = mkTmp();
+    const u = mkUpdater(root);
+    let launched = false;
+    await expectThrow(
+      () => u._launch(path.join(root, 'apply.cmd'), path.join(root, 'apply.log.ps1'), {
+        launch: () => { launched = true; return 'ok'; },
+      }),
+      /Windows|平台/,
+      '非 Windows 平台应明确拒绝 Windows 更新启动器',
+    );
+    assert(!launched, '非 Windows 平台不应调用 Windows 的 launch 回调');
+  });
+
   await test('launch 回调失败时会退到 explorer / spawn，三级都失败才抛错', async () => {
+    if (process.platform !== 'win32') return;
     const root = mkTmp();
     const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
     const u = mkUpdater(root);
