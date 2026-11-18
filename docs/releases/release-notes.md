@@ -9,6 +9,36 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 > 本节记录下一版候选变更；尚未对应正式发布版本。
 
+## [0.7.0] — 2026-11-18
+
+> Linux 成为受支持的第二个平台。本版同时发布 Windows 与 Linux 版本。
+
+### 新增
+
+- Linux x86_64 AppImage 与 deb 构建，首次启动从 Google 官方源下载 Linux 版运行时。
+- Linux 运行时按宿主系统下载 platform-tools、Android Emulator 和系统镜像，使用 `/dev/kvm`
+  加速，并在缺少系统库时给出可执行的诊断提示。
+- Linux 首启向导、XDG 数据目录、Unix 权限恢复、符号链接安全解压和 qemu 孤儿进程清理。
+- 首启向导第一页可切换中文、英文或跟随系统，设置页语言切换可双向恢复。
+- 发布工作流在每个版本中同时验证并上传 Windows 便携版、安装包、运行时整包和 Linux AppImage、deb。
+
+### 修复
+
+- Linux 上 npm 不再因平台限制拒装，数据目录不再落到 Windows 风格的 `AppData` 路径。
+- 独立窗口模式摘出 Android 画面后立即隐藏右侧浮动工具栏，避免工具栏与画面分离很远。
+- 首启向导语言选择器的作用域错误，避免打开向导时产生 `put is not defined` 脚本异常。
+
+### 下载资产
+
+| 平台 | 文件 |
+|---|---|
+| Windows | `ApkStart-v0.7.0-win64-portable.zip`、`ApkStart-0.7.0-Setup.exe`、`ApkStart-runtime-v0.7.0.zip` |
+| Linux x86_64 | `ApkStart-0.7.0-x86_64.AppImage`、`ApkStart-0.7.0-amd64.deb` |
+
+### 支持范围
+
+Windows 10/11 x64 与 Linux x86_64；macOS 暂不支持。Windows 安装版内置运行时，Linux 首次启动需要联网下载运行时。
+
 ## [0.6.7] — 2026-11-16
 
 > 对齐上游嵌入/渲染根治方案，修复「启动后黑屏」，并带出低配调优、自定义镜像与游戏模式。
@@ -518,6 +548,7 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 - ARM 兼容模式升级 Android 14（字节系应用可运行）、NSIS 单文件安装版、
   开箱即用打包、ARM 兼容性诊断与安装失败原因中文化。
 
+[0.7.0]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.7.0
 [0.6.6]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.6
 [0.6.5]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.5
 [0.6.4]: https://github.com/yuchen0x1/apkstart/releases/tag/v0.6.4

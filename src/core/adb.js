@@ -227,9 +227,10 @@ class AdbClient {
   }
 
   static resolveAdb(explicit, appRoot) {
+    const adbName = process.platform === 'win32' ? 'adb.exe' : 'adb';
     const candidates = [
       explicit,
-      appRoot && path.join(appRoot, 'tools', 'platform-tools', 'adb.exe'),
+      appRoot && path.join(appRoot, 'tools', 'platform-tools', adbName),
       ...COMMON_ADB_PATHS,
     ].filter(Boolean);
     for (const c of candidates) {

@@ -1,13 +1,17 @@
 'use strict';
 /**
  * 本地持久化：应用清单 + 设置
- * 数据目录：%APPDATA%\apkstart
+ * 数据目录：Windows %APPDATA%\apkstart；Linux 走 XDG ~/.local/share/apkstart
  */
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const DATA_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'apkstart');
+// Linux 不能落 ~/AppData/Roaming：XDG 约定的数据目录是 ~/.local/share
+// （实测记录见 docs/PLATFORM-LINUX-VALIDATION.md 缺口 #2）
+const DATA_DIR = process.platform === 'linux'
+  ? path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'apkstart')
+  : path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'apkstart');
 const ICON_DIR = path.join(DATA_DIR, 'icons');
 const APK_DIR = path.join(DATA_DIR, 'apks');
 const APPS_FILE = path.join(DATA_DIR, 'apps.json');

@@ -10,7 +10,8 @@
  *   1. 优先 `.github/release-notes-<tag>.md`（手写的完整发行说明）；
  *   2. 其次 CHANGELOG.md 里该版本的段落（内容原样，去掉标题行）；
  *   3. 最后 git log 兜底（上个 tag 到本 tag 的提交列表，而不是自动生成的废话）；
- *   4. 无论正文来自哪条路，都补齐「下载哪个」「升级」「支持范围」等固定信息。
+ *   4. 无论正文来自哪条路，都补齐「下载哪个」「升级」「支持范围」等固定信息；
+ *      v0.7.0 起固定列出 Windows 与 Linux 两个平台的发布资产。
  *
  * 产出的正文一律**不带重复的版本大标题**：GitHub Release 名称、
  * 应用内「更新日志（vX.Y.Z）」都已经写了版本号，正文再来一行 `# ApkStart vX.Y.Z`
@@ -90,6 +91,18 @@ function fromGit(root, tag, repo) {
 }
 
 /**
+ * 判断一个版本是否属于 v0.7.0 起的双平台发布线。
+ * 0.6.x 仍然是历史上的 Windows-only Release，不能回写成 Linux 版本。
+ */
+function supportsLinux(tag) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(tag || ''));
+  if (!m) return false;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  return major > 0 || (major === 0 && minor >= 7);
+}
+
+/**
  * 每个 Release 都要有的固定信息。
  *
  * 手写发行说明可以专注于「这版升级了什么、修了什么」，但不能因此把用户
@@ -99,13 +112,14 @@ function fromGit(root, tag, repo) {
 function appendBasics(raw, tag) {
   let body = tidy(raw);
   const version = String(tag).replace(/^v/i, '');
+  const dualPlatform = supportsLinux(tag);
   const hasHeading = (pattern) => body.split('\n').some((line) => (
     /^#{2,6}\s+/.test(line) && pattern.test(line)
   ));
   const sections = [];
 
   if (!hasHeading(/下载/)) {
-    sections.push([
+    const downloads = [
       '## 下载哪个',
       '',
       '| 文件 | 说明 |',
@@ -113,7 +127,14 @@ function appendBasics(raw, tag) {
       `| \`ApkStart-v${version}-win64-portable.zip\` | 轻量便携版，运行时首次启动按需下载 |`,
       `| \`ApkStart-${version}-Setup.exe\` | 完整安装包，内置运行时，离线开箱即用 |`,
       `| \`ApkStart-runtime-v${version}.zip\` | 运行时整包（便携版下载源，一般不用手动下载） |`,
-    ].join('\n'));
+    ];
+    if (dualPlatform) {
+      downloads.push(
+        `| \`ApkStart-${version}-x86_64.AppImage\` | Linux x86_64 便携版，首次启动按需下载运行时 |`,
+        `| \`ApkStart-${version}-amd64.deb\` | Linux x86_64 安装包，适合 Debian / Ubuntu |`,
+      );
+    }
+    sections.push(downloads.join('\n'));
   }
 
   if (!hasHeading(/升级/)) {
@@ -124,11 +145,13 @@ function appendBasics(raw, tag) {
     ].join('\n'));
   }
 
-  if (!/本项目仅支持\s*Windows\s*10\/11\s*x64/.test(body)) {
+  if (!hasHeading(/支持范围/)) {
     sections.push([
       '## 支持范围',
       '',
-      '本项目仅支持 Windows 10/11 x64。',
+      dualPlatform
+        ? '本项目支持 Windows 10/11 x64 与 Linux x86_64（AppImage / deb）；macOS 不支持。'
+        : '本项目仅支持 Windows 10/11 x64。',
     ].join('\n'));
   }
 
@@ -158,7 +181,7 @@ function buildNotes(opts = {}) {
   throw new Error(`找不到 ${vtag} 的任何发行说明来源（release-notes 文件 / CHANGELOG / git log）`);
 }
 
-module.exports = { buildNotes, stripTitle, tidy, fromFile, fromChangelog, fromGit, appendBasics };
+module.exports = { buildNotes, stripTitle, tidy, fromFile, fromChangelog, fromGit, appendBasics, supportsLinux };
 
 if (require.main === module) {
   const argv = process.argv.slice(2);

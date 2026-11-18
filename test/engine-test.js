@@ -9,9 +9,10 @@ const path = require('path');
 const http = require('http');
 const net = require('net');
 
-// 隔离测试数据目录，避免污染真实用户配置
+// 隔离测试数据目录，避免污染真实用户配置（双平台约定：Windows 走 APPDATA，Linux 走 XDG）
 const TMP = path.join(os.tmpdir(), `apkstart-test-${Date.now()}`);
 process.env.APPDATA = TMP;
+process.env.XDG_DATA_HOME = path.join(TMP, 'xdgdata');
 fs.mkdirSync(path.join(TMP, 'apkstart'), { recursive: true });
 
 let passed = 0;
@@ -258,8 +259,10 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
   await test('默认运行时目录位于数据目录下', async () => {
     const p = new Provisioner('C:/fake/app');
     assert(p.paths().root.startsWith(store.DATA_DIR), `路径异常: ${p.paths().root}`);
-    assert(p.paths().qemuExe.endsWith('qemu-system-x86_64.exe'), 'qemu 路径异常');
-    assert(p.paths().adbExe.endsWith('adb.exe'), 'adb 路径异常');
+    // 可执行文件名按宿主分叉：Windows 带 .exe，Linux 裸名
+    const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    assert(p.paths().qemuExe.endsWith(`qemu-system-x86_64${exeSuffix}`), 'qemu 路径异常');
+    assert(p.paths().adbExe.endsWith(`adb${exeSuffix}`), 'adb 路径异常');
   });
 
   await test('三种内置系统档位使用独立 AVD，默认是 Google Play', async () => {
@@ -336,7 +339,9 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       assert(/^https?:\/\//i.test(u), `不是绝对 URL: ${u}`);
       assert(/\.zip$/i.test(u), `不是 zip 包: ${u}`);
     }
-    assert(/windows_x64/i.test(emuUrl), `emulator 包平台不对: ${emuUrl}`);
+    // emulator 包按宿主分叉：Windows 拿 windows_x64，Linux 拿 linux_x64
+    const hostRe = process.platform === 'win32' ? /windows_x64/i : /linux_x64/i;
+    assert(hostRe.test(emuUrl), `emulator 包平台不对: ${emuUrl}`);
   });
 
   await test('AVD 配置使用 64 位架构（x86_64 不能被截成 x86）', async () => {
@@ -591,7 +596,10 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
   console.log('\n[provision.js 兼容镜像 / 完整版]');
 
   await test('playImageInfo 校验 API 34 兼容镜像完整性', async () => {
-    const dir = path.join(TMP, 'apkstart', 'runtime', 'system-images', 'android-34', 'google_apis_playstore', 'x86_64');
+    // DATA_DIR 按宿主落点不同（Windows APPDATA\apkstart；Linux XDG_DATA_HOME/apkstart），
+    // 用 store.DATA_DIR 推导而不是写死 TMP/apkstart
+    const store = require('../src/core/store');
+    const dir = path.join(store.DATA_DIR, 'runtime', 'system-images', 'android-34', 'google_apis_playstore', 'x86_64');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'kernel-ranchu'), 'k');
     const prov = new Provisioner(path.join(__dirname, '..'));

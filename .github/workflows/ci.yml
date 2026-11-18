@@ -44,3 +44,28 @@ jobs:
           $out = & .\test\pointer-hook-logic.ps1
           $out | ForEach-Object { Write-Host $_ }
           if (-not ($out -contains 'POINTER_HOOK_LOGIC_OK')) { exit 1 }
+
+  # Linux 单元测试（v0.7 起 Linux 是受支持平台）：同一套测试在 Ubuntu 上跑。
+  # Windows 专属用例（鼠标钩子/PowerShell 真机执行等）在测试内部自行跳过。
+  test-linux:
+    name: 单元测试（Linux / Node 22）
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+      - name: 运行测试
+        run: npm test
+
+      - name: 系统镜像体积闸门
+        run: node build/check-no-images.js --git

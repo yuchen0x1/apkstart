@@ -1,6 +1,6 @@
 # ApkStart
 
-<p align="center"><strong>在 Windows 上像本地软件一样运行安卓应用</strong><br/>
+<p align="center"><strong>在 Windows 和 Linux 上像本地软件一样运行安卓应用</strong><br/>
 双击 APK 即安装，每个应用一个独立窗口 + 一个桌面图标，不用进模拟器里翻应用列表。</p>
 
 <p align="center">
@@ -8,7 +8,7 @@
   <a href="https://github.com/yuchen0x1/apkstart/releases"><img src="https://img.shields.io/github/downloads/yuchen0x1/apkstart/total?color=orange" alt="Downloads" /></a>
   <a href="https://github.com/yuchen0x1/apkstart/actions/workflows/ci.yml"><img src="https://github.com/yuchen0x1/apkstart/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6.svg" alt="Windows 10/11 x64" />
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D6.svg" alt="Windows / Linux" />
 </p>
 
 <p align="center">
@@ -22,15 +22,15 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.6.18**（2026-11-18）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.7.0**（2026-11-18）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
-ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管理所需的 Android 运行时，
-把安卓应用包装成可以从桌面、开始菜单、任务栏或资源管理器直接打开的 Windows 应用——
-窗口是真 Windows 窗口（可拖动、缩放、全屏、贴边），不是模拟器里的一块画面。
+ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
+把安卓应用包装成可以从桌面、开始菜单、任务栏或应用菜单直接打开的桌面应用——Windows 上是可拖动、
+缩放、全屏、贴边的独立窗口，Linux 上也以独立模拟器窗口运行，不用进入模拟器列表找应用。
 
-> 想让安卓应用出现在 Windows 桌面上，又不想装一整套 Android Studio、不想每次开机手动点模拟器、
-> 也不想应用和数据被塞在 C 盘的某个深层目录里，ApkStart 就是干这件事的。
+> 想让安卓应用出现在桌面上，又不想装一整套 Android Studio、不想每次开机手动点模拟器、
+> 也不想应用和数据被塞在系统盘的某个深层目录里，ApkStart 就是干这件事的。
 
 ## 为什么用它
 
@@ -44,18 +44,24 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 ## 最新更新
 
 <!-- latest:start -->
-### v0.6.18
+### v0.7.0
 
-- **设置页顶栏「返回引导」和「关闭设置 ×」点不了**：主窗口标题栏有一条贯穿顶部、 44px 高的拖动区（`-webkit-app-region: drag`）。设置页全屏覆盖后这条拖动区**不会被覆盖层抵消**（drag/no-drag 按元素矩形累加/挖除，与绘制层级无关），顶栏两颗 y<44px 的按钮，真实鼠标点击被 Windows 当成「拖动窗口」吃掉——表现就是按钮看得见、点不了。修复：`.set-side-head` 整行声明 `no-drag` 把自己从拖动区里挖掉；内容区顶部保留拖动，设置页开着时窗口照样能拖动。
-- **头部间距**：「设置」标题与「返回引导」按钮之间补 8px 间距（原来贴在一起）。
-- **新增点击探针工具** `test/ui-click-probe.js`（手工跑，不进 npm test）：注入真实 OS 级鼠标点击（PowerShell SendInput）+ 对比 DOM 命中，专抓「按钮看得见、点不了」这类只有真实事件才能暴露的回归。CI / 无人值守环境注入真实点击不可重复，因此不进自动化套件。
+> 本版为「Linux 支持专项」：Linux 成为受支持的第二个平台（AppImage / deb）。完整实测报告见 `docs/PLATFORM-LINUX-VALIDATION.md`。
+
+- **首启向导第 1 页可切换界面语言（中文/英文/跟随系统）**：选完立即生效（现场重翻，无需重启）；语言选择此前埋在第 7 页。同时修复翻译层「英→中切不回去」的问题 ——渲染层现在会记住每个节点的中文原文，切换语言双向可用（设置页的语言切换同样受益）。
+- **Linux 版（AppImage / deb，x86_64）**：electron-builder 新增 Linux target； Linux 包不带 Windows 运行时整包（emulator/aehd 均为 Windows 二进制），首次启动由应用内「自动部署」从 Google 官方源分组件下载 Linux 版运行时（platform-tools / emulator / 系统镜像，`dl.google.com` 国内实测 10~70MB/s）。实测全链路：下载 → 部署 → KVM 加速开机（31 秒就绪）→ 安装 APK 成功。
+- **运行时下载按宿主分叉**：`provision` 的下载源/解析器按 host-os 分叉 —— `platform-tools-latest-<host>.zip`、`emulator-<host>_64-*.zip`（repository2-3.xml 动态解析）、系统镜像 zip 为宿主无关；AEHD / 运行时整包 / QEMU 安装器为 Windows 专有并加显式守卫。
+- **KVM 加速**：Linux 的硬件加速走 `/dev/kvm`（`platform.acceleration()` 已有检测）， `emulatorAccel()` 新增 Linux 分支解析 `-accel-check` 输出，权限/驱动问题给出「把用户加入 kvm 组」等可照做的提示。
+- **zip 解压恢复 unix 权限位与符号链接**：自研解压器此前不恢复 mode（Windows 无此概念），Linux 包解出来的 adb/emulator 全是不可执行 —— 现在按中央目录的 external attributes 恢复，并对符号链接条目做 zip-slip 防护后落地。
+- **缺系统库诊断**：Linux 上 emulator 起不来时 `ldd` 点名缺失库，并映射成 Ubuntu/Debian 的 `apt install` 包名（libpulse→libpulse0 等 15 项）。
 <!-- latest:end -->
 
-完整历史见 [CHANGELOG.md](CHANGELOG.md)。
+完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 界面与实测
 
-首次启动会显示三步引导：选择安装位置、自动下载运行时、开始使用。默认推荐剩余空间较大的非系统盘，避免把 C 盘占满。
+首次启动会显示三步引导：选择安装位置（Windows）或确认 Linux 数据目录、自动下载运行时、开始使用。
+Windows 默认推荐剩余空间较大的非系统盘，Linux 使用 XDG 数据目录。
 
 <p align="center">
   <img src="docs/images/onboarding.png" alt="ApkStart 首次运行引导" width="800" />
@@ -154,14 +160,17 @@ ApkStart 是一个独立维护的 Windows 桌面应用。它负责下载和管�
 | `ApkStart-<版本>-Setup.exe` | 约 1 GB | **推荐**。安装版，内置完整运行时，装完离线可用，不用等下载 |
 | `ApkStart-v<版本>-win64-portable.zip` | 约 150 MB | 便携版，解压即用，首次启动时按需下载运行时 |
 | `ApkStart-runtime-v<版本>.zip` | 约 1 GB | 运行时整包，便携版下载源；一般不需要手动下载 |
+| `ApkStart-<版本>-x86_64.AppImage` | 约 130 MB | Linux x86_64 便携版，首次启动时按需下载运行时 |
+| `ApkStart-<版本>-amd64.deb` | 约 105 MB | Linux x86_64 安装包，适合 Debian / Ubuntu |
 
-安装版和便携版都会把运行时、安卓数据、应用和快照放在用户数据目录中，更新程序文件不会删除已安装应用。
-C 盘空间紧张时，可在「设置 → 桌面与文件」中修改运行时目录和安卓数据目录。
+安装版、便携版和 Linux 包都会把安卓数据、应用和快照放在用户数据目录中，更新程序文件不会删除已安装应用。
+Windows 完整安装版内置运行时；Linux 首次启动会从 Google 官方源在线下载对应运行时。
+Windows 可在「设置 → 桌面与文件」中修改运行时目录和安卓数据目录，Linux 使用 XDG 默认目录。
 
 ### 第一次启动
 
 1. 在引导第一页点击「下一步」。
-2. 选择安装位置和下载源；自动模式会先测速，再选择更快的来源。
+2. Windows 选择安装位置和下载源；Linux 确认默认 XDG 数据目录。自动模式会先测速，再选择更快的来源。
 3. 点击「开始安装」，等待 adb、模拟器和 Android 14 系统镜像部署完成。
 4. 把 APK 拖进主窗口，或点击「安装 APK」选择文件。
 5. 安装完成后双击桌面图标即可启动应用。
@@ -172,13 +181,14 @@ C 盘空间紧张时，可在「设置 → 桌面与文件」中修改运行时�
 
 | 项目 | 要求 |
 |---|---|
-| 操作系统 | Windows 10/11 x64；Windows 7/8 不支持 |
-| CPU | 建议 4 核及以上，并在 BIOS 中开启 VT-x/AMD-V |
+| 操作系统 | Windows 10/11 x64 或 Linux x86_64；Windows 7/8 和 macOS 不支持 |
+| CPU | 建议 4 核及以上；Windows 在 BIOS 中开启 VT-x/AMD-V，Linux 开启 KVM |
 | 内存 | 最低 8 GB，建议 16 GB |
 | 磁盘 | 首次部署至少预留约 8 GB；安装大型应用需要更多空间 |
-| 网络 | 首次部署需要联网；使用完整安装版时，运行时已随安装包提供 |
+| 网络 | Windows 便携版与 Linux 首次部署需要联网；Windows 完整安装版内置运行时 |
 
-硬件加速可使用 AEHD 或 Windows 虚拟机平台（WHPX）。没有硬件加速时可以回退到软件模拟，
+硬件加速在 Windows 上可使用 AEHD 或 Windows 虚拟机平台（WHPX），Linux 使用 `/dev/kvm`。
+没有硬件加速时可以回退到软件模拟，
 但启动速度和流畅度会明显下降。部分依赖真实传感器、基带或强反模拟检测的应用仍可能无法运行。
 
 ### 内存和 CPU 是怎么分的
@@ -217,7 +227,8 @@ C 盘空间紧张时，可在「设置 → 桌面与文件」中修改运行时�
 如果一直卡住，去「运行状态」看部署步骤停在哪一步，日志里会写明原因。
 
 **提示没有硬件加速？**
-BIOS 里开启 VT-x/AMD-V；Intel 平台可安装 AEHD，或启用 Windows 虚拟机平台（WHPX）。
+Windows 在 BIOS 里开启 VT-x/AMD-V；Intel 平台可安装 AEHD，或启用 Windows 虚拟机平台（WHPX）。
+Linux 确认 BIOS 虚拟化已开启，并把当前用户加入 `kvm` 组。
 没有加速也能跑，只是慢。
 
 **应用能装但打不开 / 白屏 / 闪退？**
@@ -234,15 +245,17 @@ BIOS 里开启 VT-x/AMD-V；Intel 平台可安装 AEHD，或启用 Windows 虚�
 
 ## 从源码构建
 
-环境要求：Windows x64、Node.js 20 或更高版本。
+环境要求：Windows 或 Linux x64、Node.js 20 或更高版本。
+
+```sh
+# Windows / Linux 安装依赖并启动开发版
+npm install
+npm start
+```
+
+Windows 还可注册/取消注册 `.apk` 文件关联，并构建便携版或完整安装版：
 
 ```powershell
-# 安装依赖
-npm install
-
-# 启动开发版
-npm start
-
 # 可选：注册/取消注册 .apk 文件关联
 npm run assoc:on
 npm run assoc:off
@@ -256,12 +269,19 @@ npm run build:exe
 # 产出：dist/release/ApkStart-<版本>-Setup.exe
 ```
 
+Linux 构建 AppImage 与 Debian/Ubuntu 安装包：
+
+```sh
+npx electron-builder --linux AppImage deb --publish never
+# 产出：dist/release/ApkStart-<版本>-x86_64.AppImage 与 ApkStart-<版本>-amd64.deb
+```
+
 `npm run build:exe` 会先准备可分发的运行时，再调用 electron-builder 生成安装包。
 构建过程中会下载或整理 Android Emulator、adb 和系统镜像，因此需要足够磁盘空间和网络。
 
 ## 测试与自检
 
-```powershell
+```sh
 # 纯 Node 测试，不需要网络和设备
 npm test
 
@@ -310,10 +330,10 @@ docs/                架构、兼容性、测试和发布文档
 
 | 内容 | 默认位置 |
 |---|---|
-| 设置 / 应用清单 / 日志 | `%APPDATA%\apkstart` |
-| 运行时（模拟器、adb、系统镜像） | 引导里选的目录，默认非系统盘 |
+| 设置 / 应用清单 / 日志 | Windows `%APPDATA%\apkstart`；Linux `~/.local/share/apkstart` |
+| 运行时（模拟器、adb、系统镜像） | Windows 引导里选的目录；Linux `~/.local/share/apkstart/runtime` |
 | 安卓用户数据与快照 | 运行时目录下的 `avd/apkstart.avd` |
-| 与安卓互通的文件 | `%USERPROFILE%\ApkStartShared` ↔ `/sdcard/ApkStartShared` |
+| 与安卓互通的文件 | `~/ApkStartShared` ↔ `/sdcard/ApkStartShared`（Windows 为 `%USERPROFILE%`） |
 
 这些目录都可以在「设置 → 桌面与文件」里改到别的盘，改完重启软件生效。
 
@@ -323,7 +343,7 @@ ApkStart 使用 Android Emulator、QEMU、adb 和 Android 系统镜像作为运�
 项目自身主要负责安装、窗口承载、运行时管理、文件同步、备份和更新体验。
 运行时下载和系统镜像遵循各自的上游许可协议，项目代码本身使用 MIT 许可证。
 
-这是一个 Windows x64 应用，不提供 Linux 或 macOS 构建。安卓应用是否可用仍取决于 ABI、
+这是一个支持 Windows x64 与 Linux x86_64 的应用，macOS 暂不提供构建。安卓应用是否可用仍取决于 ABI、
 Google Play 服务、硬件依赖和应用自身的反模拟策略；安装前检查会尽量给出可操作的判断，
 但不能保证所有应用都能运行。完整限制说明见 [SECURITY.md](SECURITY.md)。
 

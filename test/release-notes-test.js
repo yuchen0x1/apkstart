@@ -16,7 +16,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
-const { buildNotes, stripTitle, fromFile, fromChangelog, fromGit, appendBasics } = require(path.join(ROOT, 'tools', 'release-notes.js'));
+const { buildNotes, stripTitle, fromFile, fromChangelog, fromGit, appendBasics, supportsLinux } = require(path.join(ROOT, 'tools', 'release-notes.js'));
 
 let passed = 0;
 const fails = [];
@@ -87,6 +87,21 @@ test('已有基础段落不重复，缺失的段落才补齐', () => {
   assert.strictEqual((body.match(/^## 下载$/gm) || []).length, 1, '下载类标题不能重复');
   assert.strictEqual((body.match(/^## 升级$/gm) || []).length, 1, '升级类标题不能重复');
   assert.strictEqual((body.match(/^## 支持范围/gm) || []).length, 1, '支持范围不能重复');
+});
+
+test('v0.7.0 起发行说明列出 Linux 资产，历史版本仍保持 Windows-only', () => {
+  assert.strictEqual(supportsLinux('v0.6.18'), false);
+  assert.strictEqual(supportsLinux('v0.7.0'), true);
+  assert.strictEqual(supportsLinux('v1.0.0'), true);
+
+  const current = appendBasics('## 更新内容\n\n增加 Linux 支持。', 'v0.7.0');
+  assert(current.includes('ApkStart-0.7.0-x86_64.AppImage'), '应列出 Linux AppImage');
+  assert(current.includes('ApkStart-0.7.0-amd64.deb'), '应列出 Linux deb');
+  assert(current.includes('Windows 10/11 x64 与 Linux x86_64'), '应声明双平台支持范围');
+
+  const historical = appendBasics('## 更新内容\n\n修复一个问题。', 'v0.6.18');
+  assert(!historical.includes('AppImage'), '历史版本不能补上后来的 Linux 资产');
+  assert(historical.includes('本项目仅支持 Windows 10/11 x64。'), '历史范围保持不变');
 });
 
 test('没有文件时抽取 CHANGELOG 段落（不含标题行、不吞下个版本）', () => {

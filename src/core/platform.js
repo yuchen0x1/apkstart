@@ -30,8 +30,14 @@ const isMac = platform === 'darwin';
  */
 const canEmbed = isWin;
 
-/** 内置运行时（含 AEHD 驱动、vc_redist、Windows 版 emulator 包）只做了 Windows 一套 */
-const canProvision = isWin;
+/**
+ * 内置运行时自动部署：
+ *   Windows —— 整包（GitHub Release）或官方源逐组件；加速走 WHPX/AEHD。
+ *   Linux   —— 官方源逐组件（platform-tools / emulator / 系统镜像都是 Google 官方
+ *              Linux 包）；加速走 /dev/kvm；AEHD 与运行时整包不适用（provision 内部
+ *              已按 IS_WIN 守卫）。加速检测 /dev/kvm 见 acceleration()。
+ */
+const canProvision = isWin || isLinux;
 
 /** 桌面快捷方式 / 文件关联 / 托盘菜单图标替换：Windows 注册表与 PowerShell */
 const canIntegrateShell = isWin;
@@ -41,8 +47,9 @@ const canHookMouse = isWin;
 
 /**
  * 支持级别，用于界面提示与诊断报告。
- *   full          —— 完整支持（Windows）
- *   external      —— 能用，但安卓画面是独立窗口（Linux：需自行准备 SDK 并用「连接已有运行时」）
+ *   full          —— 完整支持（Windows：含窗口嵌入）
+ *   external      —— 能用，但安卓画面是独立窗口（Linux：内置运行时可自动下载，
+ *                    窗口嵌入是 Win32 专有；Linux 需要图形会话与 /dev/kvm 才有完整体验）
  *   unsupported   —— 没有实现，启动即提示
  */
 function supportLevel() {
@@ -58,10 +65,11 @@ function supportNote() {
       return '';
     case 'external':
       return '当前系统不支持窗口嵌入：安卓应用会在模拟器自己的窗口里运行。'
-        + '内置运行时下载也只支持 Windows —— 请用 Android Studio / SDK 装好 emulator 与 platform-tools，'
-        + '然后在「设置 → 引擎 → 连接已有运行时」里填地址。';
+        + '运行时（adb / 模拟器 / 系统镜像）可以在应用内一键自动下载，'
+        + '前提是图形会话可用、且 /dev/kvm 已就绪（把用户加入 kvm 组并在 BIOS 打开虚拟化）。';
     default:
-      return 'ApkStart 目前只支持 Windows：窗口嵌入、运行时分发与驱动安装都依赖 Win32 与 PowerShell。';
+      return 'ApkStart 目前支持 Windows 与 Linux：窗口嵌入是 Windows 专有能力，'
+        + '其它系统的应用画面会显示在模拟器自己的窗口里。';
   }
 }
 

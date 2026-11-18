@@ -544,9 +544,14 @@ class Updater {
       //   3) 装完核对 exe 是否还在、package.json 的 version 是否等于目标版本
       //   4) 任一不符 → 从备份整目录还原，回到旧版，仍然能启动
       const bak = path.join(this.updateDir, `backup-${job.version}`);
-      const runtimeDir = path.join(dir, 'resources', 'runtime');
-      const appDir = path.join(dir, 'resources', 'app');
-      const pkgJson = path.join(appDir, 'package.json');
+      // 生成的脚本是给 Windows PowerShell 跑的：路径分隔符必须固定为 \。
+      // 不能用宿主的 path.join —— 在 Linux 上生成时会给出 /，robocopy /XD
+      // 就指不到 runtime 目录（测试在 Linux 上跑也会断言这一点）。
+      const wj = (...segs) => segs.join('\\');
+      const runtimeDir = wj(dir, 'resources', 'runtime');
+      const appDir = wj(dir, 'resources', 'app');
+      const pkgJson = wj(appDir, 'package.json');
+      const bakApp = wj(bak, 'resources', 'app');
       lines.push(
         `$dst = ${psq(dir)}`,
         `$bak = ${psq(bak)}`,
@@ -561,7 +566,7 @@ class Updater {
         `if (-not $hasBak -and (Test-Path -LiteralPath $probe)) {`,
         `  New-Item -ItemType Directory -Force -Path $bak | Out-Null`,
         `  Copy-Item -LiteralPath $probe -Destination (Join-Path $bak ${psq(path.basename(exe))}) -Force`,
-        `  if (Test-Path -LiteralPath ${psq(appDir)}) { Copy-Item -LiteralPath ${psq(appDir)} -Destination ${psq(path.join(bak, 'resources', 'app'))} -Recurse -Force }`,
+        `  if (Test-Path -LiteralPath ${psq(appDir)}) { Copy-Item -LiteralPath ${psq(appDir)} -Destination ${psq(bakApp)} -Recurse -Force }`,
         `  $hasBak = Test-Path -LiteralPath (Join-Path $bak ${psq(path.basename(exe))})`,
         `}`,
         `Note ("backup ok=" + $hasBak)`,

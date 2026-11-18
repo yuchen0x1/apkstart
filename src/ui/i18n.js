@@ -23,6 +23,8 @@
   let dict = {};
   let lang = 'zh-CN';
   let observer = null;
+  /** 原文记忆：英文化时把中文原文存起来，切回中文时还原（否则 en→zh 现场切换回不去） */
+  const originals = new WeakMap();
   /** 只含占位符的 key 拆成段，用于「变量拼进句子中间」的模板匹配 */
   let templates = [];
 
@@ -108,9 +110,13 @@
   }
 
   function translateTextNode(node) {
-    const next = translateOne(node.nodeValue);
+    const v = node.nodeValue;
+    // 当前值是中文原文就记住 —— 应用代码动态改写的也是中文源语言，
+    // observer 会再触发一次，这里永远存「最近一次见到的中文」
+    if (v && CJK.test(v)) originals.set(node, v);
+    const next = translateOne(v);
     // 没变就不写：写回同样的值也会触发 characterData，白白自激一次
-    if (next !== node.nodeValue) node.nodeValue = next;
+    if (next !== v) node.nodeValue = next;
   }
 
   function translateElement(el) {
@@ -145,6 +151,20 @@
     document.documentElement.classList.remove('i18n-pending');
   }
 
+  /** 切回中文：把英文化时记下的中文原文写回去（restore 之后再走 reveal） */
+  function restoreAll(root) {
+    if (!root) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let n = walker.nextNode();
+    while (n) {
+      if (originals.has(n)) {
+        const orig = originals.get(n);
+        if (n.nodeValue !== orig) n.nodeValue = orig;
+      }
+      n = walker.nextNode();
+    }
+  }
+
   function startObserver() {
     if (observer || !document.body) return;
     observer = new MutationObserver((muts) => {
@@ -172,7 +192,7 @@
       dict = (payload && payload.dict) || {};
       buildTemplates();
       document.documentElement.setAttribute('lang', lang === 'en-US' ? 'en' : 'zh-CN');
-      if (lang !== 'en-US') { reveal(); return; }
+      if (lang !== 'en-US') { restoreAll(document.body); reveal(); return; }
       if (document.title) document.title = translateOne(document.title);
       walk(document.body);
       startObserver();

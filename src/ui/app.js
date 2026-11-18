@@ -2987,7 +2987,12 @@ async function wizardFinish({ restart = false } = {}) {
 
 async function openWizard() {
   if (!document.getElementById('wizardMask')) return;
-  const drv = await api.sysDrives().catch(() => null);
+  // 平台差异（Linux：无盘符可选、不走 GitHub 整包、没有双击 APK 关联）
+  const info = state.info || await api.info().catch(() => null);
+  if (info) state.info = info;
+  const isLinux = !!(info && info.platform && info.platform.platform === 'linux');
+  patchWizardForPlatform(isLinux, info);
+  const drv = isLinux ? { drives: [], recommended: '' } : await api.sysDrives().catch(() => null);
   const configured = String((state.settings && state.settings.runtime && state.settings.runtime.dir) || '');
   const configuredDrive = /^[A-Za-z]:/.test(configured) ? `${configured.slice(0, 1).toUpperCase()}:` : '';
   if (drv) {
@@ -2999,6 +3004,9 @@ async function openWizard() {
   }
   const source = document.getElementById('wizardSource');
   if (source) source.value = state.settings?.runtime?.preferGithubRuntime === false ? 'official' : 'github';
+  // 向导第 1 页的语言选择器（与第 7 页的 wizLanguage、设置页的 setLanguage 同一设置）
+  const firstLanguage = document.getElementById('wizLanguageFirst');
+  if (firstLanguage) firstLanguage.value = (state.settings && state.settings.language) || 'auto';
   renderWizardDrives();
   wizardDirsPreview();
   wizard.deploying = false;
@@ -3009,11 +3017,52 @@ async function openWizard() {
   if (mask) mask.classList.add('on');
 }
 
+/**
+ * 首启引导的平台化：Windows 文案是源语言默认值，Linux 上替换成对应说法
+ * （渲染层替换的文本节点带进 i18n 词典，en 界面同样有英文）。
+ */
+function patchWizardForPlatform(isLinux, info) {
+  const set = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+  const show = (id, on) => { const el = document.getElementById(id); if (el) el.hidden = !on; };
+  if (!isLinux) {
+    show('fieldDrives', true);
+    show('fieldDirs', true);
+    show('fieldLinuxDir', false);
+    return;
+  }
+  set('wizardLead', '三步开始：<b>自动下载运行时</b> → 在 ApkStart 里安装 APK → 即用。');
+  set('wizardHowLong', '<b>要多久</b>：会从 Google 官方源分组件下载 adb、运行时引擎与 Android 14 系统镜像（合计约 1.6 GB）。官方源实测可达每秒数十 MB，通常几分钟。');
+  set('wizardWhere', '<b>装在哪里</b>：默认安装到用户数据目录（~/.local/share/apkstart），以后随时可以在「设置 → 系统集成」里改。');
+  set('wizardReq', '<b>配置要求</b>：Linux 64 位（x86_64），需要图形会话与 /dev/kvm（把用户加入 kvm 组并在 BIOS 打开虚拟化）。建议 8 GB 内存、至少 30 GB 可用空间。没开硬件加速也能用，但首次开机会慢很多。');
+  show('fieldDrives', false);
+  show('fieldDirs', false);
+  show('fieldLinuxDir', true);
+  const dirs = document.getElementById('wizardLinuxDirs');
+  if (dirs) {
+    const dataDir = (info && info.dataDir) || '~/.local/share/apkstart';
+    const runtimeDir = (info && info.runtimeDir) || `${dataDir}/runtime`;
+    dirs.innerHTML = `<div>运行时（引擎 + 系统镜像）：<b>${esc(runtimeDir)}</b></div>`
+      + `<div>安卓数据（应用、存档、快照）：<b>${esc(dataDir)}/avd</b></div>`;
+  }
+}
+
 async function bindWizard() {
   if (!document.getElementById('wizardMask')) return;
   document.getElementById('wizardSkip').addEventListener('click', () => wizardFinish());
   document.getElementById('wizardCloseBtn').addEventListener('click', () => wizardFinish());
   document.getElementById('wizardBack').addEventListener('click', () => wizardShowPage(Math.max(1, wizard.page - 1)));
+  // 第 1 页的语言选择：保存设置 + 现场重翻整页（与设置页 setLanguage 同一机制）
+  const langFirst = document.getElementById('wizLanguageFirst');
+  if (langFirst) langFirst.addEventListener('change', async () => {
+    const lang = langFirst.value || 'auto';
+    state.settings = await api.setSettings({ language: lang }).catch(() => state.settings);
+    const sel7 = document.getElementById('wizLanguage');
+    if (sel7) sel7.value = lang;
+    try {
+      const payload = await api.i18n();
+      if (window.apkI18n) window.apkI18n.retranslate(payload);
+    } catch (_) { /* 翻译失败保持现状 */ }
+  });
   document.getElementById('wizardNext').addEventListener('click', () => {
     const page = wizard.page;
     if (page === 1) wizardShowPage(2);

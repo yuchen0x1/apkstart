@@ -945,5 +945,16 @@
   "选择系统": "Select System",
   "目录更新时间：读取中…": "Catalog updated at: loading…",
   "配置要求": "Requirements",
-  "：Windows \u0001/\u0001 \u0001 位，建议 \u0001 GB 内存、\u0001 核 CPU、至少 \u0001 GB 可用空间（运行时 + 数据分区）。没开硬件加速也能用，但首次开机会慢很多。": ": Windows \u0001/\u0001 \u0001-bit, \u0001 GB RAM and \u0001-core CPU recommended, at least \u0001 GB free space (runtime + data). Works without hardware acceleration, but first boot is much slower."
+  "：Windows \u0001/\u0001 \u0001 位，建议 \u0001 GB 内存、\u0001 核 CPU、至少 \u0001 GB 可用空间（运行时 + 数据分区）。没开硬件加速也能用，但首次开机会慢很多。": ": Windows \u0001/\u0001 \u0001-bit, \u0001 GB RAM and \u0001-core CPU recommended, at least \u0001 GB free space (runtime + data). Works without hardware acceleration, but first boot is much slower.",
+  "自动下载运行时": "download the runtime automatically",
+  " → 在 ApkStart 里安装 APK → 即用。": " → install an APK inside ApkStart → done.",
+  "要多久": "How long it takes",
+  "：会从 Google 官方源分组件下载 adb、运行时引擎与 Android \u0001 系统镜像（合计约 \u0001 GB）。官方源实测可达每秒数十 MB，通常几分钟。": ": downloads adb, the runtime engine and the Android \u0001 system image from Google's official CDN as separate components (about \u0001 GB in total). The official CDN measures tens of MB/s; usually a few minutes.",
+  "装在哪里": "Where it goes",
+  "：默认安装到用户数据目录（~/.local/share/apkstart），以后随时可以在「设置 → 系统集成」里改。": ": installs into the user data directory (~/.local/share/apkstart) by default; change it anytime in Settings → System integration.",
+  "：Linux \u0001 位（x\u0001_\u0001），需要图形会话与 /dev/kvm（把用户加入 kvm 组并在 BIOS 打开虚拟化）。建议 \u0001 GB 内存、至少 \u0001 GB 可用空间。没开硬件加速也能用，但首次开机会慢很多。": ": Linux \u0001-bit (x\u0001_\u0001) with a graphical session and /dev/kvm (add your user to the kvm group and enable virtualization in BIOS). \u0001 GB RAM and at least \u0001 GB free space recommended. Works without hardware acceleration, but first boot is much slower.",
+  "安装位置": "Install location",
+  "Linux 版默认安装在用户数据目录，无需选择磁盘；需要换位置时可在「设置 → 系统集成 → 运行时数据目录」里修改。": "The Linux build installs into the user data directory by default — no disk picking needed; change it in Settings → System integration → Runtime data directory.",
+  "界面语言 / Language": "Language",
+  "选完立即生效；以后随时可以在「设置 → 通用」里改。": "Takes effect immediately; change it anytime in Settings → General."
 }

@@ -33,10 +33,34 @@ jobs:
       - name: 测试
         run: npm test
 
+  # 发布前必须同时通过 Linux 测试；否则不能创建只有 Windows 资产的 Release。
+  verify-linux:
+    name: 测试（Linux）
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+      - name: 测试
+        run: npm test
+
+      - name: 系统镜像体积闸门
+        run: node build/check-no-images.js --git
+
   # Release 元数据单独准备，后面的便携版和完整版可以并行构建。
   release:
     name: 创建 Release
-    needs: verify
+    needs: [verify, verify-linux]
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
@@ -343,3 +367,85 @@ jobs:
           }
           if (-not $ok) { Write-Error "上传失败: $zip"; exit 1 }
           gh release view $tag --json assets --jq '.assets[] | "\(.name) \(.size)"'
+
+  # Linux 版（v0.7 起）：AppImage + deb，不带运行时整包（整包是 Windows 二进制），
+  # 首次启动由应用内 autoDeploy 从 Google 官方源分组件下载 Linux 版运行时。
+  # 实测记录见 docs/PLATFORM-LINUX-VALIDATION.md。
+  linux:
+    name: 构建 Linux 版（AppImage / deb，在线运行时）
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+
+      - name: 下载 Electron 二进制
+        run: node node_modules/electron/install.js
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+
+      - name: 构建 AppImage 与 deb
+        run: npx electron-builder --linux AppImage deb --publish never
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: 上传 Linux 产物到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          shopt -s nullglob
+          for f in dist/release/*.AppImage dist/release/*.deb; do
+            ok=""
+            for i in 1 2 3; do
+              gh release upload "$TAG" "$f" --clobber && { ok=1; break; } || sleep 20
+            done
+            if [ -z "$ok" ]; then echo "上传失败: $f"; exit 1; fi
+            echo "已上传: $f"
+          done
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"'
+
+  # 所有构建 job 完成后再核对同一个 Release 的五类核心资产，防止某个平台上传失败
+  # 但 workflow 仍显示部分成功。
+  verify-assets:
+    name: 核对 Windows + Linux 发布资产
+    needs: [release, build, full, linux]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+
+    steps:
+      - name: 核对 Release 资产
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | tee assets.txt
+          expected=(
+            "ApkStart-${TAG}-win64-portable.zip"
+            "ApkStart-${version}-Setup.exe"
+            "ApkStart-runtime-${TAG}.zip"
+            "ApkStart-${version}-x86_64.AppImage"
+            "ApkStart-${version}-amd64.deb"
+          )
+          for asset in "${expected[@]}"; do
+            if ! grep -Fx -- "$asset" assets.txt >/dev/null; then
+              echo "缺少发布资产：$asset" >&2
+              exit 1
+            fi
+            echo "已确认：$asset"
+          done

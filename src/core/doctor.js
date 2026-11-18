@@ -225,7 +225,9 @@ function machineTier({ host = hostInfo(), accel = null, diskMB = 0 } = {}) {
     score += TIER_SCORE.noAccel;
     reasons.push(accel && accel.ok && accel.suspect
       ? 'AEHD 驱动在但服务未运行，等同于没有硬件加速'
-      : '没有可用的硬件虚拟化（WHPX / AEHD 都不可用），只能走软件模拟');
+      : (process.platform === 'linux'
+        ? '没有可用的硬件虚拟化（/dev/kvm 不可用），只能走软件模拟'
+        : '没有可用的硬件虚拟化（WHPX / AEHD 都不可用），只能走软件模拟'));
   }
   if (diskMB && diskMB < 8192) {
     score += TIER_SCORE.tightDisk;

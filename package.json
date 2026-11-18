@@ -1,9 +1,10 @@
 {
   "name": "apkstart",
   "productName": "ApkStart",
-  "version": "0.6.18",
-  "description": "极致轻量的 Windows 安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行",
+  "version": "0.7.0",
+  "description": "极致轻量的安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行（Windows / Linux）",
   "main": "src/main.js",
+  "desktopName": "apkstart.desktop",
   "author": "yuchen0x1 <https://github.com/yuchen0x1>",
   "contributors": [
     "RoutineMiku (original author, https://github.com/RoutineMiku/apkstart)"
@@ -36,7 +37,8 @@
     "node": ">=20"
   },
   "os": [
-    "win32"
+    "win32",
+    "linux"
   ],
   "scripts": {
     "start": "electron .",

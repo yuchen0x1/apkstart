@@ -835,6 +835,10 @@ public class ApkAgent
         SetWindowLong(_emu, GWL_EXSTYLE, ex);
         SetWindowPos(_emu, IntPtr.Zero, 60, 40, 480, 853, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         ShowWindow(_emu, 5);
+        // 独立窗口模式下只保留 Android 画面，隐藏右侧的 Qt 浮动工具栏。
+        // 工具栏是单独的 QWindowTool 顶层窗口，Detach 后不会随画面窗口自动收拢；
+        // 立即清一次，避免用户在画面亮起时先看到相距很远的控制栏。
+        HideToolWindows();
         // 摘出来的窗口必须自己抢到前台：以前它出现在 ApkStart 应用窗口后面，
         // 用户只看到前面那块黑壳，以为程序没反应（实测就是这么误判的）。
         SetForegroundWindow(_emu);

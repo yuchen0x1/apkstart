@@ -8,9 +8,10 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const { spawn, execFile } = require('child_process');
+const { spawn, spawnSync, execFile } = require('child_process');
 const store = require('./store');
 const doctor = require('./doctor');
+const platform = require('./platform');
 const { download, downloadAny, downloadAnyParallel, downloadMulti, head } = require('./download');
 const { ZipArchive, ZipFile } = require('./zip');
 const { Sources, getGithubToken, ghApiHeaders } = require('./sources');
@@ -18,10 +19,13 @@ const { cmpVer } = require('./version');
 const { ImageStore } = require('./images');
 
 const IS_WIN = process.platform === 'win32';
+const IS_LINUX = process.platform === 'linux';
+// dl.google.com 的包名按宿主系统分叉（platform-tools-latest-<host>.zip / emulator-<host>_64-N.zip）
+const HOST_TAG = IS_WIN ? 'windows' : IS_LINUX ? 'linux' : 'mac';
 
 const SOURCES = {
   adb: [
-    'https://dl.google.com/android/repository/platform-tools-latest-windows.zip',
+    `https://dl.google.com/android/repository/platform-tools-latest-${HOST_TAG}.zip`,
   ],
   qemuIndex: 'https://qemu.weilnetz.de/w64/',
   qemuFallback: [
@@ -35,8 +39,11 @@ const SOURCES = {
     'https://dl.google.com/android/repository/sys-img/google_apis_playstore/sys-img2-3.xml',
   ],
   aehdFallback: 'https://dl.google.com/android/repository/aehd-windows_v2.2.zip',
-  // 兜底：索引不可用时直接用的已知版本
-  emulatorFallback: 'https://dl.google.com/android/repository/emulator-windows_x64-16847572.zip',
+  // 兜底：索引不可用时直接用的已知版本（Linux 版与 Windows 版共用同一版本号，
+  // 实测记录见 docs/PLATFORM-LINUX-VALIDATION.md）
+  emulatorFallback: IS_WIN
+    ? 'https://dl.google.com/android/repository/emulator-windows_x64-16847572.zip'
+    : 'https://dl.google.com/android/repository/emulator-linux_x64-16847572.zip',
   sysimgFallback: 'https://dl.google.com/android/repository/sys-img/google_apis/x86_64-34_r14.zip',
   // ARM 兼容镜像（Google Play 版，内置 native bridge）
   playImgIndex: 'https://dl.google.com/android/repository/sys-img/google_apis_playstore/sys-img2-3.xml',
@@ -68,6 +75,28 @@ const SOURCES = {
  * 所以基准目录一律取「索引文件自身所在目录」。此前直接拿文件名当 URL 会抛 Invalid URL。
  */
 const REPO_BASE = 'https://dl.google.com/android/repository/';
+
+/**
+ * Linux 上 emulator 常缺的系统库 → 发行版包名（Ubuntu/Debian 命名）。
+ * ldd 点名后按这张表翻译成 apt 命令；表外的库按库名去 .so 后缀兜底。
+ */
+const LIB_PKG = {
+  'libpulse.so.0': 'libpulse0',
+  'libX11.so.6': 'libx11-6',
+  'libX11-xcb.so.1': 'libx11-xcb1',
+  'libXext.so.6': 'libxext6',
+  'libXi.so.6': 'libxi6',
+  'libXrandr.so.2': 'libxrandr2',
+  'libXfixes.so.3': 'libxfixes3',
+  'libXdamage.so.1': 'libxdamage1',
+  'libXcomposite.so.1': 'libxcomposite1',
+  'libXcursor.so.1': 'libxcursor1',
+  'libxcb.so.1': 'libxcb1',
+  'libGL.so.1': 'libgl1',
+  'libEGL.so.1': 'libegl1',
+  'libgbm.so.1': 'libgbm1',
+  'libasound.so.2': 'libasound2t64',
+};
 
 function baseOf(indexUrl) {
   const s = String(indexUrl || '');
@@ -303,7 +332,12 @@ class Provisioner {
 
   get root() {
     const r = store.getSettings().runtime.dir;
-    return r && r.trim() ? r : path.join(store.DATA_DIR, 'runtime');
+    const explicit = r && r.trim() ? r.trim() : '';
+    // Linux 上绝不接受 Windows 风格的运行时目录（盘符开头）—— 那是从 Windows 配置
+    // 抄过来/手滑填进来的垃圾值，拿去当根会在 WSL 里解析成相对路径（实测出现
+    // "D:/my-runtime"）。一律回落默认数据目录。
+    if (IS_LINUX && /^[a-zA-Z]:[\\/]/.test(explicit)) return path.join(store.DATA_DIR, 'runtime');
+    return explicit || path.join(store.DATA_DIR, 'runtime');
   }
 
   /** 当前内置系统镜像档位。自定义镜像仍由 ImageStore 独立管理。 */
@@ -345,16 +379,18 @@ class Provisioner {
     //  3) 全新安装（两处都没有）→ 落在运行时目录，因为用户数据目录可能是被
     //     重定向过的临时目录（CI 组装运行时就是这种情况，写歪会直接校验失败）。
     const sysRoot = fs.existsSync(rootImg) ? rootImg : (fs.existsSync(dataImg) ? dataImg : rootImg);
+    // Windows 的可执行文件带 .exe；Linux 的 adb/qemu/emulator 都是裸名
+    const exeSuffix = IS_WIN ? '.exe' : '';
     return {
       root,
       qemuDir: path.join(root, 'qemu'),
-      qemuExe: path.join(root, 'qemu', 'qemu-system-x86_64.exe'),
-      qemuImg: path.join(root, 'qemu', 'qemu-img.exe'),
+      qemuExe: path.join(root, 'qemu', `qemu-system-x86_64${exeSuffix}`),
+      qemuImg: path.join(root, 'qemu', `qemu-img${exeSuffix}`),
       adbDir: path.join(root, 'platform-tools'),
-      adbExe: path.join(root, 'platform-tools', 'adb.exe'),
+      adbExe: path.join(root, 'platform-tools', `adb${exeSuffix}`),
       // emulator 运行时（Google 官方）：root 同时充当 ANDROID_SDK_ROOT
       emulatorDir: path.join(root, 'emulator'),
-      emulatorExe: path.join(root, 'emulator', 'emulator.exe'),
+      emulatorExe: path.join(root, 'emulator', `emulator${exeSuffix}`),
       sysImgRoot: sysRoot,
       sysImgDir: path.join(sysRoot, `android-${sysApi}`, sysTag, sysAbi),
       // 自定义镜像的索引与（ZIP 导入时）副本都放这里，绝不与默认镜像目录混在一起
@@ -388,6 +424,8 @@ class Provisioner {
    */
   ensureSoftwareOpenGL() {
     const p = this.paths();
+    // opengl32sw.dll 是给「窗口嵌入」兜底用的 Windows DLL；Linux 不做嵌入，无需此补丁
+    if (!IS_WIN) return false;
     const target = path.join(p.emulatorDir, 'opengl32sw.dll');
     if (!fs.existsSync(p.emulatorExe)) return false;
     if (fileSize(target) > 1024 * 1024) return true;
@@ -444,6 +482,17 @@ class Provisioner {
 
   async hypervisor() {
     if (this._hypervisor !== null) return this._hypervisor;
+    if (IS_LINUX) {
+      const kvm = platform.acceleration();
+      this._hypervisor = {
+        whpx: false,
+        kvm: kvm.ok,
+        note: kvm.ok
+          ? '检测到 /dev/kvm：KVM 硬件加速可用'
+          : (kvm.hint || '未检测到 /dev/kvm'),
+      };
+      return this._hypervisor;
+    }
     if (!IS_WIN) { this._hypervisor = { whpx: false, note: '非 Windows 平台' }; return this._hypervisor; }
     // 只做毫秒级的文件检查。真正"WHPX 是否可用"由 emulator -accel-check 给出权威答案，
     // 避免在这里拉起 PowerShell（冷启动 1-2 秒）拖慢每次状态轮询。
@@ -463,7 +512,7 @@ class Provisioner {
     // 30s 缓存，避免状态轮询频繁拉起外部进程
     if (this._adbCache && Date.now() - this._adbCache.at < 30000) return this._adbCache.value;
     const { adbExe, adbDir } = this.paths();
-    const candidates = [adbExe, path.join(this.appRoot, 'tools', 'platform-tools', 'adb.exe')];
+    const candidates = [adbExe, path.join(this.appRoot, 'tools', 'platform-tools', path.basename(adbExe))];
     for (const c of candidates) {
       if (!fs.existsSync(c)) continue;
       const r = await run(c, ['version'], { timeout: 10000 });
@@ -485,7 +534,7 @@ class Provisioner {
       p.qemuExe,
       store.getSettings().runtime.qemuPath,
       'C:\\Program Files\\qemu\\qemu-system-x86_64.exe',   // winget 默认安装位置
-      path.join(this.appRoot, 'engine', 'qemu', 'qemu-system-x86_64.exe'),
+      path.join(this.appRoot, 'engine', 'qemu', path.basename(p.qemuExe)),
     ].filter(Boolean);
     for (const c of candidates) {
       if (!fs.existsSync(c)) continue;
@@ -493,6 +542,17 @@ class Provisioner {
       if (r.ok || r.stdout) {
         const m = /QEMU emulator version\s+(\S+)/i.exec(r.stdout);
         const v = { ok: true, path: c, version: m ? m[1] : (r.stdout || '').split('\n')[0].trim() };
+        this._qemuCache = { at: Date.now(), value: v };
+        return v;
+      }
+    }
+    // Linux：qemu 来自发行版包管理器（qemu-system-x86 / qemu-utils），在 PATH 里
+    // 直接探测 —— 没有 .exe 那种固定文件位置可查。
+    if (IS_LINUX) {
+      const r = await run('qemu-system-x86_64', ['--version'], { timeout: 15000 });
+      if (r.ok || r.stdout) {
+        const m = /QEMU emulator version\s+(\S+)/i.exec(r.stdout);
+        const v = { ok: true, path: 'qemu-system-x86_64', version: m ? m[1] : (r.stdout || '').split('\n')[0].trim(), system: true };
         this._qemuCache = { at: Date.now(), value: v };
         return v;
       }
@@ -627,7 +687,11 @@ class Provisioner {
     await this.extractZip(zipPath, p.root);
 
     const v = await this.adbVersion();
-    if (!v.ok) throw new Error('adb 解压后无法运行，请检查是否被杀毒软件拦截');
+    if (!v.ok) {
+      throw new Error(IS_WIN
+        ? 'adb 解压后无法运行，请检查是否被杀毒软件拦截'
+        : 'adb 解压后无法运行：请确认解压目录可写、文件有执行权限（可重试一次安装）');
+    }
 
     fs.rmSync(zipPath, { force: true });
     store.saveSettings({ adbPath: v.path });
@@ -701,6 +765,9 @@ class Provisioner {
    * 系统镜像在包里是 .xz，首次开机时由 materializeImages() 展开（只做一次）。
    */
   async installRuntimePack(onProgress = () => {}) {
+    // 整包里的 emulator / aehd 都是 Windows 二进制，Linux 必须走官方源逐组件安装
+    // （autoDeploy 的 catch 会自动落到 installAdb/installEmulator/installSystemImage）
+    if (!IS_WIN) throw new Error('运行时整包只提供 Windows 版');
     const p = this.ensureDirs();
     // 先给一条进度：找版本 + 测速这一段没有字节数，不给提示用户会以为「卡死了」。
     onProgress({ stage: 'download', message: '正在获取运行时版本信息…', percent: 1 });
@@ -883,11 +950,32 @@ class Provisioner {
         const target = safeTarget(name);
         fs.mkdirSync(path.dirname(target), { recursive: true });
         const e = zip.entries.get(name);
-        if (e.uncompSize > STREAM_THRESHOLD) {
+        const eAttrs = e || {};
+        if (eAttrs.symlink && !IS_WIN) {
+          // Linux 包里的符号链接条目：内容就是链接目标。zip-slip 防护同样适用。
+          const link = String(zip.read(name));
+          if (/^[a-zA-Z]:/.test(link) || path.isAbsolute(link)) {
+            throw new Error(`压缩包内含绝对路径符号链接，已拒绝解压：${name} → ${link}`);
+          }
+          const resolved = path.resolve(path.dirname(target), link);
+          if (resolved !== destRoot && !resolved.startsWith(destRoot + path.sep)) {
+            throw new Error(`压缩包内符号链接越界，已拒绝解压：${name} → ${link}`);
+          }
+          try { fs.unlinkSync(target); } catch (_) { /* 不存在则不用清 */ }
+          fs.symlinkSync(link, target);
+        } else if ((eAttrs.uncompSize || 0) > STREAM_THRESHOLD) {
           // eslint-disable-next-line no-await-in-loop
           await zip.pipeTo(name, fs.createWriteStream(target));
         } else {
           fs.writeFileSync(target, zip.read(name));
+        }
+        // Linux：恢复 unix 权限位 —— 不补的话 adb/emulator/qemu 等二进制解出来
+        // 全是不可执行（Windows 上没有权限概念，跳过）。
+        if (!IS_WIN && eAttrs.unixMode) {
+          const mode = eAttrs.unixMode & 0o7777;
+          if (mode & 0o111) {
+            try { fs.chmodSync(target, mode); } catch (_) { /* 已可写时失败无害 */ }
+          }
         }
         done += 1;
         if (opts.onEntry) opts.onEntry(name, done, total);
@@ -963,8 +1051,10 @@ class Provisioner {
       const block = /<remotePackage path="emulator"[\s\S]*?<\/remotePackage>/.exec(xml);
       if (block) {
         const base = baseOf(SOURCES.sdkIndex);
+        // emulator 包按宿主分叉（emulator-windows_x64-N.zip / emulator-linux_x64-N.zip），
+        // 版本号两边一致；mac 上是 mac_x64 / darwin，本项目暂不支持 mac。
         const entries = this._parseArchiveEntries(block[0], base)
-          .filter((x) => /windows_x64.*\.zip$/i.test(x.url));
+          .filter((x) => new RegExp(`${HOST_TAG}_x64.*\\.zip$`, 'i').test(x.url));
         const win = entries.find((x) => x.sha1) || entries[0];
         if (win) {
           this._cache.emulatorUrl = win.url;
@@ -1023,7 +1113,7 @@ class Provisioner {
       return this._cache.emulatorVersion;
     }
     const p = this.paths();
-    const candidates = [p.emulatorExe, path.join(this.appRoot, 'engine', 'emulator', 'emulator.exe')];
+    const candidates = [p.emulatorExe, path.join(this.appRoot, 'engine', 'emulator', path.basename(p.emulatorExe))];
     for (const c of candidates) {
       if (!fs.existsSync(c)) continue;
       // 上一次会话探测过、且引擎文件没变：直接用落盘结果（省掉一次 1s+ 的进程拉起）
@@ -1226,7 +1316,7 @@ class Provisioner {
     }
     const p = this.paths();
     const exe = fs.existsSync(p.emulatorExe) ? p.emulatorExe
-      : path.join(this.appRoot, 'engine', 'emulator', 'emulator.exe');
+      : path.join(this.appRoot, 'engine', 'emulator', path.basename(p.emulatorExe));
     if (!fs.existsSync(exe)) return { ok: false, kind: 'none', note: '未安装 emulator' };
 
     // 落盘缓存：冷启动时不再为这一项拉起 emulator 进程。
@@ -1239,6 +1329,34 @@ class Provisioner {
         this._cache.accelAt = Date.now();
         return cached.accel;
       }
+    }
+
+    // Linux：没有 WHPX/AEHD 那套驱动概念，加速就是 /dev/kvm（模拟器 -accel-check
+    // 输出与 Windows 同构，能复用同一段解析）。检测不出来时给出加组提示。
+    if (!IS_WIN) {
+      const r = await run(exe, ['-accel-check'], { timeout: 30000 });
+      const text = `${r.stdout}${r.stderr}`;
+      const usable = /accel:\s*\n?0\b/.test(text) && !/ERROR_ACCESS_DENIED|not installed/i.test(text);
+      const kvm = platform.acceleration();
+      let result;
+      if (usable) {
+        result = { ok: true, kind: 'kvm', note: 'KVM 硬件加速已启用' };
+      } else {
+        result = {
+          ok: false,
+          kind: 'none',
+          viaTcg: true,
+          kvmOk: !!kvm.ok,
+          note: kvm.ok
+            ? 'KVM 就绪但模拟器报告加速不可用（多为权限问题：确认当前用户在 kvm 组里）'
+            : (kvm.hint || '没有可用的硬件虚拟化（KVM 不可用），只能走软件模拟'),
+        };
+      }
+      result.v = ACCEL_CACHE_VER;
+      this._cache.accel = result;
+      this._cache.accelAt = Date.now();
+      this.envCacheSet(exe, { accel: result, accelAt: Date.now() });
+      return result;
     }
 
     const aehdSys = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'aehd.sys');
@@ -1336,6 +1454,33 @@ class Provisioner {
     return result;
   }
 
+  /**
+   * Linux：ldd 检查 emulator 与 qemu 后端缺哪些系统库（点名列出，最多 6 个）。
+   * 只在 emulator 跑不起来时调用，正常路径零开销。
+   */
+  _linuxMissingLibs() {
+    try {
+      const p = this.paths();
+      const emuDir = path.dirname(p.emulatorExe);
+      const targets = [
+        path.join(emuDir, 'emulator'),
+        path.join(emuDir, 'qemu', 'linux-x86_64', 'qemu-system-x86_64'),
+      ].filter((f) => fs.existsSync(f));
+      const missing = new Set();
+      for (const f of targets) {
+        const r = spawnSync('ldd', [f], { encoding: 'utf8', timeout: 15000 });
+        for (const line of String(r.stdout || '').split('\n')) {
+          if (!/not found/.test(line)) continue;
+          const lib = line.trim().split(/\s+/)[0];
+          if (lib) missing.add(lib);
+        }
+      }
+      return [...missing].slice(0, 6);
+    } catch (_) {
+      return [];
+    }
+  }
+
   /** 下载并安装 emulator（zip 顶层就是 emulator/，直接解到 SDK root） */
   async installEmulator(onProgress = () => {}) {
     const p = this.ensureDirs();
@@ -1372,7 +1517,19 @@ class Provisioner {
     this.ensurePlatformTools();
 
     const v = await this.emulatorVersion();
-    if (!v.ok) throw new Error('emulator 解压后无法运行，请检查是否被杀毒软件拦截');
+    if (!v.ok) {
+      if (IS_WIN) {
+        throw new Error('emulator 解压后无法运行，请检查是否被杀毒软件拦截');
+      }
+      // Linux 常见故障是缺系统库（libpulse / X11 / GL...），ldd 一趟就能点名
+      const missing = this._linuxMissingLibs();
+      if (missing.length) {
+        throw new Error('emulator 缺少系统库（' + missing.join('、') + '）：'
+          + '请安装后重试，Ubuntu/Debian 对应命令一般为 '
+          + '`sudo apt install ' + missing.map((m) => LIB_PKG[m] || m.split('.so')[0]).join(' ') + '`');
+      }
+      throw new Error('emulator 解压后无法运行：请确认解压目录可写、文件有执行权限（可重试一次安装）');
+    }
     this._cache.emulatorVersion = v.version;
     onProgress({ stage: 'done', message: `运行时引擎 ${v.version} 就绪`, percent: 100 });
     return v;
@@ -1383,13 +1540,16 @@ class Provisioner {
     const p = this.paths();
     fs.mkdirSync(p.adbDir, { recursive: true });
     if (fs.existsSync(p.adbExe)) return true;
+    const adbName = path.basename(p.adbExe);
     const src = [
       path.join(this.appRoot, 'engine', 'platform-tools'),
       path.join(this.appRoot, 'tools', 'platform-tools'),
       path.dirname(this.adbVersionPath() || ''),
-    ].find((d) => d && fs.existsSync(path.join(d, 'adb.exe')));
+    ].find((d) => d && fs.existsSync(path.join(d, adbName)));
     if (!src) return false;
-    for (const f of ['adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll']) {
+    // Windows 版 platform-tools 还要两根 ADB DLL；Linux 版只有一个 adb 可执行文件
+    const files = IS_WIN ? [adbName, 'AdbWinApi.dll', 'AdbWinUsbApi.dll'] : [adbName];
+    for (const f of files) {
       const from = path.join(src, f);
       if (fs.existsSync(from)) fs.copyFileSync(from, path.join(p.adbDir, f));
     }
@@ -1519,8 +1679,9 @@ class Provisioner {
     return this.installImage('google_apis_playstore', onProgress);
   }
 
-  /** 下载 AEHD 驱动（小文件）；安装需要管理员权限，交给引导流程 */
+  /** 下载 AEHD 驱动（小文件）；安装需要管理员权限，交给引导流程。Windows 专有。 */
   async installAehd(onProgress = () => {}) {
+    if (!IS_WIN) throw new Error('AEHD 驱动仅限 Windows；Linux 的硬件加速由 /dev/kvm 提供，无需驱动');
     const p = this.ensureDirs();
     await this.guardDisk('aehd', p.aehdDir);
     const zip = path.join(p.tmp, 'aehd.zip');
@@ -1579,6 +1740,9 @@ class Provisioner {
   }
 
   async installQemu(onProgress = () => {}) {
+    // QEMU 路线（Android-x86 ISO）在 Linux 上交给系统包管理器（qemu-system-x86 /
+    // qemu-utils），qemuVersion() 会从 PATH 探测到；应用内不代装。
+    if (!IS_WIN) throw new Error('Linux 请用系统包管理器安装 qemu（sudo apt install qemu-system-x86 qemu-utils）');
     const p = this.ensureDirs();
     await this.guardDisk('qemu', p.root);
     const setup = path.join(p.tmp, 'qemu-setup.exe');

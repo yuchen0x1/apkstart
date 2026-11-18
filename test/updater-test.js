@@ -390,8 +390,12 @@ async function main() {
     const app = path.join(root, 'app');
     fs.mkdirSync(path.join(app, 'resources', 'app'), { recursive: true });
     fs.mkdirSync(path.join(app, 'resources', 'runtime'), { recursive: true });
-    // whoami.exe 是真实 PE，被当成主程序替换后 Start-Process 起来会立刻退出，不打扰测试
-    fs.copyFileSync(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'whoami.exe'), path.join(app, 'ApkStart.exe'));
+    // 占位主程序用「某个真实存在的二进制」：Windows 上是 whoami.exe（真实 PE，
+    // Start-Process 起来会立刻退出）；Linux 上没有 System32，用 node 自己。
+    const placeholder = process.platform === 'win32'
+      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'whoami.exe')
+      : process.execPath;
+    fs.copyFileSync(placeholder, path.join(app, 'ApkStart.exe'));
     fs.writeFileSync(path.join(app, 'resources', 'app', 'package.json'), JSON.stringify({ version }), 'utf8');
     fs.writeFileSync(path.join(app, 'resources', 'runtime', 'big.bin'), 'x'.repeat(1024));
     return app;
@@ -405,7 +409,12 @@ async function main() {
     ].join('\r\n'));
   }
 
+  // 真机执行需要 Windows PowerShell：Linux/macOS 上跳过这两条（脚本生成逻辑
+  // 已由其它用例覆盖，执行行为由 Windows 侧的 npm test 负责）
+  const CAN_RUN_PS = process.platform === 'win32';
+
   await test('★ 安装器把目录删空 → 脚本从备份还原，程序仍可启动', async () => {
+    if (!CAN_RUN_PS) { console.log('  跳过：真机执行需要 Windows PowerShell'); return; }
     const root = mkTmp();
     const app = makeInstallDir(root, '0.6.2');
     const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
@@ -425,6 +434,7 @@ async function main() {
   }, 90000);
 
   await test('★ 安装器成功写入新版本 → 校验通过、备份被清理', async () => {
+    if (!CAN_RUN_PS) { console.log('  跳过：真机执行需要 Windows PowerShell'); return; }
     const root = mkTmp();
     const app = makeInstallDir(root, '0.6.2');
     const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));

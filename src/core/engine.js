@@ -268,9 +268,8 @@ class Runtime {
   }
 
   async boot({ install = false, onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
-    // 内置运行时（emulator 包 + AEHD 驱动 + Windows 版镜像下载）只有 Windows 一套。
-    // 别的系统上如果还走这条路，会在下载/解压/装驱动里各失败一次，报错还各不相同。
-    // 这里提前说清楚，并指向唯一的可行路径：「连接已有运行时」（upstream #24）。
+    // canProvision = Windows + Linux（provision 下载源已按宿主分叉）。
+    // 其它系统（mac 等）在 builtin 模式下直接说明并指向「连接已有运行时」。
     if (!platform.canProvision && (this.settings.engine.mode || 'builtin') !== 'attach') {
       throw new Error(platform.supportNote());
     }

@@ -2194,8 +2194,20 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const fs2 = require('fs');
     const os2 = require('os');
     const tmp = fs2.mkdtempSync(path.join(os2.tmpdir(), 'sysroot-'));
-    const oldAppData = process.env.APPDATA;
+    // 双平台各自的数据目录约定都要隔离：Windows 走 APPDATA，Linux 走 XDG_DATA_HOME。
+    // store 在本文件更早的用例里已被 require（DATA_DIR 是加载时算的常量），
+    // 所以清掉 store/provision 的 require 缓存重建实例，让隔离生效。
     process.env.APPDATA = path.join(tmp, 'appdata');
+    process.env.XDG_DATA_HOME = path.join(tmp, 'appdata', 'xdgdata');
+    const storePath = require.resolve('../src/core/store');
+    const provPath = require.resolve('../src/core/provision');
+    const imagesPath = require.resolve('../src/core/images');
+    const savedStore = require.cache[storePath];
+    const savedProv = require.cache[provPath];
+    const savedImages = require.cache[imagesPath];
+    delete require.cache[storePath];
+    delete require.cache[provPath];
+    delete require.cache[imagesPath];
     try {
       const store = require('../src/core/store');
       const { Provisioner } = require('../src/core/provision');
@@ -2217,7 +2229,14 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
       assert(p.paths().sysImgRoot === path.join(store.DATA_DIR, 'system-images'),
         `老布局应回退到用户数据目录，实际 ${p.paths().sysImgRoot}`);
     } finally {
-      if (oldAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = oldAppData;
+      delete require.cache[storePath];
+      delete require.cache[provPath];
+      delete require.cache[imagesPath];
+      if (savedStore) require.cache[storePath] = savedStore;
+      if (savedProv) require.cache[provPath] = savedProv;
+      if (savedImages) require.cache[imagesPath] = savedImages;
+      delete process.env.APPDATA;
+      delete process.env.XDG_DATA_HOME;
       fs2.rmSync(tmp, { recursive: true, force: true });
     }
   });

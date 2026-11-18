@@ -18,9 +18,11 @@ files:
   - "assets/**/*"
   - "!**/*.map"
   - "!**/node_modules/**"
-  # 运行时解压 .xz 镜像用（NAPI 预编译，无 ABI 问题）
+  # 运行时解压 .xz 镜像用（NAPI 预编译，无 ABI 问题）；两个平台的预编译都带上
   - "node_modules/@napi-rs/lzma/**"
   - "node_modules/@napi-rs/lzma-win32-x64-msvc/**"
+  - "node_modules/@napi-rs/lzma-linux-x64-gnu/**"
+  - "node_modules/@napi-rs/lzma-linux-x64-musl/**"
   - "!node_modules/@napi-rs/lzma/*.md"
   - "!node_modules/@napi-rs/lzma/*.ts"
   - "!node_modules/@napi-rs/lzma/browser-entry.*"
@@ -33,6 +35,7 @@ electronLanguages:
 
 # 完整运行时（emulator + platform-tools + 系统镜像），由 build/prepare-runtime.js 生成。
 # 打进包里之后首次启动不再需要任何下载。
+# Linux 打包时不带（见下方 linux.extraResources 覆盖）：整包里是 Windows 二进制。
 extraResources:
   - from: build/runtime
     to: runtime
@@ -70,6 +73,28 @@ nsis:
   include: build/installer.nsh
   # 安装包本身已含完整运行时（emulator + 系统镜像 .gz），装完首次启动
   # 自动把镜像展开到用户目录，之后不再联网下载任何东西。
+
+# ---------------- Linux（v0.7 起支持） ----------------
+# Linux 版不带 Windows 运行时整包（emulator/aehd 都是 Windows 二进制）：
+# 首次启动由应用内 autoDeploy 从 Google 官方源分组件下载 Linux 版
+# （platform-tools / emulator / 系统镜像，dl.google.com 国内实测 10-70MB/s）。
+# 平台级 extraResources: [] 覆盖顶层的 Windows 运行时整包。
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+  category: Development
+  icon: build/icon.png
+  # .desktop 由 electron-builder 从 productName/description 自动生成；
+  # AppImage/deb 都不需要 root；deb 装到 /opt，菜单入口自动接好
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  maintainer: yuchen0x1 <https://github.com/yuchen0x1>
+  # 平台级覆盖：不带走顶层的 Windows 运行时整包
+  extraResources: []
 
 # 压缩级别：normal（zlib）。镜像本身已是 xz/gz，NSIS 这层只压 Electron 的 dll，
 # normal 与 maximum 体积差别很小，但 maximum(LZMA) 会让打安装包慢十几分钟。

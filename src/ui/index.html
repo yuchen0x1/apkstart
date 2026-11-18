@@ -106,26 +106,40 @@
     <div class="modal-body">
       <!-- 第 1 页：欢迎 -->
       <section class="wizard-page" id="wizardPage1">
-        <p class="wizard-lead">三步开始：<b>选一个安装位置</b> → <b>自动下载运行时</b> → 双击 APK 即用。</p>
+        <div class="field" style="margin:0 0 10px">
+          <label>界面语言 / Language</label>
+          <select id="wizLanguageFirst" style="max-width:260px">
+            <option value="auto">跟随系统</option>
+            <option value="zh-CN">简体中文</option>
+            <option value="en-US">English</option>
+          </select>
+          <span class="sub" id="wizLanguageHint">选完立即生效；以后随时可以在「设置 → 通用」里改。</span>
+        </div>
+        <p class="wizard-lead" id="wizardLead">三步开始：<b>选一个安装位置</b> → <b>自动下载运行时</b> → 双击 APK 即用。</p>
         <ul class="wizard-list">
           <li><b>要下载什么</b>：adb 工具、Android 运行时引擎、Android 14 系统镜像（合计约 1.6&nbsp;GB）。镜像就是安卓系统本身，这个体积压不下去了；不用整个下完才能用，装完这次以后不再下载。</li>
-          <li><b>要多久</b>：会先实测多个下载源、谁快用谁——GitHub 整包被限速时会自动改走官方源分组件下载（官方源实测可达每秒数 MB），通常 3~8 分钟。</li>
-          <li><b>装在哪里</b>：下一步选择。<span class="wizard-warn">默认会推荐剩余空间最大的非系统盘，避免把 C 盘塞满。</span>以后随时可以在「设置 → 系统集成」里改。</li>
-          <li><b>配置要求</b>：Windows 10/11 64 位，建议 8 GB 内存、4 核 CPU、至少 30 GB 可用空间（运行时 + 数据分区）。没开硬件加速也能用，但首次开机会慢很多。</li>
+          <li id="wizardHowLong"><b>要多久</b>：会先实测多个下载源、谁快用谁——GitHub 整包被限速时会自动改走官方源分组件下载（官方源实测可达每秒数 MB），通常 3~8 分钟。</li>
+          <li id="wizardWhere"><b>装在哪里</b>：下一步选择。<span class="wizard-warn">默认会推荐剩余空间最大的非系统盘，避免把 C 盘塞满。</span>以后随时可以在「设置 → 系统集成」里改。</li>
+          <li id="wizardReq"><b>配置要求</b>：Windows 10/11 64 位，建议 8 GB 内存、4 核 CPU、至少 30 GB 可用空间（运行时 + 数据分区）。没开硬件加速也能用，但首次开机会慢很多。</li>
         </ul>
       </section>
       <!-- 第 2 页：位置与源 -->
       <section class="wizard-page" id="wizardPage2" hidden>
-        <div class="field">
+        <div class="field" id="fieldDrives">
           <label>安装到哪个盘？</label>
           <div class="drive-grid" id="wizardDrives">
             <div class="sub">正在读取磁盘信息…</div>
           </div>
           <span class="sub" id="wizardDriveNote">推荐 = 剩余空间充足的非系统盘。运行时与安卓数据（约 5~8 GB 起步，会持续增长）都会放在这里。</span>
         </div>
-        <div class="field">
+        <div class="field" id="fieldDirs">
           <label>目录预览</label>
           <div class="wizard-dirs" id="wizardDirs"></div>
+        </div>
+        <div class="field" id="fieldLinuxDir" hidden>
+          <label>安装位置</label>
+          <div class="wizard-dirs" id="wizardLinuxDirs"></div>
+          <span class="sub">Linux 版默认安装在用户数据目录，无需选择磁盘；需要换位置时可在「设置 → 系统集成 → 运行时数据目录」里修改。</span>
         </div>
         <div class="field">
           <label>下载源</label>

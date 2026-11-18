@@ -5,6 +5,58 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.7.0] — 2026-11-18
+
+> 本版为「Linux 支持专项」：Linux 成为受支持的第二个平台（AppImage / deb）。
+> 完整实测报告见 `docs/PLATFORM-LINUX-VALIDATION.md`。
+
+### 新增
+- **首启向导第 1 页可切换界面语言（中文/英文/跟随系统）**：选完立即生效（现场重翻，
+  无需重启）；语言选择此前埋在第 7 页。同时修复翻译层「英→中切不回去」的问题 ——
+  渲染层现在会记住每个节点的中文原文，切换语言双向可用（设置页的语言切换同样受益）。
+- **Linux 版（AppImage / deb，x86_64）**：electron-builder 新增 Linux target；
+  Linux 包不带 Windows 运行时整包（emulator/aehd 均为 Windows 二进制），首次启动由
+  应用内「自动部署」从 Google 官方源分组件下载 Linux 版运行时
+  （platform-tools / emulator / 系统镜像，`dl.google.com` 国内实测 10~70MB/s）。
+  实测全链路：下载 → 部署 → KVM 加速开机（31 秒就绪）→ 安装 APK 成功。
+- **运行时下载按宿主分叉**：`provision` 的下载源/解析器按 host-os 分叉 ——
+  `platform-tools-latest-<host>.zip`、`emulator-<host>_64-*.zip`（repository2-3.xml
+  动态解析）、系统镜像 zip 为宿主无关；AEHD / 运行时整包 / QEMU 安装器为 Windows
+  专有并加显式守卫。
+- **KVM 加速**：Linux 的硬件加速走 `/dev/kvm`（`platform.acceleration()` 已有检测），
+  `emulatorAccel()` 新增 Linux 分支解析 `-accel-check` 输出，权限/驱动问题给出
+  「把用户加入 kvm 组」等可照做的提示。
+- **zip 解压恢复 unix 权限位与符号链接**：自研解压器此前不恢复 mode（Windows 无此
+  概念），Linux 包解出来的 adb/emulator 全是不可执行 —— 现在按中央目录的
+  external attributes 恢复，并对符号链接条目做 zip-slip 防护后落地。
+- **缺系统库诊断**：Linux 上 emulator 起不来时 `ldd` 点名缺失库，并映射成
+  Ubuntu/Debian 的 `apt install` 包名（libpulse→libpulse0 等 15 项）。
+- **qemu 孤儿进程清理的 Linux 实现**：按 AVD 锁文件 + `ps` 找本 AVD 的 qemu，
+  SIGKILL 清理（原来 Linux 直接 return 0，孤儿 qemu 会占锁导致下次启动 FATAL）。
+- **首启引导平台化**：Linux 上向导文案换成 Linux 说法（KVM 要求、XDG 默认目录），
+  选盘页隐藏（Linux 无盘符概念），显示真实默认路径。
+- **软件更新 Linux 侧**：检查照常跑（能显示新版信息），「重启并安装」在 Linux 上
+  明确引导到项目发布页（AppImage/deb 的自更新超出本版范围）。
+- **CI**：ci.yml 新增 Linux 单元测试 job；release.yml 新增 Linux 构建 job
+  （AppImage + deb 自动上传 Release）。
+
+### 修复
+- **独立窗口模式隐藏浮动工具栏**：摘出 Android 画面后立即隐藏右侧 Qt 浮动工具栏，避免工具栏与画面窗口相距很远。
+- **首启向导打开时的脚本异常**：修复语言选择器初始化调用了局部 `put` 函数导致的 `put is not defined`。
+- **npm 在 Linux 上直接拒装**：`package.json` 的 `"os"` 只写 `win32`，
+  Linux 上 `npm install` 报 EBADPLATFORM —— 加入 `linux`。
+- **数据目录平台化**：Linux 上 `store.DATA_DIR` 走 XDG（`~/.local/share/apkstart`），
+  不再落 `~/AppData/Roaming/apkstart`（Windows 约定的路径在 Linux 上也能用，但不合
+  XDG，升级/备份/清理工具都不认）。
+- **测试跨平台**：updater-test 的占位文件（whoami.exe → process.execPath）、
+  PowerShell 真机执行用例按平台跳过、路径断言按平台分叉；auto-test / engine-test
+  的数据目录隔离补 XDG；全部 23 个测试文件在 Linux 上全绿。
+
+### 平台边界（本版不变）
+- 窗口嵌入仍是 Windows 专有：Linux 上安卓画面显示在模拟器自己的窗口里，
+  其余功能（装卸 APK、文件同步、截图、多系统切换）全量可用。
+- macOS 仍不支持。
+
 ## [0.6.18] — 2026-11-18
 
 ### 修复

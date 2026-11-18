@@ -55,6 +55,35 @@ const { SystemManager } = require('./core/system-manager');
 // Windows 下窗口被遮挡时 capturePage 会拿到旧帧，自动化截图需要禁用遮挡计算
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 
+// Linux：Chromium 沙箱依赖无特权 user namespace + 一组 namespace/seccomp 组合。
+// 两类已知必坏的环境：
+//   1. Ubuntu 24.04+ 用 AppArmor 限制了未打包应用的 userns（AppImage 的 squashfs
+//      又是 nosuid 挂载，setuid 的 chrome-sandbox 无从生效）；
+//   2. WSL2 —— userns 单独测是通的，但 Chromium 的沙箱组合（多 namespace +
+//      seccomp）仍起不来，GPU 进程直接 FATAL「GPU process isn't usable. Goodbye.」
+//      （Ubuntu 26.04 WSL2 实测）。
+// 启动前探测：unshare -Ur 失败（AppArmor 限制）或内核带 microsoft 标记（WSL）时，
+// 降级 no-sandbox 并写日志（主流 Electron AppImage 的同款做法）。安卓运行时进程
+// 是独立进程，不受这层影响。
+if (process.platform === 'linux') {
+  let sandboxUsable = true;
+  try {
+    const { spawnSync } = require('child_process');
+    const r = spawnSync('unshare', ['-Ur', 'true'], { timeout: 5000 });
+    if (r.status !== 0) sandboxUsable = false;
+    const uts = fs.readFileSync('/proc/version', 'utf8');
+    if (/microsoft|WSL/i.test(uts)) sandboxUsable = false;
+  } catch (_) { /* 读不到就保守认为可用，让沙箱正常路径走 */ }
+  if (!sandboxUsable) {
+    app.commandLine.appendSwitch('no-sandbox');
+    app.commandLine.appendSwitch('disable-gpu-sandbox');
+    try {
+      appLog('Linux 沙箱降级：Chromium 沙箱在此环境起不来（Ubuntu 24.04+ 的 userns 限制或 WSL2），'
+        + '已按 no-sandbox 启动 —— 仅少了 Chrome 沙箱这层防护，安卓运行时进程不受影响');
+    } catch (_) { /* appLog 尚未就绪时忽略 */ }
+  }
+}
+
 /**
  * 系统盘快满时，把 Chromium 自己的缓存（Cache / GPUCache / Local Storage …）
  * 挪到「安卓数据目录」所在的盘。
@@ -166,8 +195,11 @@ function bootstrapBundledRuntime() {
       }
       return false;
     };
+    // Windows 的 emulator 带 .exe；Linux 裸名。Linux 版目前不带内置运行时
+    // （走应用内自动下载），但这张检查表按平台写对，将来带包也不用改。
+    const emuExe = process.platform === 'win32' ? 'emulator.exe' : 'emulator';
     const bundled = candidates.find((dir) =>
-      fs.existsSync(path.join(dir, 'emulator', 'emulator.exe')) && hasImage(dir));
+      fs.existsSync(path.join(dir, 'emulator', emuExe)) && hasImage(dir));
     if (!bundled) return;
 
     const s = store.getSettings();
@@ -175,7 +207,7 @@ function bootstrapBundledRuntime() {
     // 就会一直走「缺组件」的部署向导。现在只要当前运行时目录里没有 emulator 就接管。
     const explicit = String(s.runtime.dir || '').trim();
     const current = explicit || path.join(store.DATA_DIR, 'runtime');
-    const currentExe = path.join(current, 'emulator', 'emulator.exe');
+    const currentExe = path.join(current, 'emulator', emuExe);
     // 便携版被移动/升级（解压到新目录）后，settings 里记的还是旧路径：
     // 必须只认「本次 EXE 所在目录下的 runtime」，否则会一直用旧包里的组件
     // （实测踩过：旧包的 emulator 缺 emulator-check → 加速探测失败 → 退回 TCG 软件模拟）。
@@ -471,7 +503,9 @@ async function autoDeploy({ force = false } = {}) {
     // 轻量版优先用「本项目 GitHub 的运行时整包」：一个文件搞定 emulator + 系统镜像，
     // 下载源和更新源统一在 GitHub 上（国内比 dl.google.com 稳得多）。
     // 整包拿不到（没网 / 还没发过该资产 / 被限流）再逐个从官方源装。
-    if (needEngine && store.getSettings().runtime.preferGithubRuntime !== false) {
+    // 整包只有 Windows 二进制：Linux 不必去问 GitHub，直接走官方源逐组件装
+    if (needEngine && process.platform === 'win32'
+      && store.getSettings().runtime.preferGithubRuntime !== false) {
       try {
         progress({ message: '正在从 GitHub 下载运行时…' });
         await runtime.provisioner.installRuntimePack(progress);
@@ -945,6 +979,14 @@ function notifyUpdateFailure() {
 let applyingUpdate = false;
 function startApplyUpdate(job, label) {
   if (!job || applyingUpdate) return false;
+  // Linux 发行形态（AppImage/deb）没有自更新通道：升级脚本、explorer、
+  // powershell 都是 Windows 的东西，跑了只会坏。明确引导到发布页。
+  if (process.platform !== 'win32') {
+    appLog('update apply blocked: platform linux has no auto-update channel');
+    send('update:progress', { stage: 'error', percent: 0, message: 'Linux 版暂不支持应用内自动更新，请到项目发布页下载新版本' });
+    notify('不支持应用内更新', '请到项目发布页下载 Linux 新版本');
+    return false;
+  }
   applyingUpdate = true;
   notify('正在自动更新', `即将重启并安装 ApkStart ${label || job.version || ''}`.trim());
   send('update:progress', { stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
@@ -3829,6 +3871,13 @@ function registerIpc() {
     try {
       // 用户主动点「检查更新」→ 跳过缓存，必定重新问一次两个源
       const info = await updater.check({ force: opts.force !== false });
+      // Linux：检查照常（能看到新版信息），但自动应用不可用 ——
+      // Windows 的 Setup.exe / portable zip 资产对 AppImage/deb 无意义。
+      if (process.platform !== 'win32') {
+        info.unsupportedPlatform = true;
+        info.canAutoApply = false;
+        info.note = 'Linux 版暂不支持应用内自动更新，请到项目发布页下载新版本';
+      }
       updateInfo = info;
       // 后台已经把包下好了（autoUpdateJob 就绪）：把状态一起带上，
       // 否则重查一次后按钮会从「重启并安装」退回「立即更新」，看着像白下了。

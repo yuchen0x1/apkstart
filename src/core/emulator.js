@@ -166,10 +166,11 @@ class EmulatorEngine {
     return this.avdName === AVD_NAME ? SNAPSHOT_NAME : `${this.avdName}-${SNAPSHOT_NAME}`;
   }
 
-  /** emulator.exe 与系统镜像目录（优先用户运行时目录，回退到仓库内 engine/） */
+  /** emulator（Windows 带 .exe）与系统镜像目录（优先用户运行时目录，回退到仓库内 engine/） */
   locate() {
     const p = this.provisioner.paths();
-    const emuCandidates = [p.emulatorExe, path.join(this.appRoot, 'engine', 'emulator', 'emulator.exe')];
+    const emuName = process.platform === 'win32' ? 'emulator.exe' : 'emulator';
+    const emuCandidates = [p.emulatorExe, path.join(this.appRoot, 'engine', 'emulator', emuName)];
     const emulatorExe = emuCandidates.find((c) => fs.existsSync(c)) || '';
     const img = this.provisioner.systemImageInfo();
     return { emulatorExe, sysImgDir: img.dir, sysImgOk: img.ok, custom: !!img.custom, root: emulatorExe ? path.dirname(path.dirname(emulatorExe)) : p.root };
@@ -304,8 +305,8 @@ class EmulatorEngine {
    * 按「AVD 锁里的 pid」+「命令行带本 AVD 名的 qemu/emulator」两个来源清。
    */
   async killOrphanProcesses({ onLog = () => {} } = {}) {
-    if (process.platform !== 'win32') return 0;
     const avdDir = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`);
+    const IS_WIN = process.platform === 'win32';
 
     // 快速路径（每次冷启动都会走到）：
     //  - 没有 .lock → 不可能有活着的 emulator 占着这个 AVD，直接返回；
@@ -329,21 +330,32 @@ class EmulatorEngine {
       }
     } catch (_) { /* ignore */ }
     // 2) 兜底：按进程名 + 端口找活着的 qemu（tasklist/netstat 比 wmic 快一个量级）
-    try {
-      const [tl, ns] = await Promise.all([
-        new Promise((res) => execFile('tasklist', ['/FO', 'CSV', '/NH'], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (e, o) => res(e ? '' : String(o || '')))),
-        new Promise((res) => execFile('netstat', ['-ano', '-p', 'TCP'], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (e, o) => res(e ? '' : String(o || '')))),
-      ]);
-      const qemuPids = new Set();
-      for (const line of tl.split('\n')) {
-        const m = /^"([^"]+)","(\d+)"/.exec(line.trim());
-        if (m && /qemu|emulator/i.test(m[1])) qemuPids.add(m[2]);
-      }
-      for (const line of ns.split('\n')) {
-        const m = /:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i.exec(line);
-        if (m && qemuPids.has(m[2])) pids.add(Number(m[2]));
-      }
-    } catch (_) { /* 拿不到进程列表就只靠锁文件里的 pid */ }
+    if (IS_WIN) {
+      try {
+        const [tl, ns] = await Promise.all([
+          new Promise((res) => execFile('tasklist', ['/FO', 'CSV', '/NH'], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (e, o) => res(e ? '' : String(o || '')))),
+          new Promise((res) => execFile('netstat', ['-ano', '-p', 'TCP'], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (e, o) => res(e ? '' : String(o || '')))),
+        ]);
+        const qemuPids = new Set();
+        for (const line of tl.split('\n')) {
+          const m = /^"([^"]+)","(\d+)"/.exec(line.trim());
+          if (m && /qemu|emulator/i.test(m[1])) qemuPids.add(m[2]);
+        }
+        for (const line of ns.split('\n')) {
+          const m = /:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i.exec(line);
+          if (m && qemuPids.has(m[2])) pids.add(Number(m[2]));
+        }
+      } catch (_) { /* 拿不到进程列表就只靠锁文件里的 pid */ }
+    } else {
+      // Linux：`ps -eo pid=,args=` 一趟拿全，参数里带本 AVD 名的 qemu/emulator 都算
+      try {
+        const out = await new Promise((res) => execFile('ps', ['-eo', 'pid=,args='], { timeout: 10000, maxBuffer: 8 * 1024 * 1024 }, (e, o) => res(e ? '' : String(o || ''))));
+        for (const line of out.split('\n')) {
+          const m = /^\s*(\d+)\s+(.+)$/.exec(line);
+          if (m && /qemu-system|emulator/i.test(m[2]) && m[2].includes(this.avdName)) pids.add(Number(m[1]));
+        }
+      } catch (_) { /* 只靠锁文件里的 pid */ }
+    }
     pids.delete(process.pid);
     if (!pids.size) {
       this.clearLocks(avdDir);
@@ -351,7 +363,12 @@ class EmulatorEngine {
     }
     onLog(`清理 ${pids.size} 个残留模拟器进程`);
     await Promise.all([...pids].map((pid) => new Promise((r) => {
-      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => r());
+      if (IS_WIN) {
+        execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => r());
+      } else {
+        try { process.kill(pid, 'SIGKILL'); } catch (_) { /* 进程已经不在了 */ }
+        r();
+      }
     })));
     await sleep(1200);
     this.clearLocks(avdDir);
@@ -585,24 +602,28 @@ class EmulatorEngine {
     }
   }
 
-  /** emulator 自带 qemu-img.exe：把原始镜像文件撑到目标大小（稀疏，瞬间完成）
+  /** qemu-img：Windows 用 emulator 自带的；Linux 用系统的 qemu-utils（PATH）
    *  注意参数顺序：`qemu-img <命令> -f raw <文件> <大小>`。
    *  把 -f 放命令前面会被它当成全局参数直接报 unrecognized option。 */
   _qemuImg(op, ...rest) {
-    const exe = path.join(path.dirname(this.locate().emulatorExe), 'qemu-img.exe');
+    const IS_WIN = process.platform === 'win32';
+    const dir = path.dirname(this.locate().emulatorExe);
+    const exe = IS_WIN ? path.join(dir, 'qemu-img.exe') : 'qemu-img';
     const r = spawnSync(exe, [op, '-f', 'raw', ...rest], {
-      cwd: path.dirname(exe), windowsHide: true, encoding: 'utf8',
+      cwd: IS_WIN ? dir : undefined, windowsHide: true, encoding: 'utf8',
     });
     if (r.status !== 0) throw new Error(`qemu-img ${op} 失败: ${(r.stderr || '').trim() || r.status}`);
   }
 
-  /** emulator 自带 e2fsck.exe：修复异常中断留下的 dirty userdata 后再扩容 */
+  /** e2fsck：修复异常中断留下的 dirty userdata 后再扩容。
+   *  Windows 用 emulator 自带的 cygwin 版；Linux 用系统 e2fsprogs（几乎所有发行版都预装）。 */
   _e2fsck(img) {
+    const IS_WIN = process.platform === 'win32';
     const bin = path.join(path.dirname(this.locate().emulatorExe), 'bin64');
-    const exe = path.join(bin, 'e2fsck.exe');
-    if (!fs.existsSync(exe)) throw new Error('缺少 e2fsck.exe');
+    const exe = IS_WIN ? path.join(bin, 'e2fsck.exe') : 'e2fsck';
+    if (IS_WIN && !fs.existsSync(exe)) throw new Error('缺少 e2fsck.exe');
     const r = spawnSync(exe, ['-fy', img], {
-      cwd: bin, windowsHide: true, encoding: 'utf8', timeout: 180000,
+      cwd: IS_WIN ? bin : undefined, windowsHide: true, encoding: 'utf8', timeout: 180000,
     });
     // e2fsck: 0=clean, 1=修复完成；2/4/8 都表示不能安全继续。
     if (r.status !== 0 && r.status !== 1) {
@@ -610,14 +631,19 @@ class EmulatorEngine {
     }
   }
 
-  /** emulator 自带 resize2fs.exe（cygwin 版，必须在 bin64 目录下跑才能找到 DLL） */
+  /** resize2fs：Windows 用 emulator 自带的 cygwin 版（必须在 bin64 下找 DLL）；
+   *  Linux 用系统 e2fsprogs，没装时给出明确的安装指引。 */
   _resize2fs(img) {
+    const IS_WIN = process.platform === 'win32';
     const bin = path.join(path.dirname(this.locate().emulatorExe), 'bin64');
-    const exe = path.join(bin, 'resize2fs.exe');
-    if (!fs.existsSync(exe)) throw new Error('缺少 resize2fs.exe');
+    const exe = IS_WIN ? path.join(bin, 'resize2fs.exe') : 'resize2fs';
+    if (IS_WIN && !fs.existsSync(exe)) throw new Error('缺少 resize2fs.exe');
     const r = spawnSync(exe, [img], {
-      cwd: bin, windowsHide: true, encoding: 'utf8', timeout: 180000,
+      cwd: IS_WIN ? bin : undefined, windowsHide: true, encoding: 'utf8', timeout: 180000,
     });
+    if (r.error && r.error.code === 'ENOENT') {
+      throw new Error('缺少 resize2fs：请安装 e2fsprogs（sudo apt install e2fsprogs）');
+    }
     if (r.status !== 0) throw new Error(`resize2fs 失败: ${(r.stderr || '').trim() || r.status}`);
   }
 
@@ -987,7 +1013,7 @@ class EmulatorEngine {
     if (!adb) {
       // adbVersionPath() 只查「版本文件」，很多安装形态下是空的；
       // 直接按运行时根目录找 bundled 的 platform-tools 才稳。
-      try { adb = path.join(this.locate().root, 'platform-tools', 'adb.exe'); } catch (_) { adb = ''; }
+      try { adb = path.join(this.locate().root, 'platform-tools', process.platform === 'win32' ? 'adb.exe' : 'adb'); } catch (_) { adb = ''; }
     }
     if (!adb || !fs.existsSync(adb)) adb = 'adb';
     const port = Number(process.env.ANDROID_ADB_SERVER_PORT) || this.adbPort || 5044;
@@ -1052,7 +1078,7 @@ class EmulatorEngine {
   async repairWifi(adbPath = '', onLog = () => {}) {
     let adb = adbPath || '';
     if (!adb) {
-      try { adb = path.join(this.locate().root, 'platform-tools', 'adb.exe'); } catch (_) { adb = ''; }
+      try { adb = path.join(this.locate().root, 'platform-tools', process.platform === 'win32' ? 'adb.exe' : 'adb'); } catch (_) { adb = ''; }
     }
     if (!adb || !fs.existsSync(adb)) adb = 'adb';
     const port = Number(process.env.ANDROID_ADB_SERVER_PORT) || this.adbPort || 5044;
