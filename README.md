@@ -43,6 +43,8 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 
 ## 最新更新
 
+[查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
+
 <!-- latest:start -->
 ### v0.7.1
 
