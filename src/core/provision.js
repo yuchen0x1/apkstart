@@ -12,10 +12,9 @@ const { spawn, spawnSync, execFile } = require('child_process');
 const store = require('./store');
 const doctor = require('./doctor');
 const platform = require('./platform');
-const { download, downloadAny, downloadAnyParallel, downloadMulti, head } = require('./download');
+const { download, downloadAny, downloadAnyParallel, head } = require('./download');
 const { ZipArchive, ZipFile } = require('./zip');
-const { Sources, getGithubToken, ghApiHeaders } = require('./sources');
-const { cmpVer } = require('./version');
+const { Sources } = require('./sources');
 const { ImageStore } = require('./images');
 
 const IS_WIN = process.platform === 'win32';
@@ -56,16 +55,6 @@ const SOURCES = {
     'https://downloads.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso',
   ],
   isoSizeHint: 900 * 1024 * 1024,
-  // 轻量版（不带运行时）从这里拿「运行时整包」：本项目自己的 GitHub Release。
-  // 以前轻量版要从 dl.google.com 分别下 emulator / 系统镜像，国内网络经常
-  // 卡在几十 KB/s 甚至直接 404；改成整包 + 本项目 GitHub 之后，下载源和更新源
-  // 是同一个地方，出了问题也只需要在一个地方修。
-  ghReleaseApi: 'https://api.github.com/repos/yuchen0x1/apkstart/releases',
-  ghReleasePage: 'https://github.com/yuchen0x1/apkstart/releases',
-  // 同内容的 Gitee 镜像：国内直连 api.github.com 常常几十秒才响应，Gitee 一般几百毫秒。
-  // 两边都问一次，谁先给出「带运行时整包的最高版本」就用谁。
-  giteeReleaseApi: 'https://gitee.com/api/v5/repos/daily-miku/apkstart/releases',
-  giteeReleasePage: 'https://gitee.com/daily-miku/apkstart/releases',
 };
 
 /**
@@ -168,16 +157,6 @@ const MIN_SIZE = {
   sysimg: 300 * 1024 * 1024,
   aeHD: 64 * 1024,
 };
-
-/**
- * 运行时整包的「慢速逃生」阈值。
- * GitHub 直连/公共镜像被限速是常态（实测出现过 0.14MB/s ≈ 剩余 164 分钟），
- * 而官方 dl.google.com 在国内走 Google CDN 节点，实测 3~20MB/s。
- * 整包测速低于阈值就别硬扛：立刻改走官方分组件下载。
- */
-const PACK_MIN_SPEED_BPS = 512 * 1024;      // 预检：最快候选低于 0.5MB/s 直接放弃整包
-const PACK_STALL_AFTER_MS = 30 * 1000;      // 中途逃离：下载 30 秒后仍平均低于阈值
-const PACK_STALL_SPEED_BPS = 256 * 1024;    //   → 中断整包，换官方源（断点已保留）
 
 function run(cmd, args, { timeout = 60000, cwd, windowsHide = true } = {}) {
   return new Promise((resolve) => {
@@ -698,170 +677,6 @@ class Provisioner {
     this._cache.adbVersion = v.version;
     onProgress({ stage: 'done', message: `adb ${v.version} 就绪`, percent: 100 });
     return v;
-  }
-
-  /**
-   * 用自带的 ZIP 解析器解压（避免依赖系统解压工具）
-   * 大条目（GB 级 system.img）走流式，小条目整块读，避免撞 Node 的单 Buffer 上限。
-   */
-  // ---------------- 本项目 GitHub 的运行时整包（轻量版） ----------------
-
-  async _fetchJson(url) {
-    // api.github.com 匿名限额 60 次/小时：有 gh CLI 凭据或手动 token 就带上认证（5000 次/小时）
-    const headers = url.includes('api.github.com') ? await ghApiHeaders(await getGithubToken(store.getSettings())) : {};
-    const text = await this._fetchText(url, 2 * 1024 * 1024, 30000, headers).catch(() => '');
-    try { return JSON.parse(text); } catch (_) { return null; }
-  }
-
-  /**
-   * 解析「运行时整包」的下载地址。
-   * 资产名约定：ApkStart-runtime-<tag>.zip（由 .github/workflows/release.yml 产出，
-   * 内容就是 build/runtime 的那一套：emulator/ + platform-tools/ + aehd/ + system-images/）。
-   * GitHub 与 Gitee 两边都扫一遍，取版本号最高的那个；找不到就抛错，让上层退回
-   * Google 官方分组件下载。
-   */
-  async resolveRuntimePack() {
-    const custom = String(store.getSettings().runtime.runtimePackUrl || '').trim();
-    if (custom) return { url: absUrl(custom), name: path.basename(custom.split('?')[0]), size: 0, tag: 'custom' };
-    if (this._cache.pack) return this._cache.pack;
-
-    // fork 版运行时整包只从本仓库（yuchen0x1/apkstart）取，不走 Gitee
-    const apis = [{ api: SOURCES.ghReleaseApi, page: SOURCES.ghReleasePage, name: 'GitHub' }];
-
-    // 并发问两边；任何一个失败都不影响另一个
-    const lists = await Promise.all(apis.map(async (a) => {
-      const j = await this._fetchJson(`${a.api}?per_page=15`).catch(() => null);
-      return { ...a, list: Array.isArray(j) ? j : null };
-    }));
-
-    const cands = [];
-    for (const item of lists) {
-      if (!item.list) continue;
-      for (const rel of item.list) {
-        if (!rel || rel.draft) continue;
-        const hit = (rel.assets || []).find((x) => /^ApkStart-runtime-.*\.zip$/i.test(x.name || ''));
-        if (!hit) continue;
-        cands.push({
-          url: hit.browser_download_url || hit.url,
-          name: hit.name,
-          size: hit.size || 0,
-          tag: String(rel.tag_name || rel.name || '').replace(/^v/i, ''),
-          page: rel.html_url || item.page,
-          from: item.name,
-        });
-      }
-    }
-    if (!cands.length) {
-      const errs = lists.filter((x) => !x.list).map((x) => `${x.name} 不可达`).join('、');
-      throw new Error(`两个源上都没有运行时整包${errs ? `（${errs}）` : ''}`);
-    }
-    cands.sort((a, b) => cmpVer(b.tag, a.tag));
-    this._cache.pack = cands[0];
-    return this._cache.pack;
-  }
-
-  /**
-   * 轻量版一键部署：从本项目 GitHub 下载运行时整包并解压。
-   * 系统镜像在包里是 .xz，首次开机时由 materializeImages() 展开（只做一次）。
-   */
-  async installRuntimePack(onProgress = () => {}) {
-    // 整包里的 emulator / aehd 都是 Windows 二进制，Linux 必须走官方源逐组件安装
-    // （autoDeploy 的 catch 会自动落到 installAdb/installEmulator/installSystemImage）
-    if (!IS_WIN) throw new Error('运行时整包只提供 Windows 版');
-    const p = this.ensureDirs();
-    // 先给一条进度：找版本 + 测速这一段没有字节数，不给提示用户会以为「卡死了」。
-    onProgress({ stage: 'download', message: '正在获取运行时版本信息…', percent: 1 });
-    const pack = await this.resolveRuntimePack();
-    await this.guardDisk('runtime', p.root);
-    const zip = path.join(p.tmp, 'runtime-pack.zip');
-    const total = pack.size || 0;
-    const s = store.getSettings().runtime || {};
-    const conn = Math.max(1, Math.min(16, Number(s.downloadConnections) || 8));
-
-    onProgress({ stage: 'download', message: `正在挑选最快的下载源（${pack.from || 'GitHub'} · ${pack.tag}）…`, percent: 1 });
-    // 候选 = 源站 + 镜像前缀。先各下一个 128KB 实测速度再决定用哪个：
-    // 「按域名猜」在实测里经常错 —— 同一个地址上午 30KB/s、晚上 5MB/s。
-    const urls = await this.sources
-      .rank(this._downloadUrls(pack.url), { onProgress: (pp) => onProgress({ stage: 'download', message: pp.message, percent: 1 }) })
-      .catch(() => this._downloadUrls(pack.url));
-
-    // 预检：最快的候选都慢得不可接受 → 立刻放弃整包，改走官方分组件下载。
-    // （autoDeploy 会捕获这里的错误并自动切到 installEmulator/installSystemImage，
-    // 官方源在国内走 Google CDN，实测 3~20MB/s；整包在 GitHub 上被限速到几十 KB/s
-    // 时，干等 164 分钟毫无意义。）
-    const bestSpeed = this.sources.speedOf(urls[0]);
-    if (bestSpeed > 0 && bestSpeed < PACK_MIN_SPEED_BPS) {
-      throw new Error(`GitHub 运行时整包实测过慢（${(bestSpeed / 1048576).toFixed(2)} MB/s），自动改用官方源分组件下载`);
-    }
-
-    onProgress({ stage: 'download', message: `下载运行时（约 1.5 GB，只需一次，${conn} 线程）…`, percent: 2 });
-    // 中途逃离看门狗：测速采样只有 256KB，可能「采样快、长跑慢」。
-    // 下载 30 秒后平均速度仍低于 256KB/s 就中断整包（断点已保留，边车元数据在），
-    // 让上层 autoDeploy 改走官方源 —— 宁可多一次切换，不让用户在坏源上耗一小时。
-    const abort = new AbortController();
-    let watchStart = 0;
-    let watchGot = 0;
-    const packProgress = (pr) => {
-      if (!watchStart && pr.got > 0) { watchStart = Date.now(); watchGot = pr.got; }
-      if (watchStart && !abort.signal.aborted) {
-        const elapsed = Date.now() - watchStart;
-        const got = Math.max(0, pr.got - watchGot);
-        if (elapsed > PACK_STALL_AFTER_MS && got / (elapsed / 1000) < PACK_STALL_SPEED_BPS) {
-          abort.abort();
-        }
-      }
-      const pct = pr.percent != null ? pr.percent : (total ? Math.round((pr.got / total) * 100) : 0);
-      const mb = `${(pr.got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`;
-      const sp = Number(pr.speed) > 0 ? ` · ${(pr.speed / 1048576).toFixed(2)} MB/s` : '';
-      const eta = Number(pr.eta) > 0 ? ` · 剩余约 ${Math.ceil(pr.eta / 60)} 分钟` : '';
-      onProgress({
-        stage: 'download',
-        message: `下载运行时 ${mb}${sp}${eta}`,
-        percent: Math.max(1, Math.min(90, Math.round(pct * 0.9))),
-        speed: pr.speed,
-      });
-    };
-    // 分块并行（8 线程）比单流快得多：GitHub 对单连接限速很常见，单流实测只有
-    // 一两百 KB/s，8 线程能跑满本地带宽。中途断掉会退回单流续传。
-    try {
-      await downloadMulti(urls, zip, {
-        connections: conn,
-        signal: abort.signal,
-        onProgress: packProgress,
-      });
-    } catch (e) {
-      if (abort.signal.aborted) {
-        throw new Error('GitHub 运行时整包下载过慢（30 秒平均不足 256KB/s），自动改用官方源分组件下载');
-      }
-      throw e;
-    }
-    if (fileSize(zip) < 200 * 1024 * 1024) throw new Error('运行时整包下载不完整，可重试续传');
-
-    onProgress({ stage: 'extract', message: '解压运行时（约 1 分钟）…', percent: 91 });
-    await this.extractZip(zip, p.root, {
-      onEntry: (name, done, all) => {
-        if (done % 50 === 0) {
-          onProgress({ stage: 'extract', percent: Math.min(99, 91 + Math.round((done / all) * 8)), message: `解压 ${done}/${all}` });
-        }
-      },
-    });
-    try {
-      fs.writeFileSync(path.join(p.root, '.runtime-pack.json'), JSON.stringify({
-        name: pack.name, tag: pack.tag, at: new Date().toISOString(), from: pack.url,
-      }));
-      fs.rmSync(zip, { force: true });
-    } catch (_) { /* 标记写不进去不影响使用 */ }
-
-    // 整包里的 system.img 是 .xz 压缩的（和完整版安装包一致）。这里立刻展开，
-    // 否则紧接着 checkEnv() 会认为「没装系统镜像」，又去 Google 下一套 1.4 GB。
-    // 展开失败必须让部署失败并带上原因：旧版这里 catch 成 0，用户看到进度
-    // 停在 99% 之后又跳回「改用官方源补齐」，白下一套 1.4GB。
-    onProgress({ stage: 'extract', message: '展开系统镜像（约 1 分钟，只需一次）…', percent: 99 });
-    await this.materializeImages((m) => onProgress({ stage: 'extract', message: m, percent: 99 }));
-    this.ensureSoftwareOpenGL();
-
-    onProgress({ stage: 'done', message: '运行时已就绪', percent: 100 });
-    return { ok: true, name: pack.name, tag: pack.tag };
   }
 
   /**

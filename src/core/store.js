@@ -174,7 +174,7 @@ const DEFAULT_SETTINGS = {
   update: {
     // 发现新版本：通知后自动下载；没有应用窗口在前台时自动重启安装，
     // 有应用窗口则等窗口关闭再装（不打断正在玩的应用）。关掉则只通知、手动更新。
-    autoUpdate: true,
+    autoUpdate: false,
   },
   report: {
     // 开机失败时在本机自动生成一份「脱敏诊断报告」，供用户一键上报。

@@ -12,6 +12,23 @@
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
 
+; Before the legacy uninstaller removes resources/runtime, preserve the tree
+; beside the previous installation on the same volume. Copying leaves the
+; running installation usable if the user cancels the wizard.
+!macro customInit
+  ReadRegStr $R0 HKCU "${INSTALL_REGISTRY_KEY}" InstallLocation
+  ${If} $R0 != ""
+  ${AndIf} ${FileExists} "$R0\resources\runtime\emulator\emulator.exe"
+    nsExec::ExecToLog '"$SYSDIR\robocopy.exe" "$R0\resources\runtime" "$R0.preserved-runtime" /E /XJ /R:1 /W:1'
+    Pop $R1
+    ${If} $R1 == "error"
+    ${OrIf} $R1 >= 8
+      MessageBox MB_ICONSTOP "无法完整保留旧版运行时。请关闭模拟器并检查剩余磁盘空间后重试。" /SD IDOK
+      Abort
+    ${EndIf}
+  ${EndIf}
+!macroend
+
 ; 安装收尾：再兜一层桌面图标。
 ; electron-builder 的 createDesktopShortcut 走的是它自己的 CreateShortcuts 流程，
 ; 个别环境（桌面被 OneDrive 重定向、快捷方式被安全软件回滚）里会生成失败，

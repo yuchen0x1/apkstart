@@ -1511,11 +1511,12 @@ function renderUpdate(info) {
     btn.textContent = a.text;
     btn.dataset.mode = a.mode;
     // 已下载时下面那行自带「重启并安装」，主按钮就不再重复出现同一个动作
-    showUpdateBtn(!info.downloaded);
+    showUpdateBtn(info.canAutoApply && !info.downloaded);
+    if (!info.canAutoApply) st.textContent += ' · 请通过发布页下载';
     // 发布页兜底入口：不管能不能自动更新，用户都得有一条自己拿包的路
     showPageBtn(true);
     // 只看得到发布页 = 安装包还在上传：把「为什么点不到自动更新」直接写在面板上
-    if (pendingRow && !info.asset) { pendingRow.hidden = false; pendingRow.style.display = ''; }
+    if (pendingRow && !info.asset && !info.proof) { pendingRow.hidden = false; pendingRow.style.display = ''; }
     // 更新日志 = 该版本的发布说明（GitHub Release body），完整展示（可滚动）。
     // 按轻量 markdown 渲染成 HTML，面板里不再露出 #、**、表格竖线这些记号。
     const note = $('updateNote');
@@ -1596,7 +1597,7 @@ function bindUpdate() {
       try {
         const info = await api.updateCheck();
         renderUpdate(info);
-        if (info && info.hasUpdate) toast({ title: `发现新版本 ${info.tag}`, body: '点「立即更新」自动下载安装', type: 'info' });
+        if (info && info.hasUpdate) toast({ title: `发现新版本 ${info.tag}`, body: info.canAutoApply ? '可在软件更新中下载已验证的安装包' : '请打开发布页查看详情', type: 'info' });
         else if (info && info.ok !== false) toast({ title: '已是最新版本', body: `v${info.current}`, type: 'ok' });
       } catch (e) {
         $('updateState').textContent = `检查失败：${e.message}`;
@@ -1636,6 +1637,7 @@ function bindUpdate() {
       if (label === '重启并安装') go.textContent = '重启并安装';
       return;
     }
+    if (r.mode === 'deb') { go.disabled = false; go.textContent = label; $('updateState').textContent = '请在系统安装器中确认升级'; return; }
     $('updateState').textContent = `已下载 v${r.version}，正在重启完成安装…`;
   };
 
@@ -2939,11 +2941,6 @@ function renderWizardDrives() {
 }
 
 async function wizardStartDeploy() {
-  const src = document.getElementById('wizardSource');
-  if (src) {
-    await api.setSettings({ runtime: { preferGithubRuntime: src.value !== 'official' } })
-      .then((s) => { state.settings = s; }).catch(() => {});
-  }
   wizard.deploying = true;
   wizard.bar = 0;
   wizardShowPage(3);
@@ -3002,8 +2999,6 @@ async function openWizard() {
       ? configuredDrive : (drv.recommended || '');
     state.settings = { ...(state.settings || {}), __systemDrive: drv.systemDrive || 'C:' };
   }
-  const source = document.getElementById('wizardSource');
-  if (source) source.value = state.settings?.runtime?.preferGithubRuntime === false ? 'official' : 'github';
   // 向导第 1 页的语言选择器（与第 7 页的 wizLanguage、设置页的 setLanguage 同一设置）
   const firstLanguage = document.getElementById('wizLanguageFirst');
   if (firstLanguage) firstLanguage.value = (state.settings && state.settings.language) || 'auto';

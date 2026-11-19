@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.7.1**（2026-11-18）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.8.0**（2026-11-18）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,13 +46,13 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.7.1
+### v0.8.0
 
-> Linux 复测后的稳定性补丁：更新边界和故障提示在跨平台环境下更准确。
+> Windows 和 Linux 从同一个发行页获取各自的在线安装包。已有运行时整包仍可从本地导入。
 
-- **Linux 不再误触发 Windows 更新器**：非 Windows 平台会在启动更新脚本前明确拒绝，不会调用 Windows 专用的启动回调。
-- **ADB 授权故障提示平台化**：Linux/macOS 使用 `$HOME/.android/adbkey*` 的修复路径， Windows 继续使用 `%USERPROFILE%\\.android\\adbkey*`，避免用户照着错误路径排障。
-- **跨平台回归测试**：Linux 没有 PowerShell 时会安全跳过仅 Windows 的语法/执行检查，同时保留 Windows 更新脚本的完整校验。
+- **首次部署**从官方源获取缺少的组件。Windows 安装版和便携版均单独分发桌面程序。
+- **软件更新**按安装形态选择下载文件，并核对发行签名和 SHA-256。新装默认提示更新，已有设置沿用。
+- **Linux 更新**支持 AppImage 替换与启动失败恢复；deb 下载完成后交给系统安装器确认。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。
@@ -156,20 +156,19 @@ Windows 默认推荐剩余空间较大的非系统盘，Linux 使用 XDG 数据�
 
 | 文件 | 体积 | 适合场景 |
 |---|---|---|
-| `ApkStart-<版本>-Setup.exe` | 约 1 GB | **推荐**。安装版，内置完整运行时，装完离线可用，不用等下载 |
+| `ApkStart-<版本>-Setup.exe` | 见发行页 | **推荐**。在线安装版，支持选择安装目录与系统卸载 |
 | `ApkStart-v<版本>-win64-portable.zip` | 约 150 MB | 便携版，解压即用，首次启动时按需下载运行时 |
-| `ApkStart-runtime-v<版本>.zip` | 约 1 GB | 运行时整包，便携版下载源；一般不需要手动下载 |
 | `ApkStart-<版本>-x86_64.AppImage` | 约 130 MB | Linux x86_64 便携版，首次启动时按需下载运行时 |
 | `ApkStart-<版本>-amd64.deb` | 约 105 MB | Linux x86_64 安装包，适合 Debian / Ubuntu |
 
 安装版、便携版和 Linux 包都会把安卓数据、应用和快照放在用户数据目录中，更新程序文件不会删除已安装应用。
-Windows 完整安装版内置运行时；Linux 首次启动会从 Google 官方源在线下载对应运行时。
+Windows 和 Linux 均按需从 Google 官方源下载运行时，Windows 亦可导入本地运行时整包。
 Windows 可在「设置 → 桌面与文件」中修改运行时目录和安卓数据目录，Linux 使用 XDG 默认目录。
 
 ### 第一次启动
 
 1. 在引导第一页点击「下一步」。
-2. Windows 选择安装位置和下载源；Linux 确认默认 XDG 数据目录。自动模式会先测速，再选择更快的来源。
+2. Windows 选择安装位置；Linux 确认默认 XDG 数据目录。
 3. 点击「开始安装」，等待 adb、模拟器和 Android 14 系统镜像部署完成。
 4. 把 APK 拖进主窗口，或点击「安装 APK」选择文件。
 5. 安装完成后双击桌面图标即可启动应用。
@@ -184,7 +183,7 @@ Windows 可在「设置 → 桌面与文件」中修改运行时目录和安卓�
 | CPU | 建议 4 核及以上；Windows 在 BIOS 中开启 VT-x/AMD-V，Linux 开启 KVM |
 | 内存 | 最低 8 GB，建议 16 GB |
 | 磁盘 | 首次部署至少预留约 8 GB；安装大型应用需要更多空间 |
-| 网络 | Windows 便携版与 Linux 首次部署需要联网；Windows 完整安装版内置运行时 |
+| 网络 | 首次在线部署需访问 Google 官方源，本地离线导入可复用已有组件 |
 
 硬件加速在 Windows 上可使用 AEHD 或 Windows 虚拟机平台（WHPX），Linux 使用 `/dev/kvm`。
 没有硬件加速时可以回退到软件模拟，
@@ -252,7 +251,7 @@ npm install
 npm start
 ```
 
-Windows 还可注册/取消注册 `.apk` 文件关联，并构建便携版或完整安装版：
+Windows 还可注册/取消注册 `.apk` 文件关联，并构建便携版或在线安装版：
 
 ```powershell
 # 可选：注册/取消注册 .apk 文件关联
@@ -263,7 +262,7 @@ npm run assoc:off
 npm run pack
 # 产出：dist/ApkStart-win64-portable/ApkStart.exe
 
-# 准备完整运行时并构建安装版
+# 构建在线安装版
 npm run build:exe
 # 产出：dist/release/ApkStart-<版本>-Setup.exe
 ```
@@ -309,7 +308,7 @@ git tag v0.6.8 && git push origin v0.6.8   # 触发 .github/workflows/release.ym
 ```
 
 发版工作流会依次：跑全量测试 → 用 `tools/release-notes.js` 生成发行说明并创建 Release →
-构建并上传便携版、完整版安装包、运行时整包。
+构建并上传便携版、在线安装包和 Linux 包，验证所有资产后发布。
 
 ## 项目结构
 

@@ -167,6 +167,7 @@ function bootstrapBundledRuntime() {
     // resources/ 下，进程 exe 和 resources 同级，所以几个候选位置都看一下。
     const candidates = [
       path.join(exeDir, 'runtime'),
+      exeDir + '.preserved-runtime',
       path.join(path.dirname(exeDir), 'runtime'),
       path.join(process.resourcesPath || '', 'runtime'),
       path.join(process.resourcesPath || '', 'app', 'runtime'),
@@ -198,6 +199,11 @@ function bootstrapBundledRuntime() {
     // Windows 的 emulator 带 .exe；Linux 裸名。Linux 版目前不带内置运行时
     // （走应用内自动下载），但这张检查表按平台写对，将来带包也不用改。
     const emuExe = process.platform === 'win32' ? 'emulator.exe' : 'emulator';
+    const previous = store.getSettings().runtime.dir;
+    if (previous && path.basename(previous).toLowerCase() === 'runtime'
+      && path.basename(path.dirname(previous)).toLowerCase() === 'resources') {
+      candidates.push(path.dirname(path.dirname(previous)) + '.preserved-runtime');
+    }
     const bundled = candidates.find((dir) =>
       fs.existsSync(path.join(dir, 'emulator', emuExe)) && hasImage(dir));
     if (!bundled) return;
@@ -498,27 +504,7 @@ async function autoDeploy({ force = false } = {}) {
   deploying = true;
   const progress = (p) => send('provision:progress', { ...p, component: p.component || 'all' });
   try {
-    let env = await runtime.provisioner.checkEnv();
-    const needEngine = !env.emulator.ok || !env.sysimg.ok;
-    // 轻量版优先用「本项目 GitHub 的运行时整包」：一个文件搞定 emulator + 系统镜像，
-    // 下载源和更新源统一在 GitHub 上（国内比 dl.google.com 稳得多）。
-    // 整包拿不到（没网 / 还没发过该资产 / 被限流）再逐个从官方源装。
-    // 整包只有 Windows 二进制：Linux 不必去问 GitHub，直接走官方源逐组件装
-    if (needEngine && process.platform === 'win32'
-      && store.getSettings().runtime.preferGithubRuntime !== false) {
-      try {
-        progress({ message: '正在从 GitHub 下载运行时…' });
-        await runtime.provisioner.installRuntimePack(progress);
-        const afterPack = await runtime.provisioner.checkEnv();
-        // 运行时整包可能只落下 emulator 或系统镜像的一半。后续官方源补齐时
-        // 必须使用这次检查的最新结果，否则会再次下载已经存在的组件（#66）。
-        env = afterPack;
-        if (afterPack.emulator.ok && afterPack.sysimg.ok) return { ok: true, source: 'github' };
-        progress({ message: '运行时整包不完整，改用官方源补齐…' });
-      } catch (e) {
-        progress({ message: `GitHub 运行时不可用（${e.message}），改用官方源…` });
-      }
-    }
+    const env = await runtime.provisioner.checkEnv();
     if (!env.adb.ok) {
       progress({ message: '正在准备 adb…' });
       await runtime.provisioner.installAdb(progress);
@@ -981,7 +967,7 @@ function startApplyUpdate(job, label) {
   if (!job || applyingUpdate) return false;
   // Linux 发行形态（AppImage/deb）没有自更新通道：升级脚本、explorer、
   // powershell 都是 Windows 的东西，跑了只会坏。明确引导到发布页。
-  if (process.platform !== 'win32') {
+  if (process.platform !== 'win32' && job.mode !== 'appimage') {
     appLog('update apply blocked: platform linux has no auto-update channel');
     send('update:progress', { stage: 'error', percent: 0, message: 'Linux 版暂不支持应用内自动更新，请到项目发布页下载新版本' });
     notify('不支持应用内更新', '请到项目发布页下载 Linux 新版本');
@@ -1048,36 +1034,11 @@ function handleUpdateFound(info) {
   send('update:state', info);
   if (!info.hasUpdate) return;
   appLog(`update available ${info.tag} (current v${app.getVersion()}, asset=${info.asset ? info.asset.name : 'none'})`);
-  if (info.asset && store.getSettings().update.autoUpdate !== false) {
+  if (info.canAutoApply && info.flavor !== 'deb' && store.getSettings().update.autoUpdate === true) {
     autoUpdateFlow(info).catch((e) => appLog(`auto update error: ${e.message}`));
   } else {
-    notify('发现新版本', info.asset
-      ? `ApkStart ${info.tag} 已发布，可在「设置 → 软件更新」里一键更新`
-      : `ApkStart ${info.tag} 已发布，安装包还在上传，完成后会自动下载`);
-    // 只看到发布页、安装包还在上传：过几分钟自动重查，别让用户自己盯着刷新
-    if (!info.asset) scheduleUpdateRetry();
+    notify('发现新版本', 'ApkStart ' + info.tag + ' 已发布，可在设置中查看更新详情');
   }
-}
-
-// 发布页已出现但安装包还没传完（CI 打包 10~20 分钟）时的自动重查。
-// 有次数上限，免得网络/仓库异常时空转；查到包后 handleUpdateFound 会接着走下载。
-let updateRetryTimer = null;
-let updateRetryLeft = 0;
-function scheduleUpdateRetry() {
-  if (updateRetryTimer) return;
-  if (updateRetryLeft <= 0) updateRetryLeft = 3;
-  updateRetryTimer = setTimeout(async () => {
-    updateRetryTimer = null;
-    updateRetryLeft -= 1;
-    const fresh = await updater.check({ force: true }).catch(() => null);
-    if (fresh) {
-      handleUpdateFound(fresh);
-      if (fresh.hasUpdate && !fresh.asset) scheduleUpdateRetry();
-    } else if (updateRetryLeft > 0) {
-      scheduleUpdateRetry();
-    }
-  }, 120000);
-  if (updateRetryTimer.unref) updateRetryTimer.unref();
 }
 
 async function runUpdate() {
@@ -1118,8 +1079,13 @@ async function runUpdate() {
           + '也可以点「打开下载页」自己挑安装版或便携版',
       };
     }
+    if (!info.canAutoApply) return { ok: false, error: '缺少可验证的更新包，请打开发布页' };
     sendProgress({ stage: 'download', percent: 0, message: '准备下载…' });
     const job = await updater.prepare(info);
+    if (job.mode === 'deb') {
+      const error = await shell.openPath(job.payload);
+      return error ? { ok: false, error } : { ok: true, mode: 'deb', version: job.version };
+    }
     sendProgress({ stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
     if (!startApplyUpdate(job, info.version)) {
       autoUpdateJob = job;
@@ -3871,13 +3837,6 @@ function registerIpc() {
     try {
       // 用户主动点「检查更新」→ 跳过缓存，必定重新问一次两个源
       const info = await updater.check({ force: opts.force !== false });
-      // Linux：检查照常（能看到新版信息），但自动应用不可用 ——
-      // Windows 的 Setup.exe / portable zip 资产对 AppImage/deb 无意义。
-      if (process.platform !== 'win32') {
-        info.unsupportedPlatform = true;
-        info.canAutoApply = false;
-        info.note = 'Linux 版暂不支持应用内自动更新，请到项目发布页下载新版本';
-      }
       updateInfo = info;
       // 后台已经把包下好了（autoUpdateJob 就绪）：把状态一起带上，
       // 否则重查一次后按钮会从「重启并安装」退回「立即更新」，看着像白下了。
@@ -3909,33 +3868,19 @@ function registerIpc() {
    */
   ipcMain.handle('app:updateRunPayload', async () => {
     try {
-      const pending = typeof updater.pendingApply === 'function'
-        ? updater.pendingApply() : { state: 'none' };
-      let payload = pending.payload && fs.existsSync(pending.payload) ? pending.payload : '';
-      if (!payload) {
-        // 凭条丢了就从更新目录里找最新的安装包（Setup.exe 才有可能手动装）
-        const dir = updater.updateDir;
-        const hits = [];
-        const walk = (d, depth) => {
-          if (depth > 2) return;
-          let names = [];
-          try { names = fs.readdirSync(d, { withFileTypes: true }); } catch (_) { return; }
-          for (const n of names) {
-            const p = path.join(d, n.name);
-            if (n.isDirectory()) walk(p, depth + 1);
-            else if (/^ApkStart-.*Setup\.exe$/i.test(n.name)) hits.push(p);
-          }
-        };
-        walk(dir, 0);
-        hits.sort((a, b) => {
-          try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch (_) { return 0; }
-        });
-        payload = hits[0] || '';
+      if (process.platform !== 'win32' || updater.flavor !== 'setup') {
+        return { ok: false, error: '手动安装仅适用于 Windows 安装版，请打开发布页' };
       }
-      if (!payload || !fs.existsSync(payload)) {
-        return { ok: false, error: '没找到已下载的安装包，请先点「立即更新」下载' };
-      }
-      const err = await shell.openPath(payload);
+      if (updateBusy) return { ok: false, error: '正在更新中' };
+      updateBusy = true;
+      let payload, err;
+      try {
+        const info = await updater.check({ force: true });
+        if (!info.hasUpdate || !info.canAutoApply) throw new Error('缺少可验证的新版本');
+        const job = await updater.prepare(info);
+        payload = job.payload;
+        err = await shell.openPath(payload);
+      } finally { updateBusy = false; }
       if (err) return { ok: false, error: err };
       // 用户手里已经有安装向导了，别再反复弹「上次没装成」
       updater.clearPending();
@@ -3946,7 +3891,7 @@ function registerIpc() {
     }
   });
 
-  ipcMain.handle('app:updateCancel', () => { updateBusy = false; return { ok: true }; });
+  ipcMain.handle('app:updateCancel', () => ({ ok: !updateBusy }));
 
   ipcMain.handle('app:restart', () => {
     // 以前只 app.quit()：界面上写着「重启应用」，实际是直接退出，
@@ -4096,6 +4041,10 @@ if (!gotLock) {
 
     registerIpc();
     createWindow({ show: !parseArgs(process.argv).silent && process.env.APKSTART_SELFTEST !== '1' });
+    if (mainWindow) mainWindow.webContents.once('did-finish-load', () => {
+      try { updater.confirmAppImageStartup(app.getVersion()); }
+      catch (error) { appLog('AppImage health receipt: ' + error.message); }
+    });
     scheduleSelfTest();
     buildTray();
     applyAutoStart();

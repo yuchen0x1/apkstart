@@ -21,6 +21,7 @@ const { spawn } = require('child_process');
 const { downloadAnyParallel, downloadMulti, sha256File } = require('./download');
 const { ZipFile, safeEntryPath } = require('./zip');
 const { cmpVer } = require('./version');
+const { assetNames, readManifest, matchAsset, marker } = require('./release-manifest');
 const { Sources } = require('./sources');
 
 const OWNER = 'yuchen0x1';   // 只检查本仓库的发布
@@ -43,6 +44,10 @@ class Updater {
    *          onProgress?:Function}} o
    */
   constructor(o) {
+    this.platform = o.platform || process.platform;
+    this.arch = o.arch || process.arch;
+    this.appImage = o.appImage ?? process.env.APPIMAGE;
+    this.publicKey = o.publicKey;
     this.current = o.currentVersion || '0.0.0';
     this.exePath = o.exePath;
     this.installDir = path.dirname(o.exePath || '');
@@ -58,6 +63,8 @@ class Updater {
 
   /** 安装形态：安装版（有卸载器）还是便携包 */
   get flavor() {
+    if (this.platform === 'linux') return this.appImage ? 'appimage' : 'deb';
+    if (this.platform !== 'win32') return 'unsupported';
     try {
       // 不能只认 NSIS 默认的「Uninstall ApkStart.exe」：自定义打包、第三方重打包、
       // 以及部分中文安装器会把卸载器叫 uninstall.exe / uninst000.exe。判错成便携版
@@ -87,29 +94,25 @@ class Updater {
    */
   async check(opts = {}) {
     const merged = await this.sources.latest({ force: !!opts.force });
-    const pick = (re) => merged.assets.find((a) => re.test(String(a.name || '')));
-    // 发行版里同时挂着「便携包」和「运行时整包」（ApkStart-runtime-*.zip）。
-    // 兜底的 .zip 匹配必须把运行时整包排除掉：某次发布如果只有运行时整包、
-    // 没有便携包，旧逻辑会把它当更新包解压进程序目录（多出 1.5GB 文件、程序也被换坏）。
-    const isRuntimePack = (a) => /runtime/i.test(String((a && a.name) || ''));
-
-    const wantSetup = this.flavor === 'setup';
-    const asset = wantSetup
-      ? (pick(/Setup\.exe$/i) || merged.assets.find((a) => /\.exe$/i.test(a.name) && !isRuntimePack(a)))
-      : (pick(/portable.*\.zip$/i) || pick(/win64.*\.zip$/i)
-        || merged.assets.find((a) => /\.zip$/i.test(a.name) && !isRuntimePack(a)));
+    const names = assetNames(merged.tag);
+    const asset = this.arch === 'x64' && merged.assets.find(a => a.name === names[this.flavor]);
+    const proof = (marker.exec(merged.notes || '') || [])[0] || '';
+    const verified = matchAsset(readManifest(proof, merged.tag, this.publicKey), merged.tag, asset);
 
     this.latest = {
       version: merged.version,
       tag: merged.tag,
       name: merged.name,
-      notes: merged.notes,
+      notes: String(merged.notes || '').replace(marker, '').trim(),
+      proof,
+      stale: !!merged.stale,
       htmlUrl: merged.htmlUrl,
       publishedAt: merged.publishedAt,
       // 注意带上 parts：Gitee 的分片包没有单一 url，丢掉 parts 就变成「有资产但没地址」
       asset: asset
         ? {
           name: asset.name,
+          digest: asset.digest,
           size: asset.size,
           url: asset.url,
           // 同名资产在 GitHub / Gitee 都有：两个地址都带着，prepare() 里测速择快。
@@ -128,7 +131,7 @@ class Updater {
       flavor: this.flavor,
       hasUpdate: cmpVer(merged.tag, this.current) > 0,
       current: this.current,
-      canAutoApply: !!asset && (!!asset.url || !!(asset.parts && asset.parts.length)),
+      canAutoApply: verified && !merged.stale,
     };
     this._last = this.latest;
     return this.latest;
@@ -141,6 +144,12 @@ class Updater {
   async prepare(info) {
     const it = info || this.latest;
     if (!it || !it.asset) throw new Error('这个版本没有可自动安装的安装包，请到 GitHub 发布页手动下载');
+    const names = assetNames(it.tag);
+    if (this.arch !== 'x64' || it.version !== it.tag.slice(1) || cmpVer(it.tag, this.current) <= 0
+      || it.asset.name !== names[this.flavor] || it.stale
+      || !matchAsset(readManifest(it.proof, it.tag, this.publicKey), it.tag, it.asset)) {
+      throw new Error('此更新缺少匹配的发行签名、平台信息或官方摘要，请打开发布页');
+    }
     const dir = path.join(this.updateDir, it.version);
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, it.asset.name);
@@ -201,6 +210,14 @@ class Updater {
       });
     }
 
+    const hash = await sha256File(file);
+    if ('sha256:' + hash !== it.asset.digest) {
+      fs.rmSync(file, { force: true });
+      throw new Error('更新包 SHA-256 与签名清单不符，已丢弃下载文件，请重试');
+    }
+    if (this.platform === 'linux') {
+      return { mode: this.flavor, payload: file, version: it.version, sha256: hash };
+    }
     if (/\.zip$/i.test(file)) {
       const st = fs.statSync(file);
       if (!st.size) throw new Error('下载到的更新包是空文件，请重试');
@@ -211,7 +228,7 @@ class Updater {
           throw new Error(`更新包大小异常（${st.size} 字节，期望 ${it.asset.size}），可能下载不完整，请重试`);
         }
       }
-      this.sha256 = await sha256File(file);
+      this.sha256 = hash;
       try { fs.writeFileSync(`${file}.sha256`, this.sha256); } catch (_) { /* 校验文件写不了不影响主流程 */ }
       this.onProgress({
         stage: 'verify', percent: 100,
@@ -236,7 +253,7 @@ class Updater {
     // 一个半截下载 / 错误页被当成 Setup.exe 执行时，安装器会先卸旧再解压失败，
     // 结果就是安装目录被清空、程序再也起不来。
     const meta = this._assertSetup(file, it.asset);
-    this.sha256 = await sha256File(file);
+    this.sha256 = hash;
     try { fs.writeFileSync(`${file}.sha256`, this.sha256); } catch (_) { /* 校验文件写不了不影响主流程 */ }
     this.onProgress({
       stage: 'ready', percent: 100,
@@ -429,7 +446,40 @@ class Updater {
    * @param {{mode:'zip'|'setup', payload:string, version:string}} job
    * @param {{waitPid?:number, spawn?:boolean}} [opts] 测试时可指定别的 pid / 不真启动
    */
+  applyAppImage(job) {
+    const target = fs.realpathSync(this.appImage);
+    const nonce = crypto.randomBytes(12).toString('hex');
+    const staged = target + '.update-' + nonce;
+    const backup = target + '.previous-' + nonce;
+    const receipt = path.join(this.updateDir, 'healthy-' + nonce);
+    const helper = path.join(this.updateDir, 'appimage-update.sh');
+    if (!/^[a-f0-9]{64}$/.test(job.sha256)) throw new Error('AppImage 缺少文件摘要');
+    try {
+      fs.copyFileSync(job.payload, staged, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(staged, 0o755);
+      fs.copyFileSync(path.join(__dirname, 'linux-appimage-update.sh'), helper);
+      const child = spawn('/bin/sh', [helper, String(process.pid), target, staged, backup,
+        receipt, path.join(this.updateDir, 'update.log'), job.sha256, job.version],
+      { detached: true, stdio: 'ignore' });
+      child.unref();
+      return { via: 'appimage' };
+    } catch (error) {
+      fs.rmSync(staged, { force: true });
+      throw error;
+    }
+  }
+
+  confirmAppImageStartup(version) {
+    const receipt = process.env.APKSTART_HEALTH_RECEIPT;
+    if (this.platform === 'linux' && receipt && process.env.APKSTART_HEALTH_VERSION === version
+      && path.dirname(receipt) === this.updateDir && /^healthy-[a-f0-9]{24}$/.test(path.basename(receipt))) {
+      fs.writeFileSync(receipt, version, { flag: 'wx' });
+      delete process.env.APKSTART_HEALTH_RECEIPT;
+    }
+  }
+
   apply(job, opts = {}) {
+    if (this.platform === 'linux' && job.mode === 'appimage') return this.applyAppImage(job);
     const exe = this.exePath;
     const dir = this.installDir;
     const logFile = path.join(this.updateDir, 'update.log');

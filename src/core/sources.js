@@ -41,32 +41,9 @@ const SOURCES = {
   },
 };
 
-/**
- * GitHub API 的认证凭据（可选）。认证后限额 5000 次/小时（匿名只有 60 次/小时，
- * 而且 Clash 出口是共享 IP，更容易被别人打光）。取用顺序：
- *   1. 设置 runtime.githubToken（用户手动填）；
- *   2. 本机 gh CLI 已登录的账号（gh auth token，开发机上通常都有）。
- * 都没有就返回空串（匿名 60 次/小时，检查更新每会话 2~3 次也够用）。
- * token 只发往 api.github.com，绝不写日志。
- */
-let _ghTokenCache = { at: 0, token: '' };
-const GH_TOKEN_TTL = 60 * 60 * 1000;
-
+/** 允许用户显式提供只读令牌；默认匿名访问。 */
 async function getGithubToken(settings) {
-  const explicit = String((settings && settings.runtime && settings.runtime.githubToken) || '').trim();
-  if (explicit) return explicit;
-  const now = Date.now();
-  if (_ghTokenCache.token && now - _ghTokenCache.at < GH_TOKEN_TTL) return _ghTokenCache.token;
-  let token = '';
-  try {
-    const { execFile } = require('child_process');
-    token = await new Promise((resolve) => {
-      execFile('gh', ['auth', 'token'], { windowsHide: true, timeout: 5000 }, (e, out) => resolve(e ? '' : String(out || '').trim()));
-    });
-    if (token && token.length < 20) token = '';   // gh 未登录时会输出空串/提示语
-  } catch (_) { token = ''; }                     // 没装 gh CLI：匿名额度也够用
-  _ghTokenCache = { at: now, token };
-  return token;
+  return String(settings?.runtime?.githubToken || '').trim();
 }
 
 /** api.github.com 请求头（有 token 就带上认证） */
@@ -158,7 +135,10 @@ function openUrl(url, { method = 'GET', timeout = 10000, headers = {}, redirects
         if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
           res.resume();
           const next = new URL(res.headers.location, url).href;
-          openUrl(next, { timeout, headers, redirects: redirects + 1, noProxy }).then(resolve, reject);
+          const nextHeaders = { ...headers };
+          if (new URL(next).origin !== u.origin) delete nextHeaders.Authorization;
+          if (!next.startsWith('https://') && u.protocol === 'https:') return reject(new Error('下载源重定向到非 HTTPS 地址'));
+          openUrl(next, { timeout, headers: nextHeaders, redirects: redirects + 1, noProxy }).then(resolve, reject);
           return;
         }
         resolve(res);
@@ -338,7 +318,7 @@ class Sources {
         // Gitee 没有正式 release、或 GitHub 被墙，都退回列表取第一条
         try {
           const list = await getJson(`${s.api}/releases?per_page=10`, 9000, ghApiHeaders(await getGithubToken(this.settings())));
-          const first = (Array.isArray(list) ? list : []).find((r) => r && !r.draft);
+          const first = (Array.isArray(list) ? list : []).find((r) => r && !r.draft && !r.prerelease);
           if (first) return { source: id, name: s.name, web: s.web, rel: first };
         } catch (_) { /* 这个源彻底不可用 */ }
         const limited = /\b(403|429)\b/.test(e.message);
@@ -401,6 +381,7 @@ class Sources {
           size: Number(a.size) || 0,
           url: a.browser_download_url || a.url || '',
           source: item.source,
+          digest: item.source === 'github' ? a.digest : undefined,
         });
       }
     }

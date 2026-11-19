@@ -128,6 +128,10 @@ function appendBasics(raw, tag) {
       `| \`ApkStart-${version}-Setup.exe\` | 完整安装包，内置运行时，离线开箱即用 |`,
       `| \`ApkStart-runtime-v${version}.zip\` | 运行时整包（便携版下载源，一般不用手动下载） |`,
     ];
+    const [major, minor] = version.split('.').map(Number);
+    if (major > 0 || minor >= 8) {
+      downloads.splice(-2, 2, '| `ApkStart-' + version + '-Setup.exe` | Windows 在线安装版，支持本地离线导入 |');
+    }
     if (dualPlatform) {
       downloads.push(
         `| \`ApkStart-${version}-x86_64.AppImage\` | Linux x86_64 便携版，首次启动按需下载运行时 |`,

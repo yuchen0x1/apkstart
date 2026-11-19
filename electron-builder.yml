@@ -33,17 +33,8 @@ electronLanguages:
   - zh-TW
   - en-US
 
-# 完整运行时（emulator + platform-tools + 系统镜像），由 build/prepare-runtime.js 生成。
-# 打进包里之后首次启动不再需要任何下载。
-# Linux 打包时不带（见下方 linux.extraResources 覆盖）：整包里是 Windows 二进制。
-extraResources:
-  - from: build/runtime
-    to: runtime
-    filter:
-      - "**/*"
-      - "!.prepared"
-      # 只是给 CI 判断「运行时内容有没有变」用的标记，不该出现在用户机器上
-      - "!.runtime-version"
+# Windows 与 Linux 均按需部署运行时，公开安装包只包含桌面应用。
+extraResources: []
 
 win:
   target:
@@ -71,14 +62,7 @@ nsis:
   # 卸载前先结束仍在运行的运行时进程，避免文件被锁导致无法删除
   # （火绒等粉碎工具删不掉，多半是 qemu/adb 进程还驻留）。
   include: build/installer.nsh
-  # 安装包本身已含完整运行时（emulator + 系统镜像 .gz），装完首次启动
-  # 自动把镜像展开到用户目录，之后不再联网下载任何东西。
 
-# ---------------- Linux（v0.7 起支持） ----------------
-# Linux 版不带 Windows 运行时整包（emulator/aehd 都是 Windows 二进制）：
-# 首次启动由应用内 autoDeploy 从 Google 官方源分组件下载 Linux 版
-# （platform-tools / emulator / 系统镜像，dl.google.com 国内实测 10-70MB/s）。
-# 平台级 extraResources: [] 覆盖顶层的 Windows 运行时整包。
 linux:
   target:
     - target: AppImage

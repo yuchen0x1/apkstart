@@ -92,6 +92,12 @@ if (fs.existsSync(uninstallScript)) {
 const vendorDir = path.join(ROOT, 'build', 'vendor');
 if (fs.existsSync(vendorDir)) copy(vendorDir, path.join(appDir, 'build', 'vendor'));
 
+// 离线导入可能包含 XZ 镜像，便携版也需要平台解码库。
+for (const name of ['lzma', 'lzma-win32-x64-msvc']) {
+  const rel = path.join('node_modules', '@napi-rs', name);
+  copy(path.join(ROOT, rel), path.join(appDir, rel));
+}
+
 // 3. 可选目录
 // engine/ 下只有文档类内容随包分发；大体积运行时组件（emulator、system-images、
 // platform-tools、avd）由应用首次启动时自动从官方源下载，不进安装包。

@@ -50,8 +50,10 @@ function fakeExe(file, size = 400 * 1024, opts = {}) {
   return file;
 }
 
-function mkUpdater(root) {
+function mkUpdater(root, overrides = {}) {
   return new Updater({
+    platform: 'win32',
+    ...overrides,
     currentVersion: '0.0.1',
     exePath: path.join(root, 'app', 'ApkStart.exe'),
     isPackaged: true,
@@ -364,7 +366,11 @@ async function main() {
 
   await test('已经下好的安装包会被复用，不会因为上次装失败又重下 1.4GB', async () => {
     const root = mkTmp();
-    const u = mkUpdater(root);
+    const crypto = require('crypto');
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+    const u = mkUpdater(root, { publicKey });
+    fs.mkdirSync(u.installDir, { recursive: true });
+    fs.writeFileSync(path.join(u.installDir, 'Uninstall.exe'), 'fixture');
     const version = '9.9.9';
     const dir = path.join(u.dataDir, 'update', version);
     fs.mkdirSync(dir, { recursive: true });
@@ -376,9 +382,23 @@ async function main() {
       tag: `v${version}`,
       asset: { name: `ApkStart-${version}-Setup.exe`, size: fs.statSync(setup).size, urls: [], sizes: {} },
     };
+    const { repo } = require('../src/core/release-manifest');
+    const hash = crypto.createHash('sha256').update(fs.readFileSync(setup)).digest('hex');
+    const data = Buffer.from(JSON.stringify({ schema: 1, repository: repo, tag: info.tag,
+      assets: [{ name: info.asset.name, size: info.asset.size, sha256: hash }] }));
+    const sig = crypto.sign(null, data, privateKey).toString('base64');
+    info.asset.url = repo + '/releases/download/' + info.tag + '/' + info.asset.name;
+    info.asset.digest = 'sha256:' + hash;
+    await expectThrow(() => u.prepare(info), /签名/);
+    info.proof = '<!-- apkstart-manifest ' + data.toString('base64') + ' ' + sig + ' -->';
+    await expectThrow(() => u.prepare({ ...info, proof: info.proof.replace(sig, Buffer.alloc(64).toString('base64')) }), /签名/);
     const job = await u.prepare(info);
     eq(job.mode, 'setup', '应识别为安装版');
     eq(downloaded, 0, '文件已存在且大小正确时不该重新下载');
+    fs.writeFileSync(setup, Buffer.alloc(info.asset.size, 7));
+    await expectThrow(() => u.prepare(info), /SHA-256/);
+    assert(!fs.existsSync(setup));
+
   });
 
   console.log('\n[安装版脚本真机执行：模拟「装完目录被清空」]');

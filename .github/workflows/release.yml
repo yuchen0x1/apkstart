@@ -9,7 +9,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # 先跑一次测试。测试通过后才创建 Release，避免失败的构建留下空 Release。
@@ -18,17 +22,15 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: 安装依赖
         run: npm ci
-        env:
-          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       - name: 测试
         run: npm test
@@ -39,9 +41,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -57,83 +59,46 @@ jobs:
       - name: 系统镜像体积闸门
         run: node build/check-no-images.js --git
 
-  # Release 元数据单独准备，后面的便携版和完整版可以并行构建。
-  release:
-    name: 创建 Release
-    needs: [verify, verify-linux]
+  version:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
-
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: 22
-
-      - name: 解析版本号
-        id: version
-        shell: bash
+          fetch-depth: 0
+      - id: version
         run: |
-          tag="${GITHUB_REF_NAME}"
-          if [[ ! "$tag" =~ ^v[0-9] ]]; then
-            tag="v$(node -p "require('./package.json').version")"
+          tag="v$(node -p "require('./package.json').version")"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test "$tag" = "$GITHUB_REF_NAME"
+            git merge-base --is-ancestor HEAD origin/main
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "发布版本：$tag"
-
-      # README 的版本行与「最新更新」由 tools/update-readme.js 从 package.json +
-      # CHANGELOG 生成。verify 阶段的 npm test 里已有同样的断言，这里再挡一次，
-      # 是为了让失败原因直接写清楚「跑 npm run readme:sync」，而不是埋在某条用例里。
-      - name: 校验 README 版本信息
-        run: node tools/update-readme.js --check
-
-      # 发行说明统一由 tools/release-notes.js 产出（手写 release-notes 文件 → CHANGELOG
-      # 段落 → git log 三级兜底），正文一律去掉重复的版本大标题，并自动补齐下载、升级、
-      # 支持范围等每版都必须保留的基础信息。
-      - name: 生成发行说明
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: node tools/release-notes.js "$TAG" --out RELEASE_NOTES.md
-
-      - name: 创建或更新 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          if gh release view "$TAG" --json tagName -q .tagName >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "ApkStart $TAG" --notes-file RELEASE_NOTES.md
-          else
-            gh release create "$TAG" --title "ApkStart $TAG" --notes-file RELEASE_NOTES.md
-          fi
 
   build:
-    name: 构建便携版并发布
-    needs: release
+    name: 构建 Windows 便携版
+    needs: [version, verify, verify-linux]
     runs-on: windows-latest
     env:
-      TAG: ${{ needs.release.outputs.tag }}
+      TAG: ${{ needs.version.outputs.tag }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: 安装依赖（含 Electron 运行时）
         run: npm ci
-        env:
-          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       # Electron 45 的 npm 包不再提供 postinstall：npm ci 只装 JS 包，dist/ 要显式下载。
       # 少了这一步，build/pack.js 会在「复制 Electron 运行时」处 ENOENT（v0.6.7 实测）。
       - name: 下载 Electron 二进制
         run: node node_modules/electron/install.js
-        env:
-          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       - name: 打包便携版
         run: npm run pack
@@ -150,302 +115,116 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Item "ApkStart-$tag-win64-portable.zip" | Select-Object Name, Length
 
-      # Release 已由 release job 创建；便携版和完整版在这里并行上传各自资产。
-      - name: 上传轻量便携版到 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: pwsh
-        run: |
-          $tag = $env:TAG
-          $zip = "ApkStart-$tag-win64-portable.zip"
-          $ok = $false
-          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
-            gh release upload $tag $zip --clobber
-            if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 15 }
-          }
-          if (-not $ok) { Write-Error "上传失败: $zip"; exit 1 }
-          gh release view $tag --json assets --jq '.assets[].name'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: portable
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+          path: |
+            ApkStart-v*-win64-portable.zip
 
   full:
-    name: 构建完整版（内置运行时，离线开箱即用）
-    needs: release
+    name: 构建 Windows 在线安装版
+    needs: [version, verify, verify-linux]
     runs-on: windows-latest
     env:
-      TAG: ${{ needs.release.outputs.tag }}
-      # electron-builder 的 NSIS/7-Zip 工具缓存放在工作区，便于 actions/cache 复用。
-      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\.cache\electron-builder
+      TAG: ${{ needs.version.outputs.tag }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: 安装依赖
         run: npm ci
-        env:
-          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       # 同上：Electron 45 起 dist/ 不再由 npm ci 自动下载。
       - name: 下载 Electron 二进制
         run: node node_modules/electron/install.js
-        env:
-          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
-      - name: 缓存 electron-builder 工具链
-        uses: actions/cache@v4
-        with:
-          path: .cache/electron-builder
-          key: ${{ runner.os }}-electron-builder-v1-${{ hashFiles('package-lock.json') }}
-
-      # 完整运行时约 1.4GB，最慢的是每版重新压 system.img（2 核 runner 约 22 分钟）。
-      #
-      # 缓存键只允许由「真的改变运行时字节」的输入决定：
-      #   build/runtime.version（配方版本，人工在改运行时构建逻辑时 bump）
-      #   + fetch/prepare/slim 脚本 + seed + 软件 OpenGL DLL
-      # 以前还哈希了 src/core/{layers,provision,download}.js —— 那是应用代码，
-      # 改一行加速探测就会让 1.4GB 缓存失效、白压 22 分钟（0.6.10 → 0.6.12 每次都这样）。
-      - name: 恢复完整运行时缓存
-        id: runtime-cache
-        uses: actions/cache@v4
-        with:
-          path: build/runtime
-          key: ${{ runner.os }}-apkstart-runtime-v2-${{ hashFiles('build/runtime.version', 'build/fetch-runtime.js', 'build/prepare-runtime.js', 'build/slim-runtime.js', 'build/seed/userdata.img.gz', 'build/vendor/opengl32sw.dll') }}
-
-      # 缓存没命中时，先复用上一个 Release 里的运行时整包 —— 那个 zip 本来就是发给轻量版用户的，
-      # 内容一模一样。解压 1~2 分钟，比从官方源重新下载 + xz 压 22 分钟快一个量级。
-      # 配方变了（build/runtime.version 与包内 .runtime-version 不一致）就自动放弃复用、走重建。
-      - name: 复用上一版运行时整包
-        id: prev-runtime
-        if: steps.runtime-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $want = ''
-          if (Test-Path build/runtime.version) { $want = (Get-Content build/runtime.version -Raw).Trim() }
-          $prev = @(gh release list --exclude-drafts --exclude-pre-releases --limit 20 --json tagName --jq '.[].tagName') |
-                  Where-Object { $_ -and $_ -ne $env:TAG } | Select-Object -First 1
-          if (-not $prev) { Write-Output '没有上一个 Release 可复用，改为重建'; exit 0 }
-          $asset = @(gh release view $prev --json assets --jq '.assets[].name') |
-                   Where-Object { $_ -match '^ApkStart-runtime-v.+\.zip$' } | Select-Object -First 1
-          if (-not $asset) { Write-Output "$prev 没有运行时整包，改为重建"; exit 0 }
-          Write-Output "复用 $prev / $asset"
-          gh release download $prev --pattern $asset --output prev-runtime.zip --clobber
-          if (-not (Test-Path prev-runtime.zip)) { Write-Output '下载失败，改为重建'; exit 0 }
-          Remove-Item -Recurse -Force build/runtime -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force build/runtime | Out-Null
-          tar.exe -xf prev-runtime.zip -C build/runtime
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path 'build/runtime/emulator/emulator.exe')) {
-            Write-Output '解压结果不完整，改为重建'
-            Remove-Item -Recurse -Force build/runtime -ErrorAction SilentlyContinue
-            exit 0
-          }
-          $got = ''
-          if (Test-Path 'build/runtime/.runtime-version') { $got = (Get-Content 'build/runtime/.runtime-version' -Raw).Trim() }
-          if ($got -and $want -and $got -ne $want) {
-            Write-Output "运行时配方已变（$got → $want），改为重建"
-            Remove-Item -Recurse -Force build/runtime
-            exit 0
-          }
-          if (-not $got) {
-            # 标记是本功能上线后才写进产物的：更早的整包没有它，只能按同配方接受。
-            # 从此以后每个运行时整包都带标记，这条分支不会再命中。
-            Write-Output '上一版整包没有配方标记（旧产物），按同配方接受'
-          }
-          Write-Output '复用成功，跳过下载与 22 分钟压缩'
-          "ok=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      # 从 Google 官方源组装运行时（emulator + platform-tools + aehd + Play x86_64 镜像）。
-      # 缓存命中、或上一版整包复用成功时都跳过。
-      - name: 组装运行时
-        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.prev-runtime.outputs.ok != '1'
-        run: node build/fetch-runtime.js engine
-
-      # prepare-runtime 会把 system.img/vendor.img 压成 xz(LZMA2)。
-      # CI runner 只有 2 核：XZ_PRESET=6 把压缩时间从 ~2h 降到 ~40min（体积 +3%）。
-      # XZ_TIMEOUT_MS 是看门狗：超时自动 kill 并落 gzip 兜底，
-      # 绝不重演「stdin 没接 EOF → 0 字节输出 → 挂死 3 小时」。
-      - name: 准备运行时（xz 压缩，CI 降档加速）
-        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.prev-runtime.outputs.ok != '1'
-        run: node build/prepare-runtime.js --force
-        env:
-          XZ_PRESET: '6'
-          XZ_TIMEOUT_MS: '3600000'
-
-      - name: 校验完整运行时
-        shell: pwsh
-        run: |
-          $required = @(
-            'build\runtime\emulator\emulator.exe',
-            'build\runtime\platform-tools\adb.exe'
-          )
-          foreach ($path in $required) {
-            if (-not (Test-Path $path)) { throw "运行时缓存或构建产物缺少：$path" }
-          }
-          $images = @(
-            'build\runtime\system-images\android-34\google_apis_playstore\x86_64\system.img.xz',
-            'build\runtime\system-images\android-34\google_apis_playstore\x86_64\system.img.gz'
-          )
-          if (-not ($images | Where-Object { Test-Path $_ })) {
-            throw '运行时缓存或构建产物缺少 system.img 压缩文件'
-          }
-          Write-Output "完整运行时可用"
-
-      # 内置微软 VC++ 2015-2022 x64 运行库：安卓模拟器（Qt6）与 qemu 都依赖它，
-      # 缺了在「其他电脑」上会直接起不来（0xc0000135 / MSVCP140 缺失）。
-      # 放到 build/runtime 内，随 extraResources 一起打进安装包；离线也能一键安装。
-      - name: 下载 VC++ 运行库（离线内置）
-        shell: pwsh
-        run: |
-          $dir = "build\runtime"
-          if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-          $out = "$dir\vc_redist.x64.exe"
-          # 复用上一版整包时这个文件已经在包里了，不用再下一次
-          if ((Test-Path $out) -and ((Get-Item $out).Length -gt 1MB)) {
-            Write-Output "vc_redist 已存在，跳过下载"
-            Get-Item $out | Select-Object Name, Length
-            exit 0
-          }
-          Write-Output "下载 VC++ 2015-2022 x64 运行库…"
-          curl.exe -L -o $out "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-          if (-not (Test-Path $out) -or (Get-Item $out).Length -lt 1MB) { Write-Error "vc_redist 下载失败" }
-          Get-Item $out | Select-Object Name, Length
-
-      # 不打 git tag 时 electron-builder 不会隐式发布；这里显式 --publish never，
-      # 安装包由后面的上传步骤用 gh release upload 上传。
-      - name: 构建完整版安装包
+      - name: 构建在线安装包
         run: npx electron-builder --win nsis --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
-      - name: 上传完整版到 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: pwsh
-        run: |
-          $tag = $env:TAG
-          $setup = Get-ChildItem dist/release/*Setup.exe | Select-Object -First 1
-          if (-not $setup) { Write-Error "未找到 Setup.exe"; exit 1 }
-          Write-Output ("上传 {0} ({1:N0} MB)" -f $setup.Name, ($setup.Length / 1MB))
-          $ok = $false
-          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
-            gh release upload $tag $setup.FullName --clobber
-            if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 20 }
-          }
-          if (-not $ok) { Write-Error "上传失败: $($setup.Name)"; exit 1 }
-          gh release view $tag --json assets --jq '.assets[] | "\(.name) \(.size)"'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installer
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+          path: |
+            dist/release/*Setup.exe
 
-      # 轻量版（不带运行时）不再去 dl.google.com 逐个下 emulator / 系统镜像，
-      # 而是直接下这一个整包 —— 下载源与「软件更新」同为本项目 GitHub Release，
-      # 国内网络稳定性、出问题后的排障都只在一个地方。
-      # 内容已经是 .xz 压缩过的镜像，这里用 bsdtar 直接打 zip（不再二次压缩，省几十分钟）。
-      - name: 打包运行时整包（轻量版下载源）
-        shell: pwsh
-        run: |
-          $tag = $env:TAG
-          $zip = "ApkStart-runtime-$tag.zip"
-          if (-not (Test-Path "build\runtime\emulator\emulator.exe")) { Write-Error "build\runtime 不完整"; exit 1 }
-          tar.exe -a -cf $zip -C "build\runtime" .
-          if ($LASTEXITCODE -ne 0) { Write-Error "打包运行时失败"; exit 1 }
-          Get-Item $zip | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
-
-      - name: 上传运行时整包到 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: pwsh
-        run: |
-          $tag = $env:TAG
-          $zip = "ApkStart-runtime-$tag.zip"
-          $ok = $false
-          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
-            gh release upload $tag $zip --clobber
-            if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 20 }
-          }
-          if (-not $ok) { Write-Error "上传失败: $zip"; exit 1 }
-          gh release view $tag --json assets --jq '.assets[] | "\(.name) \(.size)"'
-
-  # Linux 版（v0.7 起）：AppImage + deb，不带运行时整包（整包是 Windows 二进制），
-  # 首次启动由应用内 autoDeploy 从 Google 官方源分组件下载 Linux 版运行时。
-  # 实测记录见 docs/PLATFORM-LINUX-VALIDATION.md。
   linux:
     name: 构建 Linux 版（AppImage / deb，在线运行时）
-    needs: release
+    needs: [version, verify, verify-linux]
     runs-on: ubuntu-latest
     env:
-      TAG: ${{ needs.release.outputs.tag }}
+      TAG: ${{ needs.version.outputs.tag }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: 安装依赖
         run: npm ci
-        env:
-          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       - name: 下载 Electron 二进制
         run: node node_modules/electron/install.js
-        env:
-          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
 
       - name: 构建 AppImage 与 deb
         run: npx electron-builder --linux AppImage deb --publish never
         env:
-          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
-      - name: 上传 Linux 产物到 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          shopt -s nullglob
-          for f in dist/release/*.AppImage dist/release/*.deb; do
-            ok=""
-            for i in 1 2 3; do
-              gh release upload "$TAG" "$f" --clobber && { ok=1; break; } || sleep 20
-            done
-            if [ -z "$ok" ]; then echo "上传失败: $f"; exit 1; fi
-            echo "已上传: $f"
-          done
-          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+          path: |
+            dist/release/*.AppImage
+            dist/release/*.deb
 
-  # 所有构建 job 完成后再核对同一个 Release 的五类核心资产，防止某个平台上传失败
-  # 但 workflow 仍显示部分成功。
-  verify-assets:
-    name: 核对 Windows + Linux 发布资产
-    needs: [release, build, full, linux]
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [version, build, full, linux]
     runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
     env:
-      TAG: ${{ needs.release.outputs.tag }}
-
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: 核对 Release 资产
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: 签署更新清单
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APKSTART_RELEASE_KEY: ${{ secrets.APKSTART_RELEASE_KEY }}
+        run: |
+          node tools/release-notes.js "$TAG" --out RELEASE_NOTES.md
+          node tools/sign-release.js "$TAG" artifacts RELEASE_NOTES.md
+      - name: 在草稿中核对全部文件后发布
         run: |
           set -euo pipefail
-          version="${TAG#v}"
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | tee assets.txt
-          expected=(
-            "ApkStart-${TAG}-win64-portable.zip"
-            "ApkStart-${version}-Setup.exe"
-            "ApkStart-runtime-${TAG}.zip"
-            "ApkStart-${version}-x86_64.AppImage"
-            "ApkStart-${version}-amd64.deb"
-          )
-          for asset in "${expected[@]}"; do
-            if ! grep -Fx -- "$asset" assets.txt >/dev/null; then
-              echo "缺少发布资产：$asset" >&2
-              exit 1
-            fi
-            echo "已确认：$asset"
-          done
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo '该版本已有发行记录，请检查现有发行或草稿' >&2; exit 1
+          fi
+          gh release create "$TAG" --draft --verify-tag --title "ApkStart $TAG" --notes-file RELEASE_NOTES.md artifacts/*
+          gh release view "$TAG" --json assets > uploaded.json
+          node tools/sign-release.js --check-upload artifacts uploaded.json
+          gh release edit "$TAG" --draft=false --latest

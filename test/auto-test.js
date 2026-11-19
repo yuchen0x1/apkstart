@@ -1604,7 +1604,7 @@ const { adbKeyHint } = require('../src/core/engine');
     fs.mkdirSync(dir, { recursive: true });
     const exe = path.join(dir, 'ApkStart.exe');
     fs.writeFileSync(exe, 'x');
-    const portable = new Updater({ currentVersion: '0.1.0', exePath: exe, isPackaged: true, dataDir: TMP });
+    const portable = new Updater({ platform: 'win32', currentVersion: '0.1.0', exePath: exe, isPackaged: true, dataDir: TMP });
     assert(portable.flavor === 'portable', '没有卸载器时判定为便携版');
     fs.writeFileSync(path.join(dir, 'Uninstall ApkStart.exe'), 'x');
     assert(portable.flavor === 'setup', '有卸载器时判定为安装版');
@@ -1623,7 +1623,7 @@ const { adbKeyHint } = require('../src/core/engine');
       version: '0.5.0', tag: 'v0.5.0', name: 'ApkStart v0.5.0', notes: '', htmlUrl: '',
       publishedAt: '', sources: [], unreachable: [], assets,
     });
-    const u = new Updater({ currentVersion: '0.3.4', exePath: exe, isPackaged: true, dataDir: dir });
+    const u = new Updater({ platform: 'win32', currentVersion: '0.3.4', exePath: exe, isPackaged: true, dataDir: dir });
     // 两个资产同时存在 → 必须挑便携包
     u.sources = { latest: async () => mk([
       { name: 'ApkStart-runtime-v0.5.0.zip', url: 'https://x/runtime.zip', urls: ['https://x/runtime.zip'], sizes: {} },
@@ -1727,7 +1727,7 @@ const { adbKeyHint } = require('../src/core/engine');
   await test('分片资产必须一路传到 updater.asset，否则 prepare 会报「没有可用的下载地址」', async () => {
     const { Updater } = require('../src/core/updater');
     const u = new Updater({
-      currentVersion: '0.0.1', exePath: path.join(TMP, 'A.exe'), isPackaged: true, dataDir: TMP,
+      platform: 'win32', currentVersion: '0.0.1', exePath: path.join(TMP, 'A.exe'), isPackaged: true, dataDir: TMP,
       settings: () => ({}),
     });
     u.sources.latest = async () => ({
@@ -1744,7 +1744,7 @@ const { adbKeyHint } = require('../src/core/engine');
     });
     const info = await u.check({ force: true });
     assert(info.asset && info.asset.parts && info.asset.parts.length === 2, 'parts 必须保留到 asset 上');
-    assert(info.canAutoApply === true, '有分片就应判定为可自动更新');
+    assert(info.canAutoApply === false, '未签名的分片不能自动更新');
   });
 
   await test('双源：合并版本时只认同版本的资产，不拿旧包冒充新包', async () => {
@@ -1860,7 +1860,7 @@ const { adbKeyHint } = require('../src/core/engine');
     const port = srv.address().port;
     const sb = path.join(TMP, 'parts-upd');
     fs.mkdirSync(sb, { recursive: true });
-    const u = new Updater({ currentVersion: '0.0.0', exePath: path.join(sb, 'A.exe'), isPackaged: true, dataDir: sb, settings: () => ({}) });
+    const u = new Updater({ platform: 'win32', currentVersion: '0.0.0', exePath: path.join(sb, 'A.exe'), isPackaged: true, dataDir: sb, settings: () => ({}) });
     const target = path.join(sb, 'joined.zip');
     try {
       await u._downloadParts({

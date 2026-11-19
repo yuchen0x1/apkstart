@@ -1,0 +1,16 @@
+name: 更新失败
+description: 起始版本、目标版本、安装包格式及失败阶段
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: ApkStart 版本与操作系统
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: 起始版本、目标版本、安装包格式及失败阶段
+      description: 分享日志前请移除访问令牌、用户名与私人路径。
+    validations:
+      required: true

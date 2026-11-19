@@ -142,14 +142,8 @@
           <span class="sub">Linux 版默认安装在用户数据目录，无需选择磁盘；需要换位置时可在「设置 → 系统集成 → 运行时数据目录」里修改。</span>
         </div>
         <div class="field">
-          <label>下载源</label>
-          <div class="row">
-            <select class="input" id="wizardSource" style="max-width:420px;">
-              <option value="auto" selected>自动：实测挑选最快的源（推荐）</option>
-              <option value="official">只用官方源（dl.google.com，国内通常最快）</option>
-            </select>
-          </div>
-          <span class="sub">「自动」模式下 GitHub 整包实测太慢（如被限速到几十 KB/s）会自动切换官方源分组件下载；无论哪个源，下载完成都会校验官方校验值。</span>
+          <label>运行时来源</label>
+          <span class="sub">开始安装后从 Google 官方源下载缺少的 Android SDK 组件。使用前请阅读 Android SDK 许可条款（developer.android.com/studio/terms）。已有本地运行时整包可在设置中导入。</span>
         </div>
       </section>
       <!-- 第 3 页：部署 -->

@@ -1,0 +1,16 @@
+name: 平台兼容性
+description: 宿主架构、发行版、虚拟化后端与桌面会话
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: ApkStart 版本与操作系统
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: 宿主架构、发行版、虚拟化后端与桌面会话
+      description: 分享日志前请移除访问令牌、用户名与私人路径。
+    validations:
+      required: true

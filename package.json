@@ -1,7 +1,7 @@
 {
   "name": "apkstart",
   "productName": "ApkStart",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "极致轻量的安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行（Windows / Linux）",
   "main": "src/main.js",
   "desktopName": "apkstart.desktop",
@@ -55,7 +55,7 @@
     "test:app": "node test/run-electron.js selftest",
     "pack": "node build/pack.js",
     "runtime": "node build/prepare-runtime.js",
-    "build:exe": "node build/prepare-runtime.js && electron-builder --win nsis",
+    "build:exe": "electron-builder --win nsis --publish never",
     "selftest": "node scripts/selftest.js",
     "assoc:on": "node scripts/assoc.js on",
     "assoc:off": "node scripts/assoc.js off",

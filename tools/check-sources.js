@@ -47,12 +47,8 @@ const host = (u) => { try { return new URL(u).host; } catch (_) { return u.slice
   console.log('\n=== 3) 实测每个下载地址的速度 ===');
   let target = null;
   if (which === 'runtime') {
-    const p = new Provisioner(path.resolve(__dirname, '..'));
-    const pack = await p.resolveRuntimePack().catch((e) => { console.log('  解析失败：', e.message); return null; });
-    if (pack) {
-      console.log(`  运行时整包 ${pack.name}（${pack.tag} · ${pack.from || '?'}）`);
-      target = pack.url;
-    }
+    target = 'https://dl.google.com/android/repository/platform-tools-latest-' +
+      (process.platform === 'win32' ? 'windows' : 'linux') + '.zip';
   } else {
     const pick = merged.assets.find((a) => /portable.*\.zip$/i.test(a.name)) || merged.assets[0];
     if (pick) {
