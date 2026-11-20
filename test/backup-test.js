@@ -70,14 +70,14 @@ function mkdClient({ debuggable = false, dataBytes = 4096 } = {}) {
   };
 }
 
-function mkInstaller() {
+function mkInstaller(client) {
   const seen = [];
   return {
     seen,
-    async install(file, onProgress) {
+    async install(file, onProgress, { includeClient }) {
       seen.push(file);
       if (onProgress) onProgress({ stage: 'parse', message: '正在解析…' });
-      return { app: { package: 'com.example.demo', label: '示例 应用' } };
+      return { app: { package: 'com.example.demo', label: '示例 应用' }, ...(includeClient ? { client } : {}) };
     },
   };
 }
@@ -166,7 +166,7 @@ function mkInstaller() {
     fs.mkdirSync(dir, { recursive: true });
     const r0 = await backup.backupApp({ app, client: null, dir });
     const installer = mkInstaller();
-    const r = await backup.restoreApp({ dir: r0.folder, installer, client: mkdClient() });
+    const r = await backup.restoreApp({ dir: r0.folder, installer });
     eq(installer.seen.length, 1, '应调用一次安装');
     eq(r.dataRestored, false);
     assert(/只包含 APK/.test(r.note), r.note);
@@ -179,9 +179,9 @@ function mkInstaller() {
     const client = mkdClient({ debuggable: true });
     const r0 = await backup.backupApp({ app, client, dir });
 
-    const installer = mkInstaller();
     const c2 = mkdClient({ debuggable: true });
-    const r = await backup.restoreApp({ dir: r0.folder, installer, client: c2 });
+    const installer = mkInstaller(c2);
+    const r = await backup.restoreApp({ dir: r0.folder, installer });
     eq(r.dataRestored, true);
     assert(c2.calls.some((c) => c.startsWith('push:')), '应把 data.tar 推到设备');
     const pipeline = c2.calls.find((c) => /cat .*apkstart-restore.* \| run-as 'com\.example\.demo' tar -xf -/.test(c));
@@ -194,7 +194,7 @@ function mkInstaller() {
     const dir = path.join(ROOT, 'out7');
     fs.mkdirSync(dir, { recursive: true });
     const r0 = await backup.backupApp({ app, client: mkdClient({ debuggable: true }), dir });
-    const r = await backup.restoreApp({ dir: r0.folder, installer: mkInstaller(), client: mkdClient({ debuggable: false }) });
+    const r = await backup.restoreApp({ dir: r0.folder, installer: mkInstaller(mkdClient({ debuggable: false })) });
     eq(r.dataRestored, false);
     assert(/debuggable/.test(r.note), r.note);
   });

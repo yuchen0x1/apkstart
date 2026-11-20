@@ -540,7 +540,7 @@ test('清理逻辑不会把 apkstart-custom.avd 当成「非活动 AVD」回收'
   const names = r.candidates.map((c) => path.basename(c.path));
   assert(!names.includes('apkstart.avd'), '默认 AVD 不能被回收');
   assert(!names.includes('apkstart-custom.avd'), '自定义镜像的 AVD 也不能被回收');
-  assert(names.includes('apkstart-houdini.avd'), '真正废弃的 AVD 仍应可回收');
+  assert(!names.includes('apkstart-houdini.avd'), '无法证明可再生的 AVD 用户数据必须保留');
 });
 
 test('体检表会列出镜像来源；镜像坏了会列出原因', () => {

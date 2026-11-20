@@ -1,0 +1,47 @@
+name: Isolated UI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    name: Electron 沙箱与界面（${{ matrix.platform }} 能力夹具）
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [win32, linux]
+    env:
+      UI_AUDIT_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: 设置隔离截图目录
+        shell: pwsh
+        run: |
+          "UI_AUDIT_DIR=$env:RUNNER_TEMP/apkstart-ui-$env:UI_AUDIT_PLATFORM" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: 安装依赖与 Electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node node_modules/electron/install.js
+      # 仅加载内存 IPC 夹具，不执行产品 main，不连接设备或自动部署运行时。
+      - name: 沙箱与 preload 冒烟
+        run: npm run test:electron
+      - name: 双主题和交互回归
+        run: npm run test:ui
+      - name: 保留失败时的夹具截图与检查结果
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ui-${{ matrix.platform }}
+          path: ${{ env.UI_AUDIT_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7

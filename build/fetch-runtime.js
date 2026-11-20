@@ -3,7 +3,7 @@
  * 组装「完整版」内置运行时：
  *   node build/fetch-runtime.js <输出目录>
  * 产出 <输出目录>/runtime/：
- *   emulator/ + platform-tools/ + aehd/ + system-images/android-34/google_apis_playstore/x86_64/
+ *   emulator/ + platform-tools/ + system-images/android-34/google_apis_playstore/x86_64/
  * 全部通过 Provisioner 的官方通道下载与校验，与在线版完全同源。
  */
 const path = require('path');
@@ -28,7 +28,7 @@ const prov = new Provisioner(path.resolve(__dirname, '..'));
 const log = (p) => console.log(`[${p.stage}] ${p.message} ${p.percent != null ? p.percent + '%' : ''}`);
 
 (async () => {
-  await prov.installAehd(log);
+  // AEHD has no pinned trusted package; do not bundle an unverified elevated installer.
   await prov.installAdb(log);
   await prov.installEmulator(log);
   await prov.installPlayImage(log);

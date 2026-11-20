@@ -3,7 +3,35 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const invoke = (channel, payload) => ipcRenderer.invoke(channel, payload);
 
-contextBridge.exposeInMainWorld('apkstart', {
+const subscribe = (channel, cb) => {
+  const handler = (_e, payload) => cb(payload);
+  ipcRenderer.on(channel, handler);
+  return () => ipcRenderer.removeListener(channel, handler);
+};
+const shell = {
+  state: () => invoke('shell:state'),
+  minimize: () => invoke('shell:minimize'),
+  maximize: () => invoke('shell:maximize'),
+  close: () => invoke('shell:close'),
+  rotate: () => invoke('shell:rotate'),
+  back: () => invoke('shell:back'),
+  forward: () => invoke('shell:forward'),
+  onState: (cb) => subscribe('shell:state', cb),
+};
+
+// 角色由 BrowserWindow 的 additionalArguments 指定。这里只缩小桥接面，
+// 主进程仍独立根据真实 webContents 校验每次调用，不以此参数作为授权依据。
+const isShell = process.argv.includes('--apkstart-role=shell');
+const isMain = !isShell && process.argv.includes('--apkstart-role=main');
+if (isShell) contextBridge.exposeInMainWorld('apkstart', {
+  i18n: () => invoke('app:i18n'),
+  // theme.js 只读取 theme，保留旧方法名但不暴露完整设置。
+  getSettings: () => invoke('app:theme'),
+  on: (channel, cb) => channel === 'theme:changed' ? subscribe(channel, cb) : () => {},
+  shell,
+});
+
+if (isMain) contextBridge.exposeInMainWorld('apkstart', {
   info: () => invoke('app:info'),
   i18n: () => invoke('app:i18n'),
   listApps: () => invoke('apps:list'),

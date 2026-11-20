@@ -22,6 +22,10 @@ const IS_LINUX = process.platform === 'linux';
 // dl.google.com 的包名按宿主系统分叉（platform-tools-latest-<host>.zip / emulator-<host>_64-N.zip）
 const HOST_TAG = IS_WIN ? 'windows' : IS_LINUX ? 'linux' : 'mac';
 
+// 提权包的版本和 SHA-256 必须由发布方独立核验并一同固定，不能取自镜像、设置或缓存。
+const AEHD_ARCHIVE_URL = 'https://dl.google.com/android/repository/aehd-windows_v2.2.zip';
+const AEHD_ARCHIVE_SHA256 = ''; // 尚无可信摘要；保持禁用。
+
 const SOURCES = {
   adb: [
     `https://dl.google.com/android/repository/platform-tools-latest-${HOST_TAG}.zip`,
@@ -37,7 +41,7 @@ const SOURCES = {
     'https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-3.xml',
     'https://dl.google.com/android/repository/sys-img/google_apis_playstore/sys-img2-3.xml',
   ],
-  aehdFallback: 'https://dl.google.com/android/repository/aehd-windows_v2.2.zip',
+  aehdFallback: AEHD_ARCHIVE_URL,
   // 兜底：索引不可用时直接用的已知版本（Linux 版与 Windows 版共用同一版本号，
   // 实测记录见 docs/PLATFORM-LINUX-VALIDATION.md）
   emulatorFallback: IS_WIN
@@ -1573,16 +1577,36 @@ class Provisioner {
   /** 下载 AEHD 驱动（小文件）；安装需要管理员权限，交给引导流程。Windows 专有。 */
   async installAehd(onProgress = () => {}) {
     if (!IS_WIN) throw new Error('AEHD 驱动仅限 Windows；Linux 的硬件加速由 /dev/kvm 提供，无需驱动');
+    if (!/^[0-9a-f]{64}$/i.test(AEHD_ARCHIVE_SHA256)) {
+      const err = new Error('已拒绝安装 AEHD：没有固定的可信 SHA-256，不会下载或准备提权安装器。'
+        + '请启用 Windows 虚拟机监控程序平台（WHPX），或按 Google 官方说明手动安装驱动。');
+      err.code = 'AEHD_UNVERIFIED';
+      throw err;
+    }
     const p = this.ensureDirs();
     await this.guardDisk('aehd', p.aehdDir);
-    const zip = path.join(p.tmp, 'aehd.zip');
-    onProgress({ stage: 'download', message: '下载 AEHD 驱动…', percent: 10 });
-    await downloadAnyParallel(this._downloadUrls(SOURCES.aehdFallback), zip, { connections: 2 });
-    fs.mkdirSync(p.aehdDir, { recursive: true });
-    await this.extractZip(zip, p.aehdDir);
-    fs.rmSync(zip, { force: true });
-    const has = fs.existsSync(path.join(p.aehdDir, 'aehd.Sys')) || fs.existsSync(path.join(p.aehdDir, 'aehd.sys'));
-    if (!has) throw new Error('AEHD 驱动包解压异常');
+    const stage = fs.mkdtempSync(path.join(p.tmp, 'aehd-'));
+    const zip = path.join(stage, 'aehd.zip');
+    const extracted = path.join(stage, 'payload');
+    const installer = 'silent_install.bat';
+    try {
+      onProgress({ stage: 'download', message: '下载 AEHD 驱动…', percent: 10 });
+      await downloadAnyParallel(this._downloadUrls(AEHD_ARCHIVE_URL), zip, {
+        connections: 2,
+        expectSha256: AEHD_ARCHIVE_SHA256,
+      });
+      // 校验归档后只解到空目录，不能混入旧目录里的脚本/依赖并误认为已校验。
+      await this.extractZip(zip, extracted);
+      if (![installer, 'aehd.sys'].every((name) => fs.lstatSync(path.join(extracted, name), { throwIfNoEntry: false })?.isFile())) {
+        throw new Error('校验后的 AEHD 驱动包缺少安装脚本或驱动文件');
+      }
+      if (fs.lstatSync(p.aehdDir, { throwIfNoEntry: false })) {
+        throw new Error('无法发布已校验的 AEHD 驱动包：请先移走运行时中已有的 AEHD 目录');
+      }
+      fs.renameSync(extracted, p.aehdDir);
+    } finally {
+      fs.rmSync(stage, { recursive: true, force: true, maxRetries: 3 });
+    }
     this._cache.accel = null;
     this._cache.accelAt = 0;
     onProgress({ stage: 'done', message: 'AEHD 驱动已就绪，需管理员权限安装', percent: 100 });
@@ -1680,31 +1704,53 @@ class Provisioner {
   async downloadIso(onProgress = () => {}) {
     const p = this.ensureDirs();
     const s = store.getSettings();
-    const dest = s.runtime.isoPath || p.iso;
-    await this.guardDisk('iso', path.dirname(dest));
+    // isoPath 是读取引用，不表示写入所有权；旧版默认文件名也可能是用户导入的原件。
+    const previous = s.runtime.isoPath;
     const custom = s.runtime.isoUrl && s.runtime.isoUrl.trim();
     const urls = custom ? [custom, ...SOURCES.iso] : SOURCES.iso;
-
-    onProgress({ stage: 'download', message: '下载 Android-x86 9.0-r2（约 900MB，8 线程分块）…', percent: 1 });
-    const r = await downloadAnyParallel(urls, dest, {
-      connections: 8,
-      onProgress: (pr) => onProgress({
-        stage: 'download',
-        message: `下载系统镜像… ${(pr.got / 1048576).toFixed(0)}MB / ${(pr.total / 1048576).toFixed(0)}MB`
-          + (pr.speed ? `（${(pr.speed / 1024).toFixed(0)} KB/s）` : ''),
-        percent: pr.percent,
-        canResume: true,
-      }),
-    });
-
-    const info = this.inspectIso(dest);
-    if (!info.ok) {
-      throw new Error(`系统镜像不可用：${info.reason}${info.size && info.size < MIN_SIZE.iso ? '，可再次点击继续断点续传' : ''}`);
+    const imagesDir = path.join(fs.realpathSync(p.root), 'images');
+    const assertManagedDir = () => {
+      if (!fs.lstatSync(imagesDir).isDirectory() || path.relative(imagesDir, fs.realpathSync(p.imagesDir)) !== '') {
+        throw new Error('运行时 images 目录不是受管目录');
+      }
+    };
+    assertManagedDir();
+    await this.guardDisk('iso', imagesDir);
+    assertManagedDir();
+    const stage = fs.mkdtempSync(path.join(imagesDir, '.iso-download-'));
+    const partial = path.join(stage, 'android-x86.iso.part');
+    const dest = path.join(stage, 'android-x86.iso');
+    const active = this._isoDownloadParts || (this._isoDownloadParts = new Set());
+    active.add(partial);
+    let r;
+    let info;
+    let published = false;
+    try {
+      onProgress({ stage: 'download', message: '下载 Android-x86 9.0-r2（约 900MB，8 线程分块）…', percent: 1 });
+      r = await downloadAnyParallel(urls, partial, {
+        connections: 8,
+        onProgress: (pr) => onProgress({
+          stage: 'download',
+          message: `下载系统镜像… ${(pr.got / 1048576).toFixed(0)}MB / ${(pr.total / 1048576).toFixed(0)}MB`
+            + (pr.speed ? `（${(pr.speed / 1024).toFixed(0)} KB/s）` : ''),
+          percent: pr.percent,
+          canResume: false,
+        }),
+      });
+      info = this.inspectIso(partial);
+      if (!info.ok) throw new Error(`系统镜像不可用：${info.reason}`);
+      if (store.getSettings().runtime.isoPath !== previous) throw new Error('下载期间 ISO 选择已变更，请重试');
+      fs.renameSync(partial, dest);
+      store.saveSettings({ runtime: { isoPath: dest } });
+      published = true;
+    } finally {
+      active.delete(partial);
+      if (!published) {
+        try { fs.rmSync(stage, { recursive: true, force: true }); } catch (_) { /* 留待人工处理 */ }
+      }
     }
-
-    store.saveSettings({ runtime: { isoPath: dest } });
     onProgress({ stage: 'done', message: `系统镜像就绪（${(info.size / 1073741824).toFixed(2)} GB）`, percent: 100, path: dest });
-    return { ...r, ...info };
+    return { ...r, ...info, file: dest };
   }
 
   /** 校验用户导入的镜像/ISO */
@@ -1724,6 +1770,16 @@ class Provisioner {
   }
 
   importIso(file) {
+    if (this._isoDownloadParts?.size) {
+      const source = fs.statSync(file, { bigint: true, throwIfNoEntry: false });
+      for (const partial of this._isoDownloadParts) {
+        const target = fs.statSync(partial, { bigint: true, throwIfNoEntry: false });
+        if (path.relative(partial, file) === '' || (source && target && source.ino !== 0n
+          && source.dev === target.dev && source.ino === target.ino)) {
+          throw new Error('不能导入仍在下载的系统镜像');
+        }
+      }
+    }
     const info = this.inspectIso(file);
     if (!info.ok) {
       const e = new Error(info.reason || '镜像文件不可用');

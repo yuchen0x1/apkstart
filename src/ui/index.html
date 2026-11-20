@@ -485,14 +485,14 @@
               <div class="row">
                 <span class="inline-note" id="usageText">正在统计…</span>
                 <button class="btn ghost sm" id="btnCleanup">清理可回收文件</button>
-                <button class="btn ghost sm" id="btnRepairNetwork" title="安卓虚拟机没有网络时（应用里联网页面一直黑屏/转圈），用这个把安卓数据重置掉来修网络。应用清单会保留，点开应用会自动重装">修复网络</button>
+                <button class="btn ghost sm" id="btnRepairNetwork" title="尝试恢复安卓 Wi-Fi 连接，不清空已安装的应用或其数据">修复网络</button>
                 <button class="btn ghost sm danger" id="btnResetData" title="清空安卓 /data 用户数据 + 已装应用 + 快速启动快照，还原成刚装好系统的干净状态">重置安卓数据</button>
               </div>
               <label class="checkbox-inline">
                 <input type="checkbox" id="chkCleanSnapshots" />
                 <span>连当前 AVD 的快速启动快照也一起清（会先停运行时，能真正回收几 GB 快照）</span>
               </label>
-              <span class="sub">系统镜像全机共享一份，应用数据用差分层保存；旧镜像、旧快照、日志和锁文件都可回收。日志超过上限会自动滚动，不会无限增长。「重置安卓数据」会真实删除数 GB 用户数据，仅保留系统本身。</span>
+              <span class="sub">仅清理确认可再生的缓存；下载断点、其他 AVD 和未知来源的镜像会保留。日志超过上限会自动滚动。「重置安卓数据」会清空应用和用户数据，请先备份。</span>
             </div>
           </div>
 

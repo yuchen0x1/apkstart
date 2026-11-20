@@ -48,11 +48,15 @@ function backupFixture(meta = {}) {
   fs.writeFileSync(path.join(dir, 'data.tar'), Buffer.alloc(4096));
   backup.writeMeta(dir, { package: 'com.example.demo', apk: 'app.apk', data: 'data.tar', ...meta });
   const calls = [];
-  return { dir, calls, installer: { async install(file) { calls.push(['install', file]); return { app: { package: 'com.example.demo' } }; } }, client: {
+  const client = {
     async shell(cmd) { calls.push(['shell', cmd]); return 'uid=10001'; },
     async push(file, remote) { calls.push(['push', file, remote]); },
     async exec(args) { calls.push(['exec', args]); return { stdout: Buffer.alloc(0) }; },
-  } };
+  };
+  return { dir, calls, installer: { async install(file, _progress, { includeClient }) {
+    calls.push(['install', file]);
+    return { app: { package: 'com.example.demo' }, ...(includeClient ? { client } : {}) };
+  } } };
 }
 function poisonedZip(name, data, { deflate = false, badSize = false } = {}) {
   const zip = buildZip([{ name, data }]);

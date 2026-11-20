@@ -4,13 +4,11 @@
  * 把「解析 APK → 安装进运行时 → 落本地元数据 → 生成桌面快捷方式」串成一条流水线。
  */
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
-const crypto = require('crypto');
 const store = require('./store');
 const { parseApk } = require('./apk');
 const filetype = require('./filetype');
-const { ZipFile } = require('./zip');
+const { parseBundle } = require('./apk-bundle');
 const { iconToIco, writeShortcut, removeShortcut, safeFileName } = require('./shortcut');
 const { shellQuote } = require('./adb');
 
@@ -72,42 +70,6 @@ function abiMismatchError(meta, evidence, cause = null, launching = false) {
   return err;
 }
 
-/**
- * 拆分安装包（.apks / .xapk）：解出里面的分片 APK 到纯 ASCII 临时目录。
- * 用文件版 ZIP 读取器 + 流式落盘：拆分包动辄 2GB+，整包读内存会失败。
- * 返回 { meta, files, cleanup }；meta 来自带 AndroidManifest 的 base APK。
- */
-async function parseBundle(filePath) {
-  const zip = new ZipFile(filePath);
-  const dir = path.join(os.tmpdir(), 'apkstart-bundle', crypto.createHash('sha1')
-    .update(filePath).digest('hex').slice(0, 12));
-  const cleanup = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ignore */ } };
-  try {
-    const apkNames = zip.names().filter((n) => /\.apk$/i.test(n));
-    if (!apkNames.length) throw new Error('这个安装包里没有找到 APK 分片（可能不是 .apks/.xapk）');
-    fs.mkdirSync(dir, { recursive: true });
-    const files = [];
-    for (let i = 0; i < apkNames.length; i++) {
-      const target = path.join(dir, `split-${i}.apk`);
-      // 单个分片也可能是几百 MB：流式解压，不经过 Buffer
-      // eslint-disable-next-line no-await-in-loop
-      await zip.pipeTo(apkNames[i], fs.createWriteStream(target));
-      files.push(target);
-    }
-    let meta = null;
-    for (const f of files) {
-      try { meta = parseApk(f); break; } catch (_) { /* 分片里没有清单 */ }
-    }
-    if (!meta) throw new Error('拆分包的 base APK 解析失败');
-    return { meta, files, cleanup };
-  } catch (e) {
-    cleanup();
-    throw e;
-  } finally {
-    zip.close();
-  }
-}
-
 function accentOf(pkg) {
   let h = 0;
   for (let i = 0; i < pkg.length; i++) h = (h * 31 + pkg.charCodeAt(i)) >>> 0;
@@ -151,11 +113,12 @@ class Installer {
     return [...new Set(out)];
   }
 
-  async install(filePath, onProgress = () => {}, { meta: cachedMeta = null } = {}) {
+  // includeClient 仅供主进程内部恢复使用；默认结果可经 IPC 序列化，不暴露 ADB 对象。
+  async install(filePath, onProgress = () => {}, { meta: cachedMeta = null, kind: restoreKind = '', includeClient = false } = {}) {
     onProgress({ stage: 'parse', message: '正在解析 APK…' });
     let meta = cachedMeta;
     let bundle = null;
-    const kind = filetype.installKind(filePath);
+    const kind = restoreKind || filetype.installKind(filePath);
     if (kind === 'apks' || kind === 'xapk') {
       bundle = await parseBundle(filePath);
       meta = bundle.meta;
@@ -178,7 +141,8 @@ class Installer {
         err.needsSetup = rt.needsSetup || 'provision';
         throw err;
       }
-      return await this.finishInstall(rt, meta, filePath, bundle, onProgress);
+      const result = await this.finishInstall(rt, meta, filePath, bundle, onProgress);
+      return includeClient ? { ...result, client: rt.client } : result;
     } finally {
       if (bundle) bundle.cleanup();
     }
@@ -270,6 +234,7 @@ class Installer {
     let apkCopy = null;
     try {
       apkCopy = store.apkPath(meta.package, meta.versionCode.toString(36));
+      if (bundle) apkCopy = apkCopy.replace(/\.apk$/i, '.apks');
       fs.copyFileSync(filePath, apkCopy);
     } catch (_) { /* ignore */ }
 
@@ -450,9 +415,17 @@ class Installer {
     return true;
   }
 
-  async launch(pkg, { onLog = () => {}, beforeStart = null, onMark = () => {}, lcdOrientation = '' } = {}) {
+  async launch(pkg, { onLog = () => {}, beforeStart = null, onMark = () => {}, lcdOrientation = '', shouldCancel = () => false } = {}) {
+    const checkCancelled = () => {
+      if (!shouldCancel()) return;
+      const err = new Error('应用启动已取消；已保留应用数据');
+      err.code = 'LAUNCH_CANCELLED';
+      throw err;
+    };
+    checkCancelled();
     const app = store.getApp(pkg);
     const rt = await this.runtime.ensure({ onLog, lcdOrientation });
+    checkCancelled();
     onMark('ensure done');
     if (!rt.ok) {
       const err = new Error(rt.error || '运行时不可用');
@@ -464,7 +437,9 @@ class Installer {
       throw abiMismatchError(app, abiEvidence, null, true);
     }
     // 分辨率要在拉起应用之前改，避免 wm size 触发配置变更把刚启动的 Activity 重建
+    checkCancelled();
     if (beforeStart) await beforeStart(rt).catch((e) => onLog(`显示适配跳过：${e.message}`));
+    checkCancelled();
     // 拉起来之前先看一眼网络：**只等，不重启**。
     // 冷启动时 Wi-Fi 关联往往比 sys.boot_completed 晚几十秒，而短剧类应用一进去就拉
     // 首页数据，没网时首页渲染成整块黑底 —— 这就是「点同意并继续后一直黑屏」的真正原因。
@@ -483,21 +458,28 @@ class Installer {
       freeform: settings.freeform,
       bounds: app ? app.bounds : null,
     });
+    checkCancelled();
     // 应用可能还没装进当前运行时（镜像重建 / 清过数据 / 首次），直接拉起会报
     // "Invalid packageName"。先在本地缓存里把它装上再启动，这样「点开应用」永远能进，
     // 不用先手动装一遍——这正是「点击已安装应用直接进入系统」想要的体验。
     if (app && app.apkPath && fs.existsSync(app.apkPath)) {
       const pkgs = await rt.client.shell(`pm list packages ${shellQuote(pkg)}`, { timeout: 8000 }).catch(() => '');
+      checkCancelled();
       if (!new RegExp(`package:${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(pkgs)) {
         onLog('应用尚未安装，正在自动安装…');
         try {
-          if (app.bundle) {
+          if (app.bundle === true) {
             const b = await parseBundle(app.apkPath);
-            try { await rt.client.installMultiple(b.files); } finally { b.cleanup(); }
+            try {
+              checkCancelled();
+              await rt.client.installMultiple(b.files);
+            } finally { b.cleanup(); }
           } else {
+            checkCancelled();
             await rt.client.install(app.apkPath);
           }
         } catch (e) {
+          if (e.code === 'LAUNCH_CANCELLED') throw e;
           if (e.code === 'NO_MATCHING_ABIS' || /INSTALL_FAILED_NO_MATCHING_ABIS/.test(e.message || '')) {
             throw abiMismatchError(app, abiEvidence || await runtimeAbiEvidence(rt.client), e);
           }
@@ -521,6 +503,7 @@ class Installer {
       let aliveSince = 0;
       let seen = false;
       while (Date.now() - t0 < aliveBudgetMs) {
+        checkCancelled();
         // 先查再睡：常驻容器里热启动往往 1 秒内就能看到进程，
         // 先 sleep 1 秒等于把最快的那条路径硬生生拖慢一秒。
         // eslint-disable-next-line no-await-in-loop
@@ -546,6 +529,7 @@ class Installer {
       let ok = false;
       let cacheRetried = false;
       for (let attempt = 1; attempt <= 3 && !ok; attempt += 1) {
+        checkCancelled();
         if (attempt > 1) {
           // eslint-disable-next-line no-await-in-loop
           await rt.client.forceStop(pkg).catch(() => {});
@@ -557,6 +541,7 @@ class Installer {
           // eslint-disable-next-line no-await-in-loop
           await sleep(600 * attempt);
         }
+        checkCancelled();
         let started = true;
         try {
           // eslint-disable-next-line no-await-in-loop
@@ -581,36 +566,19 @@ class Installer {
         // eslint-disable-next-line no-await-in-loop
         ok = started ? await staysAlive() : false;
         onMark(`alive #${attempt} ${ok}`);
-        if (!ok && attempt < 3) onLog(`应用启动后退出（第 ${attempt} 次），正在自动重试…`);
+        if (!ok && attempt < 3) onLog(`应用未能稳定启动（第 ${attempt} 次），正在自动重试…`);
       }
       if (!ok) {
-        // 兜底：异常退出会留下「半初始化」的数据，导致之后每次都崩。
-        // 清一次应用数据再拉起来，成功率最高（用户不必自己去设置里清缓存）。
-        //
-        // 但**只有「进程真的起来过又死了」才算数据可疑**。如果进程从头到尾没出现过
-        // （低配机 / 无硬件加速时抖音首启要几十秒），那只是慢，不是数据坏了 ——
-        // 这时候 pm clear 会把登录态、草稿、离线缓存一起删掉，是最不该发生的事。
+        // 启动不等于授权重置应用。即使进程反复退出，也不能自动删除登录态、草稿或离线数据。
         if (!everSeen) {
           const err = new Error(
-            `应用在 ${Math.round(aliveBudgetMs / 1000)} 秒内还没起来（机器较慢，首次启动尤其明显）。`
-            + '已保留应用数据，稍后再点一次通常就能进。',
+            `未观察到应用进程启动（单次最多等待 ${Math.round(aliveBudgetMs / 1000)} 秒）。`
+            + '已保留应用数据，可稍后重试或查看运行时日志。',
           );
           err.code = 'APP_SLOW';
           throw err;
         }
-        onLog('应用连续退出，正在重置应用数据后重试…');
-        await rt.client.shell(`pm clear ${shellQuote(pkg)}`, { timeout: 20000 }).catch(() => '');
-        await sleep(800);
-        // pm clear 会把运行时权限一并清掉，必须重新授，否则会卡在系统授权框
-        await rt.client.grantRuntimePermissions(pkg).catch(() => {});
-        await start().catch((e) => {
-          if (e.code === 'APP_CRASHED' && e.crash) throw e;
-        });
-        ok = await staysAlive();
-        if (!ok) await rt.client.dismissPermissionDialog().catch(() => {});
-      }
-      if (!ok) {
-        const err = new Error('应用启动后立即退出，已自动重试并重置应用数据仍未成功');
+        const err = new Error('应用启动后退出，自动重试未成功；已保留应用数据。请查看崩溃日志或检查运行时兼容性。');
         err.code = 'APP_UNSTABLE';
         throw err;
       }

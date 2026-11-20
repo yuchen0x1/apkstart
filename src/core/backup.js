@@ -18,7 +18,9 @@
  */
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { parseApk } = require('./apk');
+const { isBundle, parseBundle } = require('./apk-bundle');
 
 const PACKAGE_RE = /^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/;
 
@@ -114,11 +116,29 @@ async function backupApp({ app, client, dir, onLog = () => {} }) {
     throw new Error('找不到这个应用的安装包（可能安装后被清理过），无法备份');
   }
 
-  const folder = path.join(dir, folderName(app));
-  fs.mkdirSync(folder, { recursive: true });
+  // 旧安装记录的 bundle 标记比 .apk 缓存后缀更可信；仍先完整解析容器，
+  // 因此陈旧/错误标记不会把普通 APK 当成 split，也不会复制损坏的 bundle。
+  let split = false;
+  if (app.bundle === true) {
+    const parsedBundle = await parseBundle(apkSrc);
+    try { split = true; } finally { parsedBundle.cleanup(); }
+  } else {
+    split = isBundle(apkSrc);
+  }
+  const apkName = split ? 'app.apks' : 'app.apk';
+  fs.mkdirSync(dir, { recursive: true });
+  const name = folderName(app);
+  let folder = '';
+  // 秒级时间戳可能碰撞；原子创建新目录，绝不复用/覆盖旧备份。
+  for (let i = 0; i < 1000; i++) {
+    const candidate = path.join(dir, name + (i ? `-${i}` : ''));
+    try { fs.mkdirSync(candidate); folder = candidate; break; }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+  }
+  if (!folder) throw new Error('备份目录重名过多，请选择其他目标目录');
 
-  const apkOut = path.join(folder, 'app.apk');
-  fs.copyFileSync(apkSrc, apkOut);
+  const apkOut = path.join(folder, apkName);
+  fs.copyFileSync(apkSrc, apkOut, fs.constants.COPYFILE_EXCL);
   onLog(`已复制 APK（${(fs.statSync(apkOut).size / 1048576).toFixed(1)} MB）`);
 
   const meta = {
@@ -127,7 +147,8 @@ async function backupApp({ app, client, dir, onLog = () => {} }) {
     label: app.label || app.package,
     versionName: app.versionName || '',
     versionCode: app.versionCode || 0,
-    apk: 'app.apk',
+    apk: apkName,
+    bundle: split,
     data: null,
     dataNote: '',
     createdAt: Date.now(),
@@ -167,16 +188,34 @@ async function backupApp({ app, client, dir, onLog = () => {} }) {
  * 从备份目录恢复：先把 APK 装回去，再尝试还原数据。
  * 数据还原要求「备份里有 data.tar」且「目标应用现在仍然可 run-as」。
  */
-async function restoreApp({ dir, installer, client, onLog = () => {} }) {
+async function restoreApp({ dir, installer, onLog = () => {} }) {
   const meta = readMeta(dir);
-  const apk = backupFile(dir, meta.apk == null || meta.apk === '' ? 'app.apk' : meta.apk, 'app.apk');
+  const name = meta.apk == null || meta.apk === '' ? 'app.apk' : meta.apk;
+  if (!['app.apk', 'app.apks', 'app.xapk'].includes(name)) throw new Error('备份路径不安全：安装包必须使用固定相对路径');
+  const apk = backupFile(dir, name, name);
   // 所有路径与包名检查必须在安装及任何设备数据操作前完成。
   const tar = meta.data == null ? '' : backupFile(dir, meta.data, 'data.tar', { optional: true });
-  const parsed = parseApk(apk);
+  // 新备份的 bundle 标记（以及旧安装记录导出的标记）优先于 .apk 名称；
+  // 但无论标记来自哪里都必须由真实 ZIP/base 清单验证，普通 APK 不会被拆分。
+  let split = meta.bundle === true;
+  let parsed;
+  if (split) {
+    const bundle = await parseBundle(apk);
+    try { parsed = bundle.meta; } finally { bundle.cleanup(); }
+  } else {
+    split = isBundle(apk);
+    if (split) {
+      const bundle = await parseBundle(apk);
+      try { parsed = bundle.meta; } finally { bundle.cleanup(); }
+    } else parsed = parseApk(apk);
+  }
   if (parsed.package !== meta.package) throw new Error('备份 APK 包名与 meta.package 不一致，已拒绝恢复');
 
   onLog('正在重新安装应用…');
-  const r = await installer.install(apk, (p) => { if (p && p.message) onLog(p.message); });
+  // kind 覆盖仅用于兼容旧版将容器命名为 app.apk 的备份；不更改原备份文件。
+  const r = await installer.install(apk, (p) => { if (p && p.message) onLog(p.message); }, {
+    kind: split ? 'apks' : 'apk', includeClient: !!tar,
+  });
   if (!r || !r.app || r.app.package !== meta.package) {
     throw new Error('安装结果包名与备份不一致，已停止恢复数据');
   }
@@ -189,15 +228,20 @@ async function restoreApp({ dir, installer, client, onLog = () => {} }) {
     };
   }
 
+  // 只能向本次安装真正选中的实例还原，不能重取 runtime.client() 或信任调用前的 client。
+  const client = r.client;
+  if (!client || typeof client.shell !== 'function' || typeof client.push !== 'function' || typeof client.exec !== 'function') {
+    throw new Error('安装器未返回本次安装使用的设备实例，已停止恢复数据');
+  }
   const { ok, note } = await canReadData(client, meta.package);
   if (!ok) {
     return { app: r.app || null, dataRestored: false, note: `备份里有数据，但${note}` };
   }
 
   onLog('正在还原应用数据…');
-  const remote = `/data/local/tmp/apkstart-restore-${Date.now()}.tar`;
-  await client.push(tar, remote);
+  const remote = `/data/local/tmp/apkstart-restore-${crypto.randomBytes(16).toString('hex')}.tar`;
   try {
+    await client.push(tar, remote);
     // shell 里 cat 用 shell 身份读文件、管道喂给 run-as（app 身份），
     // 这样既不用 root，也不需要给 /data/local/tmp 放宽权限。
     await client.exec(['exec-out', `cat ${shq(remote)} | run-as ${shq(meta.package)} tar -xf -`], {

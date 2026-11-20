@@ -48,11 +48,62 @@ function waitRetry(ms, signal) {
   });
 }
 
+function isLoopbackHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host === '::1') return true;
+  const octets = host.split('.');
+  return octets.length === 4 && octets[0] === '127'
+    && octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+function assertSecureUrl(target, previous = null) {
+  if (target.protocol === 'https:') return;
+  if (target.protocol === 'http:') {
+    if (previous && previous.protocol === 'https:') {
+      throw new Error(`下载安全策略拒绝 HTTPS 重定向降级到 HTTP：${target.href}`);
+    }
+    // 只给本地服务/测试保留 HTTP；绝不允许公网 HTTP。
+    if (isLoopbackHost(target.hostname)) return;
+  }
+  throw new Error(`下载安全策略只允许 HTTPS 或回环 HTTP：${target.href}`);
+}
+
+function writeAllAt(fd, buffer, position) {
+  let written = 0;
+  while (written < buffer.length) {
+    const remaining = buffer.length - written;
+    const count = fs.writeSync(fd, buffer, written, remaining, position + written);
+    if (!Number.isInteger(count) || count <= 0 || count > remaining) {
+      throw new Error(`文件写入返回无效字节数（返回 ${count}，剩余 ${remaining}）`);
+    }
+    written += count;
+  }
+  return written;
+}
+
+function assertChunkBytes(received, written, expected) {
+  if (received !== expected || written !== expected) {
+    throw new Error(`分块字节数不符（收到 ${received}，写入 ${written}，声明 ${expected}）`);
+  }
+}
+
+function assertDownloadBytes(written, size, total) {
+  // 分块文件预先截断到 total，仅凭文件长度无法发现未写入的空洞。
+  if (written !== total || size !== total) {
+    throw new Error(`下载不完整（写入 ${written}，文件长度 ${size}，应有 ${total} 字节）`);
+  }
+}
+
 function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy = false, timeout = 30000, signal } = {}) {
   return new Promise((resolve, reject) => {
     if (signal && signal.aborted) return reject(new Error('下载已取消'));
     if (redirects > 6) return reject(new Error('重定向次数过多'));
     let req;
+    let u;
+    try {
+      u = new URL(url);
+      assertSecureUrl(u);
+    } catch (e) { reject(e); return; }
     const cleanup = () => { if (signal) signal.removeEventListener('abort', abort); };
     const abort = () => {
       cleanup();
@@ -60,8 +111,6 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
       reject(new Error('下载已取消'));
     };
     if (signal) signal.addEventListener('abort', abort, { once: true });
-    let u;
-    try { u = new URL(url); } catch (e) { cleanup(); reject(e); return; }
     const mod = u.protocol === 'http:' ? http : https;
 
     (async () => {
@@ -69,7 +118,7 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
       // 代理本身连不上再回退直连 —— 挂着 Clash 的机器直连 GitHub 只有几十 KB/s，
       // 走代理实测十几 MB/s。noProxy 用于这次回退，避免死循环。
       // 回环地址（本地测试服务器/本地服务）永不走代理（标准 NO_PROXY 语义）
-      const loopback = /^(127\.|localhost$|\[::1\]|::1$)/i.test(u.hostname);
+      const loopback = isLoopbackHost(u.hostname);
       let proxy = null;
       if (!noProxy && !loopback) {
         try { proxy = await proxyMod.getActiveProxy(); } catch (_) { proxy = null; }
@@ -107,15 +156,13 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
           path: u.pathname + u.search,
           headers: { ...base.headers, Host: u.host }, agent: tunnelAgent, timeout,
         }, (res) => finishReq(res, req));
-      } else if (proxy && u.protocol === 'http:') {
-        // http 经代理：绝对路径转发
-        req = http.request({
-          host: proxy.host, port: proxy.port, method,
-          path: u.href, headers: { ...base.headers, Host: u.host },
-          agent: false, timeout,
-        }, (res) => finishReq(res, req));
       } else {
-        req = mod.request(url, { ...base, timeout }, (res) => finishReq(res, req));
+        // HTTP 只允许直连回环，不使用代理或通过 DNS 解析 localhost。
+        const localHttp = u.protocol === 'http:' ? {
+          agent: false,
+          ...(u.hostname === 'localhost' ? { hostname: '127.0.0.1' } : {}),
+        } : {};
+        req = mod.request(u, { ...base, ...localHttp, timeout }, (res) => finishReq(res, req));
       }
       // 连接阶段的兜底：timeout 事件没人监听就不会销毁请求 —— TCP 建立但
       // 响应不来（被墙/隧道挂死）时 fetchChunk 的空闲看门狗还没启动（它要等
@@ -140,10 +187,19 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
       cleanup();
       if (signal && signal.aborted) { res.destroy(); return reject(new Error('下载已取消')); }
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        let next;
+        try {
+          const target = new URL(res.headers.location, u);
+          assertSecureUrl(target, u);
+          next = target.href;
+        } catch (e) {
+          res.destroy();
+          return reject(e);
+        }
         res.resume();
-        const next = new URL(res.headers.location, url).href;
         return resolve(openStream(next, { method, headers, redirects: redirects + 1, noProxy, timeout, signal }));
       }
+      res.downloadUrl = url; // strong ETag 只在同一最终资源 URL 内有意义。
       resolve(res);
     }
   });
@@ -197,48 +253,52 @@ async function verifyChecksum(dest, opt) {
   }
 }
 
-/**
- * 校验本地文件末尾 len 字节与远端是否一致。
- * 用于 416（Range 越界）时确认「续传文件真的是下载完成的产物」：
- * 并行分块失败留下的预分配稀疏文件，大小恰好也等于总长，只有比对内容才分得清。
- * 服务器不支持 Range 时返回 true（放行，保持旧行为）。
- */
-async function tailMatches(url, dest, size, len, signal) {
-  let res;
-  try {
-    res = await openStream(url, { headers: { Range: `bytes=${size - len}-` }, signal });
-  } catch (e) {
-    if (signal && signal.aborted) throw e;
-    return true;   // 校验通道不可用：不因它把可能的完整文件误删
+// weak ETag / Last-Modified / 长度 / 尾部抽样均不能证明内容身份。
+function strongETag(headers) {
+  const tag = headers.etag;
+  return typeof tag === 'string' && /^"[\x21\x23-\x7e\x80-\xff]*"$/.test(tag) ? tag : '';
+}
+
+function responseETag(res) {
+  return !res.headers['content-encoding'] || res.headers['content-encoding'].toLowerCase() === 'identity'
+    ? strongETag(res.headers) : '';
+}
+
+function checksumIdentity(opt) {
+  const hashes = [];
+  for (const [name, len] of [['expectSha256', 64], ['expectSha1', 40]]) {
+    if (!opt[name]) continue;
+    const value = String(opt[name]).toLowerCase();
+    if (!new RegExp(`^[0-9a-f]{${len}}$`).test(value)) throw new Error(`${name} 格式无效`);
+    hashes.push(`${name}:${value}`);
   }
-  if (res.statusCode !== 206) { res.resume(); return true; }
-  const parts = [];
-  let got = 0;
-  await new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', abort);
-      resolve();
-    };
-    const abort = () => { res.destroy(); finish(); };
-    const timer = setTimeout(abort, 30000);
-    if (signal) signal.addEventListener('abort', abort, { once: true });
-    res.on('data', (c) => { parts.push(c); got += c.length; if (got >= len) res.destroy(); });
-    res.on('end', finish);
-    res.on('error', finish);
-    res.on('close', finish);
-    if (signal && signal.aborted) abort();
-  });
-  if (signal && signal.aborted) throw new Error('下载已取消');
-  const remoteBuf = Buffer.concat(parts).subarray(0, len);
-  if (remoteBuf.length < len) return true;   // 远端比声明的小，交给上层大小校验处理
-  const local = Buffer.alloc(len);
-  const fd = fs.openSync(dest, 'r');
-  try { fs.readSync(fd, local, 0, len, size - len); } finally { fs.closeSync(fd); }
-  return remoteBuf.equals(local);
+  return hashes.join('|');
+}
+
+function readMeta(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return null; }
+}
+
+function writeMeta(file, value) {
+  try {
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(value));
+    fs.renameSync(`${file}.tmp`, file);
+  } catch (_) {
+    // 元数据失败不能导致下一轮误用旧的身份。
+    fs.rmSync(file, { force: true });
+  }
+}
+
+function discardPartial(dest) {
+  for (const file of [dest, `${dest}.download.json`, `${dest}.chunks.json`]) fs.rmSync(file, { force: true });
+}
+
+function contentRange(res) {
+  const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(res.headers['content-range'] || ''));
+  if (!m) return null;
+  const [start, end, total] = m.slice(1).map(Number);
+  return [start, end, total].every(Number.isSafeInteger) && start <= end && end < total
+    ? { start, end, total } : null;
 }
 
 /**
@@ -249,137 +309,164 @@ async function tailMatches(url, dest, size, len, signal) {
  */
 async function download(url, dest, opt = {}) {
   if (opt.signal && opt.signal.aborted) throw new Error('下载已取消');
+  opt = { ...opt };
   const { onProgress = () => {}, signal, retries = 2 } = opt;
+  const checksum = checksumIdentity(opt);
+  const meta = `${dest}.download.json`;
   fs.mkdirSync(path.dirname(dest), { recursive: true });
+  if (fs.existsSync(`${dest}.chunks.json`)) discardPartial(dest);
 
   let attempt = 0;
   for (;;) {
     attempt++;
-    const existing = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+    const st = fs.existsSync(dest) ? fs.statSync(dest) : null;
+    const m = readMeta(meta);
+    const sameFile = st && m && m.v === 1 && m.url === url && typeof m.finalUrl === 'string'
+      && m.size === st.size && m.mtimeMs === st.mtimeMs && m.ctimeMs === st.ctimeMs
+      && m.ino === st.ino && m.dev === st.dev;
+    const resumable = sameFile && strongETag({ etag: m.etag });
+    const trustedChecksumPartial = sameFile && checksum && m.checksum === checksum;
+    const existing = st && (resumable || trustedChecksumPartial) ? st.size : 0;
     const headers = {};
-    if (existing > 0) headers.Range = `bytes=${existing}-`;
+    if (existing) {
+      headers.Range = `bytes=${existing}-`;
+      if (resumable) headers['If-Range'] = m.etag;
+    }
 
-    // eslint-disable-next-line no-await-in-loop
     const res = await openStream(url, { headers, signal });
     if (signal && signal.aborted) { res.destroy(); throw new Error('下载已取消'); }
 
-    if (res.statusCode === 416) {
-      res.resume();
-      // 416 = Range 越界，通常表示「已下载完整」。但并行分块失败留下的预分配
-      // 稀疏文件大小恰好也等于总长 —— 不核对就把全零文件当成品，会产出一份
-      // 「大小正确、内容全零」的坏运行时（历史 P0）。以远端总长为准核对。
-      const cr = /\/(\d+)\s*$/.exec(String(res.headers['content-range'] || ''));
-      let remoteTotal = cr ? Number(cr[1]) : 0;
-      if (!remoteTotal) {
-        // eslint-disable-next-line no-await-in-loop
-        const h = await head(url).catch(() => ({ size: 0 }));
-        remoteTotal = h.size || 0;
-      }
-      const actual = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
-      if (remoteTotal && actual !== remoteTotal) {
-        fs.rmSync(dest, { force: true });
-        if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
-        throw new Error(`续传状态不一致（本地 ${actual} 字节 / 远端 ${remoteTotal} 字节），已重置下载`);
-      }
-      // 大小一致也不能直接当「已下载完整」：预分配的稀疏文件大小恰好也是总长。
-      // 比对末尾 4KB，内容对不上就重置，宁可重下也不交出一份全零的「成品」。
-      if (remoteTotal && actual === remoteTotal && actual > 0) {
-        // eslint-disable-next-line no-await-in-loop
-        const same = await tailMatches(url, dest, actual, Math.min(4096, actual), signal);
-        if (!same) {
-          fs.rmSync(dest, { force: true });
-          if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
-          throw new Error('续传文件与远端内容不一致（可能是中断留下的预分配文件），已重置下载');
-        }
-      }
-      break;
+    const etag = responseETag(res);
+    const cr = res.statusCode === 206 ? contentRange(res) : null;
+    const contentLength = res.headers['content-length'] === undefined ? null : Number(res.headers['content-length']);
+    const validResume = existing && cr && cr.start === existing && cr.end === cr.total - 1
+      && (contentLength === null || Number.isSafeInteger(contentLength) && contentLength === cr.end - cr.start + 1)
+      && (checksum ? m && m.checksum === checksum && m.finalUrl === res.downloadUrl
+        && (!m.total || m.total === cr.total) : (resumable && m.finalUrl === res.downloadUrl
+          && m.etag === etag && (!m.total || m.total === cr.total)));
+    if (existing && (res.statusCode === 416 || (res.statusCode === 206 && !validResume))) {
+      // 416 不等于已完整；无身份、换版或范围不符时改用完整 GET，不耗网络重试额度。
+      res.destroy();
+      discardPartial(dest);
+      attempt--;
+      continue;
     }
-    if (res.statusCode !== 200 && res.statusCode !== 206) {
-      res.resume();
-      if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
+    if (res.statusCode !== 200 && !(res.statusCode === 206 && validResume)) {
+      res.destroy();
+      if (attempt <= retries) { await waitRetry(1500, signal); continue; }
       throw new Error(`下载失败 HTTP ${res.statusCode}: ${url}`);
     }
 
-    // 断点续传的起点必须就是本地已有长度：服务器从别的位置开始返回时，
-    // 追加写入会得到「大小对、内容错」的文件（上游 issue #91 的同类问题）。
-    if (res.statusCode === 206) {
-      const cr = /bytes\s+(\d+)-/i.exec(String(res.headers['content-range'] || ''));
-      if (cr && Number(cr[1]) !== existing) {
-        res.resume();
-        fs.rmSync(dest, { force: true });
-        if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
-        throw new Error(`续传位置不符（本地 ${existing} 字节，服务器从 ${cr[1]} 开始），已重置下载`);
+    const total = cr ? cr.total : contentLength;
+    const startSize = cr ? existing : 0;
+    const expectedBody = cr ? cr.end - cr.start + 1 : contentLength;
+    // 先移除旧身份，成功关闭写流后再记录新的部分文件；崩溃时宁可重下。
+    fs.rmSync(meta, { force: true });
+    if (!startSize) fs.rmSync(dest, { force: true });
+
+    const idleMs = Number(opt.idleMs) > 0 ? Number(opt.idleMs) : 30000;
+    const savePartialMeta = () => {
+      if (!fs.existsSync(dest) || (!etag && !checksum)) {
+        fs.rmSync(meta, { force: true });
+        return;
       }
-    }
+      try {
+        const partialStat = fs.statSync(dest);
+        if (!partialStat.size) return;
+        writeMeta(meta, {
+          v: 1, url, finalUrl: res.downloadUrl, etag, checksum,
+          total: total || 0, size: partialStat.size,
+          mtimeMs: partialStat.mtimeMs, ctimeMs: partialStat.ctimeMs,
+          ino: partialStat.ino, dev: partialStat.dev,
+        });
+      } catch (_) { fs.rmSync(meta, { force: true }); }
+    };
 
-    const total = res.statusCode === 206
-      ? existing + (Number(res.headers['content-length']) || 0)
-      : Number(res.headers['content-length']) || 0;
-
-    if (res.statusCode === 200 && existing > 0) {
-      // 服务器不支持续传，重头写
-      fs.rmSync(dest, { force: true });
-    }
-
-    await new Promise((resolve, reject) => {
-      const startSize = res.statusCode === 206 ? existing : 0;
-      let got = startSize;
-      let lastTick = Date.now();
-      let lastBytes = got;
-      const ws = fs.createWriteStream(dest, { flags: startSize > 0 ? 'a' : 'w' });
-
-      // 和分块下载一样：必须保证 promise 一定会 settle。
-      // 连接静默（被墙/被限速）时 res 既不 end 也不 error，pipe 永远不 finish，
-      // 整个下载就卡死在这里，用户看到的是进度条不动、也没有报错。
-      const idleMs = Number(opt.idleMs) > 0 ? Number(opt.idleMs) : 30000;
-      let settled = false;
-      let idle = null;
-      const finish = (err) => {
-        if (settled) return;
-        settled = true;
-        if (idle) clearTimeout(idle);
-        if (signal) signal.removeEventListener('abort', onAbort);
-        res.unpipe(ws);
-        res.destroy();
-        ws.once('close', () => { if (err) reject(err); else resolve(); });
-        ws.destroy();
-      };
-      const kick = () => {
-        if (settled) return;
-        if (idle) clearTimeout(idle);
-        idle = setTimeout(() => {
+    try {
+      await new Promise((resolve, reject) => {
+        let got = startSize;
+        let lastTick = Date.now();
+        let lastBytes = got;
+        let responseEnded = false;
+        let settled = false;
+        let idle = null;
+        const ws = fs.createWriteStream(dest, { flags: startSize > 0 ? 'a' : 'w' });
+        const clear = () => {
+          if (idle) clearTimeout(idle);
+          if (signal) signal.removeEventListener('abort', onAbort);
+        };
+        const fail = (err) => {
+          if (settled) return;
+          settled = true;
+          clear();
+          res.unpipe(ws);
           res.destroy();
-          finish(new Error('连接停滞（长时间无数据）'));
-        }, idleMs);
-      };
-      kick();
-
-      const onAbort = () => finish(new Error('下载已取消'));
-      if (signal) signal.addEventListener('abort', onAbort, { once: true });
-
-      res.on('data', (c) => {
-        got += c.length;
+          // flush bytes already accepted by the file stream so a strong validator or
+          // trusted digest can make the partial file safely resumable on the next try.
+          let done = false;
+          const finish = () => { if (!done) { done = true; reject(err); } };
+          ws.once('close', finish);
+          ws.once('error', () => {});
+          try { ws.end(finish); } catch (_) { finish(); }
+          if (ws.closed) finish();
+        };
+        const succeed = () => {
+          if (settled) return;
+          settled = true;
+          clear();
+          resolve();
+        };
+        const kick = () => {
+          if (settled) return;
+          if (idle) clearTimeout(idle);
+          idle = setTimeout(() => fail(new Error('连接停滞（长时间无数据）')), idleMs);
+        };
+        const onAbort = () => fail(new Error('下载已取消'));
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
         kick();
-        const now = Date.now();
-        if (now - lastTick > 400) {
-          const speed = (got - lastBytes) / ((now - lastTick) / 1000);
-          lastTick = now;
-          lastBytes = got;
-          onProgress({
-            got, total,
-            percent: total ? Math.min(100, (got / total) * 100) : 0,
-            speed,
-            eta: total && speed > 0 ? Math.max(0, (total - got) / speed) : null,
-          });
-        }
-      });
-      res.pipe(ws);
-      ws.on('finish', () => finish());
-      ws.on('error', (e) => finish(e));
-      res.on('error', (e) => finish(e));
-      res.on('close', () => { if (!res.complete) finish(new Error('连接被中断')); });
-    });
 
+        res.on('data', (c) => {
+          if (settled) return;
+          got += c.length;
+          kick();
+          const now = Date.now();
+          if (now - lastTick > 400) {
+            const speed = (got - lastBytes) / ((now - lastTick) / 1000);
+            lastTick = now;
+            lastBytes = got;
+            onProgress({
+              got, total,
+              percent: total ? Math.min(100, (got / total) * 100) : 0,
+              speed,
+              eta: total && speed > 0 ? Math.max(0, (total - got) / speed) : null,
+            });
+          }
+        });
+        res.pipe(ws);
+        res.on('end', () => {
+          responseEnded = true;
+          const bodyBytes = got - startSize;
+          if (expectedBody !== null && bodyBytes !== expectedBody) {
+            fail(new Error(`响应字节数不符（收到 ${bodyBytes}，声明 ${expectedBody}）`));
+            return;
+          }
+          if (total !== null && got !== total) {
+            fail(new Error(`下载不完整（收到 ${got}，声明 ${total}）`));
+          }
+        });
+        ws.on('finish', () => {
+          if (!responseEnded) fail(new Error('响应在文件写入完成前结束'));
+          else if (!settled) succeed();
+        });
+        ws.on('error', (e) => fail(e));
+        res.on('error', (e) => fail(e));
+        res.on('close', () => { if (!responseEnded && !res.complete) fail(new Error('连接被中断')); });
+      });
+    } catch (e) {
+      savePartialMeta();
+      throw e;
+    }
+    fs.rmSync(meta, { force: true });
     break;
   }
 
@@ -420,22 +507,24 @@ async function downloadParallel(url, dest, opt = {}) {
     return download(url, dest, opt);
   }
 
-  // 探测是否支持 Range
+  // 探测是否支持 Range，并固定所有并行请求所对应的同一资源身份。
+  const checksum = checksumIdentity(opt);
   let total = 0;
   let supportsRange = false;
+  let identity = null;
   try {
     const probe = await openStream(url, { headers: { Range: 'bytes=0-0' }, signal });
-    const cr = probe.headers['content-range'];
-    if (probe.statusCode === 206 && cr) {
+    const cr = probe.statusCode === 206 ? contentRange(probe) : null;
+    const length = probe.headers['content-length'] === undefined ? null : Number(probe.headers['content-length']);
+    if (cr && cr.start === 0 && cr.end === 0 && (length === null || length === 1)) {
       supportsRange = true;
-      total = Number(/\/(\d+)$/.exec(cr)[1]) || 0;
-    } else {
-      total = Number(probe.headers['content-length']) || 0;
+      total = cr.total;
+      identity = { finalUrl: probe.downloadUrl, etag: responseETag(probe) };
     }
     probe.destroy();
   } catch (_) { /* 探测失败则走单流 */ }
 
-  if (!supportsRange || !total || total < minChunk * 2) {
+  if (!supportsRange || !total || total < minChunk * 2 || (!checksum && !identity.etag)) {
     return download(url, dest, opt);
   }
 
@@ -475,34 +564,35 @@ async function downloadParallel(url, dest, opt = {}) {
 
   const fetchChunk = async (c, signal) => {
     if (signal && signal.aborted) throw new Error('下载已取消');
-    const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` }, signal });
+    const requestHeaders = { Range: `bytes=${c.pos}-${c.end}` };
+    if (identity.etag) requestHeaders['If-Range'] = identity.etag;
+    const res = await openStream(url, { headers: requestHeaders, signal });
     if (signal && signal.aborted) { res.destroy(); throw new Error('下载已取消'); }
     if (res.statusCode !== 206) {
       res.destroy();
       throw new Error(`分块请求被拒绝 HTTP ${res.statusCode}`);
     }
-    // 只检查 206 不够（上游 d0853aa）：单源并行分块也要校验 Content-Range，
-    // 否则错位/越界的响应仍按 c.pos 落盘 —— 文件长度对、内容整体错位，
-    // 最后表现为「校验失败」或运行时莫名崩溃。downloadMulti 早有这套校验，
-    // 这条单源路径（downloadAnyParallel / multi 的单源回退）之前漏了。
-    const cr = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(String(res.headers['content-range'] || ''));
-    if (!cr) {
+    // 并行的所有范围必须来自探测时的同一最终 URL 和同一强 ETag。
+    const responseTag = responseETag(res);
+    if (res.downloadUrl !== identity.finalUrl || (identity.etag && responseTag !== identity.etag)) {
       res.destroy();
-      throw new Error('分块响应缺少 Content-Range，无法确认数据位置');
+      throw new Error('分块资源身份变化（最终 URL 或 strong ETag 不一致）');
     }
-    const crStart = Number(cr[1]);
-    const crEnd = Number(cr[2]);
-    const crTotal = cr[3] === '*' ? 0 : Number(cr[3]);
-    if (crStart !== c.pos || (crTotal && crTotal !== total) || crEnd < crStart) {
+    const range = contentRange(res);
+    const contentLength = res.headers['content-length'] === undefined ? null : Number(res.headers['content-length']);
+    if (!range || range.start !== c.pos || range.end > c.end || range.total !== total
+      || (contentLength !== null && (!Number.isSafeInteger(contentLength) || contentLength !== range.end - range.start + 1))) {
       res.destroy();
-      throw new Error(`分块范围不符（请求 ${c.pos}-${c.end}，返回 ${crStart}-${crEnd}/${cr[3]}）`);
+      throw new Error(`分块范围或字节长度不符（请求 ${c.pos}-${c.end}，返回 ${res.headers['content-range'] || '无 Content-Range'}）`);
     }
-    // 服务器可能只返回请求范围的前一截：以声明的终点为界，剩下的下一轮接着取
-    const limit = Math.min(c.end, crEnd);
+    // 服务器可能只返回请求范围的前一截：剩下的下一轮接着取。
     await new Promise((resolve, reject) => {
       // 必须自己兜住「promise 永远不 settle」：res.destroy(err) 在某些情况下只发
       // close 不发 error，没有这个 guard 的话一整块会挂死，整个下载停在那里不动。
       let settled = false;
+      let received = 0;
+      let written = 0;
+      const expectedBytes = range.end - range.start + 1;
       const finish = (err) => {
         if (settled) return;
         settled = true;
@@ -522,29 +612,34 @@ async function downloadParallel(url, dest, opt = {}) {
       };
       res.on('data', (buf) => {
         if (settled || (signal && signal.aborted)) return;
-        // 只写到 Content-Range 声明的范围内：服务器多给的数据一律丢弃，
-        // 否则会覆盖相邻分块已写好的字节（同样是「长度对、内容错」）。
-        const room = limit + 1 - c.pos;
-        if (room <= 0) { kick(); return; }
-        const n = Math.min(buf.length, room);
+        received += buf.length;
+        // 响应实体必须严格匹配声明范围；多字节不能悄悄截断后冒充有效分块。
+        if (received > expectedBytes) return finish(new Error('分块响应超过 Content-Range 声明长度'));
+        let count;
         try {
-          fs.writeSync(fd, buf, 0, n, c.pos);
+          count = writeAllAt(fd, buf, c.pos);
         } catch (e) {
-          res.destroy();
+          // 没写完的 buffer 不推进断点，下次从原位置完整重写。
           return finish(e);
         }
-        c.pos += n;
-        got += n;
+        written += count;
+        c.pos += count;
+        got += count;
         kick();
         tick();
       });
-      res.on('end', () => finish());
+      res.on('end', () => {
+        try { assertChunkBytes(received, written, expectedBytes); }
+        catch (e) { return finish(e); }
+        finish();
+      });
       res.on('error', (e) => finish(e));
       res.on('close', () => finish(new Error('连接被中断')));
     });
     return c.pos > c.end;
   };
 
+  let size;
   try {
     await runWorkers(chunks, async (c, workerSignal) => {
       for (;;) {
@@ -562,6 +657,8 @@ async function downloadParallel(url, dest, opt = {}) {
         }
       }
     }, signal);
+    size = fs.fstatSync(fd).size;
+    assertDownloadBytes(got, size, total);
   } catch (e) {
     fs.closeSync(fd);
     // 预分配的稀疏文件在这里就是「全零毒丸」：不删掉的话，上层换源重试会把它
@@ -572,9 +669,7 @@ async function downloadParallel(url, dest, opt = {}) {
   }
   fs.closeSync(fd);
 
-  const size = fs.statSync(dest).size;
-  onProgress({ got: size, total: size, percent: 100, speed: 0, eta: 0 });
-  if (size !== total) throw new Error(`下载不完整：${size}/${total} 字节`);
+  onProgress({ got, total, percent: 100, speed: 0, eta: 0 });
   await verifyChecksum(dest, opt);
   return { file: dest, size, parallel: n };
 }
@@ -602,8 +697,8 @@ async function downloadAny(urls, dest, opt = {}) {
  * 8 条连接都指向同一个地址时，天花板就是那个地址的上限。把 4 条给 GitHub、
  * 4 条给镜像，两者上限相加，实测能快一倍以上。
  *
- * 安全前提：只有「声明总大小一致」的源才会被混用，否则可能拼出坏文件；
- * 任一源中途失败，它的分块会自动换到下一条可用地址重试（不整包重来）。
+ * 安全前提：只有调用方提供可信 SHA-256/SHA-1 时才跨源混块；仅长度相等不证明内容相同。
+ * 任一源中途失败，它的分块会自动换到下一条可用地址重试，最终摘要验证整包。
  */
 async function downloadMulti(urls, dest, opt = {}) {
   if (opt.signal && opt.signal.aborted) throw new Error('下载已取消');
@@ -618,21 +713,31 @@ async function downloadMulti(urls, dest, opt = {}) {
     retries = 6,
   } = opt;
   const idleMs = Number(opt.idleMs) > 0 ? Number(opt.idleMs) : 20000;
+  const checksum = checksumIdentity(opt);
 
   const list = [...new Set((urls || []).filter(Boolean))];
   if (!list.length) throw new Error('没有可用的下载地址');
   if (list.length === 1) return downloadParallel(list[0], dest, opt);
+  // 没有可信摘要时，多个镜像只能作为故障转移，不能把不同镜像的块拼在一起。
+  // downloadAnyParallel 仍保留单个源的 ETag/final URL 锁定与分块能力。
+  if (!checksum) return downloadAnyParallel(list, dest, opt);
 
-  // 1) 并行探测：总大小 + 是否支持 Range
+  // 1) 并行探测：总大小 + Range + 每个响应最终 URL 与 strong ETag。
   const probes = await Promise.all(list.map(async (u) => {
     try {
       const res = await openStream(u, { headers: { Range: 'bytes=0-0' }, signal });
-      const cr = res.headers['content-range'];
-      const total = res.statusCode === 206 && cr ? Number(/\/(\d+)$/.exec(cr)[1]) || 0 : 0;
+      const cr = res.statusCode === 206 ? contentRange(res) : null;
+      const length = res.headers['content-length'] === undefined ? null : Number(res.headers['content-length']);
+      const valid = cr && cr.start === 0 && cr.end === 0
+        && (length === null || Number.isSafeInteger(length) && length === 1);
+      const probe = {
+        url: u, total: valid ? cr.total : 0, ranged: !!valid,
+        finalUrl: res.downloadUrl, etag: responseETag(res),
+      };
       res.destroy();
-      return { url: u, total, ranged: !!total };
+      return probe;
     } catch (_) {
-      return { url: u, total: 0, ranged: false };
+      return { url: u, total: 0, ranged: false, finalUrl: '', etag: '' };
     }
   }));
 
@@ -664,10 +769,14 @@ async function downloadMulti(urls, dest, opt = {}) {
   const meta = `${dest}.chunks.json`;
   let doneSet = new Set();
   let resume = false;
+  const starts = new Set(Array.from({ length: n }, (_, i) => i * per));
   try {
     const m = JSON.parse(fs.readFileSync(meta, 'utf8'));
-    if (m && m.total === total && m.n === n && fs.existsSync(dest) && fs.statSync(dest).size === total) {
-      doneSet = new Set(m.done || []);
+    const done = Array.isArray(m && m.done) ? m.done : [];
+    if (m && m.v === 1 && m.identity === checksum && m.total === total && m.n === n
+      && done.every((start) => Number.isSafeInteger(start) && starts.has(start))
+      && fs.existsSync(dest) && fs.statSync(dest).size === total) {
+      doneSet = new Set(done);
       resume = true;
     }
   } catch (_) { /* 没有边车就全新下 */ }
@@ -690,7 +799,7 @@ async function downloadMulti(urls, dest, opt = {}) {
 
   const saveMeta = () => {
     try {
-      fs.writeFileSync(meta, JSON.stringify({ total, n, done: [...doneSet] }));
+      fs.writeFileSync(meta, JSON.stringify({ v: 1, identity: checksum, total, n, done: [...doneSet] }));
     } catch (_) { /* 边车写不进去不影响下载 */ }
   };
 
@@ -735,20 +844,15 @@ async function downloadMulti(urls, dest, opt = {}) {
     // 下面的 fs.writeSync 仍按 c.pos 写 —— 文件长度刚好对上，内容却整体错位，
     // 最后表现为「镜像/安装包校验失败」或运行时莫名崩溃，极难定位。
     // 所以起点必须与请求一致，总长必须与整包一致；终点以两者交集为界。
-    const cr = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(String(res.headers['content-range'] || ''));
-    if (!cr) {
+    const range = contentRange(res);
+    const contentLength = res.headers['content-length'] === undefined ? null : Number(res.headers['content-length']);
+    if (!range || range.start !== c.pos || range.end > c.end || range.total !== total
+      || (contentLength !== null && (!Number.isSafeInteger(contentLength) || contentLength !== range.end - range.start + 1))) {
       res.destroy();
-      throw new Error('分块响应缺少 Content-Range，无法确认数据位置');
+      throw new Error(`分块范围或字节长度不符（请求 ${c.pos}-${c.end}，返回 ${res.headers['content-range'] || '无 Content-Range'}）`);
     }
-    const crStart = Number(cr[1]);
-    const crEnd = Number(cr[2]);
-    const crTotal = cr[3] === '*' ? 0 : Number(cr[3]);
-    if (crStart !== c.pos || (crTotal && crTotal !== total) || crEnd < crStart) {
-      res.destroy();
-      throw new Error(`分块范围不符（请求 ${c.pos}-${c.end}，返回 ${crStart}-${crEnd}/${cr[3]}）`);
-    }
-    // 服务器可能只返回了请求范围的前一截：写到 crEnd 为止，剩下的下一轮接着取
-    const limit = Math.min(c.end, crEnd);
+    // 服务器可能只返回了请求范围的前一截：写到声明终点为止，剩下的下一轮接着取
+    const limit = range.end;
     const startPos = c.pos;
     const startedAt = Date.now();
     // 同一条连接 destroy 之后仍可能再收到已缓冲的包，会重复触发换源、把源跳过头，
@@ -760,6 +864,9 @@ async function downloadMulti(urls, dest, opt = {}) {
       // 可能只发 close 不发 error，promise 就永远不会 reject —— 表现是一块挂死、
       // 整个下载停在那里（实测踩过）。所以看门狗自己调用 finish。
       let settled = false;
+      let received = 0;
+      let written = 0;
+      const expectedBytes = range.end - range.start + 1;
       const finish = (err) => {
         if (settled) return;
         settled = true;
@@ -778,19 +885,18 @@ async function downloadMulti(urls, dest, opt = {}) {
       };
       res.on('data', (buf) => {
         if (settled || (signal && signal.aborted)) return;
-        // 只写到 Content-Range 声明的范围内：服务器多给的数据一律丢弃，
-        // 否则会覆盖相邻分块已写好的字节（同样是「长度对、内容错」）。
-        const room = limit + 1 - c.pos;
-        if (room <= 0) { kick(); return; }
-        const n = Math.min(buf.length, room);
+        received += buf.length;
+        if (received > expectedBytes) return finish(new Error('分块响应超过 Content-Range 声明长度'));
+        let count;
         try {
-          fs.writeSync(fd, buf, 0, n, c.pos);
+          count = writeAllAt(fd, buf, c.pos);
         } catch (e) {
-          res.destroy();
+          // 没写完的 buffer 不推进断点，下次从原位置完整重写。
           return finish(e);
         }
-        c.pos += n;
-        got += n;
+        written += count;
+        c.pos += count;
+        got += count;
         kick();
         tick(false);
         // 还没下完就慢到不可接受 → 换源（c.pos 已前进，下次从断点继续）
@@ -806,13 +912,18 @@ async function downloadMulti(urls, dest, opt = {}) {
           }
         }
       });
-      res.on('end', () => finish());
+      res.on('end', () => {
+        try { assertChunkBytes(received, written, expectedBytes); }
+        catch (e) { return finish(e); }
+        finish();
+      });
       res.on('error', (e) => finish(e));
       res.on('close', () => finish(new Error('连接被中断')));
     });
     return c.pos > c.end;
   };
 
+  let size;
   try {
     await runWorkers(chunks, async (c, workerSignal) => {
       for (;;) {
@@ -840,6 +951,8 @@ async function downloadMulti(urls, dest, opt = {}) {
         }
       }
     }, signal);
+    size = fs.fstatSync(fd).size;
+    assertDownloadBytes(got, size, total);
   } catch (e) {
     fs.closeSync(fd);
     throw e;
@@ -847,9 +960,7 @@ async function downloadMulti(urls, dest, opt = {}) {
   fs.closeSync(fd);
   fs.rmSync(meta, { force: true });
 
-  const size = fs.statSync(dest).size;
   tick(true);
-  if (size !== total) throw new Error(`下载不完整：${size}/${total} 字节`);
   await verifyChecksum(dest, opt);
   return { file: dest, size, parallel: n, sources: same.length, multi: true, resumed: resume };
 }

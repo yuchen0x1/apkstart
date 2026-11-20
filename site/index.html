@@ -665,7 +665,7 @@
 <header class="hero" id="top">
   <div class="wrap hero-grid">
     <div>
-      <div class="eyebrow"><span class="dot" aria-hidden="true"></span>开源 · MIT 协议 · v0.9.2</div>
+      <div class="eyebrow"><span class="dot" aria-hidden="true"></span>开源 · MIT 协议 · v0.9.3</div>
       <h1><span class="grad">Windows 与 Linux</span><br />上的安卓应用运行器</h1>
       <p class="hero-sub">
         让安卓应用像本机软件一样被安装和使用——
@@ -751,7 +751,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M8 14h8M12 10v8"/></svg>
         </div>
         <h3>文件双向互通</h3>
-        <p>本机共享目录与安卓 /sdcard 双向同步，按内容哈希三方合并；两侧都改会保留两份并生成冲突副本，不静默覆盖。</p>
+        <p>本机共享目录与安卓 /sdcard 按内容哈希三方合并；冲突保留副本，替换前校验暂存文件。停止同步采用协作式取消和限时等待，不撤销已发出的 I/O，超时不等于全部 I/O 已停止。</p>
       </div>
       <div class="card reveal">
         <div class="icon" aria-hidden="true">
@@ -784,12 +784,13 @@
     <div class="sec-head reveal">
       <div class="sec-tag">ENHANCED FORK</div>
       <h2>独立增强分支，为日常使用打磨</h2>
-      <p>基于 RoutineMiku/apkstart 持续维护与发版，针对真实使用痛点做了大量修复与加固。</p>
+      <p>基于 RoutineMiku/apkstart 独立维护。v0.9.3 为候选说明，新增修复仍待集成与最终门禁确认，不表示已发布或最终测试通过。</p>
+      <p>系统切换提供取消入口；取消进行中仍需等待在途操作收尾，不表示已停止或回滚。Provider 状态未知不视为已停止，停止失败或无法确认时如实报告。</p>
     </div>
     <div class="enhance-grid">
       <div class="chip-list reveal">
         <div class="chip"><div class="tick">✓</div><div><b>首次运行引导向导</b><span>新用户一步步完成部署配置，不再对着空白界面猜下一步。</span></div></div>
-        <div class="chip"><div class="tick">✓</div><div><b>多源测速与慢速逃生</b><span>每次现测现选下载源，实测吞吐排序，失败自动换线；检测到本地代理自动走代理。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>下载传输校验</b><span>公开下载入口和每次重定向均要求 HTTPS，拒绝降级；核对长度、范围和来源身份，按实际写入字节数补齐定位短写，多源拼接要求可信摘要。</span></div></div>
         <div class="chip"><div class="tick">✓</div><div><b>按安装形态更新</b><span>新装默认提示更新；可在设置中启用自动更新。安装包按平台选择并校验，Linux deb 交由系统安装器确认。</span></div></div>
       </div>
       <div class="chip-list reveal">
@@ -798,9 +799,9 @@
         <div class="chip"><div class="tick">✓</div><div><b>网络不折腾</b><span>走 QEMU 用户态 NAT 复用主机网卡，不创建虚拟网卡 / 虚拟交换机，不装驱动。</span></div></div>
       </div>
       <div class="chip-list reveal">
-        <div class="chip"><div class="tick">✓</div><div><b>多项安全加固</b><span>更新链路只认本仓库，装后核对版本、失败回滚，安装包校验到位。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>窗口与退出清理</b><span>收紧应用外壳 IPC 权限，关窗清理捕获该次操作的确切客户端并排队执行，避免旧清理误作用于新客户端；退出等待在途操作。</span></div></div>
         <div class="chip"><div class="tick">✓</div><div><b>脱敏诊断报告</b><span>开机失败自动生成已脱敏的诊断报告，修复窗口一键上报，问题定位不靠猜。</span></div></div>
-        <div class="chip"><div class="tick">✓</div><div><b>闪退自动恢复</b><span>存活观察 18 秒，闪退自动重试 / 重置数据 / 补权限，应用尽量拉得起来。</span></div></div>
+        <div class="chip"><div class="tick">✓</div><div><b>启动保护应用数据</b><span>观察应用存活并报告启动结果，异常时只作非破坏性重试；普通启动和网络修复不会自动清除应用数据。</span></div></div>
       </div>
     </div>
   </div>
@@ -886,7 +887,7 @@
       </table>
     </div>
     <div class="req-notes">
-      <div class="note reveal"><b>Windows 7 / 8 与 macOS 不支持</b>——项目面向 Windows 10/11 x64 与 Linux x86_64。Windows 建议在 BIOS 开启虚拟化并启用「虚拟机平台」功能，或使用内置 AEHD 驱动；Linux 需确认当前用户可使用 <code>/dev/kvm</code>。</div>
+      <div class="note reveal"><b>Windows 7 / 8 与 macOS 不支持</b>——项目面向 Windows 10/11 x64 与 Linux x86_64。Windows 在 BIOS 开启虚拟化，按需授权启用内置虚拟化功能或启动已有驱动服务；未经可信校验的 AEHD 自动下载及缓存脚本提权执行已禁用，不自动安装第三方驱动。新装 AEHD 请通过官方 SDK Manager 手动操作。Linux 需确认当前用户可使用 <code>/dev/kvm</code>。</div>
       <div class="note reveal"><b>数据目录可以迁移</b>——Windows 可在「设置 → 桌面与文件」中修改运行时和安卓数据目录，Linux 使用 XDG 数据目录；已装应用、存档和快照与程序文件分开存放。</div>
     </div>
   </div>
@@ -898,7 +899,7 @@
     <div class="sec-head reveal">
       <div class="sec-tag">DOWNLOAD</div>
       <h2>选择适合你的安装方式</h2>
-      <p>Windows 与 Linux 从同一个发行页获取安装包，具体文件名、体积和校验信息以 GitHub Releases 为准。当前版本 v0.9.2。</p>
+      <p>Windows 与 Linux 从同一个发行页获取安装包，具体文件名、体积和校验信息以 GitHub Releases 为准。当前版本 v0.9.3。</p>
     </div>
     <div class="dl-grid">
       <div class="dl-card featured reveal">
@@ -948,8 +949,10 @@
       </div>
     </div>
     <div class="dl-foot reveal">
-      源码构建与更多发行说明见 <a href="https://github.com/yuchen0x1/apkstart#readme" target="_blank" rel="noopener">GitHub README</a> ·
-      问题与建议请提交至 <a href="https://github.com/yuchen0x1/apkstart/issues" target="_blank" rel="noopener">Issues</a>
+      <p>Windows 程序与安装器没有本项目的 Authenticode 代码签名，可能提示未知发布者或 SmartScreen。应用内更新使用 Ed25519 签名清单及资产摘要校验；手动下载可核对发行页的 SHA256SUMS，两者都不是 Windows 代码签名。</p>
+      <p>隔离界面截图来自真实 Electron / Chromium 与内存 IPC 夹具，不是真实 Android；既有 WSLg 记录不是本次最终代码快照或裸 Linux / KVM 验收。最终测试与发布状态以集成后的门禁及发行页为准。</p>
+      <p>源码构建与更多发行说明见 <a href="https://github.com/yuchen0x1/apkstart#readme" target="_blank" rel="noopener">GitHub README</a> ·
+      问题与建议请提交至 <a href="https://github.com/yuchen0x1/apkstart/issues" target="_blank" rel="noopener">Issues</a></p>
     </div>
   </div>
 </section>

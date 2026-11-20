@@ -1,11 +1,17 @@
 'use strict';
-/** UI 专用内存夹具。不得导入 engine/store/main，也不接触真实文件、设备或网络。 */
+/** UI 专用内存夹具。只读静态词典，不导入 engine/store/main，不接触用户文件、设备或网络。 */
 function createFixture() {
   const calls = [];
+  const english = require('../../src/i18n/en-US.json');
   const platform = process.env.UI_AUDIT_PLATFORM || 'win32';
   const isWin = platform === 'win32';
   const path = require('path')[isWin ? 'win32' : 'posix'];
   const dataDir = isWin ? 'D:\\ApkStart' : '/home/ui-test/.local/share/apkstart';
+  let imageGB = 24;
+  let systemState = {
+    current: { systemId: 'google-play', running: true, vmStarted: true, androidReady: true, serial: 'ui-fixture' },
+    switching: false, stopping: false,
+  };
   let settings = {
     theme: 'light', language: 'zh-CN', wizardDone: true, wizardVersion: '0.8.0',
     engine: { mode: 'builtin', idleShutdownMinutes: 15, resourceMode: 'balanced', gpuMode: 'auto', windowMode: 'auto', memoryMB: 4096, cores: 4, autoMemory: true, audio: true, fastDns: true, liteMode: true, keepSnapshot: true, prewarm: false, mouseRightBack: true, mouseWheelMode: 'smooth' },
@@ -47,11 +53,13 @@ function createFixture() {
     calls,
     setResponse(channel, respond) { overrides.set(channel, respond); },
     clearResponse(channel) { overrides.delete(channel); },
+    setSystemState(patch) { systemState = merge(systemState, patch); },
     async respond(channel, payload) {
       calls.push({ channel, payload });
       if (overrides.has(channel)) return overrides.get(channel)(payload);
       switch (channel) {
-        case 'app:i18n': return { lang: 'zh-CN', locale: 'zh-CN', dict: {}, messages: {} };
+        case 'app:i18n': return { lang: settings.language === 'en-US' ? 'en-US' : 'zh-CN', dict: settings.language === 'en-US' ? english : {} };
+        case 'app:theme': return { theme: settings.theme };
         case 'app:info': return { version: '0.8.0', name: 'ApkStart', platform: { platform, canEmbed:isWin, canIntegrateShell:isWin, canProvision:true, support:isWin?'full':'external', acceleration:{kind:isWin?'whpx':'kvm',ok:true} }, dataDir, ...resolvedPaths(), sharedDir: settings.sharedDir };
         case 'settings:get': return settings;
         case 'settings:set': settings = merge(settings, payload); return settings;
@@ -59,7 +67,14 @@ function createFixture() {
         case 'runtime:status': return { env: { adb: {ok:true}, emulator: {ok:true}, sysimg: {ok:true}, accel: {ok:true,kind:isWin?'whpx':'kvm'} }, adbOk: true, deviceOnline: true, android: '14', serial: 'ui-fixture', installed: true, freeform: true, vmRunning: true, mode: 'builtin' };
         case 'android:status': return { ok: true, sdk: 34, wifi: true, airplane: false, animationsOff: false, volume: 60, fontScale: 1, density: 320, brightness: 70 };
         case 'android:permissions': return { ok: true, permissions: [{ name: 'android.permission.CAMERA', granted: false, label: '相机' }] };
-        case 'runtime:dataInfo': return { imageGB: 24, freeDiskMB: 64000, avdDir: path.join(resolvedPaths().avdHome, 'apkstart.avd') };
+        case 'runtime:dataInfo': return { imageGB, freeDiskMB: 64000, avdDir: path.join(resolvedPaths().avdHome, 'apkstart.avd') };
+        case 'runtime:setDataSize': {
+          const gb = Number(payload);
+          if (!Number.isSafeInteger(gb) || gb < 0 || gb > 64 || (gb && gb < imageGB)) return { ok:false, error:'UI 夹具：容量无效或不能缩小现有数据分区' };
+          if (gb) imageGB = gb;
+          settings = merge(settings, { engine: { dataPartitionGB: gb } });
+          return { ok:true, imageGB, auto:gb === 0 };
+        }
         case 'runtime:usage': return { total: 8.2 * 2 ** 30, totalText: '8.2 GB', reclaimable: 540 * 2 ** 20, reclaimableText: '540 MB', count: 2 };
         case 'assoc:status': return { registered: false };
         case 'provision:check': return { adb: true, emulator: true, sysimg: true, allReady: true, ready: true, paths: { root: settings.runtime.dir }, components: [] };
@@ -70,10 +85,20 @@ function createFixture() {
         case 'doctor:selfCheck': return { ok: true, issues: [], checks: [{ name: 'UI 隔离测试', ok: true, detail: '未操作真实运行时' }] };
         case 'sys:drives': return { drives: [{ drive: 'C:', free: 32 * 2 ** 30, total: 256 * 2 ** 30 }, { drive: 'D:', free: 128 * 2 ** 30, total: 512 * 2 ** 30 }], recommended: 'D:', systemDrive: 'C:' };
         case 'image:status': return { ok: true, selectedFlavor:'google_apis_playstore', defaultImage:{id:'google_apis_playstore',ok:true,label:'Android 14 · Google Play',playStore:true,gms:true,avd:'apkstart.avd'}, items:[{id:'fixture',name:'测试 AVD 镜像',api:34,abi:'x86_64',state:'ok'}], images: [], active: null, activeId: '', default: true };
-        case 'system:list': return { ok: true, systems, catalogInfo: { source: 'built-in' }, pathWarnings: [] };
-        case 'system:detail': return { ok: true, system: systems.find(s => s.id === payload) || systems[0] };
+        case 'system:list': return {
+          ok: true, currentSystemId: systemState.current.systemId,
+          systems: systems.map(s => ({ ...s, current: s.id === systemState.current.systemId,
+            local: { ...s.local, running: s.id === systemState.current.systemId && !!systemState.current.running } })),
+          catalogInfo: { source: 'built-in' }, pathWarnings: [],
+        };
+        case 'system:detail': return { ok: true, detail: { ...(systems.find(s => s.id === payload) || systems[0]), logs: [] } };
         case 'system:tasks': return { ok: true, tasks };
-        case 'system:status': return { ok: true, systemId: 'google-play', current: { systemId: 'google-play', running: true }, running: true };
+        case 'system:resume': case 'system:retry': return { ok: true, taskId: payload };
+        case 'system:status': return { ok: true, ...systemState, tasks: tasks.slice(0, 10) };
+        case 'system:stop':
+          systemState = { ...systemState, switching: false, stopping: false,
+            current: { ...systemState.current, running: false, vmStarted: false, androidReady: false, stopped: true } };
+          return { ok: true, running: false };
         case 'system:diskUsage': return { ok: true, totalText: '8.2 GB', systems: [] };
         case 'guest:state': return { ok: true, online: true, desired:'zh-CN', live:{localeChinese:true,locale:'zh-CN',groups:[{id:'demo',label:'示例预装应用',note:'仅用于界面测试',total:3,remaining:3}]}, locale: 'zh-CN', groups: [] };
         case 'display:state': return { ok: true, mode: 'window', size: '720x1280', portrait: true, width: 720, height: 1280 };

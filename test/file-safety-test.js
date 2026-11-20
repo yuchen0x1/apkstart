@@ -30,7 +30,7 @@ function handler(channel, next, context) {
   let callback;
   vm.runInNewContext(source.slice(start, end), {
     ipcMain: { handle: (_channel, fn) => { callback = fn; } },
-    fs, path, os, backup, ...context,
+    fs, path, os, backup, filetype: require('../src/core/filetype'), ...context,
   });
   return callback;
 }

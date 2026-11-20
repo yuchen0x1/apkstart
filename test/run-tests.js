@@ -50,6 +50,7 @@ test('能解析自身所在项目的 package.json 压缩包结构', () => {
 
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
   eocd.writeUInt16LE(1, 10);
   eocd.writeUInt32LE(46 + name.length, 12); // 中央目录总大小
   eocd.writeUInt32LE(30 + name.length + data.length, 16); // 中央目录偏移
@@ -81,19 +82,12 @@ const { parseAxml } = require('../src/core/axml');
 const { ResTable } = require('../src/core/arsc');
 const { parseApk, quickCheck } = require('../src/core/apk');
 
-// 测试夹具：优先用环境变量 APKSTART_TEST_APK 指定，
-// 否则尝试常见的本机 APK 位置（只读，不复制）
+// 仅读取明确指定或仓库内的夹具，不隐式扫描用户 Documents。
 function findFixture() {
   const candidates = [
     process.env.APKSTART_TEST_APK,
     path.join(__dirname, 'fixtures', 'sample.apk'),
   ];
-  try {
-    const dl = path.join(process.env.USERPROFILE || '', 'Documents');
-    for (const f of fs.readdirSync(dl)) {
-      if (/\.apk$/i.test(f)) candidates.push(path.join(dl, f));
-    }
-  } catch (_) { /* ignore */ }
   return candidates.find((c) => c && fs.existsSync(c));
 }
 

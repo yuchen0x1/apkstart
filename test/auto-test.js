@@ -640,7 +640,7 @@ const { adbKeyHint } = require('../src/core/engine');
 
   console.log('\n[layers.js 容器式瘦身]');
 
-  await test('盘点可回收项：非 x86_64 QEMU、旧镜像、旧 AVD、锁文件、旧快照', () => {
+  await test('盘点可再生缓存并保留其他系统镜像及 AVD 用户数据', () => {
     const root = path.join(TMP, 'runtime-layers');
     const mk = (p, size) => {
       fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -662,10 +662,10 @@ const { adbKeyHint } = require('../src/core/engine');
     const paths = a.candidates.map((c) => c.path.replace(/\\/g, '/'));
     assert(paths.some((p) => p.endsWith('qemu-system-aarch64.exe')), '应列出非 x86_64 QEMU');
     assert(!paths.some((p) => p.endsWith('qemu-system-x86_64.exe')), '不能删 x86_64 QEMU');
-    assert(paths.some((p) => p.includes('android-30')), '应列出旧版 API30 镜像');
-    assert(paths.some((p) => p.endsWith('.lock')), '应列出锁文件');
-    assert(paths.some((p) => p.includes('snapshots')), '应列出旧快照');
-    assert(paths.some((p) => p.includes('apkstart-arm.avd')), '应列出非活动 AVD');
+    assert(!paths.some((p) => p.includes('android-30')), '不能按 API 版本猜测其他镜像可删除');
+    assert(paths.some((p) => p.endsWith('.lock')), '应列出已知锁文件');
+    assert(paths.some((p) => p.includes('snapshots')), '应列出受管快照');
+    assert(!paths.some((p) => p.includes('apkstart-arm.avd')), '非活动 AVD 仍可能包含用户数据');
     assert(!paths.some((p) => p.endsWith('apkstart.avd/config.ini')), '不能删活动 AVD 配置');
 
     const dry = layers.prune(root, { apply: false });
@@ -673,8 +673,14 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(fs.existsSync(path.join(root, 'avd', 'apkstart-arm.avd', 'userdata-qemu.img')));
 
     const done = layers.prune(root, { apply: true });
-    assert(done.saved > 0 && done.removed.length >= 5, '实际清理应释放空间');
-    assert(!fs.existsSync(path.join(root, 'avd', 'apkstart-arm.avd')), '非活动 AVD 应被清掉');
+    for (const suffix of ['qemu-system-aarch64.exe', 'multiInstance.lock']) {
+      assert(done.removed.some(c => c.path.endsWith(suffix)), `已知可再生文件应被回收：${suffix}`);
+    }
+    assert(done.removed.some(c => c.path.includes('snapshots')), '受管快照应回收');
+    assert(fs.existsSync(path.join(root, 'system-images', 'android-34', 'google_apis_playstore', 'x86_64', 'NOTICE.txt')), '小型说明文件不应回收');
+    assert(done.saved > 0, '实际清理应释放空间');
+    assert(fs.existsSync(path.join(root, 'avd', 'apkstart-arm.avd', 'userdata-qemu.img')), '非活动 AVD 的用户数据应保留');
+    assert(fs.existsSync(path.join(root, 'system-images', 'android-30', 'default', 'x86_64', 'system.img')), '未声明归属的镜像必须保留');
     assert(fs.existsSync(path.join(root, 'avd', 'apkstart.avd', 'config.ini')), '活动 AVD 必须保留');
     assert(fs.existsSync(path.join(root, 'emulator', 'qemu', 'windows-x86_64', 'qemu-system-x86_64.exe')), 'x86_64 QEMU 必须保留');
   });
@@ -695,35 +701,26 @@ const { adbKeyHint } = require('../src/core/engine');
 
   await test('同一个文件不会每轮都被从设备拉回来', async () => {
     const { Sharer } = require('../src/core/sharer');
-    const localDir = path.join(TMP, 'shared');
-    fs.mkdirSync(localDir, { recursive: true });
-    const file = path.join(localDir, 'a.txt');
-    fs.writeFileSync(file, 'hello');
-
-    const calls = { push: 0, pull: 0 };
-    const fakeClient = {
-      isOnline: async () => true,
-      shellMkdir: async () => {},
-      shell: async () => '',
-      push: async () => { calls.push += 1; },
-      pull: async (_r, dst) => { calls.pull += 1; fs.writeFileSync(dst, 'hello'); },
-      listRemoteStat: async () => [{ rel: 'a.txt', size: 5, mtime: Date.now() - 60000 }],
-    };
-    const sh = new Sharer({ client: () => fakeClient });
-    sh.localDirOverride = localDir;
-    // 用真实的路径/状态文件，但目录指向临时目录
-    Object.defineProperty(sh, 'localDir', { get: () => localDir });
-    Object.defineProperty(sh, 'remoteDir', { get: () => '/sdcard/x' });
-    sh.stateFile = path.join(TMP, 'shared-state.json');
-
-    await sh.sync();          // 第 1 轮：本机新文件 → 推上去
-    const firstPull = calls.pull;
-    await sh.sync();          // 第 2 轮
-    await sh.sync();          // 第 3 轮
-    await sh.sync();          // 第 4 轮
-    assert(calls.push === 1, `只应推送一次，实际 ${calls.push}`);
-    assert(firstPull === 0, `刚推上去的文件不该立刻被拉回来，实际拉取 ${firstPull} 次`);
-    assert(calls.pull === firstPull, `后续轮次不应再反复拉取，实际累计 ${calls.pull} 次`);
+    const { makeEnv, writeStable } = require('./lib/fake-adb');
+    const { root, localDir, remoteDir, dataDir, fake } = makeEnv('apkstart-auto-sync-');
+    try {
+      writeStable(path.join(localDir, 'a.txt'), 'hello');
+      const sh = new Sharer({ client: () => fake }, {
+        dataDir, settings: () => ({ sharedDir: localDir, deviceSharedDir: remoteDir }),
+      });
+      const first = await sh.sync(); // 本机新文件 → 验证暂存再提交到设备
+      const firstPull = fake.pullCount;
+      assert(first.pushed === 1 && !first.errors.length, JSON.stringify(first));
+      assert(fs.readFileSync(path.join(remoteDir, 'a.txt'), 'utf8') === 'hello', '设备应已收到内容');
+      await sh.sync();
+      await sh.sync();
+      await sh.sync();
+      assert(fake.pushCount === 1, `只应推送一次，实际 ${fake.pushCount}`);
+      assert(firstPull === 0, `刚推上去的文件不该立刻被拉回来，实际拉取 ${firstPull} 次`);
+      assert(fake.pullCount === firstPull, `后续轮次不应再反复拉取，实际累计 ${fake.pullCount} 次`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   await test('超大文件不会被反向拉回本机（本地目录不是设备缓存下水道）', async () => {
@@ -1007,8 +1004,9 @@ const { adbKeyHint } = require('../src/core/engine');
     // qemu 还在但句柄没了 —— 之后任何应用都 embed failed: emu=0、全黑。
     assert(/on\('close',\s*\(e\)\s*=>/.test(appwin), 'close 事件必须拿到事件对象才能 preventDefault');
     assert(/e\.preventDefault\(\)/.test(appwin), '关窗必须先拦下来，等 park 完成');
-    assert(/this\.close\(\{\s*keepApp:\s*false\s*\}\)/.test(appwin), '拦下后要走 close() 统一收尾');
-    assert(/_selfClose/.test(appwin), 'close() 自己触发的关闭不能被二次拦截');
+    assert(/if \(this\.win === win\) this\.close\(\)/.test(appwin), '拦下当前窗口后要走 close() 统一收尾');
+    assert(/close\(\{\s*keepApp\s*=\s*false\s*\}/.test(appwin), '普通关窗默认不保留应用');
+    assert(/win\.destroy\(\)/.test(appwin), 'park 收尾直接销毁宿主，不再触发原生 close');
 
     // 上游 #40：DPI 不感知的 powershell 会把物理像素再乘一次缩放，
     // 125% 下画面放大 1.28 倍 + 右/下被裁 + 点击整体偏左上。
@@ -1123,7 +1121,7 @@ const { adbKeyHint } = require('../src/core/engine');
     const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
     assert(!/this\.agent\.rotate\(/.test(appwinSrc), '不能再给模拟器发 Ctrl+←（只转画面、排版不变）');
     assert(/fullscreen = null/.test(appwinSrc) || /fullscreen =/.test(appwinSrc), 'rotate 要能接收显式的全屏状态');
-    assert(/if \(wantMax\) this\.win\.maximize\(\)/.test(appwinSrc), '切完方向要恢复最大化');
+    assert(/if \(wantMax\) win\.maximize\(\)/.test(appwinSrc), '切完方向要恢复捕获窗口的最大化');
     assert(/setLandscape\(true, \{ fullscreen: true \}\)/.test(mainSrc), '进全屏时必须显式告知要保持最大化');
   });
 
@@ -1156,7 +1154,10 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(!/ensureNetwork/.test(installSrc), '启动路径不能调用会冷启动的 ensureNetwork');
     const engineSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'engine.js'), 'utf8');
     assert(/device-offline/.test(engineSrc) && /45000/.test(engineSrc), '刚重启的设备掉线要给宽限，不能立刻判失败');
-    assert(/forceWipeOnNextStart/.test(engineSrc), '修复网络要走「重置数据」这条路');
+    const repairStart = engineSrc.indexOf('  repairNetwork(');
+    assert(repairStart >= 0, '必须提供独立网络修复入口');
+    const repair = engineSrc.slice(repairStart, engineSrc.indexOf('\n  dispose(', repairStart));
+    assert(!/forceWipeOnNextStart|resetAndroidData/.test(repair), '修复网络绝不能隐式重置应用数据');
     const emuSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'emulator.js'), 'utf8');
     assert(/_forceWipe/.test(emuSrc) && /async checkNetwork/.test(emuSrc), '模拟器要提供一次性 wipe 标记与网络体检');
   });
@@ -1893,14 +1894,17 @@ const { adbKeyHint } = require('../src/core/engine');
     const { downloadMulti } = require('../src/core/download');
     const data = Buffer.alloc(3 * 1024 * 1024);
     for (let i = 0; i < data.length; i += 1) data[i] = i % 251;
+    const sha256 = require('crypto').createHash('sha256').update(data).digest('hex');
+    const etag = '"auto-multi-v1"';
     const handler = (req, res) => {
       const r = /bytes=(\d+)-(\d+)/.exec(req.headers.range || '');
-      if (!r) { res.writeHead(200, { 'Content-Length': data.length }); res.end(data); return; }
+      if (!r) { res.writeHead(200, { 'Content-Length': data.length, ETag: etag }); res.end(data); return; }
       const a = Number(r[1]);
       const b = Math.min(Number(r[2]), data.length - 1);
       res.writeHead(206, {
         'Content-Range': `bytes ${a}-${b}/${data.length}`,
         'Content-Length': b - a + 1,
+        ETag: etag,
       });
       res.end(data.slice(a, b + 1));
     };
@@ -1917,7 +1921,11 @@ const { adbKeyHint } = require('../src/core/engine');
     ];
     const out = path.join(TMP, 'multi.bin');
     try {
-      const r = await downloadMulti(urls, out, { connections: 6, minChunk: 512 * 1024 });
+      const r = await downloadMulti(urls, out, {
+        expectSha256: sha256,
+        connections: 6,
+        minChunk: 512 * 1024,
+      });
       const got = fs.readFileSync(out);
       assert(Buffer.compare(got, data) === 0, '多源拼装后内容必须与源文件完全一致');
       assert(r.sources === 2 && r.parallel >= 2, `应同时用到 2 个源，实际 ${JSON.stringify(r)}`);
@@ -1935,14 +1943,20 @@ const { adbKeyHint } = require('../src/core/engine');
     const total = 3 * MB;
     const data = Buffer.alloc(total);
     for (let i = 0; i < total; i += 1) data[i] = i % 251;
+    const sha256 = require('crypto').createHash('sha256').update(data).digest('hex');
+    const etag = '"auto-resume-v1"';
     let ranged = 0;
     const handler = (req, res) => {
       const r = /bytes=(\d+)-(\d+)/.exec(req.headers.range || '');
-      if (!r) { res.writeHead(200, { 'Content-Length': total }); res.end(data); return; }
+      if (!r) { res.writeHead(200, { 'Content-Length': total, ETag: etag }); res.end(data); return; }
       const a = Number(r[1]);
       const b = Math.min(Number(r[2]), total - 1);
       if (b > a) ranged += 1;          // 只统计真正的数据块请求（探测用 0-0 不算）
-      res.writeHead(206, { 'Content-Range': `bytes ${a}-${b}/${total}`, 'Content-Length': b - a + 1 });
+      res.writeHead(206, {
+        'Content-Range': `bytes ${a}-${b}/${total}`,
+        'Content-Length': b - a + 1,
+        ETag: etag,
+      });
       res.end(data.slice(a, b + 1));
     };
     // 必须是两条地址：只有一条时 downloadMulti 会直接交给单源分块（那条路径自带续传）
@@ -1961,9 +1975,19 @@ const { adbKeyHint } = require('../src/core/engine');
       fs.ftruncateSync(fd, total);
       fs.writeSync(fd, data, 0, per * 2, 0);
       fs.closeSync(fd);
-      fs.writeFileSync(`${out}.chunks.json`, JSON.stringify({ total, n: 3, done: [0, per] }));
+      fs.writeFileSync(`${out}.chunks.json`, JSON.stringify({
+        v: 1,
+        identity: `expectSha256:${sha256}`,
+        total,
+        n: 3,
+        done: [0, per],
+      }));
 
-      const r = await downloadMulti(urls, out, { connections: 3, minChunk: MB });
+      const r = await downloadMulti(urls, out, {
+        expectSha256: sha256,
+        connections: 3,
+        minChunk: MB,
+      });
       assert(r.resumed === true, '应识别出这是断点续传');
       assert(ranged === 1, `只应补下 1 个块，实际请求 ${ranged} 块`);
       assert(Buffer.compare(fs.readFileSync(out), data) === 0, '续传后的文件必须与源完全一致');
@@ -2009,10 +2033,15 @@ const { adbKeyHint } = require('../src/core/engine');
     try {
       let err = null;
       try {
-        await downloadMulti(urls, out, { connections: 3, minChunk: MB, retries: 1 });
+        await downloadMulti(urls, out, {
+          expectSha256: require('crypto').createHash('sha256').update(data).digest('hex'),
+          connections: 3,
+          minChunk: MB,
+          retries: 1,
+        });
       } catch (e) { err = e; }
       assert(err, '错位的 Content-Range 必须让下载失败，不能当成成功');
-      assert(/Content-Range|范围不符/.test(err.message), `错误信息要指向范围不符：${err.message}`);
+      assert(/Content-Range|范围.*不符/.test(err.message), `错误信息要指向范围不符：${err.message}`);
     } finally {
       s1.close(); s2.close();
       fs.rmSync(out, { force: true });
@@ -2326,16 +2355,15 @@ const { adbKeyHint } = require('../src/core/engine');
   });
 
   await test('.xapk 拆分包：流式解出分片、解析 base、失败时清理临时目录', async () => {
-    const crypto = require('crypto');
     const { parseBundle } = require('../src/core/installer');
     const { buildApkBytes, buildStoredZip } = require('./lib/make-apk');
     const apk = buildApkBytes();
 
-    // 成功：包内两个分片（base + config），meta 来自可解析的那个
+    // 成功：包内两个分片（base + config），meta 必须来自没有 split 属性的 base
     const okPath = path.join(TMP, 'ok.xapk');
     fs.writeFileSync(okPath, buildStoredZip([
       { name: 'base.apk', data: apk },
-      { name: 'split_config.arm64_v8a.apk', data: apk },
+      { name: 'split_config.arm64_v8a.apk', data: buildApkBytes({ split: 'config.arm64_v8a' }) },
       { name: 'manifest.json', data: Buffer.from('{}') },
     ]));
     const b = await parseBundle(okPath);
@@ -2353,9 +2381,15 @@ const { adbKeyHint } = require('../src/core/engine');
     let err = null;
     try { await parseBundle(badPath); } catch (e) { err = e; }
     assert(err && /没有找到 APK 分片/.test(err.message), `应报没有分片，实际 ${err && err.message}`);
-    const dir = path.join(os.tmpdir(), 'apkstart-bundle',
-      crypto.createHash('sha1').update(badPath).digest('hex').slice(0, 12));
-    assert(!fs.existsSync(dir), '失败时应清理临时目录');
+    const invalid = path.join(TMP, 'invalid.xapk');
+    fs.writeFileSync(invalid, buildStoredZip([{ name: 'base.apk', data: Buffer.from('invalid APK') }]));
+    const made = [];
+    const mkdtemp = fs.mkdtempSync;
+    fs.mkdtempSync = (...args) => { const dir = mkdtemp(...args); made.push(dir); return dir; };
+    err = null;
+    try { await parseBundle(invalid); } catch (e) { err = e; } finally { fs.mkdtempSync = mkdtemp; }
+    assert(err, '损坏的 APK 必须拒绝');
+    assert(made.length === 1 && !fs.existsSync(made[0]), '失败时应清理本次实际分配的临时目录');
   });
 
   await test('materializeImages：展开 .img.gz、已展开跳过、坏镜像上报失败且不留半截', async () => {

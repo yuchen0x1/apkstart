@@ -19,12 +19,41 @@
   const CJK = /[\u4e00-\u9fa5]/;
   const ATTRS = ['placeholder', 'title', 'aria-label', 'alt'];
   const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'CODE', 'PRE']);
+  // 当前 renderer 的交互文案；主词典可覆盖，中文往返仍统一记忆源文。
+  const SESSION_EN = {
+    '正在检查并启用硬件加速…': 'Checking and enabling hardware acceleration…',
+    '仅在必要时请求系统授权，用于启动已有加速服务或启用 Windows 系统功能；不会自动安装第三方驱动。': 'System authorization is requested only when needed to start an existing acceleration service or enable Windows features. Third-party drivers are not installed automatically.',
+    '停止当前系统': 'Stop current system',
+    '取消切换': 'Cancel switch',
+    '正在停止…': 'Stopping…',
+    '正在停止当前系统…': 'Stopping the current system…',
+    '正在切换系统，可取消切换…': 'Switching systems; you can cancel…',
+    '无法确认当前系统状态，请刷新后重试': 'Cannot confirm the current system status. Refresh and try again.',
+    '切换中': 'Switching',
+    '停止中': 'Stopping',
+    '当前系统已停止': 'Current system stopped',
+    '切换已取消，当前系统已停止': 'Switch cancelled; current system stopped',
+    '系统切换已取消': 'System switch cancelled',
+    '停止操作已取消': 'Stop operation cancelled',
+    '未能确认当前系统已停止': 'Could not confirm that the current system stopped',
+    '请查看当前系统的实际运行状态。': 'Check the actual status of the current system.',
+    '下载与安装任务不会因此取消；安装器运行时请先在虚拟机内正常关机。': 'Download and installation tasks are not cancelled. If an installer is running, shut it down normally inside the VM first.',
+    '取消任务': 'Cancel task',
+    '任务已取消': 'Task cancelled',
+    '仅取消任务，不停止安装器，也不删除系统数据': 'Cancels only the task; does not stop the installer or delete system data',
+    [N + ' · 正在运行']: N + ' · Running',
+    [N + ' · 已启动，等待 Android 就绪']: N + ' · Started; waiting for Android',
+    [N + ' · 未运行']: N + ' · Not running',
+    [N + ' · 已停止']: N + ' · Stopped',
+  };
 
   let dict = {};
   let lang = 'zh-CN';
   let observer = null;
   /** 原文记忆：英文化时把中文原文存起来，切回中文时还原（否则 en→zh 现场切换回不去） */
   const originals = new WeakMap();
+  const originalAttrs = new WeakMap();
+  let originalTitle = null;
   /** 只含占位符的 key 拆成段，用于「变量拼进句子中间」的模板匹配 */
   let templates = [];
 
@@ -109,30 +138,48 @@
     return m[1] + out + m[3];
   }
 
+  function skipped(node) {
+    for (let el = node.nodeType === 1 ? node : node.parentElement; el; el = el.parentElement) {
+      if (SKIP_TAGS.has(el.tagName) || el.hasAttribute('data-i18n-skip')) return true;
+    }
+    return false;
+  }
+
   function translateTextNode(node) {
+    if (skipped(node)) return;
     const v = node.nodeValue;
-    // 当前值是中文原文就记住 —— 应用代码动态改写的也是中文源语言，
-    // observer 会再触发一次，这里永远存「最近一次见到的中文」
-    if (v && CJK.test(v)) originals.set(node, v);
+    if (originals.get(node)?.translated === v) return;
     const next = translateOne(v);
-    // 没变就不写：写回同样的值也会触发 characterData，白白自激一次
-    if (next !== v) node.nodeValue = next;
+    if (next !== v) {
+      originals.set(node, { original: v, translated: next });
+      node.nodeValue = next;
+    } else if (originals.has(node) && originals.get(node).translated !== v) {
+      // 业务代码已改成其他内容，不能在切回中文时恢复过期原文。
+      originals.delete(node);
+    }
   }
 
   function translateElement(el) {
-    if (!el || el.nodeType !== 1) return;
-    if (SKIP_TAGS.has(el.tagName)) return;
-    if (el.hasAttribute && el.hasAttribute('data-i18n-skip')) return;
+    if (!el || el.nodeType !== 1 || skipped(el)) return;
     for (const name of ATTRS) {
       if (!el.hasAttribute || !el.hasAttribute(name)) continue;
       const v = el.getAttribute(name);
+      if (originalAttrs.get(el)?.get(name)?.translated === v) continue;
       const next = translateOne(v);
-      if (next !== v) el.setAttribute(name, next);
+      if (next !== v) {
+        let attrs = originalAttrs.get(el);
+        if (!attrs) { attrs = new Map(); originalAttrs.set(el, attrs); }
+        attrs.set(name, { original: v, translated: next });
+        el.setAttribute(name, next);
+      } else {
+        const attrs = originalAttrs.get(el);
+        if (attrs && attrs.has(name) && attrs.get(name).translated !== v) attrs.delete(name);
+      }
     }
   }
 
   function walk(root) {
-    if (!root) return;
+    if (!root || skipped(root)) return;
     if (root.nodeType === 3) { translateTextNode(root); return; }
     if (root.nodeType !== 1) return;
     translateElement(root);
@@ -154,15 +201,24 @@
   /** 切回中文：把英文化时记下的中文原文写回去（restore 之后再走 reveal） */
   function restoreAll(root) {
     if (!root) return;
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    let n = walker.nextNode();
-    while (n) {
-      if (originals.has(n)) {
-        const orig = originals.get(n);
-        if (n.nodeValue !== orig) n.nodeValue = orig;
+    const restore = (node) => {
+      if (node.nodeType === 3 && originals.has(node)) {
+        const saved = originals.get(node);
+        if (node.nodeValue === saved.translated) node.nodeValue = saved.original;
+        originals.delete(node);
+      } else if (node.nodeType === 1 && originalAttrs.has(node)) {
+        for (const [name, saved] of originalAttrs.get(node)) {
+          if (node.getAttribute(name) === saved.translated) node.setAttribute(name, saved.original);
+        }
+        originalAttrs.delete(node);
       }
-      n = walker.nextNode();
-    }
+    };
+    restore(root);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let n = walker.nextNode();
+    while (n) { restore(n); n = walker.nextNode(); }
+    if (originalTitle && document.title === originalTitle.translated) document.title = originalTitle.original;
+    originalTitle = null;
   }
 
   function startObserver() {
@@ -189,13 +245,23 @@
   function apply(payload) {
     try {
       lang = (payload && payload.lang) === 'en-US' ? 'en-US' : 'zh-CN';
-      dict = (payload && payload.dict) || {};
+      dict = lang === 'en-US' ? { ...SESSION_EN, ...payload?.dict } : (payload && payload.dict) || {};
       buildTemplates();
       document.documentElement.setAttribute('lang', lang === 'en-US' ? 'en' : 'zh-CN');
-      if (lang !== 'en-US') { restoreAll(document.body); reveal(); return; }
-      if (document.title) document.title = translateOne(document.title);
+      if (lang !== 'en-US') {
+        if (observer) { observer.disconnect(); observer = null; }
+        restoreAll(document.body); reveal(); return;
+      }
+      if (document.title) {
+        const next = translateOne(document.title);
+        if (next !== document.title) {
+          originalTitle = { original: document.title, translated: next };
+          document.title = next;
+        }
+      }
       walk(document.body);
       startObserver();
+      reveal();
     } catch (_) {
       // 翻译失败绝不能让界面卡在隐藏状态
       reveal();
@@ -205,6 +271,8 @@
   /** 语言切换后重新走一遍（先清 observer，避免边改边触发） */
   function retranslate(payload) {
     if (observer) { observer.disconnect(); observer = null; }
+    // 先恢复源文，重复英文载荷或词典更新也必须从中文重新翻译。
+    restoreAll(document.body);
     apply(payload);
     reveal();
   }

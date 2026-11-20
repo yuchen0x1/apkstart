@@ -30,10 +30,28 @@ class EmulatorProvider extends BaseProvider {
     return null;
   }
 
+  async getRunningState() {
+    if (this.backendEngine && typeof this.backendEngine.status === 'function') {
+      const env = await this.backendEngine.status();
+      if (!env || typeof env.vmRunning !== 'boolean' || typeof env.deviceOnline !== 'boolean') {
+        throw new Error('引擎未返回可验证的运行状态');
+      }
+      // A running guest is shared by the built-in flavor providers. Its selected
+      // flavor is presentation/configuration, not proof that the process is stopped.
+      return !!(env.vmRunning || env.deviceOnline);
+    }
+    if (this.backendEngine && typeof this.backendEngine.vmRunning === 'boolean') return this.backendEngine.vmRunning;
+    throw new Error('无法确认内置运行时状态');
+  }
+
   async getLocalStatus() {
     let env = {};
     if (this.backendEngine && this.backendEngine.status) {
-      try { env = await this.backendEngine.status(); } catch (_) {}
+      // Unknown is not stopped: lifecycle callers must see this failure.
+      env = await this.backendEngine.status();
+      if (!env || typeof env.vmRunning !== 'boolean' || typeof env.deviceOnline !== 'boolean') {
+        throw new Error('引擎未返回可验证的运行状态');
+      }
     }
     const settings = this.settings;
     const selected = settings.runtime && settings.runtime.systemImageFlavor;
@@ -63,31 +81,39 @@ class EmulatorProvider extends BaseProvider {
   }
 
   async start(ctx = {}) {
+    const signal = ctx.signal;
+    if (signal && signal.aborted) return { ok: false, code: 'START_CANCELLED', error: '系统启动已取消' };
     if (!this.backendEngine || typeof this.backendEngine.ensure !== 'function') {
       return { ok: false, error: '引擎未就绪' };
     }
     const r = await this.backendEngine.ensure({
       onLog: (m) => this.log(m),
-      lowspec: !!(ctx && ctx.lowspec),
-      timeoutMs: (ctx && ctx.timeoutMs) || 0,
+      lowspec: !!ctx.lowspec,
+      timeoutMs: ctx.timeoutMs || 0,
+      signal,
     });
+    if (signal && signal.aborted) return { ok: false, code: 'START_CANCELLED', error: '系统启动已取消' };
     return Object.assign({ backend: 'AndroidEmulatorBackend' }, r || { ok: !!r });
   }
 
-  async stop() {
+  async stop(ctx = {}) {
     if (this.backendEngine && typeof this.backendEngine.stop === 'function') {
-      const stopped = await this.backendEngine.stop();
-      if (stopped === false || (stopped && stopped.ok === false)) {
-        return { ok: false, error: stopped.error || '未能确认运行时已停止' };
+      const stopped = await this.backendEngine.stop({ cancelSignal: ctx.signal });
+      if (!(stopped === true || stopped && stopped.ok === true)) {
+        return { ok: false, error: stopped && stopped.error || '未能确认运行时已停止' };
       }
+    } else {
+      return { ok: false, error: '无法确认内置运行时归属及停止能力' };
     }
+    if (await this.getRunningState()) return { ok: false, error: '内置运行时仍在运行' };
     return { ok: true };
   }
 
-  async restart() {
-    const result = await this.stop();
+  async restart(ctx = {}) {
+    const result = await this.stop(ctx);
     if (!result.ok) return result;
-    return this.start();
+    if (ctx.signal && ctx.signal.aborted) return { ok: false, code: 'START_CANCELLED', error: '系统启动已取消' };
+    return this.start(ctx);
   }
 }
 

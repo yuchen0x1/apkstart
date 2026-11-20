@@ -79,6 +79,7 @@ app.whenReady().then(async () => {
     height: 740,
     webPreferences: {
       preload: path.join(SRC, 'preload.js'),
+      additionalArguments: ['--apkstart-role=main'],
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,

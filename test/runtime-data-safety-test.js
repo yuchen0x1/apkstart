@@ -1,0 +1,633 @@
+'use strict';
+// Pure Node: only synthetic files under a private temp directory. No real ADB,
+// process enumeration, port probes, network downloads, or settings access.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const vm = require('node:vm');
+const { EventEmitter } = require('node:events');
+const layers = require('../src/core/layers');
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-runtime-safety-'));
+const forbidden = () => { throw new Error('unexpected host operation'); };
+const childProcess = { spawn: forbidden, spawnSync: forbidden, execFile: forbidden };
+const core = path.join(__dirname, '..', 'src', 'core');
+function load(file, deps) {
+  const source = fs.readFileSync(path.join(core, file), 'utf8');
+  const module = { exports: {} };
+  const req = (name) => {
+    if (Object.hasOwn(deps, name)) return deps[name];
+    if (['fs', 'path', 'zlib', 'crypto'].includes(name)) return require(name);
+    if (name === 'child_process') return childProcess;
+    throw new Error(`unmocked dependency: ${name}`);
+  };
+  const wrap = vm.runInThisContext(`(function (require, module, __dirname) {${source}\n})`, { filename: path.join(core, file) });
+  wrap(req, module, core);
+  return module.exports;
+}
+function put(file, content = 'fixture') {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, content);
+  return file;
+}
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => { resolve = r; });
+  return { promise, resolve };
+}
+let passed = 0;
+let failed = 0;
+async function test(name, fn) {
+  const dir = fs.mkdtempSync(path.join(root, 'case-'));
+  let timer;
+  try {
+    await Promise.race([Promise.resolve().then(() => fn(dir)), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('fixture did not settle: ' + name)), 5000);
+    })]);
+    console.log(`PASS ${name}`);
+    passed++;
+  } catch (error) {
+    console.error(`FAIL ${name}: ${error.stack || error}`);
+    failed++;
+  } finally { clearTimeout(timer); }
+}
+
+function runtime(dir, overrides = {}) {
+  const settings = { engine: { mode: 'builtin' }, runtime: {}, device: '' };
+  const writes = [];
+  const processes = new Map();
+  const processOwner = {
+    listeners: async () => [...processes].map(([port, p]) => ({ port, pid: p.pid })),
+    pidOnPort: async (port) => processes.get(port)?.pid || 0,
+    getProcessInfo: async (pid) => [...processes.values()].find((p) => p.pid === pid) || null,
+    sameIdentity: (a, b) => !!a && !!b && a.pid === b.pid && a.started === b.started,
+    terminateOwnedProcess: forbidden,
+  };
+  const store = {
+    DATA_DIR: dir, getSettings: () => settings, ensureDirs: () => {},
+    saveSettings: (patch) => { writes.push(patch); Object.assign(settings, patch); },
+    saveApps: (apps) => { writes.push(apps); }, getApps: () => [],
+  };
+  const env = { emulator: { ok: false }, sysimg: { ok: false } };
+  const net = { connect: ({ port }) => {
+    const sock = new EventEmitter();
+    sock.setTimeout = () => sock;
+    sock.destroy = () => {};
+    queueMicrotask(() => sock.emit(processes.has(port) ? 'connect' : 'error', new Error('mock')));
+    return sock;
+  } };
+  const { Runtime } = load('engine.js', {
+    net, './adb': {}, './android': {}, './store': store,
+    './provision': {}, './emulator': { EmulatorEngine: class {} }, './doctor': {}, './repair': {},
+    './container': require('../src/core/container'), './guest': {}, './platform': { canProvision: true },
+    './process-owner': processOwner, './layers': layers, './userdata': require('../src/core/userdata'),
+    ...overrides,
+  });
+  const rt = Object.create(Runtime.prototype);
+  const root = path.join(dir, 'runtime');
+  const avdHome = path.join(root, 'avd');
+  Object.assign(rt, { vmProc: null, vmStarting: false, emuSerial: 'emulator-5554', _activeApps: new Set(), _bootLog: [] });
+  rt.emulator = {
+    avdName: 'apkstart', port: 5554, running: () => false, stop: forbidden,
+    ownedProcessOnPort: async (p) => processes.get(p)?.owned ? processes.get(p) : null,
+    ownsProcess: (p) => !!p?.owned,
+  };
+  rt.provisioner = { paths: () => ({ root, avdHome }), checkEnv: async () => env, materializeImages: async () => {} };
+  const online = new Set();
+  const prepared = [];
+  rt.client = (serial = settings.engine.mode === 'attach' ? settings.device : rt.emuSerial) => ({
+    serial,
+    isOnline: async () => online.has(serial),
+    devices: async () => [...online].map((serial) => ({ serial, state: 'device' })),
+    connect: async () => online.has(serial),
+    exec: async (args) => {
+      if (args[0] === 'get-state') return { stdout: online.has(serial) ? 'device' : 'offline' };
+      assert.equal(args[0], 'devices');
+      return { stdout: ['List of devices attached', ...[...online].map((id) => `${id}\tdevice`)].join('\n') };
+    },
+    shell: async () => '1',
+  });
+  rt.prepare = async (c) => { prepared.push(c.serial); };
+  rt.probe = async () => [{ serial: '127.0.0.1:7555', name: 'another runtime' }];
+  rt.stop = async () => true;
+  const avdDir = path.join(avdHome, 'apkstart.avd');
+  const userdata = put(path.join(avdDir, 'userdata-qemu.img'), 'user data');
+  const snapshot = put(path.join(avdDir, 'snapshots', 'boot', 'ram.bin'), 'snapshot');
+  const cache = put(path.join(root, '_tmp', 'cache.tmp'));
+  return { Runtime, rt, settings, writes, online, prepared, processes, processOwner, root, userdata, snapshot, cache };
+}
+
+function provision(dir, download) {
+  const { Provisioner } = load('provision.js', {
+    './store': { getSettings: () => settings, saveSettings: ({ runtime }) => Object.assign(settings.runtime, runtime) },
+    './doctor': {}, './platform': {}, './download': { downloadAnyParallel: download },
+    './zip': {}, './sources': {}, './images': {},
+  });
+  const settings = { runtime: {} };
+  const p = Object.create(Provisioner.prototype);
+  const imagesDir = path.join(dir, 'runtime', 'images');
+  const iso = path.join(imagesDir, 'android-x86.iso');
+  fs.mkdirSync(imagesDir, { recursive: true });
+  p.ensureDirs = () => ({ root: path.dirname(imagesDir), imagesDir, iso });
+  p.paths = p.ensureDirs;
+  p.guardDisk = async () => {};
+  p.inspectIso = (file) => ({ ok: fs.existsSync(file) && fs.readFileSync(file, 'utf8') !== 'invalid', size: 7, reason: 'bad ISO' });
+  return { p, settings, imagesDir, iso };
+}
+
+async function main() {
+  await test('cancelled native discovery settles without late prepare or spawn', async (dir) => {
+    const { rt, prepared } = runtime(dir);
+    const entered = deferred();
+    const release = deferred();
+    rt.ownedRuntimeIdentity = () => { entered.resolve(); return release.promise; };
+    rt.boot = forbidden;
+    const controller = new AbortController();
+    const pending = rt.ensure({ signal: controller.signal });
+    await entered.promise;
+    controller.abort();
+    assert.equal((await pending).code, 'START_CANCELLED');
+    release.resolve({ owned: true });
+    await new Promise(setImmediate);
+    assert.deepEqual(prepared, []);
+    assert.equal(rt._ensurePromise, null);
+  });
+  await test('ensure cannot share another caller cancellation scope', async (dir) => {
+    const { rt } = runtime(dir);
+    const entered = deferred();
+    const release = deferred();
+    rt._ensureInner = async () => { entered.resolve(); await release.promise; return { ok: false }; };
+    const a = new AbortController();
+    const b = new AbortController();
+    const pending = rt.ensure({ signal: a.signal });
+    await entered.promise;
+    assert.equal(rt.ensure({ signal: a.signal }), pending);
+    assert.equal((await rt.ensure({ signal: b.signal })).code, 'START_BUSY');
+    release.resolve();
+    await pending;
+  });
+  await test('Runtime fences actual spawn and AVD retry after awaited before-spawn cancellation', async (dir) => {
+    const entered = deferred();
+    const release = deferred();
+    let spawns = 0;
+    let avds = 0;
+    class BaseEngine {
+      async start() {
+        this.ensureAvd();
+        entered.resolve();
+        await release.promise;
+        for (let i = 0; i < 2; i++) {
+          try { this.spawnOnce(); } catch (_) { /* base retry loop catches errors */ }
+          try { this.ensureAvd(); } catch (_) { /* next retry is also fenced */ }
+        }
+        return { ok: false };
+      }
+      ensureAvd() { avds++; }
+      spawnOnce() { spawns++; }
+    }
+    const { Runtime } = runtime(dir, { './emulator': { EmulatorEngine: BaseEngine },
+      './provision': { Provisioner: class {} } });
+    const rt = new Runtime(dir);
+    const c = new AbortController();
+    const pending = rt.emulator.start({ signal: c.signal });
+    await entered.promise;
+    c.abort();
+    release.resolve();
+    await pending;
+    assert.equal(spawns, 0);
+    assert.equal(avds, 1);
+    await rt.emulator.start(); // cancellation scope is not retained by a later start
+    assert.equal(spawns, 2);
+  });
+  for (const boundary of ['priority', 'active-callback', 'shell']) {
+    await test(`beginApp cancellation fence at ${boundary} uses captured client`, async (dir) => {
+      const { rt, settings } = runtime(dir);
+      settings.engine.deepTrim = true;
+      let cancelled = false;
+      let active = 0;
+      let shells = 0;
+      let logs = 0;
+      const entered = deferred();
+      const release = deferred();
+      rt.client = forbidden;
+      rt.log = () => logs++;
+      rt.emulator.cancelSnapshotSave = () => {};
+      rt.emulator.setPriority = async () => { if (boundary === 'priority') { entered.resolve(); await release.promise; } };
+      const client = { shell: async () => { shells++; if (boundary === 'shell') { entered.resolve(); await release.promise; } } };
+      const pending = rt.beginApp('test.app', { client, shouldCancel: () => cancelled,
+        onActive: () => { active++; if (boundary === 'active-callback') cancelled = true; } });
+      if (boundary !== 'active-callback') { await entered.promise; cancelled = true; release.resolve(); }
+      assert.equal((await pending).cancelled, true);
+      assert.equal(active, boundary === 'priority' ? 0 : 1);
+      assert.equal(shells, boundary === 'shell' ? 1 : 0);
+      assert.equal(logs, 0);
+    });
+  }
+  for (const boundary of ['entry', 'forceStop', 'shell', 'priority']) {
+    await test(`endApp cancellation fence at ${boundary} does not rearm snapshots or polling`, async (dir) => {
+      const { rt } = runtime(dir);
+      let cancelled = boundary === 'entry';
+      const calls = [];
+      const entered = deferred();
+      const release = deferred();
+      const step = async (name) => { calls.push(name); if (boundary === name) { entered.resolve(); await release.promise; } };
+      rt.client = forbidden;
+      rt._armSnapshotSave = () => calls.push('snapshot');
+      rt.emulator.setPriority = () => step('priority');
+      const client = { forceStop: () => step('forceStop'), shell: () => step('shell') };
+      const pending = rt.endApp('test.app', { client, shouldCancel: () => cancelled, onIdle: () => calls.push('idle') });
+      if (boundary !== 'entry') { await entered.promise; cancelled = true; release.resolve(); }
+      assert.equal((await pending).cancelled, true);
+      assert.deepEqual(calls, boundary === 'entry' ? [] : ['forceStop', 'shell', 'priority'].slice(0,
+        ['forceStop', 'shell', 'priority'].indexOf(boundary) + 1));
+    });
+  }
+  await test('endApp normal captured-client path retains onIdle(true) contract', async (dir) => {
+    const { rt } = runtime(dir);
+    const calls = [];
+    rt.client = forbidden;
+    rt.emulator.setPriority = async () => calls.push('priority');
+    rt._armSnapshotSave = () => calls.push('snapshot');
+    await rt.endApp('test.app', { client: { forceStop: async () => calls.push('stop'), shell: async () => calls.push('shell') },
+      onIdle: (idle) => calls.push(idle) });
+    assert.deepEqual(calls, ['stop', 'shell', 'priority', 'snapshot', true]);
+  });
+  for (const serial of ['emulator-5554', 'emulator-5580']) {
+    await test(`builtin requires ownership evidence before prepare (${serial})`, async (dir) => {
+      const { rt, online, prepared } = runtime(dir);
+      online.add(serial);
+      const result = await rt.ensure();
+      assert.equal(result.ok, false);
+      assert.deepEqual(prepared, []);
+    });
+  }
+  await test('builtin still reuses a verified native serial', async (dir) => {
+    const { rt, online, prepared, processes } = runtime(dir);
+    const owner = { owned: true, pid: 1234, started: 'birth' };
+    processes.set(5554, owner);
+    processes.set(5555, owner);
+    online.add('emulator-5554');
+    assert.equal((await rt.ensure()).ok, true);
+    assert.deepEqual(prepared, ['emulator-5554']);
+  });
+  await test('builtin still adopts a verified detached instance on its dynamic port', async (dir) => {
+    const { rt, online, prepared, processes } = runtime(dir);
+    const owner = { owned: true, pid: 1234, started: 'birth' };
+    processes.set(5580, owner);
+    processes.set(5581, owner);
+    online.add('127.0.0.1:5581');
+    const r = await rt.ensure();
+    assert.equal(r.reused, true);
+    assert.deepEqual(prepared, ['127.0.0.1:5581']);
+  });
+  await test('builtin rechecks process identity after the online probe', async (dir) => {
+    const { rt, prepared, processes } = runtime(dir);
+    const first = { owned: true, pid: 1234, started: 'first' };
+    const second = { ...first, owned: false, started: 'second' };
+    for (const port of [5554, 5555]) processes.set(port, first);
+    rt.client = () => ({ isOnline: async () => {
+      for (const port of [5554, 5555]) processes.set(port, second);
+      return true;
+    } });
+    assert.equal((await rt.ensure()).ok, false);
+    assert.deepEqual(prepared, []);
+  });
+  await test('attach can use its selected device without builtin ownership', async (dir) => {
+    const { rt, settings, online, prepared } = runtime(dir);
+    settings.engine.mode = 'attach';
+    settings.device = 'selected-serial';
+    online.add(settings.device);
+    assert.equal((await rt.ensure()).ok, true);
+    assert.deepEqual(prepared, [settings.device]);
+  });
+  await test('attach does not fall back to a different device', async (dir) => {
+    const { rt, settings, online, prepared, writes } = runtime(dir);
+    settings.engine.mode = 'attach';
+    settings.device = 'selected-serial';
+    online.add('127.0.0.1:7555');
+    assert.equal((await rt.ensure()).ok, false);
+    assert.deepEqual(prepared, []);
+    assert.deepEqual(writes, []);
+  });
+  await test('reset and gc previews only enumerate files, even while running', async (dir) => {
+    const { rt, writes, userdata, snapshot, cache } = runtime(dir);
+    rt.emulator.running = () => true;
+    let stops = 0;
+    rt.stop = async () => { stops++; return false; };
+    const gc = await rt.cleanup({ apply: false, includeSnapshots: true });
+    const reset = await rt.resetAndroidData({ apply: false });
+    assert(gc.candidates.some((c) => snapshot.startsWith(c.path + path.sep)));
+    assert(reset.candidates.some((c) => c.path === userdata));
+    assert.equal(stops, 0);
+    assert.deepEqual(writes, []);
+    for (const file of [userdata, snapshot, cache]) assert(fs.existsSync(file));
+  });
+  for (const failure of ['stop false', 'stop throws', 'device remains online', 'ADB read fails', 'ADB output invalid', 'startup pending']) {
+    await test(`reset and gc fail closed: ${failure}`, async (dir) => {
+      const { rt, writes, online, userdata, snapshot, cache } = runtime(dir);
+      let stops = 0;
+      rt.stop = async () => {
+        stops++;
+        if (failure === 'stop throws') throw new Error('stop fault');
+        return failure !== 'stop false';
+      };
+      if (failure === 'device remains online') online.add('127.0.0.1:5555');
+      if (failure === 'ADB read fails') rt.client = () => ({ exec: async () => { throw new Error('ADB fault'); }, isOnline: async () => false });
+      if (failure === 'ADB output invalid') rt.client = () => ({ exec: async () => ({ stdout: '' }), isOnline: async () => false });
+      if (failure === 'startup pending') rt._ensurePromise = deferred().promise;
+      const reset = await rt.resetAndroidData();
+      assert.equal(reset.ok, false);
+      await assert.rejects(rt.cleanup({ apply: true, includeSnapshots: true }));
+      assert.equal(stops, failure === 'startup pending' ? 0 : 2);
+      assert.deepEqual(writes, []);
+      for (const file of [userdata, snapshot, cache]) assert(fs.existsSync(file));
+    });
+  }
+  await test('reset only touches current data after successful stop, with concurrent start blocked', async (dir) => {
+    const { rt, writes, userdata, snapshot, cache } = runtime(dir);
+    const keep = put(path.join(path.dirname(userdata), 'config.ini'));
+    const other = put(path.join(path.dirname(path.dirname(userdata)), 'apkstart-custom.avd', 'userdata-qemu.img'));
+    const stop = deferred();
+    let stops = 0;
+    rt.stop = async () => { stops++; return stop.promise; };
+    const reset = rt.resetAndroidData();
+    try {
+      assert.equal((await rt.ensure()).ok, false);
+      await assert.rejects(rt.cleanup({ apply: true }), /另一项/);
+      assert(fs.existsSync(userdata));
+    } finally { stop.resolve(true); }
+    assert.equal((await reset).ok, true);
+    assert.equal(stops, 1);
+    assert(!fs.existsSync(userdata));
+    assert(!fs.existsSync(snapshot));
+    assert.equal(writes.length, 2);
+    for (const file of [keep, other, cache]) assert(fs.existsSync(file));
+  });
+  await test('failed Wi-Fi repair cannot schedule an implicit wipe or overlap maintenance', async (dir) => {
+    const { rt, writes, userdata } = runtime(dir);
+    rt.emulator.running = () => true;
+    rt.emulator.forceWipeOnNextStart = forbidden;
+    const repair = deferred();
+    const entered = deferred();
+    rt.emulator.repairWifi = () => { entered.resolve(); return repair.promise; };
+    rt.adbPath = () => 'fake-adb';
+    rt.stop = forbidden;
+    const repairing = rt.repairNetwork();
+    assert.strictEqual(rt.repairNetwork(), repairing);
+    await entered.promise;
+    try {
+      assert.match((await rt.resetAndroidData()).error, /另一项/);
+      assert.match((await rt.resizeDataPartition(8192)).error, /另一项/);
+      assert.equal((await rt.ensure()).ok, false);
+    } finally { repair.resolve({ ok: false }); }
+    assert.match((await repairing).error, /未重置/);
+    assert.equal((await repairing).wiped, false);
+    assert(fs.existsSync(userdata));
+    assert.deepEqual(writes, []);
+  });
+  await test('a QEMU readiness wait blocks both forms of data maintenance', async (dir) => {
+    const { rt, userdata, cache, writes } = runtime(dir);
+    const ready = deferred();
+    rt._bootQemu = () => ready.promise;
+    rt.stop = forbidden;
+    const boot = rt.bootQemu();
+    try {
+      assert.match((await rt.resetAndroidData()).error, /正在启动/);
+      await assert.rejects(rt.cleanup({ apply: true }), /正在启动/);
+      assert(fs.existsSync(userdata) && fs.existsSync(cache));
+      assert.deepEqual(writes, []);
+    } finally { ready.resolve({ ok: true }); }
+    assert.equal((await boot).ok, true);
+    assert.equal(rt.vmStarting, false);
+  });
+  await test('maintenance discovers and stops an owned detached emulator at its real port', async (dir) => {
+    const { rt, processes, userdata } = runtime(dir);
+    const owner = { owned: true, pid: 1234, started: 'birth' };
+    processes.set(5580, owner);
+    processes.set(5581, owner);
+    delete rt.stop;
+    rt.emulator.stop = async ({ adbPath }) => {
+      assert.equal(rt.emulator.port, 5580);
+      assert.equal(adbPath, undefined, 'stop must not run snapshot invalidation during maintenance');
+      assert(fs.existsSync(userdata));
+      processes.clear();
+      return true;
+    };
+    assert.equal((await rt.resetAndroidData()).ok, true);
+    assert(!fs.existsSync(userdata));
+  });
+  await test('maintenance refuses an attached guest and does not stop or probe it', async (dir) => {
+    const { rt, settings, userdata, writes } = runtime(dir);
+    settings.engine.mode = 'attach';
+    rt.stop = forbidden;
+    rt.client = forbidden;
+    assert.match((await rt.resetAndroidData()).error, /不允许维护/);
+    await assert.rejects(rt.cleanup({ apply: true }), /不允许维护/);
+    assert(fs.existsSync(userdata));
+    assert.deepEqual(writes, []);
+  });
+  await test('gc frees only owned regenerable candidates; never removes download workspace or unrelated AVDs', async (dir) => {
+    const { rt, root, settings, userdata, snapshot, cache } = runtime(dir);
+    const lock = put(path.join(path.dirname(userdata), 'multiInstance.lock'));
+    const unknownLock = put(path.join(path.dirname(userdata), 'unrelated.lock'));
+    const unrelated = put(path.join(root, 'avd', 'someone.avd', 'userdata-qemu.img'));
+    const unrelatedLock = put(path.join(root, 'avd', 'someone.avd', 'multiInstance.lock'));
+    const staleDownload = put(path.join(root, '_tmp', 'components', 'emulator.zip.part'));
+    const oldBase = put(path.join(root, 'system-images', 'android-30', 'default', 'x86_64', 'system.img'));
+    put(path.join(root, 'system-images', 'android-34', 'google_apis_playstore', 'x86_64', 'system.img'));
+    const otherSnapshot = put(path.join(root, 'avd', 'apkstart-aosp.avd', 'snapshots', 'boot', 'ram.bin'));
+    const keep = [cache, unknownLock, unrelated, unrelatedLock, staleDownload, oldBase, otherSnapshot];
+    const iso = put(path.join(root, 'images', 'android-x86.iso'));
+    const disk = put(path.join(root, 'images', 'android.qcow2'));
+    settings.runtime.isoPath = iso;
+    const externalToImages = put(path.join(root, 'x86_64', 'custom.qcow2'));
+    settings.runtime.diskPath = externalToImages;
+    const preview = await rt.cleanup({ apply: false });
+    for (const f of [iso, disk, externalToImages, snapshot, ...keep]) {
+      assert(!preview.candidates.some((c) => c.path === f || f.startsWith(c.path + path.sep)), f);
+    }
+    let stops = 0;
+    rt.stop = async () => { stops++; return true; };
+    const gc = await rt.cleanup({ apply: true, includeSnapshots: true });
+    assert.equal(gc.ok, true);
+    assert.equal(stops, 1);
+    assert(!fs.existsSync(lock));
+    assert(!fs.existsSync(snapshot));
+    for (const f of [iso, disk, externalToImages, userdata, ...keep]) assert(fs.existsSync(f), f);
+  });
+  await test('grow refuses unconfirmed stop and reports before touching userdata or settings', async (dir) => {
+    const { rt, writes, userdata, snapshot } = runtime(dir);
+    rt.stop = async () => ({ ok: false });
+    rt.emulator.resizeDataPartition = forbidden;
+    assert.match((await rt.resizeDataPartition(8192)).error, /未能停止/);
+    assert.equal(fs.readFileSync(userdata, 'utf8'), 'user data');
+    assert(fs.existsSync(snapshot));
+    assert.deepEqual(writes, []);
+  });
+  await test('async grow holds the offline maintenance lock until it settles', async (dir) => {
+    const { rt, writes, userdata } = runtime(dir);
+    const ext4 = Buffer.alloc(2048);
+    ext4.writeUInt16LE(0xef53, 1024 + 0x38);
+    fs.writeFileSync(userdata, ext4);
+    const entered = deferred();
+    const resize = deferred();
+    rt.emulator.resizeDataPartition = (mb) => { entered.resolve(mb); return resize.promise; };
+    rt.emulator.dataInfo = () => ({ imageBytes: 8192 * 1048576 });
+    const growing = rt.resizeDataPartition(8192);
+    assert.equal(await entered.promise, 8192);
+    try {
+      assert.equal((await rt.ensure()).ok, false);
+      assert.equal((await rt.bootQemu()).ok, false);
+      assert.match((await rt.resetAndroidData()).error, /另一项/);
+      assert.match((await rt.resizeDataPartition(12288)).error, /另一项/);
+      await assert.rejects(rt.clearStaleLocks(), /另一项/);
+    } finally { resize.resolve({ ok: true, grown: true }); }
+    assert.deepEqual(await growing, { ok: true, grown: true, imageBytes: 8192 * 1048576, stoppedVm: false });
+    assert.deepEqual(writes, []);
+  });
+  await test('pending stop blocks launches and maintenance; killed flag is not exit confirmation', async (dir) => {
+    const { rt, writes, userdata } = runtime(dir);
+    const stopped = deferred();
+    const entered = deferred();
+    delete rt.stop;
+    rt._stop = () => { entered.resolve(); return stopped.promise; };
+    rt.vmProc = { pid: 17, killed: true };
+    assert.equal(rt.vmRunning, true);
+    const stopping = rt.stop();
+    assert.strictEqual(rt.stop(), stopping);
+    await entered.promise;
+    try {
+      assert.equal((await rt.bootEmulator()).ok, false);
+      assert.equal((await rt.bootQemu()).ok, false);
+      assert.equal((await rt.ensure()).ok, false);
+      assert.match((await rt.resetAndroidData()).error, /另一项/);
+    } finally { stopped.resolve(false); }
+    assert.equal(await stopping, false);
+    assert.equal(rt.vmProc.pid, 17);
+    assert.equal((await rt.bootQemu()).ok, false);
+    assert.equal((await rt.bootEmulator()).ok, false);
+    rt.installing = true;
+    assert.equal(await rt.markInstalled(), false);
+    assert.equal(fs.readFileSync(userdata, 'utf8'), 'user data');
+    assert.deepEqual(writes, []);
+  });
+  await test('environment discovery reserves boot before direct backend calls can spawn', async (dir) => {
+    const { rt } = runtime(dir);
+    const env = deferred();
+    rt.provisioner.checkEnv = () => env.promise;
+    let starts = 0;
+    rt._bootQemu = async () => { starts++; return { ok: true }; };
+    const booting = rt.boot();
+    try {
+      assert.equal((await rt.bootQemu()).ok, false);
+      assert.equal((await rt.bootEmulator()).ok, false);
+      assert.match((await rt.resetAndroidData()).error, /正在启动/);
+    } finally { env.resolve({ emulator: { ok: false }, sysimg: { ok: false } }); }
+    assert.equal((await booting).ok, true);
+    assert.equal(starts, 1);
+  });
+  for (const kind of ['invalid ext4', 'qcow2 only', 'hard link', 'reassigned AVD parent']) {
+    await test(`grow rejects ambiguous or unsafe userdata: ${kind}`, async (dir) => {
+      const { rt, writes, root, userdata } = runtime(dir);
+      let preserve = userdata;
+      if (kind === 'qcow2 only') {
+        preserve = `${userdata}.qcow2`;
+        fs.renameSync(userdata, preserve);
+      }
+      if (kind === 'hard link') fs.linkSync(userdata, path.join(dir, 'shared-userdata.img'));
+      if (kind === 'reassigned AVD parent') {
+        rt.stop = async () => {
+          fs.renameSync(path.join(root, 'avd'), path.join(root, 'avd-original'));
+          put(userdata, 'new directory');
+          return true;
+        };
+        preserve = path.join(root, 'avd-original', 'apkstart.avd', 'userdata-qemu.img');
+      }
+      rt.emulator.resizeDataPartition = forbidden;
+      const result = await rt.resizeDataPartition(8192);
+      assert.match(result.error, /无法安全|归属不明|覆盖层|目录已变更/);
+      assert.equal(fs.readFileSync(preserve, 'utf8'), 'user data');
+      assert.deepEqual(writes, []);
+    });
+  }
+  await test('clearStaleLocks scopes to known locks in configured AVD home, without deleting snapshots', async (dir) => {
+    const { rt, root } = runtime(dir);
+    const avdHome = path.join(dir, 'explicit-avd-home');
+    const activeAvd = path.join(avdHome, 'apkstart.avd');
+    rt.provisioner.paths = () => ({ root, avdHome });
+    const lock = put(path.join(activeAvd, 'hardware-qemu.ini.lock', 'pid'));
+    const other = put(path.join(activeAvd, 'other.lock'));
+    const snapshot = put(path.join(activeAvd, 'snapshots', 'keep', 'ram.bin'));
+    const otherProfile = put(path.join(avdHome, 'apkstart-aosp.avd', 'multiInstance.lock'));
+    const result = await rt.clearStaleLocks();
+    assert(result.ok);
+    assert.deepEqual(result.removed.map(({ path: candidate }) => candidate), [path.dirname(lock)]);
+    assert(!fs.existsSync(lock));
+    for (const p of [other, snapshot, otherProfile]) assert(fs.existsSync(p));
+  });
+  await test('cleanup never follows an aliased AVD home outside the runtime', async (dir) => {
+    const runtimeRoot = path.join(dir, 'runtime');
+    const outside = path.join(dir, 'outside');
+    const snapshot = put(path.join(outside, 'apkstart.avd', 'snapshots', 'keep', 'ram.bin'));
+    fs.mkdirSync(runtimeRoot);
+    fs.symlinkSync(outside, path.join(runtimeRoot, 'avd'), 'junction');
+    const result = layers.prune(runtimeRoot, { apply: true });
+    assert.deepEqual(result.removed, []);
+    assert(fs.existsSync(snapshot));
+  });
+  for (const legacyName of [false, true]) {
+    await test(`download never writes an imported ISO (${legacyName ? 'legacy default filename' : 'external path'})`, async (dir) => {
+      const destinations = [];
+      const { p, iso, settings, imagesDir } = provision(dir, async (_urls, file) => {
+        destinations.push(file);
+        put(file, 'download');
+        return { file };
+      });
+      const original = put(legacyName ? iso : path.join(dir, 'borrowed.iso'), 'original');
+      p.importIso(original);
+      const result = await p.downloadIso();
+      assert.equal(fs.readFileSync(original, 'utf8'), 'original');
+      assert.notEqual(destinations[0], original);
+      assert(result.file.startsWith(imagesDir + path.sep));
+      assert.equal(settings.runtime.isoPath, result.file);
+      assert.equal(fs.readFileSync(result.file, 'utf8'), 'download');
+    });
+  }
+  await test('failed download does not publish a new ISO or mutate the old reference', async (dir) => {
+    const { p, settings } = provision(dir, async (_urls, file) => {
+      put(file, 'invalid');
+      return { file };
+    });
+    const original = put(path.join(dir, 'borrowed.iso'), 'original');
+    p.importIso(original);
+    await assert.rejects(p.downloadIso(), /bad ISO/);
+    assert.equal(settings.runtime.isoPath, original);
+    assert.equal(fs.readFileSync(original, 'utf8'), 'original');
+  });
+  await test('an explicit import during download wins; a partial download cannot be imported', async (dir) => {
+    const started = deferred();
+    const resume = deferred();
+    const { p, settings } = provision(dir, async (_urls, file) => {
+      put(file, 'download');
+      started.resolve(file);
+      await resume.promise;
+      return { file };
+    });
+    const downloading = p.downloadIso();
+    const partial = await started.promise;
+    const original = put(path.join(dir, 'chosen.iso'), 'original');
+    try {
+      assert.throws(() => p.importIso(partial), /仍在下载/);
+      p.importIso(original);
+    } finally { resume.resolve(); }
+    await assert.rejects(downloading, /选择已变更/);
+    assert.equal(settings.runtime.isoPath, original);
+    assert.equal(fs.readFileSync(original, 'utf8'), 'original');
+    assert(!fs.existsSync(path.dirname(partial)));
+  });
+  console.log(`\n[runtime-data-safety-test] ${passed} passed, ${failed} failed`);
+  if (failed) process.exitCode = 1;
+}
+main().catch((error) => { console.error(error); process.exitCode = 1; })
+  .finally(() => fs.rmSync(root, { recursive: true, force: true }));

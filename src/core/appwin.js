@@ -20,7 +20,12 @@ const TITLEBAR_H = 38;
  * 这圈灰边就正好被推到客户区外面，画面干净地贴满四周。
  */
 const EMU_PAD = 8;
+const CLOSE_PARK_TIMEOUT_MS = 1500;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function bestEffort(fn) {
+  try { Promise.resolve(fn()).catch(() => {}); } catch (_) { /* ignore */ }
+}
 // 宿主侧画面亮度低于这个值（连续多次）就算黑帧。0.6.7 删掉检测后
 // 「嵌入成功但一片黑」会被当成启动成功，用户完全不知道发生了什么。
 const BLACK_MEAN = Number(process.env.APKSTART_BLACK_MEAN || 40);
@@ -43,6 +48,12 @@ class AppWindow {
     this.state = { label: '', tip: '', ready: false, landscape: false };
     this._fitTimer = null;
     this._closedCb = null;
+    this._pendingCloses = new Set();
+    this._pendingParks = new Set();
+    this._agentTail = new WeakMap();
+    this._parkEpoch = 0;
+    this._windowGeneration = 0;
+    this._closeAllPromise = null;
     // 模拟器窗口已成功嵌入本窗口。显示类事件（show/restore）靠它决定
     // 是否要顺带把被 minimize→agent.hide() 藏掉的模拟器窗口重新亮出来。
     this._embedded = false;
@@ -58,6 +69,42 @@ class AppWindow {
   }
 
   get isOpen() { return !!(this.win && !this.win.isDestroyed()); }
+
+  _isCurrent(win, generation) {
+    return !!win && this.win === win && this._windowGeneration === generation && !win.isDestroyed();
+  }
+
+  // embed/detach/park 都改变同一代理的原生窗口归属，park 又不带 HWND。
+  // 关窗把 park 排在旧操作之后、下一窗口接管之前，而不是等旧回包再补发全局 park。
+  _queueOwnership(agent, action) {
+    const previous = this._agentTail.get(agent);
+    const epoch = this._parkEpoch;
+    let start;
+    const operation = new Promise((resolve, reject) => {
+      start = () => {
+        // 批量关闭到期后，旧队列里尚未发送的 embed/detach/park 一律作废。
+        if (epoch !== this._parkEpoch) { resolve(null); return; }
+        try { resolve(action()); } catch (err) { reject(err); }
+      };
+    });
+    this._agentTail.set(agent, operation);
+    const clear = () => {
+      if (this._agentTail.get(agent) === operation) this._agentTail.delete(agent);
+    };
+    operation.then(clear, clear);
+    if (previous) previous.then(start, start);
+    else start();
+    return operation;
+  }
+
+  _queueWindowCommand(action, win = this.win, generation = this._windowGeneration) {
+    const agent = this.agent;
+    if (!agent || !this._isCurrent(win, generation)) return Promise.resolve(null);
+    return this._queueOwnership(agent, () => {
+      if (!this._isCurrent(win, generation) || this.agent !== agent) return null;
+      return action(agent);
+    });
+  }
 
   /**
    * 竖屏 / 横屏下窗口内容的目标尺寸（自动缩放到屏幕内）。
@@ -135,10 +182,11 @@ class AppWindow {
    *   lcd 是模拟器 LCD 尺寸（横屏应用为 1920x1080），窗口按它定比例。
    */
   open(o) {
+    // 批量关闭一旦开始，不准关窗回调在其期限内再创建宿主。
+    if (this._closeAllPromise) return null;
     const { pkg, label, iconPath, lcd, fullscreen, hidden } = o;
-    // 保留外部（main）通过 onWindowClosed() 注册的回调：open 可能被反复调用
-    this._closedCb = o.onClosed || this._closedCb;
     if (this.isOpen && this.pkg === pkg) {
+      this._closedCb = o.onClosed || this._closedCb;
       // 独立窗口模式：用户再点一次这个应用，该把模拟器窗口抬到前面，
       // 而不是把藏着黑壳的宿主窗口弹出来。
       if (this.standaloneActive) {
@@ -151,8 +199,10 @@ class AppWindow {
       return this.win;
     }
     this.close({ keepApp: true });
+    const generation = ++this._windowGeneration;
 
     this.pkg = pkg;
+    this._closedCb = o.onClosed || null;
     // 独立窗口模式：宿主窗口只作为「这个应用还开着」的状态载体，不显示出来。
     // 用户要看的是模拟器自己的窗口，不是一块永远连不上画面的黑壳。
     this._hidden = !!hidden;
@@ -189,6 +239,7 @@ class AppWindow {
       icon: iconFile,
       webPreferences: {
         preload: path.join(__dirname, '..', 'preload.js'),
+        additionalArguments: ['--apkstart-role=shell'],
         contextIsolation: true,
         nodeIntegration: false,
         // 渲染进程只通过 preload 暴露的白名单接口与主进程通信，不需要 Node，
@@ -199,91 +250,79 @@ class AppWindow {
       },
     });
 
-    this.win.loadFile(path.join(__dirname, '..', 'ui', 'shell.html'));
+    const win = this.win;
+    const isCurrent = () => this._isCurrent(win, generation);
+    win.loadFile(path.join(__dirname, '..', 'ui', 'shell.html'));
     // 页面标题会把窗口标题改成 shell.html 的 <title>，任务栏就认不出是哪个应用了，
     // 这里挡住，让 OS 标题一直等于应用名（任务栏悬浮提示、Alt+Tab 都靠它）。
-    this.win.webContents.on('page-title-updated', (e) => {
+    win.webContents.on('page-title-updated', (e) => {
       e.preventDefault();
-      try { this.win.setTitle(label || 'ApkStart'); } catch (_) { /* 窗口可能已销毁 */ }
+      if (isCurrent()) bestEffort(() => win.setTitle(label || 'ApkStart'));
     });
-    this.win.once('ready-to-show', () => {
-      if (!this._hidden) this.win.show();
+    win.once('ready-to-show', () => {
+      if (!isCurrent()) return;
+      if (!this._hidden) win.show();
       this._push();
     });
     // 同主窗口的兜底：首帧事件收不到时不能让用户对着「没反应」猜。
-    setTimeout(() => {
+    const showTimer = setTimeout(() => {
       try {
-        if (this._hidden) return;
-        if (this.win && !this.win.isDestroyed() && !this.win.isVisible()) {
-          this.win.show();
+        if (isCurrent() && !this._hidden && !win.isVisible()) {
+          win.show();
           this._push();
         }
       } catch (_) { /* 窗口可能已关 */ }
-    }, 3000).unref?.();
+    }, 3000);
+    showTimer.unref?.();
 
     // Electron 的窗口动画 / DPI 重算分几步才稳定（上游实测）：单次 40ms 防抖
     // 常抓到中间态，画面只占左上角一条。连续贴合 6 轮，每轮取最新 bounds。
-    const refit = () => this.scheduleFit(6);
-    this.win.on('resize', refit);
-    this.win.on('move', refit);
-    this.win.on('maximize', refit);
-    this.win.on('unmaximize', refit);
-    this.win.on('restore', () => {
-      this.agent.show().catch(() => {});
+    const refit = () => { if (isCurrent()) this.scheduleFit(6); };
+    win.on('resize', refit);
+    win.on('move', refit);
+    win.on('maximize', refit);
+    win.on('unmaximize', refit);
+    win.on('restore', () => {
+      if (!isCurrent()) return;
+      this._queueWindowCommand(agent => agent.show(), win, generation).catch(() => {});
       this.scheduleFit(6);
     });
-    this.win.on('minimize', () => { this.agent.hide().catch(() => {}); });
-    // 程序化 show()（从主界面把已运行的应用调回前台、embed 后抬 Z 序等路径）
-    // 不触发 restore 事件：这里统一兜底，否则模拟器窗口还停在
-    // minimize 时被 agent.hide() 藏起来的状态 —— 宿主有窗口但画面全黑
-    // （实测表现：窗口在、进程活着、安卓侧正常，只有嵌入画面消失）。
-    this.win.on('show', () => this._revealEmbedded());
-    // 关闭统一收口到 close()：它先 agent.park() 把模拟器窗口从宿主上摘下来藏好，
-    // 再销毁宿主。少了这一步，Windows 会连带销毁嵌入的 Qt 子窗口（qemu 还在跑），
-    // 之后任何应用再打开都拿不到句柄 —— 日志是 `embed failed: emu=0`、窗口全黑，
-    // 只能重启 ApkStart 才恢复（上游 issue #42，实测复现）。
-    // 点 × / Alt+F4 / 任务栏关闭 / 系统关机 都走这条。
-    this.win.on('close', (e) => {
-      if (this._selfClose) return;          // close() 自己收尾时放行
-      if (this._closing) return;            // 已经在收尾（park 还没回来）：放行，别卡住用户
-      e.preventDefault();
-      this._closing = true;
-      this.close({ keepApp: false });
+    win.on('minimize', () => {
+      if (isCurrent()) this._queueWindowCommand(agent => agent.hide(), win, generation).catch(() => {});
     });
-    this.win.on('closed', () => {
-      if (this._selfClose) return;   // close() 自己在 park 完成后收尾
-      this.win = null;
-      const pkg = this.pkg;
-      this.pkg = null;
-      // 只有「宿主被别的东西直接销毁」才会走到这里（应用退出、系统关机）。
-      // 普通关窗已经在 close 事件里 preventDefault 转给 close()，不会重复收尾。
-      try { if (this.agent) this.agent.park().catch(() => {}); } catch (_) { /* ignore */ }
-      if (this._onCloseApp) { try { this._onCloseApp(pkg); } catch (_) { /* ignore */ } }
-      if (this._closedCb) this._closedCb(pkg);
-      if (this._windowClosedCb) { try { this._windowClosedCb(pkg); } catch (_) { /* ignore */ } }
+    // 程序化 show() 不触发 restore；已嵌入的模拟器也要从隐藏状态恢复。
+    win.on('show', () => { if (isCurrent()) this._revealEmbedded(); });
+    // 原生 close（× / Alt+F4 / 重复退出）都拦下，由 park 完成后的 destroy() 收尾。
+    // 已替换的旧窗口仍能收到 close，但不能借此关闭当前的新窗口。
+    win.on('close', (e) => {
+      e.preventDefault();
+      if (this.win === win) this.close();
+    });
+    win.once('closed', () => {
+      clearTimeout(showTimer);
+      // 外部直接 destroy() 时走同一收尾；本类发出的 destroy() 不会再进入关闭流程。
+      if (this.win === win) this.close();
     });
     // 只在「应用窗口真正处于前台」且至少一项鼠标映射开启时装全局钩子；
     // 失焦/关闭立即卸载，绝不让 ApkStart 在后台拖慢整个系统的鼠标。
-    this.win.on('focus', () => {
+    win.on('focus', () => {
+      if (!isCurrent()) return;
       this._syncHook(true);
-      // Electron 窗口重新获得焦点时，Qt 子窗口可能还停留在被遮挡后的黑帧；
-      // 只做无激活重排/重绘，不抢回焦点，也不把鼠标事件发给模拟器。
-      this.agent.refresh?.().catch(() => {});
-      // 焦点回来兜底再亮一次：覆盖「minimize 藏窗后从任务栏/主界面点回来」
-      // 走不到 restore/show 事件的路径。已可见时 ShowWindow 是无害空操作。
+      // 无激活重绘，不抢回焦点，也不把鼠标事件发给模拟器。
+      this._queueWindowCommand(agent => agent.refresh?.(), win, generation).catch(() => {});
       this._revealEmbedded();
     });
-    this.win.on('blur', () => {
+    win.on('blur', () => {
+      if (!isCurrent()) return;
       this._syncHook(false);
-      // 失焦本身不应触发任何前台切换；延迟一次无激活刷新，给 DWM 一个
-      // 处理遮挡变化的机会，避免用户点击其它窗口后留下黑帧。
+      // 给 DWM 处理遮挡变化的机会，但不能刷新已替换的新窗口。
       setTimeout(() => {
-        if (this.isOpen) this.agent.refresh?.().catch(() => {});
+        if (isCurrent()) this._queueWindowCommand(agent => agent.refresh?.(), win, generation).catch(() => {});
       }, 80).unref?.();
     });
 
-    if (fullscreen) this.win.maximize();
-    return this.win;
+    if (fullscreen) win.maximize();
+    return win;
   }
 
   _pointerOptions() {
@@ -342,14 +381,14 @@ class AppWindow {
   /** 窗口重新可见时，把被藏起来的模拟器窗口重新亮出来（只对已嵌入状态生效） */
   _revealEmbedded() {
     if (!this._embedded || !this.isOpen) return;
-    this.agent.show().catch(() => {});
+    this._queueWindowCommand(agent => agent.show()).catch(() => {});
     this.scheduleFit();
   }
 
   /** 宿主侧模拟器窗口的平均亮度；抓不到返回 null（绝不能据此误判成黑屏） */
   async _frameBrightness() {
     try {
-      const r = await this.agent.pixmean();
+      const r = await this._queueWindowCommand(agent => agent.pixmean());
       if (!r || r.ok === false) return null;
       const v = Number(r.mean);
       return Number.isFinite(v) && v >= 0 ? v : null;
@@ -364,45 +403,59 @@ class AppWindow {
    * 但 Qt/GL 的交换链在嵌入后死掉，窗口纯黑。连续多次采样都黑才动手，
    * 中间做一次无害重绘；仍黑就把窗口摘成独立窗口，让用户看得见、点得到。
    */
-  async _looksBlackAfterEmbed() {
+  async _looksBlackAfterEmbed(isCurrent = () => this.isOpen) {
     // 首帧可能还没到，先给它一点时间
     await sleep(600);
+    if (!isCurrent()) return false;
     // 5 次跨越约 3 秒：应用刚启动时常挂着全黑启动图，只看一眼就摘窗口会误伤好机器。
     // 只要有一次测到画面就立即收工；中间做一次重绘，顺手救回失焦导致的黑帧。
     for (let i = 0; i < 5; i += 1) {
       // eslint-disable-next-line no-await-in-loop
       const mean = await this._frameBrightness();
+      if (!isCurrent()) return false;
       this.lastEmbedMean = mean;
       if (mean === null || mean >= BLACK_MEAN) return false;
       if (i === 1) {
         // eslint-disable-next-line no-await-in-loop
-        await this.agent.refresh().catch(() => {});
+        await this._queueWindowCommand(agent => agent.refresh()).catch(() => {});
+        if (!isCurrent()) return false;
       }
       // eslint-disable-next-line no-await-in-loop
-      if (i < 4) await sleep(700);
+      if (i < 4) {
+        await sleep(700);
+        if (!isCurrent()) return false;
+      }
     }
     this.lastBlackMean = this.lastEmbedMean;
     return true;
   }
 
   async embed() {
-    if (!this.isOpen) return false;
+    const win = this.win;
+    const generation = this._windowGeneration;
+    const agent = this.agent;
+    const isCurrent = () => this._isCurrent(win, generation) && this.agent === agent;
+    if (!isCurrent()) return false;
     // 非 Windows / 没有原生代理：嵌入这条路根本不存在。
     // 以前这里照样进 4 次重试，每次都要等一条 6 秒的 TCP 超时，用户看到的是
     // 「启动卡很久 → 黑屏 → 没有任何提示」。现在直接置 external：画面留在
     // 模拟器自己的窗口里，应用窗口只显示一句说明（upstream #24）。
-    if (!platform.canEmbed || !this.agent || this.agent.available === false) {
+    if (!platform.canEmbed || !agent || agent.available === false) {
       this.external = true;
       this.lastEmbedError = platform.canEmbed ? 'no-native-agent' : 'platform-cannot-embed';
       return false;
     }
     let last = null;
     for (let attempt = 0; attempt < 4; attempt += 1) {
-      if (!this.isOpen) return false;
-      const hwnd = this._hwnd();
-      if (!hwnd) return false;
+      if (!isCurrent()) return false;
       // eslint-disable-next-line no-await-in-loop
-      const r = await this.agent.embed(hwnd, this._rect()).catch((e) => ({ ok: false, error: e.message }));
+      const r = await this._queueOwnership(agent, () => {
+        // 排队等待交接期间，宿主可能又被关闭或替换。
+        if (!isCurrent()) return null;
+        const hwnd = this._hwnd();
+        return hwnd ? agent.embed(hwnd, this._rect()) : null;
+      }).catch((e) => ({ ok: false, error: e.message }));
+      if (!isCurrent() || !r) return false;
       last = r;
       // 对齐上游：嵌入成功就是成功。黑画面不要在这里用「跟随模式」掩盖 ——
       // 真因是 chrome 渲染层尺寸 / 面板尺寸，由 agent 的 Fit 与 -skin 负责。
@@ -413,13 +466,16 @@ class AppWindow {
         // 之前是独立窗口模式（窗口被藏起来了）：现在嵌成了，得让宿主露出来
         if (this._hidden) {
           this._hidden = false;
-          try { this.win.show(); } catch (_) { /* 窗口可能刚关 */ }
+          try { win.show(); } catch (_) { /* 窗口可能刚关 */ }
         }
         // eslint-disable-next-line no-await-in-loop
-        if (await this._looksBlackAfterEmbed()) {
+        const black = await this._looksBlackAfterEmbed(isCurrent);
+        if (!isCurrent()) return false;
+        if (black) {
           // 刷新也救不回来：摘成独立窗口。画面还在，只是不能嵌进应用里。
           // eslint-disable-next-line no-await-in-loop
-          await this.agent.detach().catch(() => {});
+          await this._queueOwnership(agent, () => isCurrent() && agent.detach()).catch(() => {});
+          if (!isCurrent()) return false;
           this._embedded = false;
           this.blackDetached = true;
           this.lastEmbedError = 'black-frame-detached';
@@ -430,6 +486,7 @@ class AppWindow {
       // eslint-disable-next-line no-await-in-loop
       await sleep(attempt < 2 ? 300 : 800);
     }
+    if (!isCurrent()) return false;
     // 把失败原因带出去：上层会写进 app.log，出问题时一眼能看出是「没找到模拟器窗口」
     // 还是「SetParent 失败」，不用再靠猜。
     this.lastEmbedError = last ? (last.error || `emu=${last.emu}`) : 'no-response';
@@ -447,12 +504,19 @@ class AppWindow {
    * 亮出来并抢到前台。
    */
   async standalone() {
-    if (!this.agent || this.agent.available === false) {
+    const win = this.win;
+    const generation = this._windowGeneration;
+    const agent = this.agent;
+    const isCurrent = () => this._isCurrent(win, generation) && this.agent === agent;
+    if (!isCurrent()) return false;
+    if (!agent || agent.available === false) {
       this.external = true;
       this.lastEmbedError = 'no-native-agent';
       return false;
     }
-    const r = await this.agent.detach().catch((e) => ({ ok: false, error: e.message }));
+    const r = await this._queueOwnership(agent, () => isCurrent() && agent.detach())
+      .catch((e) => ({ ok: false, error: e.message }));
+    if (!isCurrent()) return false;
     if (!r || !r.ok) {
       // 代理说找不到模拟器窗口：这已经不是「显示方式」的问题，
       // 而是 qemu 活着但 Qt 画面窗口没了（上层会走重启运行时的恢复流程）。
@@ -464,22 +528,26 @@ class AppWindow {
     this.standaloneActive = true;
     // 宿主窗口只留作状态载体，不能挡在画面前面
     this._hidden = true;
-    try { if (this.isOpen) this.win.hide(); } catch (_) { /* 窗口可能刚关 */ }
+    try { win.hide(); } catch (_) { /* 窗口可能刚关 */ }
     return true;
   }
 
   /** 独立窗口模式下把模拟器窗口重新亮出来并置前（从主界面再点一次应用时用）。 */
   async revealStandalone() {
-    if (!this.standaloneActive) return false;
-    const r = await this.agent.detach().catch(() => null);
-    return !!(r && r.ok);
+    const win = this.win;
+    const generation = this._windowGeneration;
+    const agent = this.agent;
+    const isCurrent = () => this._isCurrent(win, generation) && this.agent === agent && this.standaloneActive;
+    if (!agent || !isCurrent()) return false;
+    const r = await this._queueOwnership(agent, () => isCurrent() && agent.detach()).catch(() => null);
+    return isCurrent() && !!(r && r.ok);
   }
 
   async fitNow() {
     if (!this.isOpen) return;
     // 外部窗口模式：画面不在我们窗口里，贴合没有任何意义（也不该调代理）
     if (this.external) return;
-    await this.agent.fit(this._rect()).catch(() => {});
+    await this._queueWindowCommand(agent => agent.fit(this._rect())).catch(() => {});
   }
 
   /** 模拟器子窗口应该占据的矩形（物理像素，已把 8px 内边距推出可视区） */
@@ -500,16 +568,20 @@ class AppWindow {
   /** 连续贴合几轮（窗口动画 / DPI 重算会分几步才稳定） */
   scheduleFit(rounds = 1) {
     if (!this.isOpen) return;
-    if (this._fitTimer) clearTimeout(this._fitTimer);
-    const run = async (left) => {
-      await this.fitNow().catch(() => {});
-      if (left > 1) {
-        this._fitTimer = setTimeout(() => run(left - 1), 160);
-      } else {
+    const win = this.win;
+    clearTimeout(this._fitTimer);
+    const schedule = (left, delay) => {
+      const timer = setTimeout(async () => {
+        if (this.win !== win || this._fitTimer !== timer) return;
+        await this.fitNow().catch(() => {});
+        // 在途 fit 的回包不能覆盖新窗口或新一轮 resize 的计时器。
+        if (this.win !== win || this._fitTimer !== timer) return;
         this._fitTimer = null;
-      }
+        if (left > 1) schedule(left - 1, 160);
+      }, delay);
+      this._fitTimer = timer;
     };
-    this._fitTimer = setTimeout(() => run(Math.max(1, rounds)), 40);
+    schedule(Math.max(1, rounds), 40);
   }
 
   _hwnd() {
@@ -533,13 +605,22 @@ class AppWindow {
    */
   async rotate({ fullscreen = null } = {}) {
     if (!this.isOpen) return this.state.landscape;
+    const win = this.win;
+    const generation = this._windowGeneration;
+    const isCurrent = () => this._isCurrent(win, generation);
     // 横屏 LCD：窗口比例就是 LCD 的比例，「把窗口转成横的」已经没意义了。
     // 继续按 wm size 切排版只会让画面在窗口里留边，所以这里直接不做事。
     if (this.lcdLandscape) return this.state.landscape;
     const next = !this.state.landscape;
-    if (this.setOrientation) await this.setOrientation(next).catch(() => {});
+    if (this.setOrientation) {
+      try {
+        if (await this.setOrientation(next) === false) return false;
+      } catch (_) { return false; }
+    }
+    if (!isCurrent()) return false;
     // wm size 会触发全局配置变更，应用要重建一次界面，给足时间再贴窗口
     await sleep(1200);
+    if (!isCurrent()) return false;
     const area = this._area();
     const size = AppWindow.sizeFor(area, this.portrait, next);
     // 最大化状态下 setContentSize 无效，必须先退出最大化再改尺寸，
@@ -548,18 +629,19 @@ class AppWindow {
     // 但「全屏 → 横屏」这条路径上窗口本来就该是最大化的：maximize() 在 Windows 上是
     // 异步的，紧接着调 isMaximized() 可能还是 false，所以这里不接受调用方猜，
     // 由 fullscreen 参数显式指定（null = 沿用当前状态，即标题栏旋转按钮那条路）。
-    const wantMax = fullscreen === null ? this.win.isMaximized() : !!fullscreen;
-    if (this.win.isMaximized()) this.win.unmaximize();
-    this.win.setContentSize(Math.max(320, size.w), Math.max(420, size.h + TITLEBAR_H));
-    const b = this.win.getBounds();
-    this.win.setPosition(
+    const wantMax = fullscreen === null ? win.isMaximized() : !!fullscreen;
+    if (win.isMaximized()) win.unmaximize();
+    win.setContentSize(Math.max(320, size.w), Math.max(420, size.h + TITLEBAR_H));
+    const b = win.getBounds();
+    win.setPosition(
       Math.round(area.x + (area.w - b.width) / 2),
       Math.round(area.y + (area.h - b.height) / 2),
     );
     // 该是全屏就恢复最大化：否则设置里写着「全屏」，窗口却变成一个居中的小窗
-    if (wantMax) this.win.maximize();
+    if (wantMax) win.maximize();
     // 改尺寸 / 退出最大化后把窗口抬到最前，别被别的窗口盖住（盖住就是黑屏 / 点不动）
-    try { this.win.show(); this.win.focus(); } catch (_) { /* 窗口可能刚关 */ }
+    try { win.show(); win.focus(); } catch (_) { /* 窗口可能刚关 */ }
+    if (!isCurrent()) return false;
     this.state.landscape = next;
     this._push();
     // wm size 改了 guest framebuffer 尺寸后，Qt 会自己重排好几次；每次都可能把
@@ -568,10 +650,11 @@ class AppWindow {
     for (let i = 0; i < 6; i += 1) {
       // eslint-disable-next-line no-await-in-loop
       await sleep(500);
+      if (!isCurrent()) return false;
       // eslint-disable-next-line no-await-in-loop
       await this.fitNow();
     }
-    return next;
+    return isCurrent() && next;
   }
 
   /** 需要时切到指定方向（全屏=横屏，窗口=竖屏） */
@@ -598,26 +681,91 @@ class AppWindow {
    * 用户桌面上就会凭空多出一个 "Android Emulator - apkstart5554" 的黑窗。
    */
   close({ keepApp = false } = {}) {
-    if (!this.isOpen) return;
     const win = this.win;
+    if (!win) return [...this._pendingCloses].at(-1) || Promise.resolve();
     const pkg = this.pkg;
+    const onClosed = this._closedCb;
+    const onWindowClosed = this._windowClosedCb;
+    let resolveClose;
+    const closing = new Promise(resolve => { resolveClose = resolve; });
+    // 先登记再调用代理/回调：重入者复用同一个 Promise，且不能改写本次 keepApp。
+    this._pendingCloses.add(closing);
+    this.win = null;
+    this._windowGeneration += 1;
+    this.pkg = null;
+    this._closedCb = null;
     this._embedded = false;
     this.blackDetached = false;
     this.standaloneActive = false;
     this._hidden = false;
-    this._syncHook(false);
-    if (!keepApp && pkg && this._onCloseApp) this._onCloseApp(pkg);
-    this._selfClose = true;
-    this.win = null;
-    this.pkg = null;
-    const done = () => {
-      try { win.destroy(); } catch (_) { /* ignore */ }
-      this._selfClose = false;
-      this._closing = false;
-      if (this._closedCb) this._closedCb(pkg);
-      if (this._windowClosedCb) { try { this._windowClosedCb(pkg); } catch (_) { /* ignore */ } }
+    clearTimeout(this._fitTimer);
+    this._fitTimer = null;
+
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(parkTimer);
+      bestEffort(() => { if (!win.isDestroyed()) win.destroy(); });
+      bestEffort(() => onClosed?.(pkg));
+      bestEffort(() => onWindowClosed?.(pkg));
+      this._pendingCloses.delete(closing);
+      resolveClose();
     };
-    Promise.resolve(this.agent && this.agent.park()).catch(() => {}).then(done, done);
+    const parkTimer = setTimeout(finish, CLOSE_PARK_TIMEOUT_MS);
+    const agent = this.agent;
+    const epoch = this._parkEpoch;
+    bestEffort(() => this._syncHook(false));
+    const park = agent && agent.available !== false
+      ? this._queueOwnership(agent, () => {
+        if (this._parkEpoch !== epoch || this.agent !== agent) return null;
+        // 即使宿主已到销毁期限，交接前仍须停靠；只有批次超时才作废未发出的 park。
+        return agent.park(0);
+      }).then(reply => reply?.ok === true, () => false)
+      : Promise.resolve(true);
+    this._pendingParks.add(park);
+    park.then(confirmed => {
+      // 失败回包也要保留给 closeAll 汇总，不能因单窗已销毁而误报已停靠。
+      if (confirmed) this._pendingParks.delete(park);
+      finish();
+    });
+    if (!keepApp && pkg) bestEffort(() => this._onCloseApp?.(pkg, win));
+    return closing;
+  }
+
+  /** 关闭所有宿主；在批次期限内未确认停靠则返回 false。 */
+  closeAll({ keepApp = false } = {}) {
+    if (this._closeAllPromise) return this._closeAllPromise;
+    this._closeAllPromise = Promise.resolve().then(async () => {
+      let deadline;
+      const parks = [...this._pendingParks];
+      try {
+        // 批次期间 open 被拦截；park 覆盖它之前的原生归属变更。不能无限等待
+        // 在途 embed/detach 的回包，也不用等过期的黑帧采样、重试等 JS 任务。
+        const drained = Promise.all([
+          Promise.all(parks).then(acks => acks.every(Boolean)),
+          Promise.all([...this._pendingCloses]),
+        ]).then(([confirmed]) => confirmed);
+        const cutoff = new Promise(resolve => {
+          deadline = setTimeout(() => {
+            this._parkEpoch += 1;
+            this._pendingParks.clear();
+            // 已发送的命令不能撤销，但同一 socket 原生执行为 FIFO。新队列可在
+            // 它们之后接管，不再被旧回包阻塞；旧队列醒来也不会补发全局 park。
+            this._agentTail = new WeakMap();
+            resolve(false);
+          }, CLOSE_PARK_TIMEOUT_MS);
+        });
+        return await Promise.race([drained, cutoff]);
+      } finally {
+        clearTimeout(deadline);
+        for (const park of parks) this._pendingParks.delete(park);
+        this._closeAllPromise = null;
+      }
+    });
+    // 在回调可能重入之前登记批次，但同步开始关闭当前窗口。
+    if (this.win) this.close({ keepApp });
+    return this._closeAllPromise;
   }
 
   onCloseApp(cb) { this._onCloseApp = cb; }

@@ -39,6 +39,13 @@ class QemuIsoProvider extends BaseProvider {
   isoPath() { return path.join(this.downloadsDir, this.isoFileName || (this.id + '.iso')); }
   diskPath() { return path.join(this.disksDir, 'system.qcow2'); }
 
+  async getRunningState() {
+    if (!this.backend || typeof this.backend.running !== 'function') throw new Error('无法确认 QEMU 后端运行状态');
+    const running = this.backend.running();
+    if (typeof running !== 'boolean') throw new Error('QEMU 后端未返回明确运行状态');
+    return running;
+  }
+
   async getLocalStatus() {
     const m = this.readManifest() || {};
     let isoSize = 0;
@@ -77,6 +84,8 @@ class QemuIsoProvider extends BaseProvider {
     const result = await downloadMulti(urls, dest, {
       connections,
       retries: 6,
+      // 目录中的可信摘要是跨镜像混拼、断点续传和最终文件唯一可用的内容身份。
+      expectSha256: info.sha256 || undefined,
       onProgress: (p) => {
         if (task && typeof task.updateProgress === 'function') {
           task.updateProgress({
@@ -154,7 +163,9 @@ class QemuIsoProvider extends BaseProvider {
 
   /** 引导安装绝不因超时、暂停或取消而强行关闭安装器。 */
   async install(task, ctx = {}) {
-    const stopped = () => !!(task && (task.aborted || task.signal && task.signal.aborted));
+    const signals = [ctx.signal, task && task.signal].filter(Boolean);
+    const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+    const stopped = () => !!(signal && signal.aborted || task && task.aborted);
     if (stopped()) return { ok: false, interrupted: true };
     const disk = this.diskPath();
     const iso = this.isoPath();
@@ -181,27 +192,37 @@ class QemuIsoProvider extends BaseProvider {
       return { ok: false, error: '虚拟机正在运行，请先正常关闭后安装。' };
     }
     if (!this.backend.running() && !m.installationPending) {
+      if (stopped()) return { ok: false, interrupted: true, code: 'START_CANCELLED' };
       const created = await this.createDevice(ctx);
-      if (stopped()) return { ok: false, interrupted: true };
+      if (stopped()) return { ok: false, interrupted: true, code: 'START_CANCELLED' };
       if (!created.ok) return created;
       if (!fs.existsSync(iso)) return { ok: false, error: 'ISO 文件不存在' };
       const accel = await this.backend.accelInfo();
-      if (stopped()) return { ok: false, interrupted: true };
+      if (stopped()) return { ok: false, interrupted: true, code: 'START_CANCELLED' };
       const pending = this.writeManifest({ installed: false, installationEvidence: null,
         installationPending: { mode: 'guided', taskId: task && task.taskId || '',
           startedAt: new Date().toISOString(), version: ctx.version || m.version || '' } });
       if (!pending) return { ok: false, error: '无法记录安装会话' };
       this._installSessionActive = true;
-      const vm = await this.backend.startVM({
-        disk, iso, install: true, uefi: true,
-        memoryMB: (this.settings.engine && this.settings.engine.memoryMB) || 4096,
-        cores: (this.settings.engine && this.settings.engine.cores) || 4, accel,
-      });
-      if (stopped()) return { ok: false, interrupted: true };
-      if (!vm.ok) {
-        if (!this.backend.running()) this.writeManifest({ installationPending: null });
-        this._installSessionActive = this.backend.running();
-        return { ok: false, error: 'ISO 引导失败：' + vm.error };
+      let vm;
+      try {
+        if (stopped()) return { ok: false, interrupted: true, code: 'START_CANCELLED' };
+        vm = await this.backend.startVM({
+          disk, iso, install: true, uefi: true,
+          memoryMB: (this.settings.engine && this.settings.engine.memoryMB) || 4096,
+          cores: (this.settings.engine && this.settings.engine.cores) || 4, accel, signal,
+        });
+        if (stopped()) return { ok: false, interrupted: true, code: 'START_CANCELLED', vmStarted: await this.getRunningState() };
+        if (!vm || !vm.ok) return { ok: false, error: 'ISO 引导失败：' + (vm && vm.error || '未返回启动确认') };
+      } finally {
+        // Cancel before spawn is not a resumable installation session. Keep a
+        // live installer untouched, but do not leave confirmation metadata for
+        // a VM that never existed. Unknown process state preserves the record.
+        if ((!vm || !vm.ok || stopped()) && await this.getRunningState() === false
+            && !this.backend.isStarting?.()) {
+          this.writeManifest({ installationPending: null });
+          this._installSessionActive = false;
+        }
       }
     }
     if (stopped()) return { ok: false, interrupted: true };
@@ -229,7 +250,6 @@ class QemuIsoProvider extends BaseProvider {
         });
       } catch (_) {}
       await new Promise((resolve) => {
-        const signal = task && task.signal;
         const done = () => { clearTimeout(timer); if (signal) signal.removeEventListener('abort', done); resolve(); };
         const timer = setTimeout(done, this._installWaitIntervalMs);
         if (signal) signal.addEventListener('abort', done, { once: true });
@@ -273,30 +293,39 @@ class QemuIsoProvider extends BaseProvider {
 
   /** 从已安装的 qcow2 磁盘启动；返回 VM 进程状态 + backend 供上层做 Android 就绪检查 */
   async start(ctx = {}) {
+    const signal = ctx.signal;
+    const cancelled = () => ({ ok: false, code: 'START_CANCELLED', error: '系统启动已取消' });
+    if (signal && signal.aborted) return cancelled();
     const m = this.readManifest() || {};
     if (!this._hasInstallationEvidence(m)) return { ok: false, error: '系统尚未确认安装完成，请先完成安装确认。' };
     const disk = this.diskPath();
     if (!fs.existsSync(disk)) return { ok: false, error: '虚拟磁盘不存在。' };
     const accel = await this.backend.accelInfo();
+    if (signal && signal.aborted) return cancelled();
     const vm = await this.backend.startVM({
       disk, iso: '', install: false, uefi: true,
       memoryMB: (this.settings.engine && this.settings.engine.memoryMB) || 4096,
       cores: (this.settings.engine && this.settings.engine.cores) || 4,
-      accel,
+      accel, signal,
     });
+    if (signal && signal.aborted) return Object.assign(cancelled(), { vmStarted: !!(vm && vm.vmStarted) });
     if (vm.ok) this.writeManifest({ running: true });
     return Object.assign({}, vm, { backend: 'QemuBackend', needsAndroidReadyCheck: true });
   }
 
-  async stop() {
-    const r = await this.backend.stop();
-    if (r.ok) this.writeManifest({ running: false });
-    return r;
+  async stop(ctx = {}) {
+    if (!this.backend || typeof this.backend.stop !== 'function') return { ok: false, error: '无法确认 QEMU 后端停止状态' };
+    const r = await this.backend.stop(ctx);
+    if (!(r === true || r && r.ok === true)) return Object.assign({}, r, { ok: false, error: r && r.error || '未确认 QEMU 进程退出' });
+    if (await this.getRunningState()) return { ok: false, error: 'QEMU 进程仍在运行' };
+    this.writeManifest({ running: false });
+    return { ok: true, ...(typeof r === 'object' ? r : {}) };
   }
 
-  async restart() {
-    await this.stop();
-    return this.start();
+  async restart(ctx = {}) {
+    const stopped = await this.stop(ctx);
+    if (!stopped || !stopped.ok) return stopped;
+    return this.start(ctx);
   }
 
   async backup(destDir) {

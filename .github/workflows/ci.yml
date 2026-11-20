@@ -10,6 +10,9 @@ permissions:
   contents: read
 
 jobs:
+  ui:
+    uses: ./.github/workflows/ui.yml
+
   test:
     name: 单元测试（Windows / Node ${{ matrix.node }}）
     runs-on: windows-latest

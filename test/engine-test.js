@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const net = require('net');
+const crypto = require('crypto');
 
 // 隔离测试数据目录，避免污染真实用户配置（双平台约定：Windows 走 APPDATA，Linux 走 XDG）
 const TMP = path.join(os.tmpdir(), `apkstart-test-${Date.now()}`);
@@ -35,6 +36,8 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
   // 本地 HTTP 服务模拟下载源（含 Range 续传）
   const payload = Buffer.alloc(300 * 1024);
   for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
+  const payloadSha256 = crypto.createHash('sha256').update(payload).digest('hex');
+  const payloadEtag = '"engine-payload-v1"';
 
   const server = http.createServer((req, res) => {
     if (req.url === '/big.bin') {
@@ -57,35 +60,47 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     }
     // 慢速端点：每 200ms 才吐一小块，供「外部中断」测试用
     if (req.url === '/slow.bin') {
-      const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
-      const start = range ? Number(range[1]) : 0;
-      res.writeHead(range ? 206 : 200, range ? {
-        'Content-Range': `bytes ${start}-${payload.length - 1}/${payload.length}`,
-        'Content-Length': payload.length - start,
-      } : { 'Content-Length': payload.length });
+      const match = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+      const start = match ? Number(match[1]) : 0;
+      const end = match ? Math.min(Number(match[2]), payload.length - 1) : payload.length - 1;
+      res.writeHead(match ? 206 : 200, match ? {
+        'Content-Range': `bytes ${start}-${end}/${payload.length}`,
+        'Content-Length': end - start + 1,
+        ETag: payloadEtag,
+      } : { 'Content-Length': payload.length, ETag: payloadEtag });
       let pos = start;
       const timer = setInterval(() => {
-        const end = Math.min(pos + 8192, payload.length);
-        res.write(payload.subarray(pos, end));
-        pos = end;
-        if (pos >= payload.length) { clearInterval(timer); res.end(); }
+        const next = Math.min(pos + 8192, end + 1);
+        res.write(payload.subarray(pos, next));
+        pos = next;
+        if (pos >= end + 1) { clearInterval(timer); res.end(); }
       }, 200);
       res.on('close', () => clearInterval(timer));
       return;
     }
-    // 中途断开的源：模拟并行分块下载遇到网络抖动
+    // 中途断开的范围源：严格按请求范围返回声明头，再在实体中途断开。
     if (req.url === '/broken-range.bin') {
-      const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
-      if (!range) {
-        res.writeHead(200, { 'Content-Length': payload.length });
+      const match = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+      if (!match) {
+        res.writeHead(200, { 'Content-Length': payload.length, ETag: payloadEtag });
         return res.end(payload);
       }
-      const start = Number(range[1]);
+      const start = Number(match[1]);
+      const end = Math.min(Number(match[2]), payload.length - 1);
       res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${payload.length - 1}/${payload.length}`,
-        'Content-Length': payload.length - start,
+        'Content-Range': `bytes ${start}-${end}/${payload.length}`,
+        'Content-Length': end - start + 1,
+        ETag: payloadEtag,
       });
-      res.write(payload.subarray(start, Math.min(start + 1024, payload.length)));
+      const firstEnd = Math.min(start + 1024, end + 1);
+      res.write(payload.subarray(start, firstEnd));
+      if (firstEnd === end + 1) return res.end();
+      return setTimeout(() => res.destroy(), 20);
+    }
+    // 无 Range 的普通 GET 也真实截断，覆盖单流长度校验而非分块失败。
+    if (req.url === '/broken-single.bin') {
+      res.writeHead(200, { 'Content-Length': payload.length, ETag: payloadEtag });
+      res.write(payload.subarray(0, 1024));
       return setTimeout(() => res.destroy(), 20);
     }
     // 黑洞端点：收到请求后永远不响应（模拟「TCP 通但被墙/隧道挂死」）。
@@ -99,7 +114,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       server.rangeHits = (server.rangeHits || 0) + 1;
       const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
       if (!range) {
-        res.writeHead(200, { 'Content-Length': payload.length, 'Accept-Ranges': 'bytes' });
+        res.writeHead(200, { 'Content-Length': payload.length, 'Accept-Ranges': 'bytes', ETag: payloadEtag });
         return res.end(payload);
       }
       const start = Number(range[1]);
@@ -108,6 +123,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
         'Accept-Ranges': 'bytes',
         'Content-Range': `bytes ${start}-${end}/${payload.length}`,
         'Content-Length': end - start + 1,
+        ETag: payloadEtag,
       });
       return res.end(payload.subarray(start, end + 1));
     }
@@ -165,6 +181,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     server.rangeHits = 0;
     let maxPercent = 0;
     const r = await downloadParallel(`http://127.0.0.1:${port}/ranged.bin`, dest, {
+      expectSha256: payloadSha256,
       connections: 8,
       minChunk: 32 * 1024,
       onProgress: (p) => { maxPercent = Math.max(maxPercent, p.percent); },
@@ -206,6 +223,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       `http://127.0.0.1:${port}/slow.bin`,
       `http://127.0.0.1:${port}/broken-range.bin`,
     ], dest, {
+      expectSha256: payloadSha256,
       connections: 2, minChunk: 1, signal: ac.signal, idleMs: 8000,
     }).then(() => ({ threw: false }), (e) => ({ threw: true, msg: e.message }));
     setTimeout(() => ac.abort(), 1500);
@@ -216,6 +234,21 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     assert(fs.existsSync(`${dest}.chunks.json`) || fs.existsSync(dest), '断点状态应保留');
     fs.rmSync(dest, { force: true });
     fs.rmSync(`${dest}.chunks.json`, { force: true });
+  });
+
+  await test('单流响应中途断开：未收到声明长度时必须失败', async () => {
+    const dest = path.join(TMP, 'broken-single.bin');
+    let threw = false;
+    try {
+      await download(`http://127.0.0.1:${port}/broken-single.bin`, dest, { retries: 0 });
+    } catch (_) { threw = true; }
+    assert(threw, '单流必须拒绝未达到 Content-Length 的响应');
+    assert(fs.existsSync(dest), '断流后应保留已接收的部分文件');
+    assert(fs.statSync(dest).size > 0 && fs.statSync(dest).size < payload.length,
+      '应留下部分数据而不是完整文件或空文件');
+    assert(fs.existsSync(`${dest}.download.json`), 'strong ETag 的失败单流应保存可验证续传凭据');
+    fs.rmSync(dest, { force: true });
+    fs.rmSync(`${dest}.download.json`, { force: true });
   });
 
   await test('并行分块失败：不残留预分配的全零文件（P0-2 回归）', async () => {
@@ -306,6 +339,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
     cen.writeUInt32LE(data.length, 20);
     const eocd = Buffer.alloc(22);
     eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(1, 8);
     eocd.writeUInt16LE(1, 10);
     eocd.writeUInt32LE(46 + name.length, 12);
     eocd.writeUInt32LE(30 + name.length + data.length, 16);
@@ -662,6 +696,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
       const cdSize = cens.reduce((s, b) => s + b.length, 0);
       const eocd = Buffer.alloc(22);
       eocd.writeUInt32LE(0x06054b50, 0);
+      eocd.writeUInt16LE(names.length, 8);
       eocd.writeUInt16LE(names.length, 10);
       eocd.writeUInt32LE(cdSize, 12);
       eocd.writeUInt32LE(offset, 16);

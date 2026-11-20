@@ -1,7 +1,7 @@
 {
   "name": "apkstart",
   "productName": "ApkStart",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "description": "极致轻量的安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行（Windows / Linux）",
   "main": "src/main.js",
   "desktopName": "apkstart.desktop",
@@ -43,9 +43,10 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test": "node --test test/store-integrity-test.js && node test/run-tests.js && node test/engine-test.js && node test/auto-test.js && node test/sync-test.js && node test/updater-test.js && node test/security-test.js && node test/compat-test.js && node test/backup-test.js && node test/uninstall-test.js && node test/i18n-test.js && node test/guest-test.js && node test/repair-test.js && node test/lowspec-test.js && node test/image-adapter-test.js && node test/report-test.js && node test/collector-test.js && node test/release-notes-test.js && node test/readme-test.js && node test/system-catalog-test.js && node test/system-providers-test.js && node test/system-task-manager-test.js && node test/build-size-test.js && node test/file-safety-test.js && node test/import-safety-test.js && node test/system-install-safety-test.js && node test/download-lifecycle-test.js && node test/runtime-ownership-test.js && node test/apk-orientation-test.js && node test/ui-theme-test.js",
+    "test": "node test/syntax-test.js && node --test test/store-integrity-test.js && npm run test:safety && node test/run-tests.js && node test/engine-test.js && node test/auto-test.js && node test/sync-test.js && node test/updater-test.js && node test/security-test.js && node test/compat-test.js && node test/backup-test.js && node test/uninstall-test.js && node test/i18n-test.js && node test/guest-test.js && node test/repair-test.js && node test/lowspec-test.js && node test/image-adapter-test.js && node test/report-test.js && node test/collector-test.js && node test/release-notes-test.js && node test/readme-test.js && node test/system-catalog-test.js && node test/system-providers-test.js && node test/system-task-manager-test.js && node test/build-size-test.js && node test/file-safety-test.js && node test/import-safety-test.js && node test/system-install-safety-test.js && node test/download-lifecycle-test.js && node test/runtime-ownership-test.js && node test/apk-orientation-test.js && node test/ui-theme-test.js",
     "readme:sync": "node tools/update-readme.js",
     "readme:check": "node tools/update-readme.js --check",
+    "test:safety": "node --test test/bundle-backup-test.js test/download-identity-test.js test/i18n-roundtrip-test.js test/ipc-role-test.js test/launch-data-safety-test.js test/quit-lifecycle-test.js test/runtime-actions-test.js test/runtime-data-safety-test.js test/sync-boundary-test.js test/system-lifecycle-test.js",
     "test:sync": "node test/sync-test.js",
     "test:updater": "node test/updater-test.js",
     "test:security": "node test/security-test.js",

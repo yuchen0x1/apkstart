@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.9.2**（2026-11-21）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.9.3**（2026-11-21）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,19 +46,38 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.9.2
+### v0.9.3
 
-- Windows 安装版更新必须同时确认安装器退出成功、主程序非空且版本精确匹配，缺失或损坏的版本文件不再视为更新成功。
-- 安装前验证备份完成及当前用户的恢复写权限，失败时停止安装；每次使用独立恢复目录，重试不会覆盖上一次的备份。
-- 用户取消 UAC 时不改写未变的旧版文件；同版本安装尝试写入持久凭条，阻止失败后自动循环安装及备份膨胀，保留显式手动重试。
-- 更新失败时保留安装包、待安装凭条及备份；即使失败记录写入失败，也不会触发成功清理。回滚未经确认时不自动重启。
-- 更新失败通知兼容旧版 UTF-8 BOM 记录，区分已恢复、未安装和恢复未确认，不再一概宣称已回到旧版。
-- 增加 Windows PowerShell 临时目录执行用例，覆盖安装失败、版本缺失或损坏、备份/回滚失败及失败记录无法落盘；补齐启动通知回归。
+> 候选发行说明：新增修复仍待集成与最终门禁确认；不表示已正式发布或完成最终验收。
+
+- 整合主线设置与应用清单持久化保护：读取权限或 I/O 错误不再回退并覆盖默认值；损坏数据先保留唯一恢复副本，健康应用记录保持可恢复。配置合并拒绝非法分区类型及未知键，保存使用独占随机暂存文件，刷新后原子替换。
+- 公开下载入口及每次重定向均要求 HTTPS，拒绝降级到 HTTP；定位写入按实际写入字节数计数并补齐短写。续传核对响应长度、字节范围和来源身份；不能确认身份时改为完整单源下载，多源拼接必须有可信摘要。共享文件先暂存再校验，目录读取不完整或文件仍在写入时不传播删除。
+- 普通启动和网络修复不再自动清空应用数据；显式重置由主进程再次确认。启停、退出、系统切换和磁盘维护验证运行实例，避免影响其他 AVD、未知镜像和有效下载断点。
+- `.apks` / `.xapk` 纳入安装前兼容性预检，分包导出不会误标为单个 `.apk`。应用恢复核对包名，只对本次安装使用的设备恢复私有数据；非 debuggable 应用通常只能恢复安装包。
+- 收紧应用外壳 IPC（进程间通信）权限；关窗清理捕获该次操作对应的确切客户端，并将清理排队，避免迟到清理作用于新客户端。退出等待在途操作与外壳停靠；系统卡片按原任务继续或重试，完善双语状态与失败提示。
+- 禁用未经可信校验的 AEHD 自动下载及缓存安装脚本提权执行；硬件加速仅使用 Windows 内置虚拟化功能或已有驱动服务。需要安装 AEHD 时，通过官方 SDK Manager 手动操作；不自动安装第三方驱动。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 界面与实测
+
+### 0.9.3 隔离界面测试
+
+下图由真实 Electron / Chromium 渲染，应用列表、运行状态与失败响应由隔离内存 IPC 夹具提供。没有启动 Android 客机或产品主进程，不是真实 Android 画面，也不是安装、磁盘扩容或启动成功的证据。新增截图来自本轮 UI 审核夹具，不代表集成后的最终测试已经通过。
+
+<p align="center">
+  <img src="docs/screenshots/v0.9.3/light-library.png" alt="隔离夹具中的浅色应用库" width="400" />
+  <img src="docs/screenshots/v0.9.3/dark-library.png" alt="隔离夹具中的深色应用库" width="400" />
+</p>
+
+夹具中的失败反馈：[扩容失败](docs/screenshots/v0.9.3/capacity-apply-failed.png) · [无法确认系统安装完成](docs/screenshots/v0.9.3/mark-installed-failed.png)。
+
+本轮系统操作与授权提示截图：[浅色系统切换中的取消入口](docs/screenshots/v0.9.3/light-system-switch-cancel.png) · [深色停止失败反馈](docs/screenshots/v0.9.3/dark-system-stop-error.png) · [硬件加速检查（中文）](docs/screenshots/v0.9.3/accel-checking.png) · [Hardware acceleration check（English）](docs/screenshots/v0.9.3/accel-checking-english.png)。取消入口截图不证明取消已完成；检查提示不证明驱动已安装或加速已生效。
+
+### 历史界面与 Android 实机记录
+
+以下为既有截图，不作为 0.9.3 的运行时或升级验收证据。
 
 首次启动会显示三步引导：选择安装位置（Windows）或确认 Linux 数据目录、自动下载运行时、开始使用。
 Windows 默认推荐剩余空间较大的非系统盘，Linux 使用 XDG 数据目录。
@@ -94,7 +113,7 @@ Windows 默认推荐剩余空间较大的非系统盘，Linux 使用 XDG 数据�
   只有在「设置 → 安卓系统 → 选择系统」里主动选择，才会触发对应镜像的下载与安装。已下载的不重复下载，不用的不占磁盘。
 - **真实进度**：下载 / 校验 / 建盘 / 安装 / 启动的进度全部显示在「设置 → 运行状态 → 系统任务」区域，
   含真实速度、已下载/总大小、剩余时间、当前阶段，支持暂停/继续/取消/重试。
-- **一键切换**：选中已安装系统即真实停旧启新，各系统独立 userdata，切换不清空其它系统数据。
+- **系统切换**：对已安装系统请求停旧启新，各系统独立 userdata。Provider 状态未知不视为已停止；停止失败或无法确认时报告原因，不宣称切换成功。切换期间可请求取消，仍需等待在途操作收尾，取消进行中不等于已停止，也不撤销已发出的操作。
 
 三个系统的真实接入状态（详见 [docs/SYSTEMS.md](docs/SYSTEMS.md)）：
 
@@ -125,7 +144,7 @@ Windows 默认推荐剩余空间较大的非系统盘，Linux 使用 XDG 数据�
 - **一键部署**：自动准备 adb、Android Emulator 和 Android 14 系统镜像，支持测速选源、断点续传、换源重试。
 - **本地整包导入**：网络不好时可以先在别处下好运行时整包，再从本地导入，离线也能装。
 - **自定义镜像适配**：可导入带清单的 x86_64 模拟器镜像，单独启用、停用或移除，不影响默认 AVD 和已装应用。
-- **硬件加速检测**：自动识别 WHPX / AEHD，缺驱动时给出安装入口；没有硬件加速会明确提示「会慢」而不是假装没事。
+- **硬件加速检测**：检查 WHPX / AEHD 状态；必要时请求系统授权以启用 Windows 内置虚拟化功能或启动已有驱动服务。不自动安装第三方驱动，已禁用未经可信校验的 AEHD 自动下载及缓存安装脚本提权执行；需要新装 AEHD 时使用官方 SDK Manager 手动安装。
 - **首次开箱即用**：全新安卓数据第一次开机自动切换中文界面、把媒体音量拉满（默认 100%）。
 
 ### 兼容性与转译
@@ -138,9 +157,8 @@ Windows 默认推荐剩余空间较大的非系统盘，Linux 使用 XDG 数据�
 ### 文件与数据
 
 - **文件互通**：`%USERPROFILE%\ApkStartShared` 与安卓侧 `/sdcard/ApkStartShared` 双向同步；
-  冲突文件保留副本，不会静默覆盖。
-- **导出与备份**：可以导出 APK，也可以生成包含 `app.apk`、`meta.json` 和可选应用数据的备份目录；
-  读不到私有数据时会说明原因（例如应用关闭了备份），而不是给你一个空包。
+  冲突文件保留副本，不会静默覆盖。停止同步采用协作式取消，并在限定时间内等待在途任务收尾；不能撤销已经发出的文件或设备 I/O，等待超时不保证全部 I/O 已停止。
+- **导出与备份**：可导出单个 APK 或分包容器；备份包含 `app.apk` 或 `app.apks`、`meta.json`，以及在应用允许 `run-as` 时才能读出的私有数据。没有私有数据的备份只能重装应用，不能还原存档。
 - **磁盘可控**：运行时目录、安卓数据目录、共享目录都能改到别的盘；设置页可直接看各部分占用并清理旧镜像/快照。
 
 ### 更新与卸载
@@ -162,9 +180,11 @@ Windows 默认推荐剩余空间较大的非系统盘，Linux 使用 XDG 数据�
 | `ApkStart-<版本>-x86_64.AppImage` | 约 130 MB | Linux x86_64 便携版，首次启动时按需下载运行时 |
 | `ApkStart-<版本>-amd64.deb` | 约 105 MB | Linux x86_64 安装包，适合 Debian / Ubuntu |
 
-安装版、便携版和 Linux 包都会把安卓数据、应用和快照放在用户数据目录中，更新程序文件不会删除已安装应用。
-Windows 和 Linux 均按需从 Google 官方源下载运行时，Windows 亦可导入本地运行时整包。
-Windows 可在「设置 → 桌面与文件」中修改运行时目录和安卓数据目录，Linux 使用 XDG 默认目录。
+桌面包不内置 Android 运行时，首次部署按需从 Google 官方源下载；Windows 也可导入兼容的本地运行时整包。Windows 可在「设置 → 桌面与文件」中修改运行时和安卓数据目录，Linux 使用 XDG 默认目录。
+
+Windows 程序与安装器没有本项目的 Authenticode 代码签名，可能提示未知发布者或 SmartScreen。手动下载可与发行页的 `SHA256SUMS` 核对；应用内更新使用签名更新清单和资产摘要校验，两者都不是 Windows 代码签名。
+
+升级前退出应用和运行时，备份实际使用的安卓数据、应用清单和共享目录。Windows 安装版同形态覆盖安装，不要先卸载；便携版只替换程序文件。Linux AppImage 若无法在原位置写入则手动换包，deb 交由系统包管理器。不保证旧离线整包、上游构建、跨形态或降级迁移。详见 [0.9.3 发行说明](docs/releases/release-notes.md#093--2026-11-21)。
 
 ### 第一次启动
 
@@ -226,21 +246,18 @@ Windows 可在「设置 → 桌面与文件」中修改运行时目录和安卓�
 如果一直卡住，去「运行状态」看部署步骤停在哪一步，日志里会写明原因。
 
 **提示没有硬件加速？**
-Windows 在 BIOS 里开启 VT-x/AMD-V；Intel 平台可安装 AEHD，或启用 Windows 虚拟机平台（WHPX）。
-Linux 确认 BIOS 虚拟化已开启，并把当前用户加入 `kvm` 组。
-没有加速也能跑，只是慢。
+Windows 在 BIOS 里开启 VT-x/AMD-V，并按提示启用 Windows 内置虚拟化功能（WHPX），或使用已经安装的 AEHD 驱动服务。需要新装 AEHD 时，通过官方 Android SDK Manager 手动安装；ApkStart 不自动下载或安装第三方驱动，也不提权执行未经可信校验的缓存安装脚本。
+Linux 确认 BIOS 虚拟化已开启，并把当前用户加入 `kvm` 组。软件模拟是否能启动仍取决于宿主和镜像，不保证可用。
 
 **应用能装但打不开 / 白屏 / 闪退？**
 先看 [兼容性实测](docs/COMPAT-MATRIX.md)。常见原因：只发 arm64 包（可跑但慢）、
 依赖 Google Play 服务（需要在「安卓系统」里换 Play 镜像）、依赖真实传感器或基带、应用自身检测模拟器。
 
 **会改我的系统吗？**
-只会在用户目录写数据，加一条 `.apk` 文件关联和（可选的）开机启动项。不装驱动、不改系统服务；
-硬件加速驱动需要你自己点安装（AEHD），卸载时会提示如何移除。
+程序会在配置的数据目录写入运行时与应用资料；Windows 可注册 `.apk` 文件关联和可选的开机启动项。硬件加速操作仅在必要时请求系统授权，用于启用 Windows 内置虚拟化功能或启动已安装的驱动服务，可能需要重启。不会自动安装第三方驱动；新装 AEHD 请使用官方 SDK Manager 手动完成。
 
 **数据在哪？删软件会丢应用吗？**
-程序文件和数据分开：卸载 / 覆盖更新只动程序文件，已装应用、存档、系统镜像都在数据目录里。
-具体路径见「设置 → 关于」。
+覆盖更新与主动卸载不同：主动卸载可能删除 ApkStart 管理的数据，不能当作升级步骤。备份前请在「设置 → 关于」核对数据和运行时实际位置。
 
 ## 从源码构建
 
@@ -275,8 +292,7 @@ npx electron-builder --linux AppImage deb --publish never
 # 产出：dist/release/ApkStart-<版本>-x86_64.AppImage 与 ApkStart-<版本>-amd64.deb
 ```
 
-`npm run build:exe` 会先准备可分发的运行时，再调用 electron-builder 生成安装包。
-构建过程中会下载或整理 Android Emulator、adb 和系统镜像，因此需要足够磁盘空间和网络。
+`npm run build:exe` 通过 electron-builder 生成在线安装包，不会把 Android Emulator、adb 或系统镜像打入安装包。
 
 ## 测试与自检
 
@@ -284,32 +300,31 @@ npx electron-builder --linux AppImage deb --publish never
 # 纯 Node 测试，不需要网络和设备
 npm test
 
-# Electron 首屏、沙箱和 preload 冒烟测试
+# 隔离 Electron：首屏、沙箱、preload 与双主题交互
 npm run test:electron
+npm run test:ui
 
-# 主进程 IPC 与页面自检
+# 产品主进程 IPC 与页面自检
 npm run test:app
 
 # 已部署 Android 后，执行安装、启动、截图和共享目录验收
 npm run selftest
 ```
 
-测试覆盖 APK/AXML/资源解析、下载器和换源、更新器安全、共享目录同步、兼容性判定、备份恢复、
-IPC 来源校验、卸载清理和发布说明生成等模块。测试说明见 [docs/TESTING.md](docs/TESTING.md)。
+Node 回归使用合成 APK、临时文件和 fake ADB（模拟设备响应）。隔离 UI 使用真实 Electron / Chromium 和内存 IPC 夹具，不运行产品主进程、不启动模拟器、不连接真实 Android 设备。CI 在 Windows runner 上检查 Windows / Linux 两种能力分支，不是原生 Linux UI、真机运行时或安装升级验收。既有 WSLg 记录不是本次最终代码快照，也不等于裸 Linux 桌面或 KVM 实测。新增修复仍待集成后的统一门禁确认；这里不声明最终测试通过、性能提升或发布成功。测试说明见 [docs/TESTING.md](docs/TESTING.md)。
 
 ## 发布流程（维护者）
 
 版本号只有两个来源：`package.json` 和 `CHANGELOG.md`。README 里的版本号与「最新更新」
 由脚本生成，不要手改：
 
-```powershell
+```sh
 npm run readme:sync    # 按 package.json 版本 + CHANGELOG 段落刷新 README
-npm test               # README 版本与 package.json 不一致会直接失败
-git tag v0.6.8 && git push origin v0.6.8   # 触发 .github/workflows/release.yml
+npm test               # README 未同步会直接失败
+node tools/release-notes.js v0.9.3   # 在本地预览实际发行正文，不发布
 ```
 
-发版工作流会依次：跑全量测试 → 用 `tools/release-notes.js` 生成发行说明并创建 Release →
-构建并上传便携版、在线安装包和 Linux 包，验证所有资产后发布。
+正式发版工作流要求 Windows / Linux Node 回归及隔离 UI 通过后，才构建 Windows 便携版、在线安装包及 Linux AppImage、deb。仅 tag 运行会进入 `release` 环境的发布步骤；四个资产齐备后才生成发行正文并签署更新清单，核对草稿资产的数量、名称、大小和 SHA-256 后才转正式发布。
 
 ## 项目结构
 

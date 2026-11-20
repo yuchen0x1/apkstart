@@ -5,9 +5,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const { download, downloadParallel, downloadMulti, downloadAnyParallel } = require('../src/core/download');
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-download-life-'));
+const SAMPLE = Buffer.alloc(8192, 7);
+const SAMPLE_SHA256 = crypto.createHash('sha256').update(SAMPLE).digest('hex');
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let passed = 0;
 async function test(name, fn) { await fn(); passed += 1; console.log('  ✓ ' + name); }
@@ -23,15 +26,28 @@ async function serverFor(handler, fn) {
     await new Promise((resolve) => server.close(resolve));
   }
 }
-function range(req) { return /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '').slice(1).map(Number); }
+function range(req) {
+  const match = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range || '');
+  return match ? match.slice(1).map(Number) : null;
+}
 function respond(res, start, end, total) {
-  res.writeHead(206, { 'Content-Range': `bytes ${start}-${end}/${total}`, 'Content-Length': end - start + 1 });
+  res.writeHead(206, {
+    'Content-Range': `bytes ${start}-${end}/${total}`,
+    'Content-Length': end - start + 1,
+    ETag: '"lifecycle-v1"',
+  });
+}
+function respondFull(res, body = SAMPLE) {
+  res.writeHead(200, { 'Content-Length': body.length, ETag: '"lifecycle-v1"' });
+  res.end(body);
 }
 
 (async () => {
   await test('单个分块失败会取消仍在等响应头的分块，不留后续重试', async () => {
     await serverFor((req, res, timers) => {
-      const [start, end] = range(req);
+      const pair = range(req);
+      if (!pair) { respondFull(res, Buffer.alloc(4096)); return; }
+      const [start, end] = pair;
       if (start === 0 && end === 0) { respond(res, 0, 0, 4096); res.end(Buffer.alloc(1)); return; }
       if (start === 0) timers.add(setTimeout(() => { res.writeHead(500); res.end(); }, 40));
       // 另一个分块故意永不返回响应头，必须由失败信号销毁请求。
@@ -48,17 +64,27 @@ function respond(res, start, end, total) {
   });
   await test('多源下载取消后保留断点，返回后不再写入', async () => {
     await serverFor((req, res, timers) => {
-      const [start, end] = range(req);
-      respond(res, start, end, 8192);
-      if (start === 0 && end === 0) { res.end(Buffer.alloc(1)); return; }
-      res.write(Buffer.alloc(16, 7));
-      timers.add(setInterval(() => { if (!res.destroyed) res.write(Buffer.alloc(16, 7)); }, 10));
+      const pair = range(req);
+      if (!pair) { respondFull(res, SAMPLE); return; }
+      const [start, end] = pair;
+      respond(res, start, end, SAMPLE.length);
+      if (start === 0 && end === 0) { res.end(SAMPLE.subarray(0, 1)); return; }
+      let pos = start;
+      const timer = setInterval(() => {
+        if (res.destroyed) { clearInterval(timer); return; }
+        const next = Math.min(pos + 16, end + 1);
+        res.write(SAMPLE.subarray(pos, next));
+        pos = next;
+        if (pos >= end + 1) { clearInterval(timer); res.end(); }
+      }, 10);
+      timers.add(timer);
     }, async (url, count) => {
       const dest = path.join(ROOT, 'paused.bin');
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 60);
       try {
         await assert.rejects(downloadMulti([url + '/a', url + '/b'], dest, {
+          expectSha256: SAMPLE_SHA256,
           minChunk: 1024, connections: 4, signal: controller.signal,
         }), /取消|失败/);
       } finally { clearTimeout(timer); }

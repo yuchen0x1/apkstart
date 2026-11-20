@@ -22,9 +22,70 @@ const container = require('./container');
 const guest = require('./guest');
 const platform = require('./platform');
 const processOwner = require('./process-owner');
+const userdata = require('./userdata');
 
 const LOG_DIR = path.join(store.DATA_DIR, 'logs');
 const MONITOR_PORT = 5556;
+const QEMU_SERIAL = '127.0.0.1:5555';
+const DATA_MAINTENANCE_BUSY = '正在维护运行时数据，请稍后再启动';
+
+function throwIfAborted(signal) {
+  if (!signal || !signal.aborted) return;
+  const error = new Error('运行时启动已取消');
+  error.code = 'START_CANCELLED';
+  throw error;
+}
+
+function cancelledBoot() { return { ok: false, code: 'START_CANCELLED', error: '运行时启动已取消' }; }
+
+// Only detach from observational probes. Operations that can write files, issue
+// guest mutations or create a child must settle before the startup lock is released.
+async function waitStartupProbe(signal, probe) {
+  if (!signal) return probe();
+  throwIfAborted(signal);
+  let abort;
+  try {
+    const cancelled = new Promise((resolve) => {
+      abort = () => resolve(undefined);
+      signal.addEventListener('abort', abort, { once: true });
+    });
+    const result = await Promise.race([cancelled, probe()]);
+    throwIfAborted(signal);
+    return result;
+  } finally {
+    signal.removeEventListener('abort', abort);
+  }
+}
+
+// Runtime owns the engine and serializes start(). The callbacks in the base
+// retry loop are not cancellation fences: onBeforeSpawn can await and probe
+// 'fatal' can retry. Guard both AVD preparation and the actual synchronous spawn.
+class RuntimeEmulator extends EmulatorEngine {
+  async start(options = {}) {
+    const signal = options.signal;
+    throwIfAborted(signal);
+    this._runtimeStartSignal = signal;
+    try { return await super.start(options); }
+    finally { this._runtimeStartSignal = undefined; }
+  }
+
+  ensureAvd(...args) {
+    throwIfAborted(this._runtimeStartSignal);
+    return super.ensureAvd(...args);
+  }
+
+  spawnOnce(...args) {
+    throwIfAborted(this._runtimeStartSignal);
+    return super.spawnOnce(...args);
+  }
+}
+
+function emulatorConsolePort(serial) {
+  const native = /^emulator-(\d+)$/.exec(serial);
+  const tcp = /^127\.0\.0\.1:(\d+)$/.exec(serial);
+  const port = native ? Number(native[1]) : tcp ? Number(tcp[1]) - 1 : 0;
+  return port > 0 && port < 65535 ? port : 0;
+}
 
 /** 自动修复动作的中文说法（日志 / 启动窗口提示要用它，别把动作 id 露给用户） */
 const AUTO_ACTION_TEXT = {
@@ -71,7 +132,7 @@ class Runtime {
   constructor(appRoot) {
     this.appRoot = appRoot;
     this.provisioner = new Provisioner(appRoot);
-    this.emulator = new EmulatorEngine(appRoot);
+    this.emulator = new RuntimeEmulator(appRoot);
     this.vmProc = null;
     this.vmStarting = false;
     this.installing = false;
@@ -155,7 +216,7 @@ class Runtime {
       imageWhy: (env.activeImage && env.activeImage.custom && !env.activeImage.ok)
         ? env.activeImage.reason : '',
       accel: env.accel,
-      vmRunning: this.emulator.running() || !!(this.vmProc && !this.vmProc.killed),
+      vmRunning: this.emulator.running() || !!this.vmProc,
       vmStarting: this.vmStarting,
       installing: this.installing,
       adbOk: env.adb.ok,
@@ -273,52 +334,52 @@ class Runtime {
     return args;
   }
 
-  async boot({ install = false, onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
-    // canProvision = Windows + Linux（provision 下载源已按宿主分叉）。
-    // 其它系统（mac 等）在 builtin 模式下直接说明并指向「连接已有运行时」。
-    if (!platform.canProvision && (this.settings.engine.mode || 'builtin') !== 'attach') {
-      throw new Error(platform.supportNote());
+  async boot({ install = false, onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0, signal } = {}) {
+    try { throwIfAborted(signal); } catch (_) { return cancelledBoot(); }
+    if (this._dataMaintenance || this._stopPromise || this._repairPromise) return { ok: false, error: DATA_MAINTENANCE_BUSY };
+    if (this._booting || this.vmStarting) return { ok: false, error: '运行时正在启动' };
+    // 环境探测结束前还没有 vmStarting，也必须阻止数据维护。
+    this._booting = true;
+    try {
+      if (!platform.canProvision && (this.settings.engine.mode || 'builtin') !== 'attach') {
+        throw new Error(platform.supportNote());
+      }
+      const env = await waitStartupProbe(signal, () => this.provisioner.checkEnv());
+      throwIfAborted(signal);
+      this._hv = env.hypervisor;
+      if (env.emulator.ok && env.sysimg.ok) {
+        return await this._bootEmulator({ env, onLog, lcdOrientation, lowspec, timeoutMs, signal });
+      }
+      return await this._bootQemuEntry({ install, env, onLog, signal });
+    } finally {
+      this._booting = false;
     }
-    const env = await this.provisioner.checkEnv();
-    this._hv = env.hypervisor;
-
-    // 首选：官方 emulator（自带设备模型与 GPU 转译，体验最好）
-    if (env.emulator.ok && env.sysimg.ok) {
-      return this.bootEmulator({ env, onLog, lcdOrientation, lowspec, timeoutMs });
-    }
-
-    return this.bootQemu({ install, env, onLog });
   }
 
   /**
    * 用官方 emulator 启动 Android。
    * 与 QEMU+ISO 不同，这里没有"安装系统"这一步：镜像本身就是系统，首次启动即开机。
    */
-  async bootEmulator({ env, onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0 } = {}) {
-    if (this.vmStarting) {
-      const started = Date.now();
-      while (this.vmStarting && Date.now() - started < 300000) {
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      const c = this.client();
-      if (await c.isOnline()) {
-        await this.prepare(c);
-        return { ok: true, client: c, reused: true };
-      }
-    }
+  bootEmulator(options = {}) {
+    if (this._booting) return Promise.resolve({ ok: false, error: '运行时正在启动' });
+    return this._bootEmulator(options);
+  }
 
-    const accel = env && env.accel ? env.accel : await this.provisioner.emulatorAccel();
-    if (!accel.ok) {
-      onLog('未检测到硬件加速：将自动回退软件模拟（首次开机会明显变慢，无需手动设置）');
-    } else if (accel.suspect) {
-      // AEHD 驱动在、检查也过，但服务没跑：这种机器「检查通过、开机即退」。
-      // 参数按软件模拟给（见 doctor.accelUsable），失败后引擎会自动尝试修复。
-      onLog('AEHD 驱动已安装但服务没在运行：本次可能开不了机，失败后会自动尝试修复');
-    }
-
+  async _bootEmulator({ env, onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0, signal } = {}) {
+    try { throwIfAborted(signal); } catch (_) { return cancelledBoot(); }
+    if (this._dataMaintenance || this._stopPromise || this._repairPromise) return { ok: false, error: DATA_MAINTENANCE_BUSY };
+    if (this.vmStarting || this.vmProc) return { ok: false, error: '运行时正在启动或已有 QEMU 进程，未覆盖句柄' };
     this.vmStarting = true;
     try {
+      const accel = env && env.accel ? env.accel : await waitStartupProbe(signal, () => this.provisioner.emulatorAccel());
+      try { throwIfAborted(signal); } catch (_) { return cancelledBoot(); }
+      if (!accel.ok) {
+        onLog('未检测到硬件加速：将自动回退软件模拟（首次开机会明显变慢，无需手动设置）');
+      } else if (accel.suspect) {
+        // AEHD 驱动在、检查也过，但服务没跑：这种机器「检查通过、开机即退」。
+        // 参数按软件模拟给（见 doctor.accelUsable），失败后引擎会自动尝试修复。
+        onLog('AEHD 驱动已安装但服务没在运行：本次可能开不了机，失败后会自动尝试修复');
+      }
       // probe 交给 EmulatorEngine 的开机循环：进程退出/致命日志时它会换一组参数重试
       // 每轮只发一次 adb 命令：以前是 get-state + getprop + pm path 三次进程拉起，
       // 快照恢复时一轮就差 300~500ms，正好卡在「点开应用」的观感上。
@@ -327,13 +388,14 @@ class Runtime {
       let lastHeal = 0;
       let authHealed = false; // unauthorized 只自愈一次，避免反复删快照冷启动死循环
       const probe = async ({ serial }) => {
-        if (!this.emulator.running()) return 'fatal';
+        if (signal && signal.aborted || !this.emulator.running()) return 'fatal';
         if (!this._probeClient || this._probeClient.serial !== serial) {
           this._probeClient = new AdbClient({ adbPath: this.adbPath(), serial });
         }
         const c = this._probeClient;
         try {
-          const out = String(await c.shell('getprop sys.boot_completed; pm path android', { timeout: 8000 }));
+          const out = String(await waitStartupProbe(signal,
+            () => c.shell('getprop sys.boot_completed; pm path android', { timeout: 8000 })));
           const lines = out.split(/\r?\n/).map((l) => l.trim());
           const booted = lines[0] === '1' || /^1$/.test(lines[0] || '');
           const pmReady = lines.some((l) => /^package:/.test(l));
@@ -341,6 +403,7 @@ class Runtime {
           if (booted && pmReady) return 'ok';
           return booted ? 'pending' : 'booting';
         } catch (e) {
+          if (signal?.aborted) return 'fatal';
           errStreak += 1;
           // adb shell 报错可能是「还没开机」也可能是「授权对话框卡住」（上游 b7c4f06）。
           // 后者每轮 shell 都抛异常，只按普通 offline 处理会按 240s×4 组参数干等，
@@ -350,7 +413,8 @@ class Runtime {
           const raw = String((e && (e.raw || e.stderr || e.message)) || '');
           let unauthorized = isUnauthorizedError(raw);
           if (!unauthorized) {
-            const st2 = await c.deviceState().catch(() => '');
+            const st2 = await waitStartupProbe(signal, () => c.deviceState()).catch(() => '');
+            if (signal?.aborted) return 'fatal';
             unauthorized = st2 === 'unauthorized';
           }
           if (unauthorized) {
@@ -394,7 +458,9 @@ class Runtime {
         lcdOrientation,
         lowspec,
         timeoutMs,
+        signal,
       });
+      if (signal?.aborted) return cancelledBoot();
       // start() 失败时是「返回 {ok:false}」而不是抛异常（磁盘不足、多次重试仍失败等）。
       // 老实现不看这个字段，直接把 ok:true 往上返回 —— 上层于是认为「已经就绪」，
       // 接着 adb 一顿报 device not found，用户看到的是「点开没反应」而不是真实原因。
@@ -408,10 +474,15 @@ class Runtime {
           exitCode: st && st.exitCode,
         };
       }
+      const serial = st.serial || this.emulator.serial;
+      const identity = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
+      if (!identity) return { ok: false, error: '无法确认新启动的运行时归属' };
+      throwIfAborted(signal);
       this.lastActivity = Date.now();
-      this.emuSerial = st.serial || this.emulator.serial;
-      const client = this.client(this.emuSerial);
+      this.emuSerial = serial;
+      const client = this.client(serial);
       await this.prepare(client);
+      if (signal?.aborted) return cancelledBoot();
       // 快照改成「空闲时再存」：立刻存要写 1~3GB，会和用户刚点开的应用抢磁盘 I/O
       this._armSnapshotSave(20000);
       return { ok: true, client, engine: 'emulator', serial: this.emuSerial, profile: st.profile, network: st.network || null };
@@ -445,6 +516,7 @@ class Runtime {
    *  - 省资源：开机完成后把 qemu 降到最低优先级停放。
    */
   prewarm({ onLog = () => {} } = {}) {
+    if (this._dataMaintenance || this._stopPromise || this._repairPromise) return Promise.resolve({ ok: false, skipped: 'maintenance' });
     if (this._prewarmPromise) return this._prewarmPromise;
     if (this._activeApps.size > 0) return Promise.resolve({ ok: true, skipped: 'busy' });
     // 高级模式是复用别人家已经跑起来的运行时，不该再替用户开一台自己的
@@ -474,7 +546,25 @@ class Runtime {
     return p;
   }
 
-  async bootQemu({ install = false, env, onLog = () => {} } = {}) {
+  bootQemu(options = {}) {
+    if (this._booting) return Promise.resolve({ ok: false, error: '运行时正在启动' });
+    return this._bootQemuEntry(options);
+  }
+
+  async _bootQemuEntry(options) {
+    if (options.signal && options.signal.aborted) return cancelledBoot();
+    if (this._dataMaintenance || this._stopPromise || this._repairPromise) return { ok: false, error: DATA_MAINTENANCE_BUSY };
+    if (this.vmStarting || this.vmProc || this.emulator.running()) return { ok: false, error: '已有 QEMU 运行时正在启动或运行' };
+    this.vmStarting = true;
+    try {
+      return await this._bootQemu(options);
+    } finally {
+      this.vmStarting = false;
+    }
+  }
+
+  async _bootQemu({ install = false, env, onLog = () => {}, signal }) {
+    if (signal && signal.aborted) return cancelledBoot();
     if (!env.qemu.ok) throw new Error('未安装 QEMU，请先完成运行时部署');
     if (install && !env.iso.ok) throw new Error('系统镜像（ISO）未就绪');
 
@@ -482,7 +572,6 @@ class Runtime {
     const disk = this.settings.runtime.diskPath || p.disk;
     if (!install && !fs.existsSync(disk)) throw new Error('尚未安装 Android 系统到虚拟磁盘');
 
-    this.vmStarting = true;
     const args = this.buildArgs({ install });
     const logFile = path.join(LOG_DIR, install ? 'qemu-install.log' : 'qemu.log');
     const out = fs.openSync(logFile, 'a');
@@ -490,6 +579,7 @@ class Runtime {
 
     onLog(`启动运行时（${env.hypervisor.whpx ? 'WHPX 硬件加速' : '纯软件模拟'}）…`);
     if (!env.hypervisor.whpx) onLog(env.hypervisor.note);
+    if (signal && signal.aborted) { fs.closeSync(out); return cancelledBoot(); }
 
     const proc = spawn(env.qemu.path, args, {
       cwd: path.dirname(env.qemu.path),
@@ -503,22 +593,23 @@ class Runtime {
     this.lastActivity = Date.now();
 
     proc.on('error', (e) => {
+      if (!proc.pid && this.vmProc === proc) { this.vmProc = null; this.installing = false; }
       this.log(`spawn error: ${e.message}`);
       onLog(`启动失败：${e.message}`);
-      this.vmProc = null;
-      this.vmStarting = false;
     });
-    proc.on('exit', (code) => {
+    const exited = (code) => {
+      if (this.vmProc !== proc) return;
+      this.vmProc = null;
+      this.installing = false;
       this.log(`qemu exit ${code}`);
       onLog(`运行时已退出（code=${code}）`);
-      this.vmProc = null;
-      this.vmStarting = false;
-      this.installing = false;
-    });
+    };
+    proc.on('exit', exited);
+    proc.on('close', exited);
 
     await new Promise((r) => setTimeout(r, 1500));
-    this.vmStarting = false;
-    if (!this.vmProc) throw new Error(`QEMU 启动失败，详见日志：${logFile}`);
+    if (signal && signal.aborted) return cancelledBoot();
+    if (this.vmProc !== proc) throw new Error(`QEMU 启动失败，详见日志：${logFile}`);
 
     // 装机模式：ISO 里是 Linux 安装程序，没有 adb，不能按「等 adb」处理
     if (install) {
@@ -526,16 +617,18 @@ class Runtime {
       return { ok: true, install: true, needsManualInstall: true };
     }
 
-    const client = this.client('127.0.0.1:5555');
+    const client = this.client(QEMU_SERIAL);
     const timeout = env.hypervisor.whpx ? 180000 : 900000;
-    const linked = await this.waitAdb(client, timeout, onLog);
+    const linked = await this.waitAdb(client, timeout, onLog, signal);
+    if (signal && signal.aborted) return cancelledBoot();
     if (!linked) {
       return {
         ok: false,
         error: '虚拟机已启动，但 adb 未能连接：请在虚拟机里开启「开发者选项 → ADB over network」后重试',
       };
     }
-    const ready = await this.waitAndroidReady(client, Math.max(60000, timeout / 2), onLog);
+    const ready = await this.waitAndroidReady(client, Math.max(60000, timeout / 2), onLog, signal);
+    if (signal && signal.aborted) return cancelledBoot();
     if (!ready.ok) {
       return {
         ok: false,
@@ -544,6 +637,8 @@ class Runtime {
           : 'Android 已引导但系统服务未就绪（可能停在首次开机设置界面，请在虚拟机窗口里完成向导）',
       };
     }
+    if (!(await this.ownedRuntimeIdentity(QEMU_SERIAL))) return { ok: false, error: '无法确认 QEMU 的 ADB 端口归属' };
+    this.emuSerial = QEMU_SERIAL;
     await this.prepare(client);
     return { ok: true, client };
   }
@@ -552,18 +647,21 @@ class Runtime {
    * 等待 Android 真正可用：adb 在线 ≠ 系统可用。
    * 必须等到 sys.boot_completed=1 且包管理器可响应，否则 am start 会直接失败。
    */
-  async waitAndroidReady(client, timeoutMs, onLog = () => {}) {
+  async waitAndroidReady(client, timeoutMs, onLog = () => {}, signal) {
     const start = Date.now();
     let bootCompleted = false;
     let lastNotice = 0;
     while (Date.now() - start < timeoutMs) {
+      if (signal && signal.aborted) return { ok: false, cancelled: true };
       /* eslint-disable no-await-in-loop */
       const online = await client.isOnline();
+      if (signal && signal.aborted) return { ok: false, cancelled: true };
       if (!online) {
         await client.connect().catch(() => false);
       } else {
         if (!bootCompleted) {
           const v = await client.shell('getprop sys.boot_completed').catch(() => '');
+          if (signal && signal.aborted) return { ok: false, cancelled: true };
           if (String(v).trim() === '1') {
             bootCompleted = true;
             onLog(`Android 内核已启动，等待系统服务就绪…（${Math.round((Date.now() - start) / 1000)}s）`);
@@ -571,6 +669,7 @@ class Runtime {
         }
         if (bootCompleted) {
           const pm = await client.shell('pm path android').catch(() => '');
+          if (signal && signal.aborted) return { ok: false, cancelled: true };
           if (/package:/.test(pm)) {
             onLog(`Android 已就绪（${Math.round((Date.now() - start) / 1000)}s）`);
             return { ok: true, ms: Date.now() - start };
@@ -589,19 +688,22 @@ class Runtime {
     return { ok: false, stage: bootCompleted ? 'services' : 'kernel', ms: Date.now() - start };
   }
 
-  async waitAdb(client, timeoutMs, onLog = () => {}) {
+  async waitAdb(client, timeoutMs, onLog = () => {}, signal) {
     const start = Date.now();
     let lastNotice = 0;
     const needConnect = String(client.serial || '').includes(':')
       && !/^emulator-/.test(client.serial);
     while (Date.now() - start < timeoutMs) {
+      if (signal && signal.aborted) return false;
       // emulator-5554 这类由 emulator 自己注册，不需要 adb connect
       if (needConnect) {
         // eslint-disable-next-line no-await-in-loop
         await client.connect().catch(() => false);
+        if (signal && signal.aborted) return false;
       }
       // eslint-disable-next-line no-await-in-loop
-      if (await client.isOnline()) return true;
+      if (await client.isOnline()) return !(signal && signal.aborted);
+      if (signal && signal.aborted) return false;
       if (Date.now() - lastNotice > 20000) {
         lastNotice = Date.now();
         onLog(`等待 Android 启动… ${Math.round((Date.now() - start) / 1000)}s`);
@@ -753,24 +855,38 @@ class Runtime {
     this.startWatchdog();
   }
 
-  /** 优雅停止：emulator 走控制台关机，QEMU 走 monitor */
-  async stop({ graceful = true } = {}) {
-    // 下次开机要重新做一次 LCD 归一（方向可能被换掉）
-    this._lcdNormalized = false;
+  /** Pending launches cannot acknowledge a stop they may later undo. */
+  stop(options = {}) {
+    if (this._stopPromise) return this._stopPromise;
+    if (this._startupPending() || this._repairPromise || (this._dataMaintenance && !options.forDataMaintenance)) return Promise.resolve(false);
+    const p = Promise.resolve().then(() => this._stop(options));
+    this._stopPromise = p;
+    const clear = () => { if (this._stopPromise === p) this._stopPromise = null; };
+    p.then(clear, clear);
+    return p;
+  }
+
+  /** 优雅停止：emulator 走控制台关机，QEMU 走归属进程终止 */
+  async _stop({ graceful = true, forDataMaintenance = false } = {}) {
     // Attach mode is explicitly somebody else's runtime, not ours to shut down.
-    if (this.settings.engine.mode === 'attach') return false;
-    const adbPath = this.adbPath();
+    if (this.settings.engine.mode === 'attach' || (this._dataMaintenance && !forDataMaintenance)) return false;
+    // During maintenance, do not let stop() invalidate an unhealthy guest's snapshot
+    // before the caller has established that all affected runtime data is offline.
+    const adbPath = forDataMaintenance ? undefined : this.adbPath();
+    this._lcdNormalized = false;
     if (!this.vmProc) {
       const spawning = this.emulator.running();
-      const serial = spawning ? `emulator-${this.emulator.port}` : String(this.emuSerial || '');
-      const local = /^127\.0\.0\.1:(\d+)$/.exec(serial);
-      const native = /^emulator-(\d+)$/.exec(serial);
-      if (local) this.emulator.port = Number(local[1]) - 1;
-      else if (native) this.emulator.port = Number(native[1]);
-      else return false;
+      let port = spawning ? this.emulator.port : emulatorConsolePort(this.emuSerial);
+      if (forDataMaintenance && !spawning) {
+        const ports = await this.emulatorPorts();
+        if (ports.length && !ports.includes(port)) [port] = ports;
+      }
+      if (!port) return false;
+      this.emulator.port = port;
+      const serial = spawning || emulatorConsolePort(this.emuSerial) !== port ? `emulator-${port}` : this.emuSerial;
       const stopped = await this.emulator.stop({ adbPath }).catch(() => false);
       const online = await this.client(serial).isOnline().catch(() => true);
-      if (!stopped || online || await portAlive(this.emulator.port)) return false;
+      if (!stopped || online || await portAlive(port) || (forDataMaintenance && await portAlive(port + 1))) return false;
       this._activeApps.clear();
       return true;
     }
@@ -780,9 +896,10 @@ class Runtime {
     let stopped = await processOwner.terminateOwnedProcess(info, (p) => this.ownsQemuProcess(p), graceful ? 'SIGTERM' : 'SIGKILL');
     if (!stopped && process.platform === 'linux') stopped = await processOwner.terminateOwnedProcess(info, (p) => this.ownsQemuProcess(p), 'SIGKILL');
     if (!stopped) return false;
-    if (this.vmProc === proc) this.vmProc = null;
     const online = await this.client('127.0.0.1:5555').isOnline().catch(() => true);
     if (online || await portAlive(MONITOR_PORT) || await portAlive(5555)) return false;
+    if (this.vmProc === proc) this.vmProc = null;
+    this.installing = false;
     this._activeApps.clear();
     return true;
   }
@@ -840,22 +957,26 @@ class Runtime {
   // ---------------- 安装系统到虚拟磁盘 ----------------
 
   async startInstaller({ onLog = () => {} } = {}) {
-    const env = await this.provisioner.checkEnv();
-    if (!env.iso.ok) {
-      throw new Error(env.iso.reason || '请先下载/导入 Android 系统镜像（ISO）');
+    if (this._dataMaintenance || this._stopPromise || this._repairPromise) throw new Error(DATA_MAINTENANCE_BUSY);
+    if (this._startupPending() || this.vmRunning) throw new Error('已有运行时正在启动或运行');
+    this._installerStarting = true;
+    try {
+      const env = await this.provisioner.checkEnv();
+      if (!env.iso.ok) throw new Error(env.iso.reason || '请先下载/导入 Android 系统镜像（ISO）');
+      if (!env.disk.ok) await this.provisioner.createDisk(this.settings.runtime.diskSizeGB || 24, () => {});
+      this.installing = true;
+      const r = await this.boot({ install: true, onLog });
+      if (!r.ok) throw new Error(r.error || '安装环境启动失败');
+      return r;
+    } finally {
+      this._installerStarting = false;
     }
-    if (!env.disk.ok) await this.provisioner.createDisk(this.settings.runtime.diskSizeGB || 24, () => {});
-    this.installing = true;
-    const r = await this.boot({ install: true, onLog });
-    if (!r.ok) throw new Error(r.error || '安装环境启动失败');
-    return r;
   }
 
   /** 安装完成后：关掉安装程序 → 写标记 → 之后直接从磁盘启动 */
   async markInstalled() {
-    if (this.installing) {
-      try { await this.stop({ graceful: true }); } catch (_) { /* ignore */ }
-    }
+    if (this._dataMaintenance || this._repairPromise || this._stopPromise || this._startupPending() || this.settings.engine.mode === 'attach') return false;
+    if (this.installing && await this.stop({ graceful: true }) !== true) return false;
     store.saveSettings({ runtime: { installed: true } });
     this.installing = false;
     return true;
@@ -892,50 +1013,69 @@ class Runtime {
     return consoles.length ? consoles : all;
   }
 
-  async adoptExisting({ onLog = () => {} } = {}) {
-    const alive = await this.emulatorPorts();
+  async ownedRuntimeIdentity(serial) {
+    if (serial === QEMU_SERIAL && this.vmProc) {
+      const proc = this.vmProc;
+      const [info, pid] = await Promise.all([processOwner.getProcessInfo(proc.pid), processOwner.pidOnPort(5555)]);
+      return this.vmProc === proc && pid === proc.pid && this.ownsQemuProcess(info) ? info : null;
+    }
+    const port = emulatorConsolePort(serial);
+    if (!port) return null;
+    const [target, adbPid] = await Promise.all([this.emulator.ownedProcessOnPort(port), processOwner.pidOnPort(port + 1)]);
+    return target && Number(target.pid) === adbPid ? target : null;
+  }
+
+  async adoptExisting({ onLog = () => {}, signal } = {}) {
+    const alive = await waitStartupProbe(signal, () => this.emulatorPorts());
     if (!alive.length) {
       onLog('没有发现上一台运行时，准备冷启动');
       return null;
     }
     onLog(`发现 ${alive.length} 台残留运行时（端口 ${alive.join(', ')}），尝试接管`);
 
-    // adb server 里可能还留着上个进程的 offline 记录（模拟器重启过 adbd 就会这样），
-    // 先清掉再连，否则 get-state 永远返回 offline，会误判成"没就绪"把好好的机器杀掉。
-    await this.client().exec(['kill-server'], { withSerial: false, timeout: 8000 }).catch(() => {});
-
     for (const port of alive) {
-      const target = await this.emulator.ownedProcessOnPort(port);
-      if (!target) continue;
       const serial = `127.0.0.1:${port + 1}`;
+      const target = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
+      if (!target) continue;
       const c = this.client(serial);
       let booted = '';
       for (let i = 0; i < 6 && booted !== '1'; i += 1) {
         // eslint-disable-next-line no-await-in-loop
         await c.connect().catch(() => false);
+        throwIfAborted(signal);
         // eslint-disable-next-line no-await-in-loop
-        const state = (await c.exec(['get-state'], { timeout: 5000 }).then((r) => r.stdout).catch(() => '')).trim();
+        const state = (await waitStartupProbe(signal,
+          () => c.exec(['get-state'], { timeout: 5000 }).then((r) => r.stdout).catch(() => ''))).trim();
         if (state === 'device') {
           // eslint-disable-next-line no-await-in-loop
-          booted = (await c.shell('getprop sys.boot_completed', { timeout: 6000 }).catch(() => '')).trim();
+          booted = (await waitStartupProbe(signal,
+            () => c.shell('getprop sys.boot_completed', { timeout: 6000 }).catch(() => ''))).trim();
+        } else if (i === 0) {
+          // Clear a stale registration for this endpoint only, not the shared ADB server.
+          await c.exec(['disconnect', serial], { withSerial: false, timeout: 8000 }).catch(() => {});
         }
-        if (booted !== '1') await new Promise((r) => setTimeout(r, 700));
+        throwIfAborted(signal);
+        if (booted !== '1') await waitStartupProbe(signal, () => new Promise((r) => setTimeout(r, 700)));
       }
+      throwIfAborted(signal);
       if (booted !== '1') {
         onLog(`发现上一台运行时（${serial}）但没就绪，先关掉它再重新开机`);
         // AVD 目录有锁：留着这台会让新实例直接退出，表现成"怎么都开不了机"。
         // adb 都连不上了，只能按控制台端口找到进程强杀。
-        await processOwner.terminateOwnedProcess(target, (p) => this.emulator.ownsProcess(p, { discoverRoot: true }));
-        await new Promise((r) => setTimeout(r, 1200));
+        throwIfAborted(signal);
+        await processOwner.terminateOwnedProcess(target, (p) => !signal?.aborted && this.emulator.ownsProcess(p, { discoverRoot: true }));
+        await waitStartupProbe(signal, () => new Promise((r) => setTimeout(r, 1200)));
         continue;
       }
-      if (!processOwner.sameIdentity(target, await this.emulator.ownedProcessOnPort(port))) continue;
+      if (!processOwner.sameIdentity(target, await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial)))) continue;
+      throwIfAborted(signal);
+      // `device` belongs to attach mode; builtin discovery must not replace that selection.
       this.emuSerial = serial;
       this.emulator.port = port;
-      store.saveSettings({ device: serial });
       onLog(`已接管正在运行的运行时（${serial}）`);
       // eslint-disable-next-line no-await-in-loop
       await this.prepare(c);
+      throwIfAborted(signal);
       return { ok: true, client: c, engine: 'emulator', reused: true };
     }
     return null;
@@ -983,11 +1123,17 @@ class Runtime {
    * 幂等入口：预热与用户点击可能同时发生，共用一个 Promise，
    * 避免两边各判断一次「没在线」后各自拉起一台模拟器（AVD 锁冲突 + 双倍内存）。
    */
-  async ensure({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0, autoRepair = true } = {}) {
-    if (this._ensurePromise) return this._ensurePromise;
-    const p = this._ensureInner({ onLog, lcdOrientation, lowspec, timeoutMs, autoRepair });
+  ensure({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0, autoRepair = true, signal } = {}) {
+    try { throwIfAborted(signal); } catch (_) { return Promise.resolve(cancelledBoot()); }
+    if (this._dataMaintenance || this._stopPromise || this._repairPromise) return Promise.resolve({ ok: false, error: DATA_MAINTENANCE_BUSY });
+    if (this._ensurePromise) return this._ensureSignal === signal ? this._ensurePromise
+      : Promise.resolve({ ok: false, code: 'START_BUSY', error: '另一项运行时启动尚未结束' });
+    if (this._booting || this._installerStarting || this.vmStarting) return Promise.resolve({ ok: false, error: '运行时正在启动' });
+    const p = Promise.resolve().then(() => this._ensureInner({ onLog, lcdOrientation, lowspec, timeoutMs, autoRepair, signal }))
+      .catch((error) => { if (signal?.aborted) return cancelledBoot(); throw error; });
+    this._ensureSignal = signal;
     this._ensurePromise = p;
-    const clear = () => { if (this._ensurePromise === p) this._ensurePromise = null; };
+    const clear = () => { if (this._ensurePromise === p) { this._ensurePromise = null; this._ensureSignal = undefined; } };
     p.then(clear, clear);
     return p;
   }
@@ -1108,56 +1254,57 @@ class Runtime {
     };
   }
 
-  async _ensureInner({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0, autoRepair = true } = {}) {
+  async _ensureInner({ onLog = () => {}, lcdOrientation = '', lowspec = false, timeoutMs = 0, autoRepair = true, signal } = {}) {
+    try { throwIfAborted(signal); } catch (_) { return cancelledBoot(); }
     // 每轮启动的「自动做过什么」独立记账：上一轮修过的东西不该出现在这一轮的修复窗口里
     this.autoRepairLog = [];
-    const client = this.client();
-    if (await client.isOnline()) {
-      await this.prepare(client);
-      return { ok: true, client, engine: 'builtin', reused: true };
+    const s = this.settings;
+    // attach is opt-in for the configured serial only. UI discovery remains an explicit action.
+    if (s.engine.mode === 'attach') {
+      const serial = String(s.device || '').trim();
+      if (serial) {
+        const client = this.client(serial);
+        const online = await waitStartupProbe(signal, () => client.isOnline()) || (serial.includes(':') && await client.connect());
+        if (signal && signal.aborted) return cancelledBoot();
+        const current = this.settings;
+        if (online && current.engine.mode === 'attach' && String(current.device || '').trim() === serial) {
+          await this.prepare(client);
+          if (signal && signal.aborted) return cancelledBoot();
+          return { ok: true, client, engine: 'attach', reused: true };
+        }
+      }
+      return { ok: false, needsSetup: 'attach', error: '所选运行时未连接，请检查设备地址或在设置中探测并选择' };
     }
 
-    // 上一次 ApkStart 退出时模拟器会留着（下次点开秒进），但新进程里没有它的
-    // 句柄，adb server 也可能被重启过——只靠 isOnline() 会判成"没有运行时"，
-    // 于是又开一台新的。这里先把还活着的模拟器接管过来，避免重复开机器吃内存。
-    const adopted = await this.adoptExisting({ onLog });
-    if (adopted) return adopted;
-
-    // 上次会话遗留 / 别的进程拉起的 emulator：换个端口也要复用，绝不重复开一台
-    try {
-      const devices = await client.devices();
-      const running = devices.find((d) => /^emulator-\d+$/.test(d.serial) && d.state === 'device');
-      if (running) {
-        this.emuSerial = running.serial;
-        const m = /(\d+)$/.exec(running.serial);
-        if (m) this.emulator.port = Number(m[1]);
-        const c2 = this.client(running.serial);
-        await this.prepare(c2);
-        return { ok: true, client: c2, engine: 'emulator', reused: true };
+    const serial = this.vmProc ? QEMU_SERIAL : this.emuSerial;
+    const target = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
+    if (signal && signal.aborted) return cancelledBoot();
+    if (target) {
+      const client = this.client(serial);
+      const online = await waitStartupProbe(signal, () => client.isOnline());
+      if (signal && signal.aborted) return cancelledBoot();
+      const identity = online ? await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial)) : null;
+      if (signal && signal.aborted) return cancelledBoot();
+      if (online && processOwner.sameIdentity(target, identity)) {
+        await this.prepare(client);
+        if (signal && signal.aborted) return cancelledBoot();
+        return { ok: true, client, engine: 'builtin', reused: true };
       }
-    } catch (_) { /* 没找到就正常拉起 */ }
+    }
+    if (this.vmProc) return { ok: false, error: '已有 QEMU 实例，但无法确认其 ADB 连接可用，请先停止运行时' };
+
+    // 上次退出留下的 detached emulator 不一定在原端口；只从已验证进程发现它。
+    const adopted = await this.adoptExisting({ onLog, signal });
+    if (signal && signal.aborted) return cancelledBoot();
+    if (adopted) return adopted;
 
     // 进程还在但设备离线（多半卡在引导）：先停掉再重新拉起，避免干等
     if (this.emulator.running()) {
       onLog('检测到卡住的运行时，正在重启…');
-      await this.emulator.stop({ adbPath: this.adbPath() });
-    }
-
-    const s = this.settings;
-
-    // 高级模式：连接已有运行时
-    if (s.engine.mode === 'attach') {
-      onLog('正在探测已有运行时…');
-      const found = await this.probe();
-      if (found.length) {
-        store.saveSettings({ device: found[0].serial });
-        const c2 = this.client(found[0].serial);
-        if (await c2.isOnline()) {
-          await this.prepare(c2);
-          return { ok: true, client: c2, engine: found[0].name };
-        }
+      if (!await this.emulator.stop({ adbPath: this.adbPath() })) {
+        return { ok: false, error: '无法确认原有运行时已停止' };
       }
-      return { ok: false, needsSetup: 'attach', error: '未发现可用的已有运行时' };
+      if (signal && signal.aborted) return cancelledBoot();
     }
 
     // 默认：自带运行时
@@ -1168,22 +1315,28 @@ class Runtime {
       onLog(`系统镜像展开失败：${e.message}`);
       this.log(`materialize failed: ${e.message}`);
     });
+    if (signal && signal.aborted) return cancelledBoot();
     const env = await this.provisioner.checkEnv();
+    if (signal && signal.aborted) return cancelledBoot();
 
     // emulator 路径：镜像即系统，没有"安装到磁盘"这一步
     if (env.emulator.ok && env.sysimg.ok) {
       // 关掉 ApkStart 后可能残留未接管的模拟器（detached 的 qemu 仍存活），
       // 它一直占着 AVD 锁，会让冷启直接 FATAL "Running multiple emulators with the same AVD"。
       // 接管失败时先把这些孤儿清掉，再冷启，保证「关掉再开」一定能起来。
+      if (signal && signal.aborted) return cancelledBoot();
       await this.killOrphanEmulators({ onLog }).catch(() => {});
+      if (signal && signal.aborted) return cancelledBoot();
       try {
-        const r = await this.boot({ onLog, lcdOrientation, lowspec, timeoutMs });
+        const r = await this.boot({ onLog, lcdOrientation, lowspec, timeoutMs, signal });
+        if (signal && signal.aborted) return cancelledBoot();
         if (r.ok) return { ok: true, client: r.client, engine: 'emulator', profile: r.profile, network: r.network || null };
         // 全自动修复：先把「不需要用户做决定」的毛病自己处理掉（清锁、补文件、
         // 换软件渲染、降配），再自动重来一遍。加速类会弹一次管理员授权，
         // 预热/后台启动传 autoRepair:false —— 不能因为一次静默预热就弹授权框吓人一跳。
         const diagnosis = r.diagnosis || this.emulator.lastDiagnosis;
-        const healed = autoRepair ? await this.autoRepair({ diagnosis, onLog }) : null;
+        const healed = autoRepair && !(signal && signal.aborted) ? await this.autoRepair({ diagnosis, onLog }) : null;
+        if (signal && signal.aborted) return cancelledBoot();
         if (healed && healed.retry) {
           // 修复窗口要如实写「重开过一次」：只写「清过锁」会让用户以为程序没再试
           this.autoRepairLog.push('重新开了一次机');
@@ -1193,7 +1346,9 @@ class Runtime {
             lowspec: lowspec || !!healed.lowspec,
             // 软件模拟/超时类放宽等待：修完还是按原来的 4 分钟等，等于白修
             timeoutMs: Math.max(timeoutMs || 0, healed.waitMore ? 900000 : 0),
+            signal,
           });
+          if (signal && signal.aborted) return cancelledBoot();
           const autoRepair = { ...healed, retried: true };
           if (again.ok) {
             return {
@@ -1237,7 +1392,9 @@ class Runtime {
     }
 
     try {
-      const r = await this.boot({ onLog });
+      if (signal && signal.aborted) return cancelledBoot();
+      const r = await this.boot({ onLog, signal });
+      if (signal && signal.aborted) return cancelledBoot();
       if (r.ok) return { ok: true, client: r.client, engine: 'builtin' };
       return { ok: false, error: r.error };
     } catch (e) {
@@ -1256,7 +1413,10 @@ class Runtime {
    *   - 有窗口时给 qemu 一个「让着前台」的优先级；
    *   - 只在有窗口时才开启文件同步 / 通知轮询（由 onActive 回调交给 UI 层）。
    */
-  async beginApp(pkg, { onActive = () => {} } = {}) {
+  async beginApp(pkg, { client, onActive = () => {}, shouldCancel = () => false } = {}) {
+    if (shouldCancel()) return { cancelled: true };
+    // Pin this session to the installer/window client, not a later runtime selection.
+    const sessionClient = client || this.client();
     const first = this._activeApps.size === 0;
     this._activeApps.add(pkg);
     this.touch();
@@ -1268,9 +1428,11 @@ class Runtime {
       // 有应用要开了：把「空闲存快照」推迟，别在应用启动时抢磁盘
       this.emulator.cancelSnapshotSave();
       await this.emulator.setPriority(perf ? 'normal' : 'below').catch(() => {});
+      if (shouldCancel()) return { ...state, cancelled: true };
       try { onActive(true); } catch (_) { /* 轮询启动失败不影响打开应用 */ }
     }
 
+    if (shouldCancel()) return { ...state, cancelled: true };
     const installed = store.getApps().map((a) => a && a.package).filter(Boolean);
     const plan = container.buildSessionCommands({
       pkg,
@@ -1279,8 +1441,10 @@ class Runtime {
       // App 刚 am start 完，此刻清后台可能误伤正在进前台的进程；清理放到 endApp
       killBackground: false,
     });
+    if (shouldCancel()) return { ...state, cancelled: true };
     if (plan.commands.length) {
-      await this.client().shell(plan.commands.join(' ; '), { timeout: 20000 }).catch(() => '');
+      await sessionClient.shell(plan.commands.join(' ; '), { timeout: 20000 }).catch(() => '');
+      if (shouldCancel()) return { ...state, cancelled: true };
     }
     this.log(container.describeSession(state, plan));
     return { ...state, plan };
@@ -1291,17 +1455,26 @@ class Runtime {
    * 「常驻但几乎不耗资源」的停放状态（清后台 + Android idle + qemu 降优先级）。
    * 不关机、不删 AVD —— 下次点开还是秒进。
    */
-  async endApp(pkg, { onIdle = () => {} } = {}) {
+  async endApp(pkg, { client, onIdle = () => {}, shouldCancel = () => false } = {}) {
     this._activeApps.delete(pkg);
-    await this.client().forceStop(pkg).catch(() => {});
-    const state = container.nextSessionState([...this._activeApps], 'close', pkg);
+    const sessionState = () => container.nextSessionState([...this._activeApps], 'close', pkg);
+    if (shouldCancel()) return { ...sessionState(), cancelled: true };
+    const sessionClient = client || this.client();
+    if (shouldCancel()) return { ...sessionState(), cancelled: true };
+    await sessionClient.forceStop(pkg).catch(() => {});
+    const state = sessionState();
+    if (shouldCancel()) return { ...state, cancelled: true };
     if (state.idle) {
       const s = this.settings;
       const cmds = container.buildIdleCommands({ deep: !!(s.engine && s.engine.deepTrim) });
-      await this.client().shell(cmds.join(' ; '), { timeout: 15000 }).catch(() => '');
+      if (shouldCancel()) return { ...state, cancelled: true };
+      await sessionClient.shell(cmds.join(' ; '), { timeout: 15000 }).catch(() => '');
+      if (shouldCancel()) return { ...state, cancelled: true };
       await this.emulator.setPriority('idle').catch(() => {});
+      if (shouldCancel()) return { ...state, cancelled: true };
       // 现在最空闲：把内存状态存成快照，下次开机走恢复而不是冷启动
       this._armSnapshotSave(8000);
+      if (shouldCancel()) { this.emulator.cancelSnapshotSave(); return { ...state, cancelled: true }; }
       try { onIdle(true); } catch (_) { /* ignore */ }
       this.log('容器已停放（Android 常驻，0 个应用进程，qemu 最低优先级）');
     }
@@ -1345,7 +1518,7 @@ class Runtime {
     if (this._watchdog.unref) this._watchdog.unref();
   }
 
-  get vmRunning() { return this.emulator.running() || !!(this.vmProc && !this.vmProc.killed); }
+  get vmRunning() { return this.emulator.running() || !!this.vmProc; }
 
   /** 当前运行时的 LCD 方向（landscape / portrait）；未知时按竖屏算 */
   get lcdOrientation() { return this.emulator.lcdOrientation; }
@@ -1398,33 +1571,144 @@ class Runtime {
     });
   }
 
-  usage() {
-    // 只把「当前这轮用的那套 AVD」当作活动 AVD：另一套（默认 ↔ 自定义镜像）
-    // 的快照不该被当成可回收项列出来，否则用户一清理，切回去就要重新冷启动。
-    const layers = require('./layers');
-    return layers.summary(this.provisioner.paths().root, { keepAvd: `${this.emulator.avdName}.avd` });
+  _protectedImagePaths() {
+    const { isoPath, diskPath } = this.settings.runtime;
+    return [isoPath, diskPath];
   }
 
-  /**
-   * 回收运行时里的旧镜像 / 旧 AVD / 锁文件 / 快照。
-   * 之前「点清理却清不掉」的根因：运行时正在跑时 keepSnapshots 把当前 AVD 的
-   * 快速启动快照（≈几 GB 的 ram.img）排除掉了，单 AVD 环境下几乎没有可清项。
-   * 现在调用方可以显式传 includeSnapshots：先停运行时再裁，快照就能真正回收。
-   */
-  async cleanup({ apply = false, aggressive = false, includeSnapshots = false } = {}) {
-    let stoppedVm = false;
-    if (includeSnapshots && this.vmRunning) {
-      await this.stop().catch(() => {});
-      stoppedVm = true;
-    }
-    const report = require('./layers').prune(this.provisioner.paths().root, {
-      apply,
-      aggressive,
-      keepAvd: `${this.emulator.avdName}.avd`,
-      keepSnapshots: !includeSnapshots && this.vmRunning,
+  usage() {
+    const { root, avdHome } = this.provisioner.paths();
+    return require('./layers').summary(root, {
+      avdHome, keepAvd: `${this.emulator.avdName}.avd`, protectedPaths: this._protectedImagePaths(),
     });
-    // 预览阶段若停了机，给用户一个提示：清完可手动重启运行时
-    return { ...report, apply, stoppedVm };
+  }
+
+  _startupPending() {
+    return !!(this.vmStarting || this._ensurePromise || this._booting || this._installerStarting || this._prewarmPromise);
+  }
+
+  async _withStoppedDataRuntime(apply) {
+    if (this._dataMaintenance || this._stopPromise || this._repairPromise) throw new Error('另一项运行时数据维护或停机正在执行');
+    if (this._startupPending()) throw new Error('运行时正在启动，请等待启动结束后重试');
+    if (this.installing) throw new Error('安装器仍在运行，请先完成安装并正常关机');
+    if (this.settings.engine.mode === 'attach') throw new Error('连接已有运行时模式不允许维护内置运行时数据');
+    this._dataMaintenance = true;
+    try {
+      const { root, avdHome } = this.provisioner.paths();
+      const avdName = this.emulator.avdName;
+      const protectedPaths = this._protectedImagePaths();
+      const identity = (p) => {
+        const st = fs.statSync(p, { throwIfNoEntry: false });
+        if (!st) return '';
+        if (!st.isDirectory()) throw new Error('运行时数据路径并非目录');
+        return `${fs.realpathSync(p)}:${st.dev}:${st.ino}`;
+      };
+      const rootIdentity = identity(root);
+      const avdIdentity = identity(avdHome);
+      const hadQemu = !!this.vmProc;
+      const ports = new Set([emulatorConsolePort(this.emuSerial), this.emulator.port]);
+      const serials = new Set([this.emuSerial]);
+      const wasRunning = this.vmRunning || (await this.emulatorPorts()).length > 0;
+      if (await this.stop({ forDataMaintenance: true }) !== true) throw new Error('未能停止运行时，未修改数据');
+      // isOnline() folds transport errors into false. Require a successful ADB listing,
+      // and check both registrations of a managed emulator after the process has stopped.
+      const { stdout } = await this.client().exec(['devices'], { withSerial: false, timeout: 8000 });
+      const [header, ...devices] = String(stdout || '').trim().split(/\r?\n/);
+      if (header !== 'List of devices attached') throw new Error('无法确认 ADB 离线状态，未修改数据');
+      serials.add(this.emuSerial);
+      if (hadQemu) serials.add(QEMU_SERIAL);
+      ports.add(emulatorConsolePort(this.emuSerial));
+      ports.add(this.emulator.port);
+      const endpoints = new Set(hadQemu ? [MONITOR_PORT, 5555] : []);
+      for (const port of ports) {
+        if (port) {
+          serials.add(`emulator-${port}`);
+          serials.add(`127.0.0.1:${port + 1}`);
+          endpoints.add(port);
+          endpoints.add(port + 1);
+        }
+      }
+      const online = devices.some((line) => {
+        const [serial, state] = line.trim().split(/\s+/);
+        return serials.has(serial) && state !== 'offline';
+      });
+      if (online || this.vmRunning || (await this.emulatorPorts()).length
+          || (await Promise.all([...endpoints].map((port) => portAlive(port)))).some(Boolean)
+          || this._startupPending() || this.vmRunning || this.installing) {
+        throw new Error('运行时仍在运行或启动，未修改数据');
+      }
+      const current = this.provisioner.paths();
+      if (this.settings.engine.mode === 'attach' || current.root !== root || current.avdHome !== avdHome || this.emulator.avdName !== avdName
+          || identity(root) !== rootIdentity || identity(avdHome) !== avdIdentity
+          || this._protectedImagePaths().some((p, i) => p !== protectedPaths[i])) {
+        throw new Error('运行时设置或目录已变更，未修改数据');
+      }
+      // Keep the lock through async maintenance success AND failure.
+      return await apply({ root, avdHome, avdName, wasRunning, protectedPaths });
+    } finally {
+      this._dataMaintenance = false;
+    }
+  }
+
+  /** 预览只盘点；执行必须成功停机并验证离线。 */
+  async cleanup({ apply = false, aggressive = false, includeSnapshots = false } = {}) {
+    const run = ({ root, avdHome, avdName, wasRunning = false, protectedPaths = this._protectedImagePaths() }) => ({
+      ...require('./layers').prune(root, {
+        apply, avdHome, aggressive, keepSnapshots: !includeSnapshots, keepAvd: `${avdName}.avd`, protectedPaths,
+      }),
+      ok: true, stoppedVm: wasRunning,
+    });
+    if (!apply) return run({ ...this.provisioner.paths(), avdName: this.emulator.avdName });
+    // 现有清理调用方通过异常显示失败；返回一个失败对象会被旧 UI 当成成功。
+    return this._withStoppedDataRuntime(run);
+  }
+
+  async clearStaleLocks() {
+    return this._withStoppedDataRuntime(({ root, avdHome, avdName, wasRunning, protectedPaths }) => ({
+      ...require('./layers').prune(root, { apply: true, avdHome, keepAvd: `${avdName}.avd`, locksOnly: true, protectedPaths }),
+      ok: true, stoppedVm: wasRunning,
+    }));
+  }
+
+  _managedAvdDir(avdHome, avdName) {
+    const layers = require('./layers');
+    const name = `${avdName}.avd`;
+    if (!layers.MANAGED_AVDS.includes(name)) throw new Error('无法确认当前 AVD 归属');
+    const dir = path.join(avdHome, name);
+    const st = fs.lstatSync(dir, { throwIfNoEntry: false });
+    if (st && (!st.isDirectory() || !layers.isManagedEntry(avdHome, dir))) throw new Error('当前 AVD 目录不是受管目录');
+    return { dir, st };
+  }
+
+  /** 就地增长有效 userdata；不允许底层重建回退覆盖已有数据。调用方仅在 ok 后保存设置。 */
+  async resizeDataPartition(dataMB) {
+    if (!Number.isSafeInteger(dataMB) || dataMB < 1024 || dataMB > 64 * 1024) {
+      return { ok: false, error: '安卓数据分区容量须为 1024–65536 MB 的整数' };
+    }
+    try {
+      return await this._withStoppedDataRuntime(async ({ avdHome, avdName, wasRunning, protectedPaths }) => {
+        const layers = require('./layers');
+        const { dir, st } = this._managedAvdDir(avdHome, avdName);
+        const img = path.join(dir, 'userdata-qemu.img');
+        const base = fs.lstatSync(img, { throwIfNoEntry: false });
+        for (const name of st ? fs.readdirSync(dir) : []) {
+          if (!/^userdata(?:[-.]|$)/i.test(name)) continue;
+          const entry = path.join(dir, name);
+          const stat = fs.lstatSync(entry);
+          if (!stat.isFile() || stat.nlink !== 1 || !layers.isManagedEntry(avdHome, entry) || layers.protectsPath(entry, protectedPaths)) {
+            throw new Error('安卓用户数据归属不明，未执行扩容');
+          }
+          if (name !== 'userdata-qemu.img') throw new Error('存在旧版或覆盖层用户数据，未执行不安全的基础镜像扩容');
+        }
+        if (layers.protectsPath(img, protectedPaths) || layers.protectsPath(`${img}.qcow2`, protectedPaths)
+            || (base && (!base.isFile() || base.nlink !== 1 || !layers.isManagedEntry(avdHome, img) || !userdata.hasExt4Superblock(img)))) {
+          throw new Error('现有 userdata 无法安全扩容，未重建或覆盖任何数据');
+        }
+        const r = await this.emulator.resizeDataPartition(dataMB);
+        if (!r || r.ok !== true) return { ...r, ok: false, stoppedVm: wasRunning, error: r?.error || r?.reason || '扩容未完成' };
+        return { ...r, ...this.emulator.dataInfo(), ok: true, stoppedVm: wasRunning };
+      });
+    } catch (e) { return { ok: false, error: e.message }; }
   }
 
   /**
@@ -1436,60 +1720,46 @@ class Runtime {
    * 保留 config.ini / hardware-qemu.ini，AVD 仍有效，下次点开应用会重新冷启动建数据。
    * @returns {{ok:boolean, reclaimed:number, avdDir:string, error?:string}}
    */
-  async resetAndroidData() {
-    const fs = require('fs');
-    const path = require('path');
-    try {
-      if (this.vmRunning) await this.stop().catch(() => {});
-      // 必须取「当前活动 AVD」：写死 apkstart.avd 时，用自定义镜像的用户点「重置数据」
-      // 清的是默认镜像那份用户数据（应用的存档、登录态全没了），而真正出问题的
-      // 自定义 AVD 一个字节都没动 —— 既丢了数据，又没修好问题。
-      const avdName = (this.emulator && this.emulator.avdName) || 'apkstart';
-      const avdDir = path.join(this.provisioner.paths().avdHome, `${avdName}.avd`);
-      let reclaimed = 0;
-      if (fs.existsSync(avdDir)) {
-        for (const e of fs.readdirSync(avdDir, { withFileTypes: true })) {
-          const p = path.join(avdDir, e.name);
-          // 删除：用户数据镜像（含 qcow2 差量 + 基址）、快速启动快照、残留锁文件/锁目录。
-          // 保留：config.ini / hardware-qemu.ini / AVD.conf / cache.img / encryptionkey* /
-          //       initrd / modem_simulator / 各类 *.ini / *.txt / *.cache —— 它们是 AVD
-          //       的身份与基础设施，删了 AVD 直接失效或下次开机异常。
-          const isUserdata = /^userdata(-qemu)?(-[0-9]+)?\.img(\.qcow2)?$/.test(e.name)
-            || /^userdata\.img(\.qcow2)?\.\d+$/.test(e.name);
-          const isSnapshot = /^snapshots(\.stale-\d+)?$/.test(e.name);
-          const isLock = /\.lock$/.test(e.name);
-          if (!e.isDirectory() && !isUserdata && !isLock) continue;
-          if (e.isDirectory() && !isSnapshot && !isLock) continue;
-          try {
-            if (e.isDirectory()) {
-              const s = require('./layers').dirSize(p);
-              fs.rmSync(p, { recursive: true, force: true });
-              reclaimed += s;
-            } else {
-              const s = fs.statSync(p).size;
-              fs.rmSync(p, { force: true });
-              reclaimed += s;
-            }
-          } catch (_) { /* 占用中的暂跳，下次再清 */ }
+  async resetAndroidData({ apply = true } = {}) {
+    const layers = require('./layers');
+    let avdDir = '';
+    let reclaimed = 0;
+    const run = ({ avdHome, avdName, protectedPaths = this._protectedImagePaths() }) => {
+      const { dir: activeDir, st } = this._managedAvdDir(avdHome, avdName);
+      avdDir = activeDir;
+      const candidates = [];
+      for (const e of st ? fs.readdirSync(avdDir, { withFileTypes: true }) : []) {
+        const p = path.join(avdDir, e.name);
+        // 保留 config.ini / hardware-qemu.ini / cache.img 等 AVD 基础设施。
+        const isUserdata = /^userdata(-qemu)?(-[0-9]+)?\.img(\.qcow2)?$/.test(e.name)
+          || /^userdata\.img(\.qcow2)?\.\d+$/.test(e.name);
+        const isSnapshot = /^snapshots(\.stale-\d+)?$/.test(e.name);
+        const isLock = /\.lock$/.test(e.name);
+        const dir = e.isDirectory();
+        if (!(dir ? isSnapshot || isLock : isUserdata || isLock)) continue;
+        if ((!dir && !e.isFile()) || !layers.isManagedEntry(avdHome, p) || layers.protectsPath(p, protectedPaths)) {
+          throw new Error(`拒绝重置非受管或正在引用的文件：${e.name}`);
         }
+        candidates.push({ path: p, kind: dir ? 'dir' : 'file', size: dir ? layers.dirSize(p) : fs.statSync(p).size });
       }
-      // 用户数据镜像被删后，用户侧「已安装 app」的记录也要清掉，
-      // 否则桌面/启动器还显示着其实已不存在的 app。
-      // 但这份清单是两套 AVD 共用的：自定义镜像下重置只影响 apkstart-custom，
-      // 默认镜像里的应用其实还在（点开时会自动装回来），清空等于把它们的记录也删了。
-      const customActive = avdName === 'apkstart-custom';
-      if (!customActive) {
-        try { store.saveApps([]); } catch (_) { /* ignore */ }
+      if (!apply) return { ok: true, apply: false, avdDir, reclaimed, candidates };
+      for (const c of candidates) {
+        fs.rmSync(c.path, { recursive: c.kind === 'dir', force: true });
+        reclaimed += c.size;
       }
-      // /data 被删了，guest 里的语言与音量也一起回到出厂值：
-      // 清掉这个一次性标记，下次开机重新设中文环境 + 100% 音量，
-      // 否则重置过的机器会一直是英文界面 / 可能的静音状态。
-      // 首次开机收尾的两个标记也一起清：新 /data 要重新走一遍
-      // 「写中文 → 重启生效 → 精简预装」的流程。
-      try { store.saveSettings({ androidVolumeInitialized: false, guest: { localeRebootDone: false, autoTrimDone: false } }); } catch (_) { /* ignore */ }
+      // 自定义镜像与默认镜像各有自己的 /data，但共享应用清单。
+      if (avdName !== 'apkstart-custom') store.saveApps([]);
+      store.saveSettings({ androidVolumeInitialized: false, guest: { localeRebootDone: false, autoTrimDone: false } });
+      this._guestDefaultsReady = false;
+      this._freeformReady = false;
+      this._chineseImeReady = false;
       return { ok: true, reclaimed, avdDir };
+    };
+    try {
+      if (!apply) return run({ avdHome: this.provisioner.paths().avdHome, avdName: this.emulator.avdName });
+      return await this._withStoppedDataRuntime(run);
     } catch (e) {
-      return { ok: false, reclaimed: 0, avdDir: '', error: e.message };
+      return { ok: false, reclaimed, avdDir, error: e.message };
     }
   }
 
@@ -1543,51 +1813,29 @@ class Runtime {
     return last || { ok: false, reason: 'timeout' };
   }
 
-  /**
-   * 修复「安卓虚拟机没有网络」。
-   *
-   * 实测：这个镜像在已有用户数据上冷启时 Wi-Fi 经常一直 NO-CARRIER、拿不到 IP；
-   * 只有 -wipe-data 后的那次开机才稳定连上。所以这里直接重置安卓数据
-   * （应用清单保留，点开应用会自动重装），联网成功后立刻存快照，
-   * 下次恢复时网卡状态一起还原。
-   *
-   * @returns {Promise<{ok:boolean, network?:object, boot?:boolean, wiped?:boolean, error?:string}>}
-   */
-  async repairNetwork({ onLog = () => {} } = {}) {
-    try {
-      // 先走轻量修复：绝大多数「没网」只是 WifiConfigStore 里保存网络撞车
-      // （同一个 AndroidWifi 两条记录、network id 都是 0），清掉重连即可，
-      // 完全不用抹数据 —— 抹数据会丢已装应用，是最重的一步。
-      if (this.vmRunning) {
-        const quick = await this.emulator.repairWifi(this.adbPath(), onLog).catch(() => null);
+  /** 网络修复只重连 Wi-Fi；重置 /data 必须走独立的显式确认流程。 */
+  repairNetwork({ onLog = () => {} } = {}) {
+    if (this._repairPromise) return this._repairPromise;
+    if (this._dataMaintenance || this._stopPromise || this._startupPending()) {
+      return Promise.resolve({ ok: false, wiped: false, error: '运行时正在启动、停止或维护，请稍后重试' });
+    }
+    if (this.settings.engine.mode === 'attach' || !this.vmRunning || this.vmProc || this.installing) {
+      return Promise.resolve({ ok: false, wiped: false, error: '没有正在运行的内置 Android 模拟器，未重置安卓数据' });
+    }
+    const p = Promise.resolve().then(async () => {
+      try {
+        const quick = await this.emulator.repairWifi(this.adbPath(), onLog);
         if (quick && quick.ok) {
           onLog('网络已恢复（Wi-Fi 关联已重新建立，未重置安卓数据）。');
-          return { ok: true, network: { ok: true }, wiped: false };
+          return { ok: true, network: quick, wiped: false };
         }
-      }
-      onLog('正在修复虚拟机网络：重置安卓数据并重新开机（应用清单会保留，点开时自动重装）…');
-      if (this.vmRunning) await this.stop({ graceful: false }).catch(() => {});
-      // 给上一次的 qemu / netsimd 一点时间退干净，否则 -wipe-data 会撞 AVD 锁
-      await new Promise((r) => setTimeout(r, 2500));
-      this.emulator.forceWipeOnNextStart();
-      const boot = await this.ensure({ onLog });
-      if (!boot || !boot.ok) {
-        return { ok: false, error: (boot && boot.error) || '虚拟机没能启动', boot: false, wiped: true };
-      }
-      // Wi-Fi 关联 + DHCP 比 sys.boot_completed 晚很多（实测最长 2 分多钟），要给足时间。
-      const network = await this.waitForNetwork({ onLog, timeoutMs: 240000 });
-      if (network && network.ok) {
-        // 立刻把「网络正常」的状态存成快照：下次恢复时网卡状态一起还原，
-        // 否则关掉再开又会回到没网状态。
-        try { await this.emulator.saveSnapshotNow(this.adbPath(), { timeout: 90000 }); } catch (_) { /* ignore */ }
-        onLog(`网络已恢复（${network.ip || ''} 网关 ${network.gateway || '可达'}），已存好可用快照。`);
-      } else {
-        onLog('重置后仍未联网。请检查本机网络/防火墙是否拦截了模拟器（netsimd 走本机回环端口）。');
-      }
-      return { ok: !!(network && network.ok), network, boot: true, wiped: true };
-    } catch (e) {
-      return { ok: false, error: e.message };
-    }
+        return { ok: false, network: quick, wiped: false, error: 'Wi-Fi 重连未恢复网络；未重置安卓数据' };
+      } catch (e) { return { ok: false, wiped: false, error: e.message }; }
+    });
+    this._repairPromise = p;
+    const clear = () => { if (this._repairPromise === p) this._repairPromise = null; };
+    p.then(clear, clear);
+    return p;
   }
 
   dispose() {

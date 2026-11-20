@@ -15,6 +15,7 @@ const { Runtime } = require('./core/engine');
 const { Installer } = require('./core/installer');
 const { Sharer } = require('./core/sharer');
 const { parseApk } = require('./core/apk');
+const { isBundle, parseBundle } = require('./core/apk-bundle');
 const filetype = require('./core/filetype');
 const compat = require('./core/compat');
 const backup = require('./core/backup');
@@ -53,6 +54,7 @@ const guest = require('./core/guest');
 // 多系统按需下载/安装/切换：统一目录、Provider、任务管理器、系统管理器
 const { SystemCatalog } = require('./core/system-catalog');
 const { SystemManager } = require('./core/system-manager');
+const { RuntimeActions, channelMode } = require('./core/runtime-actions');
 
 // Windows 下窗口被遮挡时 capturePage 会拿到旧帧，自动化截图需要禁用遮挡计算
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
@@ -286,11 +288,17 @@ let sharer = null;
 let quitting = false;
 let winAgent = null;
 let appWin = null;
+const windowClients = new WeakMap();
 let notifier = null;
 let androidSet = null;
 let updater = null;
 let updateBusy = false;
 let updateInfo = null;
+let currentSystemStatus;
+const runtimeActions = new RuntimeActions({
+  status: () => currentSystemStatus(),
+  isQuitting: () => quitting,
+});
 
 // ---------------- 命令行解析 ----------------
 
@@ -405,6 +413,7 @@ function refreshPointerMapping() {
  * @param {object} [box] 模拟器 LCD 尺寸；横屏应用传 1920x1080，窗口按它定比例
  */
 function openAppWindow(pkg, tip, box = null, opts = {}) {
+  if (quitting) throw new Error('ApkStart 正在退出');
   const rec = store.getApp(pkg);
   appWin.open({
     pkg,
@@ -418,6 +427,7 @@ function openAppWindow(pkg, tip, box = null, opts = {}) {
   appWin.setIcon(rec && rec.icoPath);
   appWin.setState({ tip: tip || '正在启动安卓运行时…', ready: false, landscape: appWin.lcdLandscape });
   currentAppPkg = pkg;
+  return appWin.win;
 }
 
 /**
@@ -665,6 +675,7 @@ function createWindow({ show = true } = {}) {
     icon: nativeImage.createFromBuffer(ICON_PNG),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
+      additionalArguments: ['--apkstart-role=main'],
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -725,7 +736,8 @@ function createWindow({ show = true } = {}) {
 }
 
 function showWindow() {
-  if (!mainWindow) createWindow();
+  if (quitting) return;
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow();
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
@@ -850,6 +862,7 @@ function parseApkCached(filePath) {
 }
 
 async function runInstall(filePath) {
+  if (quitting) throw new Error('ApkStart 正在退出');
   showWindow();
   // 同一个包正在装（用户连点了几次图标 / 拖了好几次）→ 只提示一次，别重复跑一遍安装
   if (installBusy) {
@@ -865,7 +878,8 @@ async function runInstall(filePath) {
   try {
     let parsedMeta = null;
     try { parsedMeta = parseApkCached(filePath); } catch (_) { /* installer 会给出统一解析错误 */ }
-    const result = await installer.install(filePath, (p) => send('install:progress', p), { meta: parsedMeta });
+    const result = await runtimeActions.run('apk:install', () =>
+      installer.install(filePath, (p) => send('install:progress', p), { meta: parsedMeta }));
     send('install:done', result);
     // 新建的桌面图标要让资源管理器立刻刷新，否则用户会以为「没创建快捷方式」
     windowctl.refreshShell().catch(() => {});
@@ -913,7 +927,8 @@ let autoUpdateTag = '';
 function quitForUpdate() {
   quitting = true;
   setTimeout(() => { try { app.quit(); } catch (_) { /* ignore */ } }, 900);
-  setTimeout(() => { try { app.exit(0); } catch (_) { /* ignore */ } }, 15000);
+  // 留足操作排空与窗口批量关闭的时间，仍短于更新脚本的 60 秒等待。
+  setTimeout(() => { try { app.exit(0); } catch (_) { /* ignore */ } }, 45000);
 }
 
 /**
@@ -1197,7 +1212,11 @@ async function runLaunch(pkg) {
   }
   launchBusy = true;
   try {
-    return await runLaunchInner(pkg);
+    return await runtimeActions.run('app:launch', () => runLaunchInner(pkg));
+  } catch (e) {
+    send('toast', { type: 'error', message: e.message });
+    if (!quitting) showWindow();
+    return { ok: false, error: e.message };
   } finally {
     launchBusy = false;
   }
@@ -1240,8 +1259,9 @@ async function runLaunchInner(pkg) {
     const wantStandalone = engCfg.windowMode === 'standalone'
       || (engCfg.windowMode !== 'embedded' && engCfg.embeddedBlack === true);
     if (wantStandalone) appLog(`window mode: standalone (embeddedBlack=${!!engCfg.embeddedBlack})`);
-    openAppWindow(pkg, '正在启动安卓运行时…', want ? lcd.orientBox(portraitSize(), want) : windowBox(),
+    const launchWindow = openAppWindow(pkg, '正在启动安卓运行时…', want ? lcd.orientBox(portraitSize(), want) : windowBox(),
       { hidden: wantStandalone });
+    const launchCancelled = () => quitting || appWin.win !== launchWindow || launchWindow.isDestroyed();
     // 1) 先把「应用窗口」打开显示启动动画：整个过程看不到安卓桌面，也看不到模拟器窗口
     // 开机阶段把模拟器主窗 + qemu / netsimd 的控制台黑窗藏起来，避免任何闪现。
     // 压制是常驻的（embed 后它会自动跳过被嵌入的那一个窗口，见 appwin.embed）。
@@ -1281,6 +1301,7 @@ async function runLaunchInner(pkg) {
 
     const launchOptions = {
       lcdOrientation,
+      shouldCancel: launchCancelled,
       onLog: (m) => {
         send('runtime:log', m);
         appLog(`  rt ${m}`);
@@ -1297,6 +1318,8 @@ async function runLaunchInner(pkg) {
       },
       onMark: mark,
       beforeStart: async (rt) => {
+        if (launchCancelled()) throw new Error('应用窗口已关闭或 ApkStart 正在退出，未打开应用');
+        windowClients.set(launchWindow, rt.client);
         mark('engine ready');
         appWin.setState({ tip: '正在打开应用…' });
         // 沉浸式 + 关动画 + 收起锁屏：只做一次，之后每次启动都秒进
@@ -1305,6 +1328,8 @@ async function runLaunchInner(pkg) {
       },
     };
     let r = await installer.launch(pkg, launchOptions);
+    if (launchCancelled()) throw new Error('应用窗口已关闭或 ApkStart 正在退出，已取消窗口接管');
+    if (!r || !r.ok) throw new Error((r && r.error) || '应用未能启动');
     mark('app started');
 
     // ensure() 可能复用了切换运行时目录前留下的 detached 模拟器。此时
@@ -1400,8 +1425,8 @@ async function runLaunchInner(pkg) {
           appWin.win.moveTop();
           appWin.win.focus();
           setTimeout(() => {
-            if (appWin.isOpen) {
-              try { appWin.win.setAlwaysOnTop(false); } catch (_) { /* 窗口已关 */ }
+            if (!launchCancelled()) {
+              try { launchWindow.setAlwaysOnTop(false); } catch (_) { /* 窗口已关 */ }
             }
           }, 700);
         } catch (_) { /* 窗口可能刚关闭 */ }
@@ -1432,10 +1457,11 @@ async function runLaunchInner(pkg) {
         for (let i = 0; i < delays.length; i += 1) {
           // eslint-disable-next-line no-await-in-loop
           await new Promise((resolve) => setTimeout(resolve, delays[i]));
-          if (!appWin.isOpen || appWin.pkg !== pkg) return;
+          if (launchCancelled()) return;
           appWin.setState({ ready: false, tip: `正在连接安卓画面…（${i + 2}/${delays.length + 1}）` });
           // eslint-disable-next-line no-await-in-loop
           const ok = await appWin.embed().catch(() => false);
+          if (launchCancelled()) return;
           mark(`embed retry ${i + 1}/${delays.length}=${ok}`);
           if (ok) {
             appWin.setState({ ready: true, tip: '' });
@@ -1443,7 +1469,7 @@ async function runLaunchInner(pkg) {
             return;
           }
         }
-        if (appWin.isOpen && appWin.pkg === pkg) {
+        if (!launchCancelled()) {
           appWin.setState({ ready: false, tip: '安卓画面窗口没有连接。请关闭当前窗口后再点开应用，程序会自动重建显示通道。' });
           appLog('embed retries exhausted; keeping startup overlay visible');
         }
@@ -1454,7 +1480,9 @@ async function runLaunchInner(pkg) {
     // 按设置决定，失焦即卸载。
     deviceSize.value = null;
     appWin.refreshPointer();
-    await runtime.beginApp(pkg, { onActive: onContainerActive }).catch(() => {});
+    if (launchCancelled()) throw new Error('应用窗口已关闭或 ApkStart 正在退出，未启动后台会话');
+    await runtime.beginApp(pkg, { client: windowClients.get(launchWindow), onActive: onContainerActive, shouldCancel: launchCancelled }).catch(() => {});
+    if (launchCancelled()) throw new Error('应用窗口已关闭或 ApkStart 正在退出');
     // 游戏/低延迟模式：让窗口代理降频扫描，减少全桌面 EnumWindows 造成的整机卡顿
     if (winAgent) {
       const game = store.getSettings().engine && store.getSettings().engine.priorityMode === 'game';
@@ -1468,7 +1496,7 @@ async function runLaunchInner(pkg) {
     try { appWin.close({ keepApp: true }); } catch (_) { /* ignore */ }
     // 启动失败也把模拟器窗口继续压住（不要让它以「独立的模拟器窗口」形式露出来），
     // 下次点应用还是走同一条隐藏 → embed 的路径。
-    if (winAgent) armAgent(winAgent).catch(() => {});
+    if (!quitting && winAgent) armAgent(winAgent).catch(() => {});
     showWindow();
     // 运行时起不来时，用户该看到的是人话（哪坏了 + 程序做了什么 + 下一步点哪），
     // 而不是 installer 里那句「运行时多次尝试仍未能启动」。
@@ -1613,23 +1641,36 @@ async function compatEnv() {
 const IPC_TRUSTED_ROOT = path.resolve(__dirname);
 
 /**
- * 给所有 IPC 通道统一加一道来源校验。
- *
- * 渲染层能发起的调用有 90 多个，逐个检查容易漏；这里在注册前把 ipcMain.handle
- * 包一层，凡是「不是主框架」或「页面已经跑到我们自己目录之外」的调用一律拒绝。
- * 即使渲染层被注入脚本，也没法借 IPC 去读任意文件、装任意 APK、改系统设置。
+ * 给所有 invoke 通道统一校验窗口身份、主框架、页面与角色权限。
+ * 窗口代理只能操作自己的界面，不继承主窗口的设置、安装和维护权限。
  */
 function installIpcGuards() {
   if (ipcMain.__apkstartGuarded) return;
   ipcMain.__apkstartGuarded = true;
+  const changesSession = new Set([
+    'system:switch', 'system:stop', 'system:confirmInstall', 'system:restore', 'system:remove',
+    'runtime:stop', 'runtime:setImageFlavor', 'runtime:setDataSize', 'runtime:resetData',
+    'runtime:repairRun', 'runtime:startInstaller', 'runtime:markInstalled', 'runtime:resetInstall',
+    'image:activate', 'image:restore', 'image:remove', 'provision:installAdb',
+  ]);
   const wrap = (orig) => function guarded(channel, listener) {
     return orig.call(ipcMain, channel, (event, ...args) => {
-      const verdict = ipcguard.checkEvent(IPC_TRUSTED_ROOT, event);
+      const verdict = ipcguard.authorizeEvent(IPC_TRUSTED_ROOT, event, channel, {
+        mainWindow, shellWindow: appWin?.win,
+      });
       if (!verdict.ok) {
         console.warn(`[ipc] 拒绝不可信调用 ${channel}：${verdict.reason}`);
-        throw new Error('IPC 调用被拒绝：来源不是本应用页面');
+        throw new Error('IPC 调用被拒绝：此窗口无权调用该功能');
       }
-      return listener(event, ...args);
+      const has = (obj, key) => obj != null && typeof obj === 'object' && Object.hasOwn(obj, key);
+      const patch = channel === 'settings:set' ? args[0] : null;
+      const changesTarget = has(patch, 'device') || has(patch, 'adbPath') || has(patch?.engine, 'mode')
+        || ['dir', 'avdDir', 'systemImageFlavor', 'compatImage'].some(key => has(patch?.runtime, key));
+      if ((changesTarget || changesSession.has(channel)) && appWin?.isOpen) {
+        throw new Error('请先关闭安卓应用窗口，再更改运行时目标或执行系统维护');
+      }
+      const mode = channelMode(channel) || (changesTarget || channel === 'provision:installAdb' ? { builtin: false } : null);
+      return mode ? runtimeActions.run(channel, () => listener(event, ...args), mode) : listener(event, ...args);
     });
   };
   ipcMain.handle = wrap(ipcMain.handle);
@@ -1671,6 +1712,7 @@ function registerIpc() {
     });
     return _systemManager;
   };
+  currentSystemStatus = () => getSystemManager().getStatus();
 
   ipcMain.handle('app:info', () => ({
     version: app.getVersion(),
@@ -1689,6 +1731,7 @@ function registerIpc() {
   // 界面文案（upstream #38）：中文是源语言，词典按中文原文索引。
   // 渲染层只拿一次「语言 + 词典」，自己遍历 DOM 翻译 —— 不为每条文案走一次 IPC。
   ipcMain.handle('app:i18n', () => i18n.payload(app.getLocale()));
+  ipcMain.handle('app:theme', () => ({ theme: store.getSettings().theme }));
 
   // 选文件夹（用于把运行时/镜像/已装应用挪到非系统盘）
   ipcMain.handle('dialog:openDir', async (_e, defaultPath) => {
@@ -1747,20 +1790,22 @@ function registerIpc() {
     name: filetype.displayName(filePath),
   }));
 
-  /**
-   * 安装前兼容性分析：解析 APK + 对照当前运行时环境给出结论。
-   * 只做判断，不改动任何文件，装不装由用户在界面上决定。
-   */
+  /** 安装前分析单 APK 或分包；分包仅在临时目录读取，不启动或安装到客机。 */
   ipcMain.handle('apk:compat', async (_e, filePath) => {
     if (typeof filePath !== 'string' || !filetype.isInstallable(filePath)) {
       throw new Error('只支持 .apk / .xapk / .apks 文件');
     }
     if (!fs.existsSync(filePath)) throw new Error('文件不存在或已被移动');
-    const info = parseApkCached(filePath);
-    const result = compat.analyze(info, await compatEnv());
-    // 图标是 Buffer，跨 IPC 传一次就是几百 KB，这里没必要带出去
-    const { iconPng, iconSvg, ...rest } = info;
-    return { info: rest, compat: result };
+    const bundle = filetype.isSingleApk(filePath) ? null : await parseBundle(filePath);
+    try {
+      const info = bundle ? bundle.meta : parseApkCached(filePath);
+      const result = compat.analyze(info, await compatEnv());
+      // 图标是 Buffer，跨 IPC 传一次就是几百 KB，这里没必要带出去。
+      const { iconPng, iconSvg, ...rest } = info;
+      return { info: rest, compat: result };
+    } finally {
+      bundle?.cleanup();
+    }
   });
 
   ipcMain.handle('apk:install', async (_e, filePath) => {
@@ -1812,13 +1857,21 @@ function registerIpc() {
     if (!record.apkPath || !fs.existsSync(record.apkPath)) {
       throw new Error('找不到这个应用的安装包（可能安装后被清理过）');
     }
-    const name = `${backup.sanitizeName(record.label || pkg, 40)}-${backup.sanitizeName(record.versionName || '1.0', 20)}.apk`;
+    let kind = filetype.installKind(record.apkPath);
+    if (record.bundle === true && kind === 'apk') {
+      // 旧版本把分包容器缓存为 .apk；只检查 ZIP 目录，不为一次导出解压整个包。
+      if (!isBundle(record.apkPath)) throw new Error('已缓存安装包与分包记录不匹配');
+      kind = 'apks';
+    }
+    if (!kind) throw new Error('无法识别已缓存安装包的格式');
+    const name = `${backup.sanitizeName(record.label || pkg, 40)}-${backup.sanitizeName(record.versionName || '1.0', 20)}.${kind}`;
     const { canceled, filePath } = await dialog.showSaveDialog(mainWindow || undefined, {
-      title: '导出 APK',
+      title: '导出 Android 安装包',
       defaultPath: path.join(app.getPath('downloads'), name),
-      filters: [{ name: 'Android 安装包', extensions: ['apk'] }],
+      filters: [{ name: 'Android 安装包', extensions: [kind] }],
     });
     if (canceled || !filePath) return { ok: false, canceled: true };
+    if (filetype.installKind(filePath) !== kind) throw new Error(`请保留 .${kind} 后缀，以便重新导入安装包`);
     fs.copyFileSync(record.apkPath, filePath);
     return { ok: true, path: filePath };
   });
@@ -1857,7 +1910,7 @@ function registerIpc() {
     const client = runtime.client();
     if (!(await client.isOnline())) throw new Error('恢复应用需要先启动运行时');
     const r = await backup.restoreApp({
-      dir: filePaths[0], installer, client, onLog: () => {},
+      dir: filePaths[0], installer, onLog: () => {},
     });
     return { ok: true, ...r };
   });
@@ -2413,59 +2466,19 @@ function registerIpc() {
       return { ok: false, detail: '这一步会动数据，需要你自己确认后才能做' };
     }
     switch (id) {
-      /**
-       * 只删「删了也不会少任何东西」的文件：运行时自己的临时目录、下载残留。
-       * 数据分区、已装应用、系统镜像、其他 AVD 一律不碰 —— 这是全自动路径，
-       * 必须保证用户完全无感。腾不出空间就如实说，别假装清过了。
-       */
       case 'cleanup-safe': {
-        const p = runtime.provisioner.paths();
-        let files = 0;
-        let freed = 0;
-        const drop = (f) => {
-          try {
-            const st = fs.statSync(f);
-            const size = st.isDirectory() ? 0 : st.size;
-            fs.rmSync(f, { recursive: true, force: true });
-            files += 1;
-            freed += size;
-          } catch (_) { /* 被占用：跳过，不纠缠 */ }
-        };
-        const walk = (dir, depth = 0) => {
-          let names = [];
-          try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
-          for (const d of names) {
-            const f = path.join(dir, d.name);
-            if (d.isDirectory()) {
-              if (depth < 2) walk(f, depth + 1);
-              continue;
-            }
-            if (/\.(part|tmp|crdownload|download|partial)$/i.test(d.name)) drop(f);
-          }
-        };
-        walk(p.tmp);
-        // 运行时根目录下的半截下载（旧版本把 zip 直接下在 root）
-        let rootNames = [];
-        try { rootNames = fs.readdirSync(p.root); } catch (_) { /* ignore */ }
-        for (const name of rootNames) {
-          if (/\.(part|tmp|crdownload|download|partial)$/i.test(name)) drop(path.join(p.root, name));
-        }
-        if (!files) {
-          return { ok: false, detail: '没有可安全清理的临时文件（磁盘满需要手动清理，或把数据目录换到别的盘）' };
-        }
-        return { ok: true, detail: `清掉 ${files} 个临时文件，释放约 ${Math.round(freed / 1048576)} MB` };
+        // 下载共用 _tmp，后缀无法区分残留与在途内容；仅使用运行时的受管候选清单。
+        const r = await runtime.cleanup({ apply: true, aggressive: false, includeSnapshots: false });
+        if (!r.ok) return { ok: false, detail: r.error || '未能安全清理缓存' };
+        const count = r.removed?.length || 0;
+        return count ? { ok: true, detail: `清掉 ${count} 个缓存项，释放约 ${Math.round((r.saved || 0) / 1048576)} MB` }
+          : { ok: false, detail: '没有可安全清理的缓存；下载断点和应用数据已保留' };
       }
       case 'clear-locks': {
-        const avdHome = runtime.provisioner.paths().avdHome;
-        let removed = 0;
-        try {
-          for (const f of fs.readdirSync(avdHome)) {
-            if (!/\.lock$/i.test(f)) continue;
-            try { fs.rmSync(path.join(avdHome, f), { recursive: true, force: true }); removed += 1; } catch (_) { /* 被占用，交给下面的杀进程 */ }
-          }
-        } catch (_) { /* AVD 还没建过 */ }
-        await runtime.emulator.killOrphanProcesses().catch(() => {});
-        return { ok: true, detail: removed ? `清掉 ${removed} 个残留锁文件` : '没有发现残留锁文件' };
+        const r = await runtime.clearStaleLocks();
+        if (!r.ok) return { ok: false, detail: r.error || '无法确认锁文件已失效' };
+        const count = r.removed?.length || 0;
+        return { ok: true, detail: count ? `清掉 ${count} 个残留锁文件` : '没有发现残留锁文件' };
       }
       case 'gpu-software': {
         store.saveSettings({ engine: { gpuMode: 'swiftshader' } });
@@ -2939,26 +2952,19 @@ function registerIpc() {
 
   ipcMain.handle('runtime:setDataSize', async (_e, gb) => {
     const want = Math.max(0, Math.min(64, Number(gb) || 0));
-    store.saveSettings({ engine: { dataPartitionGB: want } });
-    if (!want) {
-      const info = runtime.emulator.dataInfo();
-      return { ok: true, auto: true, ...info };
-    }
-    const mb = Math.round(want * 1024);
-    // 镜像正被 qemu 占着时不能改，先停容器（应用会跟着退出，属于预期）
-    let stopped = false;
     try {
-      const online = await runtime.client().isOnline().catch(() => false);
-      if (runtime.emulator.running() || online) {
-        await runtime.stop().catch(() => {});
-        stopped = true;
+      if (!want) {
+        store.saveSettings({ engine: { dataPartitionGB: 0 } });
+        return { ok: true, auto: true, ...runtime.emulator.dataInfo() };
       }
-    } catch (_) { /* ignore */ }
-    try {
-      const r = runtime.emulator.resizeDataPartition(mb);
+      // 由运行时在停机维护锁内确认镜像不再被占用；失败不保存容量设置。
+      const r = await runtime.resizeDataPartition(Math.round(want * 1024));
       appLog(`data partition -> ${want}GB: ${JSON.stringify(r)}`);
-      if (r && r.ok) notify('数据分区已调整', `安卓可用空间约 ${want} GB${stopped ? '（运行时已重启）' : ''}`);
-      return { ok: !!(r && r.ok), stopped, ...r, ...runtime.emulator.dataInfo() };
+      if (r.ok) {
+        store.saveSettings({ engine: { dataPartitionGB: want } });
+        notify('数据分区已调整', `安卓可用空间约 ${want} GB${r.stoppedVm ? '（运行时已停止，下次打开应用时启动）' : ''}`);
+      }
+      return { ...r, stopped: !!r.stoppedVm };
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -2985,10 +2991,20 @@ function registerIpc() {
     return runtime.cleanup({ apply: true, aggressive: !!opts.aggressive, includeSnapshots: !!opts.includeSnapshots });
   });
 
-  // 彻底重置安卓数据：清空 /data 用户分区 + 已装应用 + 快速启动快照，
-  // AVD 还原成「刚装好系统」的干净状态。会真实删除数 GB 数据，UI 必须二次确认。
+  // 重置数据必须由主进程确认，不能信任渲染层传来的确认状态。
   ipcMain.handle('runtime:resetData', async () => {
     try {
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        title: '重置安卓数据',
+        message: '要清空安卓应用数据并重置此运行时吗？',
+        detail: '已安装的应用、应用登录状态及资料、快速启动快照都会被清除。此操作不可撤销，请先备份重要资料。',
+        buttons: ['取消', '重置安卓数据'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      if (response !== 1) return { ok: false, cancelled: true };
       const r = await runtime.resetAndroidData();
       if (!r.ok) return { ok: false, error: r.error };
       return { ok: true, reclaimed: r.reclaimed, reclaimedMB: Math.round(r.reclaimed / 1048576) };
@@ -3066,56 +3082,14 @@ function registerIpc() {
     }
   });
 
-  /** 提权安装 AEHD 驱动：弹出 UAC，用户确认后静默安装 */
-  ipcMain.handle('provision:enableAccel', async () => {
-    try {
-      // 驱动正被运行中的 VM 占用时，安装脚本 sc stop 必然 1061、sc delete 必然 1072，
-      // 服务会被留在「待删除 + 已禁用」的半残状态 —— 本来好的驱动就这样被点坏。
-      // 这里先拦下，明确告诉用户先停止运行时（历史 P1，实测复现）。
-      if (runtime.vmRunning) {
-        return {
-          ok: false,
-          error: '安卓运行时正在运行，无法重装硬件加速驱动（驱动被虚拟机占用）。'
-            + '请先关闭所有应用窗口并在「运行时」页停止运行时，再回来点「启用」。',
-        };
-      }
-      const p = runtime.provisioner.paths();
-      const bat = path.join(p.aehdDir, 'silent_install.bat');
-      if (!fs.existsSync(bat)) {
-        const r = await runtime.provisioner.installAehd(
-          (x) => send('provision:progress', { ...x, component: 'aehd' }),
-        );
-        if (!fs.existsSync(bat)) throw new Error(r.error || 'AEHD 驱动包未就绪');
-      }
-
-      await new Promise((resolve, reject) => {
-        const { spawn: sp } = require('child_process');
-        const esc = bat.replace(/'/g, "''");
-        const ps = `try { $p = Start-Process -FilePath '${esc}' -WorkingDirectory '${path.dirname(bat).replace(/'/g, "''")}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode } catch { exit 2 }`;
-        const proc = sp('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], {
-          windowsHide: true,
-        });
-        proc.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(
-          code === 2 ? '已取消管理员授权（需要点「是」才能安装驱动）' : `驱动安装失败（退出码 ${code}）`,
-        ))));
-        proc.on('error', (e) => reject(e));
-      });
-
-      const accel = await runtime.provisioner.emulatorAccel();
-      return { ok: accel.ok, accel, error: accel.ok ? '' : accel.note };
-    } catch (e) {
-      return { ok: false, error: e.message };
-    }
-  });
+  // 旧向导入口继续走 Windows 功能/既有服务，不提权执行缓存的驱动脚本。
+  ipcMain.handle('provision:enableAccel', () => enableVirtualizationImpl());
 
   /**
    * 自动开启/修复硬件加速：用户无需手动去「Windows 功能」面板。
    *
-   * 三条路，按「能不能当场生效」排序：
-   *   1. AEHD 装了但服务没在跑（ACCEL_UNUSABLE 的根因）→ `sc start aehd`，不用重启；
-   *   2. 系统带虚拟机平台组件 → 开启 WHPX 功能（需重启，Google 现在的推荐路径）；
-   *   3. 老系统没有该组件 → 安装 Google 的 AEHD 驱动。
-   * 全部需要管理员提权；BIOS 里虚拟化没开时直接说明，不让用户白点一次 UAC、白重启一次。
+   * 优先启动已安装的 AEHD 服务；否则启用 Windows 自带的虚拟化组件。
+   * 不自动执行 AEHD 第三方驱动安装器。BIOS 里虚拟化没开时直接说明。
    */
   async function enableVirtualizationImpl() {
     try {
@@ -3179,34 +3153,10 @@ function registerIpc() {
         };
       }
 
-      // 没有 WHPX 组件：改用 AEHD 驱动（Google 自家，装完即用）
-      const ae = await runtime.provisioner.installAehd(
-        (x) => send('provision:progress', { ...x, component: 'aehd' }),
-      ).catch((e) => ({ ok: false, error: e.message }));
-      if (!ae.ok) return { ok: false, error: ae.error || 'AEHD 驱动包准备失败' };
-      const bat = path.join(runtime.provisioner.paths().aehdDir, 'silent_install.bat');
-      await new Promise((resolve, reject) => {
-        const { spawn: sp } = require('child_process');
-        const esc = bat.replace(/'/g, "''");
-        const ps = `try { $p = Start-Process -FilePath '${esc}' -WorkingDirectory '${path.dirname(bat).replace(/'/g, "''")}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode } catch { exit 2 }`;
-        const proc = sp('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true });
-        proc.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(
-          code === 2 ? '已取消管理员授权（需要点「是」才能安装驱动）' : `驱动安装失败（退出码 ${code}）`,
-        ))));
-        proc.on('error', (e) => reject(e));
-      });
-      // 装完驱动必须清缓存再复测：否则拿到的还是安装前的「不可用」
-      runtime.provisioner.invalidateEnvCache();
-      const after = await runtime.provisioner.emulatorAccel({ force: true });
+      // 尚无可信的 AEHD 包摘要及安全提权暂存链；已有脚本也不是信任凭证。
       return {
-        ok: after.ok && !after.suspect,
-        accel: after,
-        firmwareEnabled: firmware,
-        note: after.ok && !after.suspect
-          ? 'AEHD 硬件加速已启用'
-          : (after.suspect
-            ? `AEHD 驱动已安装，但服务没有随安装启动（${after.note}）：请重启电脑后再试一次`
-            : (firmware === false ? 'BIOS 里虚拟化（SVM / VT-x）未开启，AEHD 驱动无法运行' : after.note)),
+        ok: false, accel, firmwareEnabled: firmware,
+        error: '未检测到可启用的 Windows 虚拟化组件；已禁用未经可信校验的 AEHD 自动驱动安装。请通过 Android Studio 官方 SDK Manager 手动安装驱动，或升级 Windows 并启用 Windows Hypervisor Platform。',
       };
     } catch (e) {
       return { ok: false, error: e.message };
@@ -3576,8 +3526,12 @@ function registerIpc() {
   });
 
   ipcMain.handle('runtime:markInstalled', async () => {
-    await runtime.markInstalled();
-    return { ok: true };
+    try {
+      if (!await runtime.markInstalled()) return { ok: false, error: '无法确认安装虚拟机已退出；请先在虚拟机内正常关机' };
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
   });
 
   ipcMain.handle('runtime:resetInstall', async () => {
@@ -3624,14 +3578,8 @@ function registerIpc() {
   /** 清理上次残留的 AVD 锁文件：会让下次启动被误判为「AVD 已被占用」而 FATAL */
   ipcMain.handle('app:clearLocks', async () => {
     try {
-      const avdHome = runtime.provisioner.paths().avdHome;
-      let removed = 0;
-      for (const f of fs.readdirSync(avdHome)) {
-        if (/\.lock$/i.test(f)) {
-          try { fs.rmSync(path.join(avdHome, f), { force: true }); removed++; } catch (_) { /* ignore */ }
-        }
-      }
-      return { ok: true, removed };
+      const r = await runtime.clearStaleLocks();
+      return { ...r, removed: r.removed?.length || 0 };
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -3719,6 +3667,7 @@ function registerIpc() {
   ipcMain.handle('shell:openPath', (_e, p) => {
     const dir = String(p || '');
     if (!path.isAbsolute(dir)) throw new Error('只允许打开绝对路径');
+    if (!fs.statSync(dir).isDirectory()) throw new Error('只允许打开现存目录');
     return shell.openPath(dir);
   });
 
@@ -4004,16 +3953,29 @@ if (!gotLock) {
       agent: winAgent,
       // 旋转要改 Android 的逻辑分辨率，交给 adb 客户端做
       setOrientation: async (landscape) => {
-        deviceSize.value = null;
-        return runtime.client().setOrientation(landscape);
+        const win = appWin?.win;
+        const client = win && windowClients.get(win);
+        const shouldCancel = () => quitting || !win || appWin.win !== win || win.isDestroyed();
+        if (!client || !client.serial || shouldCancel()) return false;
+        return runtimeActions.run('app:rotate', () => {
+          if (shouldCancel()) return false;
+          deviceSize.value = null;
+          return client.setOrientation(landscape, { shouldCancel });
+        }, { builtin: false });
       },
       // 传 getter：设置页改了键位，下一次窗口 focus / 刷新就生效，不用重启
       pointerConfig: () => pointer.pointerOptions(store.getSettings()),
     });
-    appWin.onCloseApp((pkg) => {
-      // 关窗口 = 停这个应用；最后一个窗口关掉时容器停放（降优先级、停轮询），
-      // 但 Android 环境留着，下次点开是秒进而非重新冷启动。
-      runtime?.endApp(pkg, { onIdle: onContainerActive }).catch(() => {});
+    appWin.onCloseApp((pkg, win) => {
+      onContainerActive(false);
+      const client = windowClients.get(win);
+      if (!client || !client.serial || quitting) return;
+      // 立即登记关窗租约，已有操作结束后再清理；不能用届时的设置重选目标。
+      runtimeActions.run('app:close', () => {
+        const shouldCancel = () => quitting || !!appWin?.isOpen || runtime?.client() !== client;
+        if (shouldCancel()) return;
+        return runtime.endApp(pkg, { client, shouldCancel });
+      }, { builtin: false, afterCurrent: true }).catch(e => appLog(`关窗清理未完成：${e.message}`));
     });
     // 应用窗口关闭：若自动更新已把新版本下载好，此刻是安全的安装时机
     appWin.onWindowClosed(() => {
@@ -4039,10 +4001,12 @@ if (!gotLock) {
     };
     // 范围存在代理进程的内存里，代理一重建就没了 —— 所以每次开机压制前都重发一次。
     armAgent = async (agent) => {
-      if (!agent) return { ok: false };
+      if (!agent || quitting) return { ok: false };
       const dirs = await agentScope();
+      if (quitting) return { ok: false };
       // 第二个参数是本进程 pid：代理据此拒绝把窗口嵌进「不是我们的」窗口
       await agent.scope(dirs, process.pid).catch(() => null);
+      if (quitting) return { ok: false };
       if (!dirs.length) appLog('agent scope 为空：不压制任何窗口（避免误伤其他软件）');
       return agent.bootHide().catch(() => ({ ok: false }));
     };
@@ -4056,6 +4020,7 @@ if (!gotLock) {
         if (pointer.pointerOptions(store.getSettings()).wheel === 'smooth') wheelRouter.push(m);
       });
       agent.on('exit', () => {
+        if (quitting) return;
         const next = new WinAgent();
         winAgent = next;
         appWin.agent = next;
@@ -4070,6 +4035,7 @@ if (!gotLock) {
     // 旧实现是「等 ApkStart 起来 4 秒后再藏」，而模拟器在这之前就已经把
     // qemu 控制台窗口创建出来了 —— 用户看到的就是一次一闪而过的黑框。
     runtime.emulator.onBeforeSpawn = async () => {
+      if (quitting) throw new Error('ApkStart 正在退出，未启动模拟器');
       if (!winAgent) return;
       await armAgent(winAgent);
     };
@@ -4155,7 +4121,8 @@ if (!gotLock) {
           if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
           const t0 = Date.now();
           appLog('prewarm start');
-          const r = await runtime.prewarm({ onLog: (m) => appLog(`prewarm ${m}`) });
+          const r = await runtimeActions.run('runtime:prewarm', () =>
+            runtime.prewarm({ onLog: (m) => appLog(`prewarm ${m}`) }));
           if (r && r.ok) appLog(`prewarm ready in ${Date.now() - t0}ms`);
           else {
             appLog(`prewarm failed: ${r && (r.error || r.skipped)}`);
@@ -4276,39 +4243,44 @@ if (!gotLock) {
     app.on('activate', () => showWindow());
   });
 
+  let quitReady = false;
+  let quitTask = null;
   app.on('window-all-closed', () => {
-    // 正常关闭窗口时只隐藏到托盘（close 事件已拦截），
-    // 走到这里说明是真正要退出，必须放行，否则进程会残留并占住单实例锁。
-    if (quitting) app.exit(0);
+    // 收尾期间不能 app.exit()：窗口停靠、代理释放仍可能没有完成。
+    if (quitting && !quitTask && !quitReady) app.quit();
   });
 
-  let quitReady = false;
   app.on('before-quit', (e) => {
     quitting = true;
-    // 退出前必须先让窗口代理把模拟器窗口「摘下 + 藏好」。这一步是异步的
-    // （要等代理回包），所以第一次 before-quit 先拦下来，收尾完成再真正退出。
-    // 少了这一步，宿主窗口一销毁，Windows 会把模拟器子窗口重挂到桌面并显示出来——
-    // 表现就是「关掉 ApkStart 之后，桌面上还留着一个 Android Emulator 黑窗」。
-    if (!quitReady) {
-      e.preventDefault();
-      quitReady = true;
-      sharer?.stop();
-      notifier?.stop();
-      try { appWin?.close({ keepApp: true }); } catch (_) { /* ignore */ }
-      const finish = () => {
-        try { winAgent?.dispose(); } catch (_) { /* ignore */ }
-        try { wheelRouter?.dispose(); } catch (_) { /* ignore */ }
-        runtime?.dispose();
-        // 隐藏的图标解码窗口也算一个窗口，不关掉会让 window-all-closed 永远不触发
-        try { if (decodeWindow && !decodeWindow.isDestroyed()) decodeWindow.destroy(); } catch (_) { /* ignore */ }
-        app.quit();
+    if (quitReady) return;
+    e.preventDefault();
+    if (quitTask) return;
+    quitTask = Promise.resolve().then(async () => {
+      const safely = (fn) => {
+        try { fn(); } catch (err) { console.warn('[quit] 收尾失败', err); }
       };
-      setTimeout(finish, 400);
-      return;
-    }
-    try { winAgent?.dispose(); } catch (_) { /* ignore */ }
-    try { wheelRouter?.dispose(); } catch (_) { /* ignore */ }
-    runtime?.dispose();
-    try { if (decodeWindow && !decodeWindow.isDestroyed()) decodeWindow.destroy(); } catch (_) { /* ignore */ }
+      const syncDrained = Promise.resolve().then(() => sharer?.stop({ timeoutMs: 5000 }))
+        .then(result => result !== false, err => {
+          console.warn('[quit] 取消共享同步失败', err);
+          return false;
+        });
+      safely(() => notifier?.stop());
+      let runtimeDrained = false;
+      try {
+        runtimeDrained = await runtimeActions.drain();
+        if (!runtimeDrained) console.warn('[quit] 在途操作未在期限内结束，停止等待');
+      } catch (err) { console.warn('[quit] 等待在途操作失败', err); }
+      // closeAll 也等待已被新窗口替换、但仍在停靠的窗口；内部有有界超时。
+      try {
+        if (await appWin?.closeAll({ keepApp: true }) === false) console.warn('[quit] 未在期限内确认窗口停靠');
+      } catch (err) { console.warn('[quit] 窗口停靠失败', err); }
+      safely(() => winAgent?.dispose());
+      safely(() => wheelRouter?.dispose());
+      if (await syncDrained && runtimeDrained) safely(() => runtime?.dispose());
+      else console.warn('[quit] 仍有设备操作未排空，不主动关闭其 ADB 传输');
+      safely(() => { if (decodeWindow && !decodeWindow.isDestroyed()) decodeWindow.destroy(); });
+      quitReady = true;
+      app.quit();
+    });
   });
 }

@@ -985,20 +985,24 @@ class AdbClient {
    * Android 里还是竖屏，用户看到的就是整屏横躺的文字（emu rotate / user_rotation /
    * 聚焦后发按键，三种都试过，都是这个结果）。改 wm size 才会真正触发重新排版。
    */
-  async setOrientation(landscape) {
+  async setOrientation(landscape, { shouldCancel = () => false } = {}) {
     try {
+      if (shouldCancel()) return false;
       // 无论哪边，先把自动旋转关掉并把用户旋转锁回 0，画面才不会横躺
       await this.shell('settings put system accelerometer_rotation 0; wm user-rotation lock 0', { timeout: 15000 });
+      if (shouldCancel()) return false;
       if (!landscape) {
         await this.shell('wm size reset; wm density reset', { timeout: 15000 });
         return true;
       }
       const sizeOut = await this.shell('wm size', { timeout: 10000 });
+      if (shouldCancel()) return false;
       // 注意：重置过之后这里读到的是「Physical size」，用物理尺寸算横屏分辨率
       const m = /Physical size:\s*(\d+)x(\d+)/.exec(sizeOut);
       const w = m ? Math.max(Number(m[1]), Number(m[2])) : 1280;
       const h = m ? Math.min(Number(m[1]), Number(m[2])) : 720;
       const denOut = await this.shell('wm density', { timeout: 10000 });
+      if (shouldCancel()) return false;
       const dm = /Physical density:\s*(\d+)/.exec(denOut);
       const dpi = dm ? Number(dm[1]) : 0;
       const cmds = [`wm size ${w}x${h}`];

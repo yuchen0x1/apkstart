@@ -21,6 +21,7 @@
  * requiredFeatures / usesLibraries / split / debuggable，用来覆盖兼容性判定。
  */
 const { drawAppIcon } = require('../../src/core/png');
+const { crc32 } = require('../../src/core/zip');
 
 const ANDROID_NS = 'http://schemas.android.com/apk/res/android';
 
@@ -245,7 +246,8 @@ function buildStoredZip(entries) {
     lh.writeUInt32LE(0x04034b50, 0);
     lh.writeUInt16LE(20, 4);
     lh.writeUInt16LE(0, 8);
-    lh.writeUInt32LE(it.data.length, 14);
+    const crc = crc32(it.data);
+    lh.writeUInt32LE(crc, 14);
     lh.writeUInt32LE(it.data.length, 18);
     lh.writeUInt32LE(it.data.length, 22);
     lh.writeUInt16LE(name.length, 26);
@@ -255,6 +257,7 @@ function buildStoredZip(entries) {
     ch.writeUInt16LE(20, 4);
     ch.writeUInt16LE(20, 6);
     ch.writeUInt16LE(0, 10);
+    ch.writeUInt32LE(crc, 16);
     ch.writeUInt32LE(it.data.length, 20);
     ch.writeUInt32LE(it.data.length, 24);
     ch.writeUInt16LE(name.length, 28);
