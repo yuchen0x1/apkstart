@@ -589,65 +589,72 @@ class Updater {
       // （磁盘空间不足、杀软拦截、安装包数据区损坏、UAC 被拒）都会把安装目录
       // 留成空的 —— 0.6.1 → 0.6.2 实测事故，用户重启就再也打不开。
       // 所以这里不再「下载完就无脑跑 /S」，而是：
-      //   1) 先把现有程序备份出来（跳过 1.4GB 的 resources\runtime，它能重下）
-      //   2) 跑安装器，读 exit code
-      //   3) 装完核对 exe 是否还在、package.json 的 version 是否等于目标版本
-      //   4) 任一不符 → 从备份整目录还原，回到旧版，仍然能启动
-      const bak = path.join(this.updateDir, `backup-${job.version}`);
-      // 生成的脚本是给 Windows PowerShell 跑的：路径分隔符必须固定为 \。
-      // 不能用宿主的 path.join —— 在 Linux 上生成时会给出 /，robocopy /XD
-      // 就指不到 runtime 目录（测试在 Linux 上跑也会断言这一点）。
-      const wj = (...segs) => segs.join('\\');
-      const runtimeDir = wj(dir, 'resources', 'runtime');
-      const appDir = wj(dir, 'resources', 'app');
-      const pkgJson = wj(appDir, 'package.json');
-      const bakApp = wj(bak, 'resources', 'app');
+      // 每次尝试使用新目录，重试时不能覆盖上一次的恢复备份。
+      const bak = path.join(this.updateDir, `backup-${job.version}-${crypto.randomBytes(8).toString('hex')}`);
+      const runtimeDir = `${dir}\\resources\\runtime`;
       lines.push(
         `$dst = ${psq(dir)}`,
         `$bak = ${psq(bak)}`,
         `$probe = ${psq(exe)}`,
-        `$pkg = ${psq(pkgJson)}`,
+        `$pkgRel = 'resources\\app\\package.json'`,
+        `$pkg = Join-Path $dst $pkgRel`,
         `$want = ${psq(String(job.version || '').replace(/^v/i, ''))}`,
         `$ok = $false`,
-        `Note 'installer: backup first'`,
-        `$null = robocopy $dst $bak /E /XD ${psq(runtimeDir)} /NFL /NDL /NJH /NJS /R:1 /W:1`,
-        `$hasBak = Test-Path -LiteralPath (Join-Path $bak ${psq(path.basename(exe))})`,
-        // 二级兜底：robocopy 整目录失败时，至少把「能启动」必需的东西留一份
-        `if (-not $hasBak -and (Test-Path -LiteralPath $probe)) {`,
-        `  New-Item -ItemType Directory -Force -Path $bak | Out-Null`,
-        `  Copy-Item -LiteralPath $probe -Destination (Join-Path $bak ${psq(path.basename(exe))}) -Force`,
-        `  if (Test-Path -LiteralPath ${psq(appDir)}) { Copy-Item -LiteralPath ${psq(appDir)} -Destination ${psq(bakApp)} -Recurse -Force }`,
-        `  $hasBak = Test-Path -LiteralPath (Join-Path $bak ${psq(path.basename(exe))})`,
+        `$rollback = 'not-attempted'`,
+        // PowerShell 5.1 的默认文件编码不是 UTF-8。发行包的 manifest 可能含中文。
+        `function Read-Version($file) {`,
+        `  try {`,
+        `    $body = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)) -ErrorAction Stop`,
+        `    if ($body.version -is [string]) { return $body.version }`,
+        `  } catch { Note ("read version failed: " + $file) }`,
+        `  return ''`,
         `}`,
-        `Note ("backup ok=" + $hasBak)`,
-        `if ($hasBak -or -not (Test-Path -LiteralPath $probe)) {`,
+        `function Exe-Size($file) {`,
+        `  if (Test-Path -LiteralPath $file -PathType Leaf) { return (Get-Item -LiteralPath $file).Length }`,
+        `  return 0`,
+        `}`,
+        `$before = Read-Version $pkg`,
+        `$beforeSize = Exe-Size $probe`,
+        `$canRestart = ($beforeSize -gt 0 -and $before -ne '')`,
+        `Note ("installer: backup first: " + $bak)`,
+        `$LASTEXITCODE = $null`,
+        `$null = robocopy $dst $bak /E /XJ /XD ${psq(runtimeDir)} /NFL /NDL /NJH /NJS /R:1 /W:1`,
+        `$backupExit = $LASTEXITCODE`,
+        `$backupSize = Exe-Size (Join-Path $bak ${psq(path.basename(exe))})`,
+        `$backupVersion = Read-Version (Join-Path $bak $pkgRel)`,
+        // robocopy 用位标志报告结果，8 以上表示至少一个复制错误。
+        `$hasBak = ($null -ne $backupExit -and $backupExit -lt 8 -and $canRestart -and $beforeSize -eq $backupSize -and $before -ceq $backupVersion)`,
+        `Note ("backup ok=" + $hasBak + " exit=" + $backupExit)`,
+        `if ($hasBak) {`,
         `  Note 'run installer'`,
-        `  $p = Start-Process -FilePath ${psq(job.payload)} -ArgumentList '/S' -PassThru -Wait`,
-        `  Note ("installer exit " + $p.ExitCode)`,
-        `  Start-Sleep -Milliseconds 500`,
-        `  $gotVer = ''`,
-        // 必须显式按 UTF-8 读：Windows PowerShell 5.1 的 Get-Content 默认用 ANSI(GBK)，
-        // package.json 里的中文会被解成乱码、连带把 JSON 结构弄坏（实测报
-        // 「应为“:”或“}”」），版本号就永远读成空 —— 核对等于没做。
-        `  if (Test-Path -LiteralPath $pkg) {`,
-        `    try { $gotVer = [string]((ConvertFrom-Json ([IO.File]::ReadAllText($pkg, [Text.Encoding]::UTF8))).version) }`,
-        `    catch { Note ("read version failed: " + ($_.Exception.Message -replace '\\r?\\n', ' ')) }`,
-        `  }`,
-        `  $size = 0`,
-        `  if (Test-Path -LiteralPath $probe) { $size = (Get-Item -LiteralPath $probe).Length }`,
+        `  $installerExit = $null`,
+        `  try {`,
+        `    $p = Start-Process -FilePath ${psq(job.payload)} -ArgumentList '/S' -PassThru -Wait -ErrorAction Stop`,
+        `    $installerExit = $p.ExitCode`,
+        `  } catch { Note ("installer launch failed: " + $_.Exception.Message) }`,
+        `  Note ("installer exit " + $installerExit)`,
+        `  $gotVer = Read-Version $pkg`,
+        `  $size = Exe-Size $probe`,
         `  Note ("after install: exe=" + $size + " ver=" + $gotVer)`,
-        `  if ($size -gt 0 -and ($gotVer.Trim() -eq '' -or $gotVer.Trim() -eq $want)) { $ok = $true }`,
-        `  if (-not $ok -and $hasBak) {`,
+        `  $ok = (0 -eq $installerExit -and $size -gt 0 -and $want -ne '' -and $gotVer -ceq $want)`,
+        `  if (-not $ok) {`,
         `    Note 'verify failed, rolling back to previous version'`,
-        `    $null = robocopy $bak $dst /E /NFL /NDL /NJH /NJS /R:1 /W:1`,
-        `    Note 'rollback done'`,
+        `    $LASTEXITCODE = $null`,
+        // 即使新旧文件大小和修改时间相同，也用备份覆盖；不镜像清除未知文件。
+        `    $null = robocopy $bak $dst /E /XJ /IS /IT /NFL /NDL /NJH /NJS /R:1 /W:1`,
+        `    $restoreExit = $LASTEXITCODE`,
+        `    $canRestart = ($null -ne $restoreExit -and $restoreExit -lt 8 -and (Exe-Size $probe) -eq $beforeSize -and (Read-Version $pkg) -ceq $before)`,
+        `    if ($canRestart) { $rollback = 'restored'; Note 'rollback done' }`,
+        `    else { $rollback = 'unverified'; Note ("rollback not verified, exit=" + $restoreExit) }`,
         `  }`,
         `} else { Note 'backup unavailable, install skipped' }`,
         `if ($ok) { Remove-Item -LiteralPath $bak -Recurse -Force }`,
-        // 装失败：把「版本号 + 日志位置」落成标记，安装包故意留在原处 —— 用户
-        // 下次可以点「安装已下载的更新」直接跑它，不用再下 1.4GB。
-        `if (-not $ok) {`,
-        `  Set-Content -Path ${psq(failFile)} -Value ('{"version":"' + $want + '","log":' + (ConvertTo-Json $log) + '}') -Encoding UTF8`,
+        `else {`,
+        `  try {`,
+        `    $failure = @{ version = $want; log = $log; rollback = $rollback; backup = $bak } | ConvertTo-Json -Compress`,
+        // WriteAllText 默认写 UTF-8 无 BOM，主进程的 JSON.parse 可直接读取。
+        `    [IO.File]::WriteAllText(${psq(failFile)}, $failure)`,
+        `  } catch { Note 'could not write update failure marker' }`,
         `  Note 'update failed, payload kept for manual install'`,
         `}`,
       );
@@ -655,12 +662,12 @@ class Updater {
 
     lines.push(
       `if ($ok) { Remove-Item -LiteralPath ${psq(path.join(this.updateDir, 'pending.json'))} -Force }`,
-      `if (Test-Path ${psq(exe)}) { Start-Process -FilePath ${psq(exe)}; Note 'relaunched' }`,
+      `if (($ok -or $canRestart) -and (Test-Path -LiteralPath ${psq(exe)} -PathType Leaf)) { Start-Process -FilePath ${psq(exe)}; Note 'relaunched' }`,
       `Note 'updater done'`,
+      // 只有验证通过才清理载荷；即使失败标记写不出来也必须保留。
+      `if (-not $ok) { exit 1 }`,
       `Start-Sleep -Milliseconds 400`,
-      // 失败时保留载荷：下次「安装已下载的更新」直接跑它，不用再下 1.4GB
-      `if (-not (Test-Path ${psq(failFile)})) { Remove-Item -Path ${psq(path.join(this.updateDir, job.version))} -Recurse -Force }`,
-      // 收尾的清理语句失败（目录已被删/被杀软占用）不应该让调用方以为更新失败
+      `Remove-Item -LiteralPath ${psq(path.join(this.updateDir, job.version))} -Recurse -Force`,
       `exit 0`,
     );
 

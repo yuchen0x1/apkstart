@@ -943,16 +943,20 @@ function notifyUpdateFailure() {
   try {
     const f = path.join(updater.updateDir, 'failed.json');
     if (!fs.existsSync(f)) return;
-    const raw = JSON.parse(fs.readFileSync(f, 'utf8')) || {};
+    // 也兼容旧脚本和便携更新写出的 UTF-8 BOM。
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, '')) || {};
     fs.rmSync(f, { force: true });
+    updater.clearPending();
     const v = String(raw.version || '').replace(/^v/i, '');
-    appLog(`previous update failed: v${v} log=${raw.log || ''}`);
+    const detail = raw.rollback === 'restored' ? '已恢复旧版程序文件。'
+      : raw.rollback === 'not-attempted' ? '备份检查未通过，未运行安装程序。'
+        : raw.rollback === 'unverified' ? '未能确认旧版已恢复，请查看更新日志。' : '';
+    appLog(`previous update failed: v${v} rollback=${raw.rollback || 'unknown'} log=${raw.log || ''}`);
     send('toast', {
       type: 'warn',
       sticky: true,
-      message: `上次更新到 ${v || '新版本'} 没有装成功，已回到旧版本。`
-        + '安装包已经下载好了，到「设置 → 软件更新」点一次即可重试（不会重新下载）；'
-        + '如果仍然失败，点「手动安装」直接跑安装包。',
+      message: `上次更新到 ${v || '新版本'} 没有装成功。${detail}`
+        + '安装包已经下载好了，可在「设置 → 软件更新」重试或选择手动安装。',
     });
   } catch (_) { /* 标记损坏无关紧要 */ }
 }
