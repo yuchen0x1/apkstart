@@ -287,19 +287,21 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
   });
 
   await test('内置 ZIP 解压可用', async () => {
-    const { ZipArchive } = require('../src/core/zip');
+    const { ZipArchive, crc32 } = require('../src/core/zip');
     // 构造一个 stored 模式的最小 zip
     const name = Buffer.from('platform-tools/adb.exe');
     const data = Buffer.from('fake-adb-binary');
     const loc = Buffer.alloc(30);
     loc.writeUInt32LE(0x04034b50, 0);
     loc.writeUInt16LE(0, 8);
+    loc.writeUInt32LE(crc32(data), 14);
     loc.writeUInt32LE(data.length, 18);
-    loc.writeUInt32LE(data.length, 14);
+    loc.writeUInt32LE(data.length, 22);
     loc.writeUInt16LE(name.length, 26);
     const cen = Buffer.alloc(46);
     cen.writeUInt32LE(0x02014b50, 0);
     cen.writeUInt16LE(name.length, 28);
+    cen.writeUInt32LE(crc32(data), 16);
     cen.writeUInt32LE(data.length, 24);
     cen.writeUInt32LE(data.length, 20);
     const eocd = Buffer.alloc(22);
@@ -514,12 +516,18 @@ function assert(cond, msg) { if (!cond) throw new Error(msg || '断言失败'); 
         sock.write('ok\r\n(qemu) ');
       });
     });
-    await new Promise((r) => srv.listen(5556, '127.0.0.1', r));
+    await new Promise((resolve, reject) => {
+      srv.once('error', reject);
+      srv.listen(0, '127.0.0.1', resolve);
+    });
 
-    const rt = new Runtime(TMP);
-    await rt.monitorCmd('system_powerdown');
-    assert(srv.lastCmd === 'system_powerdown', `实际收到: ${srv.lastCmd}`);
-    await new Promise((r) => srv.close(r));
+    try {
+      const rt = new Runtime(TMP);
+      await rt.monitorCmd('system_powerdown', { port: srv.address().port });
+      assert(srv.lastCmd === 'system_powerdown', `实际收到: ${srv.lastCmd}`);
+    } finally {
+      await new Promise((r) => srv.close(r));
+    }
   });
 
   await test('未安装系统时 ensure 返回 needsSetup', async () => {

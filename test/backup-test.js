@@ -11,6 +11,7 @@ const os = require('os');
 const path = require('path');
 
 const backup = require('../src/core/backup');
+const { buildApkBytes } = require('./lib/make-apk');
 
 let passed = 0;
 let failed = 0;
@@ -34,7 +35,7 @@ function mkApp(overrides = {}) {
   seq += 1;
   const apkPath = path.join(ROOT, `cache-${seq}`, 'base.apk');
   fs.mkdirSync(path.dirname(apkPath), { recursive: true });
-  fs.writeFileSync(apkPath, Buffer.from('PK\u0003\u0004fake-apk-bytes'));
+  fs.writeFileSync(apkPath, buildApkBytes({ packageName: overrides.package || 'com.example.demo' }));
   return {
     package: 'com.example.demo',
     label: '示例 应用',

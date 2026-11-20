@@ -20,6 +20,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { resolveSystemPaths, legacyPathWarnings } = require('./system-providers/system-paths');
 
 const STATUS = {
   WAITING: 'waiting',
@@ -34,6 +35,7 @@ const STATUS = {
   FAILED: 'failed',
   PAUSED: 'paused',
   CANCELLED: 'cancelled',
+  AWAITING_CONFIRMATION: 'awaiting_confirmation',
 };
 
 const TASK_TYPES = [
@@ -92,6 +94,10 @@ class SystemTask {
   }
 
   setStatus(status, step, extra = {}) {
+    // 迟到的 provider 不能复活终结任务，也不能越过暂停状态继续流水线。
+    if ([STATUS.COMPLETED, STATUS.FAILED, STATUS.CANCELLED].includes(this.status)
+      && status !== this.status) return false;
+    if (this.aborted && this.status === STATUS.PAUSED && status !== STATUS.PAUSED && status !== STATUS.CANCELLED) return false;
     this.status = status;
     if (step) this.currentStep = step;
     if (extra.error !== undefined) this.error = extra.error;
@@ -131,9 +137,9 @@ class SystemTaskManager {
    */
   constructor(opts = {}) {
     this.onEvent = opts.onEvent || (() => {});
-    this.dataDir = opts.dataDir || path.join(
-      process.env.APPDATA || require('os').homedir(), 'apkstart', 'runtime', 'systems'
-    );
+    const paths = resolveSystemPaths(opts);
+    this.dataDir = opts.dataDir || paths.systemsDir;
+    this.pathWarnings = legacyPathWarnings(this.dataDir, paths.legacySystemsDirs);
     this.stateFile = path.join(this.dataDir, '_tasks.json');
     this.tasks = new Map();       // taskId -> SystemTask
     this.activeBySystem = new Map(); // systemId -> taskId（单活跃锁）
@@ -198,7 +204,7 @@ class SystemTaskManager {
     const existingId = this.activeBySystem.get(systemId);
     if (existingId) {
       const t = this.tasks.get(existingId);
-      if (t && ![STATUS.COMPLETED, STATUS.FAILED, STATUS.CANCELLED].includes(t.status)) {
+      if (t && (t._inFlight || ![STATUS.COMPLETED, STATUS.FAILED, STATUS.CANCELLED].includes(t.status))) {
         return { task: t, reused: true };
       }
     }
@@ -234,15 +240,30 @@ class SystemTaskManager {
     this._persist();
   }
 
+  _providerHasActiveInstall(task) {
+    const p = task && task._provider;
+    try {
+      if (p && typeof p.isInstallerRunning === 'function') return !!p.isInstallerRunning();
+      return !!(p && p.backend && typeof p.backend.running === 'function' && p.backend.running());
+    } catch (_) { return false; }
+  }
+
+  _interruptedResult(task) {
+    if (task.status === STATUS.CANCELLED) return { ok: false, cancelled: true };
+    if (task.status === STATUS.PAUSED) return { ok: false, paused: true };
+    return { ok: false, cancelled: !!task.aborted };
+  }
+
   pause(taskId) {
     const t = this.tasks.get(taskId);
     if (!t) return { ok: false, error: '任务不存在' };
-    if (![STATUS.DOWNLOADING, STATUS.PREPARING, STATUS.VERIFYING, STATUS.INSTALLING].includes(t.status)) {
+    if (![STATUS.DOWNLOADING, STATUS.PREPARING, STATUS.VERIFYING, STATUS.INSTALLING,
+      STATUS.AWAITING_CONFIRMATION].includes(t.status)) {
       return { ok: false, error: '当前状态无法暂停' };
     }
     t.aborted = true;
     try { t._controller.abort(); } catch (_) {}
-    t.setStatus(STATUS.PAUSED, '已暂停（保留断点）');
+    t.setStatus(STATUS.PAUSED, '已暂停（保留任务与安装器）');
     this._persist();
     return { ok: true };
   }
@@ -250,10 +271,13 @@ class SystemTaskManager {
   cancel(taskId) {
     const t = this.tasks.get(taskId);
     if (!t) return { ok: false, error: '任务不存在' };
+    if ([STATUS.COMPLETED, STATUS.FAILED, STATUS.CANCELLED].includes(t.status)) return { ok: false, error: '任务已经结束' };
     t.aborted = true;
     try { t._controller.abort(); } catch (_) {}
-    t.setStatus(STATUS.CANCELLED, '已取消（不删除已安装系统）');
-    this._release(t);
+    t.setStatus(STATUS.CANCELLED, '已取消（不停止安装器，保留当前安装会话）');
+    // 安装会话留在 manifest 中，后续任务只能接续，不重复拉起虚拟机。
+    if (!t._inFlight && !this._providerHasActiveInstall(t)) this._release(t);
+    else this._persist();
     return { ok: true };
   }
 
@@ -264,10 +288,24 @@ class SystemTaskManager {
    */
   async runPipeline(opts = {}) {
     const task = opts.task;
-    const provider = opts.provider || task._provider;
-    if (!task || !provider) throw new Error('缺少任务或 Provider');
+    if (!task) throw new Error('缺少任务');
+    if (task._inFlight) return { ok: false, error: '上一次任务仍在收尾，请稍后重试' };
+    task._provider = opts.provider || task._provider;
+    opts = { ...opts, ctx: opts.ctx || task._ctx || {} };
+    task._inFlight = true;
+    try { return await this._runPipeline(opts); }
+    finally {
+      task._inFlight = false;
+      if (task.status === STATUS.CANCELLED && !this._providerHasActiveInstall(task)) this._release(task);
+    }
+  }
 
-    // 磁盘空间预检（download.js 自身不检查）
+  async _runPipeline(opts = {}) {
+    const task = opts.task;
+    const provider = opts.provider || (task && task._provider);
+    if (!task || !provider) throw new Error('缺少任务或 Provider');
+    if ([STATUS.CANCELLED, STATUS.COMPLETED, STATUS.FAILED].includes(task.status)) return this._interruptedResult(task);
+
     if (opts.diskRequiredMB && opts.doctor && typeof opts.doctor.freeDiskMB === 'function') {
       try {
         const free = opts.doctor.freeDiskMB(provider.dataDir);
@@ -281,14 +319,13 @@ class SystemTaskManager {
       } catch (_) {}
     }
 
-    // 下载地址有效性 / 来源合法性（HTTPS）
     task.setStatus(STATUS.PREPARING, '准备下载信息');
     let info;
-    try {
-      info = await provider.getDownloadInfo();
-    } catch (e) { info = null; }
+    try { info = await provider.getDownloadInfo(); } catch (_) { info = null; }
+    if (task.aborted || [STATUS.CANCELLED, STATUS.PAUSED].includes(task.status)) return this._interruptedResult(task);
     if (!info || !/^https:\/\//i.test(info.url || '')) {
       const avail = await provider.getAvailability();
+      if (task.aborted || [STATUS.CANCELLED, STATUS.PAUSED].includes(task.status)) return this._interruptedResult(task);
       const err = avail.reason || '无合法的 HTTPS 下载地址（不下载未经验证的资源）';
       task.setStatus(STATUS.FAILED, '无可用下载源', { error: err });
       this._release(task);
@@ -298,49 +335,51 @@ class SystemTaskManager {
     task.totalBytes = info.fileSize || 0;
 
     try {
-      // 1) 下载
       task.setStatus(STATUS.DOWNLOADING, '正在下载系统镜像');
       const dl = await provider.download(task, { info });
-      if (task.aborted) return { ok: false, cancelled: true };
+      if (task.aborted || [STATUS.CANCELLED, STATUS.PAUSED].includes(task.status)) return this._interruptedResult(task);
 
-      // 2) 校验
       task.setStatus(STATUS.VERIFYING, '文件校验中');
       const vr = await provider.verify(dl.file, info);
+      if (task.aborted || [STATUS.CANCELLED, STATUS.PAUSED].includes(task.status)) return this._interruptedResult(task);
       if (!vr.ok) {
-        // 校验失败：删除损坏文件（下次重新下载，不续传毒丸）
         try { fs.rmSync(dl.file, { force: true }); } catch (_) {}
         task.setStatus(STATUS.FAILED, '校验失败', { error: vr.error });
         this._release(task);
         return { ok: false, error: vr.error, verifyFailed: true };
       }
-      if (task.aborted) return { ok: false, cancelled: true };
 
-      // 3) 安装（展开/建盘/装机）—— 下载成功绝不冒充安装成功
       if (!opts.skipInstall) {
         task.setStatus(STATUS.INSTALLING, '正在安装系统');
         const ir = await provider.install(task, Object.assign({ version: info.version }, opts.ctx));
+        if (task.aborted || [STATUS.CANCELLED, STATUS.PAUSED].includes(task.status)) return this._interruptedResult(task);
+        if (ir.awaitingConfirmation || task.status === STATUS.AWAITING_CONFIRMATION) {
+          task.setStatus(STATUS.AWAITING_CONFIRMATION,
+            '请完成安装并正常关机，再确认安装完成');
+          return { ok: false, awaitingConfirmation: true, taskId: task.taskId };
+        }
         if (!ir.ok) {
           task.setStatus(STATUS.FAILED, '安装失败', { error: ir.error });
           this._release(task);
           return Object.assign({ ok: false }, ir);
         }
-        if (task.aborted) return { ok: false, cancelled: true };
       }
+      if (task.aborted || [STATUS.CANCELLED, STATUS.PAUSED].includes(task.status)) return this._interruptedResult(task);
 
-      // 4) 初始化
       task.setStatus(STATUS.INITIALIZING, '正在初始化设备');
-      await provider.initialize(task, opts.ctx);
+      const initialized = await provider.initialize(task, opts.ctx);
+      if (task.aborted || [STATUS.CANCELLED, STATUS.PAUSED].includes(task.status)) return this._interruptedResult(task);
+      if (initialized && initialized.ok === false) throw new Error(initialized.error || '初始化失败');
 
-      // 5) 启动（可选）—— 仅启动引擎，Android 就绪由 system-manager 另做检查
       if (!opts.skipStart) {
         task.setStatus(STATUS.STARTING, '正在启动 Android');
         const sr = await provider.start(opts.ctx || {});
+        if (task.aborted || [STATUS.CANCELLED, STATUS.PAUSED].includes(task.status)) return this._interruptedResult(task);
         if (!sr.ok) {
           task.setStatus(STATUS.FAILED, '启动失败', { error: sr.error || '引擎启动失败' });
           this._release(task);
           return { ok: false, error: sr.error || '引擎启动失败', vmStarted: false };
         }
-        // 需要区分：VM 进程启动 vs Android 真正就绪
         task.setStatus(STATUS.COMPLETED, '虚拟机已启动（等待 Android 就绪检查）');
         this._release(task);
         return { ok: true, needsAndroidReadyCheck: !!sr.needsAndroidReadyCheck, startResult: sr };
@@ -351,10 +390,12 @@ class SystemTaskManager {
       this._release(task);
       return { ok: true };
     } catch (e) {
-      if (task.aborted) {
-        task.setStatus(STATUS.CANCELLED, '已取消');
-        this._release(task);
-        return { ok: false, cancelled: true };
+      if (task.status === STATUS.CANCELLED || task.status === STATUS.PAUSED || task.aborted) {
+        if (task.status !== STATUS.CANCELLED && task.status !== STATUS.PAUSED) {
+          task.setStatus(STATUS.CANCELLED, '已取消');
+          if (!this._providerHasActiveInstall(task)) this._release(task);
+        }
+        return this._interruptedResult(task);
       }
       task.setStatus(STATUS.FAILED, '任务失败', { error: e.message });
       this._release(task);
@@ -366,14 +407,22 @@ class SystemTaskManager {
   retry(taskId) {
     const t = this.tasks.get(taskId);
     if (!t) return { ok: false, error: '任务不存在' };
-    if (t.status !== STATUS.FAILED && t.status !== STATUS.PAUSED) {
-      return { ok: false, error: '仅失败或暂停的任务可重试' };
+    const heldCancelledLock = t.status === STATUS.CANCELLED
+      && this.activeBySystem.get(t.systemId) === t.taskId;
+    if (t.status !== STATUS.FAILED && t.status !== STATUS.PAUSED && !heldCancelledLock) {
+      return { ok: false, error: '仅失败、暂停或保留安装会话的取消任务可重试' };
     }
+    if (t._inFlight || t._confirming) return { ok: false, error: '上一次任务仍在收尾，请稍后重试' };
+    const active = this.getActiveTask(t.systemId);
+    if (active && active !== t) return { ok: false, error: '该系统已有另一个任务，不能重试旧任务' };
     if (t.retryCount >= t.maxRetries) return { ok: false, error: '重试次数已用尽' };
     t.retryCount += 1;
     t.error = '';
     t.aborted = false;
     try { t._controller = new AbortController(); t.signal = t._controller.signal; } catch (_) {}
+    // 只有管理器显式重试能离开失败/取消终态；旧流水线此时已完全结束。
+    t.status = STATUS.WAITING;
+    this.activeBySystem.set(t.systemId, t.taskId);
     t.setStatus(STATUS.WAITING, '等待重试');
     this._persist();
     return { ok: true, task: t };

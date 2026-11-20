@@ -14,10 +14,54 @@ const { URL } = require('url');
 const UA = 'ApkStart/0.3 (Windows; +https://github.com/yuchen0x1/apkstart)';
 const proxyMod = require('./proxy');
 
-function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy = false, timeout = 30000 } = {}) {
+/** 分块先停止所有请求并等待 worker 收尾，再允许调用方关闭共享文件。 */
+async function runWorkers(chunks, worker, signal) {
+  const controller = new AbortController();
+  require('events').setMaxListeners(0, controller.signal);
+  const abort = () => controller.abort();
+  if (signal) signal.addEventListener('abort', abort, { once: true });
+  if (signal && signal.aborted) abort();
+  let failure = null;
+  try {
+    await Promise.allSettled(chunks.map(async (chunk) => {
+      try { await worker(chunk, controller.signal); }
+      catch (e) { if (!failure) failure = e; abort(); }
+    }));
+    if (failure) throw failure;
+    if (controller.signal.aborted) throw new Error('下载已取消');
+  } finally {
+    if (signal) signal.removeEventListener('abort', abort);
+  }
+}
+
+function waitRetry(ms, signal) {
+  if (signal && signal.aborted) return Promise.reject(new Error('下载已取消'));
   return new Promise((resolve, reject) => {
+    const finish = (err) => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', abort);
+      if (err) reject(err); else resolve();
+    };
+    const abort = () => finish(new Error('下载已取消'));
+    const timer = setTimeout(() => finish(), ms);
+    if (signal) signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy = false, timeout = 30000, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) return reject(new Error('下载已取消'));
     if (redirects > 6) return reject(new Error('重定向次数过多'));
-    const u = new URL(url);
+    let req;
+    const cleanup = () => { if (signal) signal.removeEventListener('abort', abort); };
+    const abort = () => {
+      cleanup();
+      if (req) req.destroy(new Error('下载已取消'));
+      reject(new Error('下载已取消'));
+    };
+    if (signal) signal.addEventListener('abort', abort, { once: true });
+    let u;
+    try { u = new URL(url); } catch (e) { cleanup(); reject(e); return; }
     const mod = u.protocol === 'http:' ? http : https;
 
     (async () => {
@@ -30,8 +74,8 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
       if (!noProxy && !loopback) {
         try { proxy = await proxyMod.getActiveProxy(); } catch (_) { proxy = null; }
       }
+      if (signal && signal.aborted) { cleanup(); return; }
       const base = { method, headers: { 'User-Agent': UA, 'Accept-Encoding': 'identity', ...headers } };
-      let req;
       if (proxy && u.protocol === 'https:') {
         // https 经代理：CONNECT 隧道上做端到端 TLS。
         // 注意：agent:false 时 Node 会忽略 options.createConnection（agent:false 新建的
@@ -79,22 +123,26 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
       // 剩一块挂着 12 分钟无任何网络活动）。所以必须在请求层 destroy。
       req.on('timeout', () => req.destroy(new Error('连接超时')));
       req.on('error', (e) => {
+        cleanup();
+        if (signal && signal.aborted) return reject(new Error('下载已取消'));
         // 代理连不通（没开代理软件/端口变了）：立即回退直连，不能让用户卡死。
         // 注意不能用宽泛的 /connect/i —— 'disconnected' 里也有 connect，会误匹配。
         const etext = `${(e && e.code) || ''}${(e && e.name) || ''}${(e && e.message) || ''}`;
         if (proxy && !noProxy && /代理 CONNECT|ECONNREFUSED|ETIMEDOUT|AggregateError/i.test(etext)) {
-          return resolve(openStream(url, { method, headers, redirects, noProxy: true }));
+          return resolve(openStream(url, { method, headers, redirects, noProxy: true, timeout, signal }));
         }
         reject(e);
       });
       req.end();
-    })().catch(reject);
+    })().catch((e) => { cleanup(); reject(e); });
 
     function finishReq(res, req) {
+      cleanup();
+      if (signal && signal.aborted) { res.destroy(); return reject(new Error('下载已取消')); }
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
         res.resume();
         const next = new URL(res.headers.location, url).href;
-        return resolve(openStream(next, { method, headers, redirects: redirects + 1, noProxy }));
+        return resolve(openStream(next, { method, headers, redirects: redirects + 1, noProxy, timeout, signal }));
       }
       resolve(res);
     }
@@ -155,22 +203,36 @@ async function verifyChecksum(dest, opt) {
  * 并行分块失败留下的预分配稀疏文件，大小恰好也等于总长，只有比对内容才分得清。
  * 服务器不支持 Range 时返回 true（放行，保持旧行为）。
  */
-async function tailMatches(url, dest, size, len) {
+async function tailMatches(url, dest, size, len, signal) {
   let res;
   try {
-    res = await openStream(url, { headers: { Range: `bytes=${size - len}-` } });
-  } catch (_) {
+    res = await openStream(url, { headers: { Range: `bytes=${size - len}-` }, signal });
+  } catch (e) {
+    if (signal && signal.aborted) throw e;
     return true;   // 校验通道不可用：不因它把可能的完整文件误删
   }
   if (res.statusCode !== 206) { res.resume(); return true; }
   const parts = [];
   let got = 0;
   await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', abort);
+      resolve();
+    };
+    const abort = () => { res.destroy(); finish(); };
+    const timer = setTimeout(abort, 30000);
+    if (signal) signal.addEventListener('abort', abort, { once: true });
     res.on('data', (c) => { parts.push(c); got += c.length; if (got >= len) res.destroy(); });
-    res.on('end', () => resolve());
-    res.on('error', () => resolve());
-    res.on('close', () => resolve());
+    res.on('end', finish);
+    res.on('error', finish);
+    res.on('close', finish);
+    if (signal && signal.aborted) abort();
   });
+  if (signal && signal.aborted) throw new Error('下载已取消');
   const remoteBuf = Buffer.concat(parts).subarray(0, len);
   if (remoteBuf.length < len) return true;   // 远端比声明的小，交给上层大小校验处理
   const local = Buffer.alloc(len);
@@ -186,6 +248,7 @@ async function tailMatches(url, dest, size, len) {
  * @param {object} opt { onProgress({got,total,percent,speed}), signal, expectSha256, expectSha1, idleMs, retries }
  */
 async function download(url, dest, opt = {}) {
+  if (opt.signal && opt.signal.aborted) throw new Error('下载已取消');
   const { onProgress = () => {}, signal, retries = 2 } = opt;
   fs.mkdirSync(path.dirname(dest), { recursive: true });
 
@@ -197,7 +260,8 @@ async function download(url, dest, opt = {}) {
     if (existing > 0) headers.Range = `bytes=${existing}-`;
 
     // eslint-disable-next-line no-await-in-loop
-    const res = await openStream(url, { headers });
+    const res = await openStream(url, { headers, signal });
+    if (signal && signal.aborted) { res.destroy(); throw new Error('下载已取消'); }
 
     if (res.statusCode === 416) {
       res.resume();
@@ -221,7 +285,7 @@ async function download(url, dest, opt = {}) {
       // 比对末尾 4KB，内容对不上就重置，宁可重下也不交出一份全零的「成品」。
       if (remoteTotal && actual === remoteTotal && actual > 0) {
         // eslint-disable-next-line no-await-in-loop
-        const same = await tailMatches(url, dest, actual, Math.min(4096, actual));
+        const same = await tailMatches(url, dest, actual, Math.min(4096, actual), signal);
         if (!same) {
           fs.rmSync(dest, { force: true });
           if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
@@ -274,8 +338,11 @@ async function download(url, dest, opt = {}) {
         if (settled) return;
         settled = true;
         if (idle) clearTimeout(idle);
-        try { ws.destroy(); } catch (_) { /* ignore */ }
-        if (err) reject(err); else resolve();
+        if (signal) signal.removeEventListener('abort', onAbort);
+        res.unpipe(ws);
+        res.destroy();
+        ws.once('close', () => { if (err) reject(err); else resolve(); });
+        ws.destroy();
       };
       const kick = () => {
         if (settled) return;
@@ -287,7 +354,7 @@ async function download(url, dest, opt = {}) {
       };
       kick();
 
-      const onAbort = () => { res.destroy(new Error('已取消')); };
+      const onAbort = () => finish(new Error('下载已取消'));
       if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
       res.on('data', (c) => {
@@ -316,6 +383,7 @@ async function download(url, dest, opt = {}) {
     break;
   }
 
+  if (signal && signal.aborted) throw new Error('下载已取消');
   // 收尾：确保进度条走到 100%
   const finalSize = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
   onProgress({ got: finalSize, total: finalSize, percent: 100, speed: 0, eta: 0 });
@@ -330,6 +398,7 @@ async function download(url, dest, opt = {}) {
  * 仅在「目标文件不存在」时并行；已有部分文件时退回单流续传，避免分块状态丢失。
  */
 async function downloadParallel(url, dest, opt = {}) {
+  if (opt.signal && opt.signal.aborted) throw new Error('下载已取消');
   const {
     connections = 8,
     onProgress = () => {},
@@ -355,7 +424,7 @@ async function downloadParallel(url, dest, opt = {}) {
   let total = 0;
   let supportsRange = false;
   try {
-    const probe = await openStream(url, { headers: { Range: 'bytes=0-0' } });
+    const probe = await openStream(url, { headers: { Range: 'bytes=0-0' }, signal });
     const cr = probe.headers['content-range'];
     if (probe.statusCode === 206 && cr) {
       supportsRange = true;
@@ -370,6 +439,7 @@ async function downloadParallel(url, dest, opt = {}) {
     return download(url, dest, opt);
   }
 
+  if (signal && signal.aborted) throw new Error('下载已取消');
   const n = Math.max(1, Math.min(connections, Math.ceil(total / minChunk)));
   const per = Math.ceil(total / n);
   const idleMs = Number(opt.idleMs) > 0 ? Number(opt.idleMs) : 20000;
@@ -403,11 +473,12 @@ async function downloadParallel(url, dest, opt = {}) {
     });
   };
 
-  const fetchChunk = async (c) => {
+  const fetchChunk = async (c, signal) => {
     if (signal && signal.aborted) throw new Error('下载已取消');
-    const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` } });
+    const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` }, signal });
+    if (signal && signal.aborted) { res.destroy(); throw new Error('下载已取消'); }
     if (res.statusCode !== 206) {
-      res.resume();
+      res.destroy();
       throw new Error(`分块请求被拒绝 HTTP ${res.statusCode}`);
     }
     // 只检查 206 不够（上游 d0853aa）：单源并行分块也要校验 Content-Range，
@@ -416,7 +487,7 @@ async function downloadParallel(url, dest, opt = {}) {
     // 这条单源路径（downloadAnyParallel / multi 的单源回退）之前漏了。
     const cr = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(String(res.headers['content-range'] || ''));
     if (!cr) {
-      res.resume();
+      res.destroy();
       throw new Error('分块响应缺少 Content-Range，无法确认数据位置');
     }
     const crStart = Number(cr[1]);
@@ -436,6 +507,8 @@ async function downloadParallel(url, dest, opt = {}) {
         if (settled) return;
         settled = true;
         clearTimeout(idle);
+        if (signal) signal.removeEventListener('abort', onAbort);
+        res.destroy();
         if (err) reject(err); else resolve();
       };
       // 外部中断（上层判定这个源太慢、要换路）：立刻断流抛出，别在坏源上耗着。
@@ -448,6 +521,7 @@ async function downloadParallel(url, dest, opt = {}) {
         idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（长时间无数据）')); }, idleMs);
       };
       res.on('data', (buf) => {
+        if (settled || (signal && signal.aborted)) return;
         // 只写到 Content-Range 声明的范围内：服务器多给的数据一律丢弃，
         // 否则会覆盖相邻分块已写好的字节（同样是「长度对、内容错」）。
         const room = limit + 1 - c.pos;
@@ -472,21 +546,22 @@ async function downloadParallel(url, dest, opt = {}) {
   };
 
   try {
-    await Promise.all(chunks.map(async (c) => {
+    await runWorkers(chunks, async (c, workerSignal) => {
       for (;;) {
         try {
           // eslint-disable-next-line no-await-in-loop
-          const ok = await fetchChunk(c);
+          const ok = await fetchChunk(c, workerSignal);
           if (ok) return;
           throw new Error('分块未完整返回');
         } catch (e) {
+          if (workerSignal.aborted) throw e;
           c.tries += 1;
           if (c.tries >= retries) throw new Error(`分块下载失败（${c.start}-${c.end}）：${e.message}`);
           // eslint-disable-next-line no-await-in-loop
-          await new Promise((r) => setTimeout(r, 800 * c.tries));
+          await waitRetry(800 * c.tries, workerSignal);
         }
       }
-    }));
+    }, signal);
   } catch (e) {
     fs.closeSync(fd);
     // 预分配的稀疏文件在这里就是「全零毒丸」：不删掉的话，上层换源重试会把它
@@ -513,6 +588,7 @@ async function downloadAny(urls, dest, opt = {}) {
       const r = await download(u, dest, opt);
       return { ...r, url: u };
     } catch (e) {
+      if (opt.signal && opt.signal.aborted) throw e;
       errors.push(`${u} → ${e.message}`);
     }
   }
@@ -530,6 +606,7 @@ async function downloadAny(urls, dest, opt = {}) {
  * 任一源中途失败，它的分块会自动换到下一条可用地址重试（不整包重来）。
  */
 async function downloadMulti(urls, dest, opt = {}) {
+  if (opt.signal && opt.signal.aborted) throw new Error('下载已取消');
   const {
     connections = 8,
     onProgress = () => {},
@@ -549,7 +626,7 @@ async function downloadMulti(urls, dest, opt = {}) {
   // 1) 并行探测：总大小 + 是否支持 Range
   const probes = await Promise.all(list.map(async (u) => {
     try {
-      const res = await openStream(u, { headers: { Range: 'bytes=0-0' } });
+      const res = await openStream(u, { headers: { Range: 'bytes=0-0' }, signal });
       const cr = res.headers['content-range'];
       const total = res.statusCode === 206 && cr ? Number(/\/(\d+)$/.exec(cr)[1]) || 0 : 0;
       res.destroy();
@@ -559,6 +636,7 @@ async function downloadMulti(urls, dest, opt = {}) {
     }
   }));
 
+  if (signal && signal.aborted) throw new Error('下载已取消');
   const usable = probes.filter((p) => p.ranged && p.total > 0);
   if (!usable.length) {
     return downloadAnyParallel(list, dest, opt);
@@ -644,12 +722,13 @@ async function downloadMulti(urls, dest, opt = {}) {
   const slowAfterMs = Number(opt.slowAfterMs) > 0 ? Number(opt.slowAfterMs) : 45000;
   const slowBps = Number(opt.slowBps) > 0 ? Number(opt.slowBps) : 120 * 1024;
 
-  const fetchChunk = async (c) => {
+  const fetchChunk = async (c, signal) => {
     if (signal && signal.aborted) throw new Error('下载已取消');
     const url = same[c.src % same.length].url;
-    const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` } });
+    const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` }, signal });
+    if (signal && signal.aborted) { res.destroy(); throw new Error('下载已取消'); }
     if (res.statusCode !== 206) {
-      res.resume();
+      res.destroy();
       throw new Error(`分块被拒绝 HTTP ${res.statusCode}`);
     }
     // 只检查 206 不够（上游 issue #91）：服务器返回一个错位/越界的 Content-Range 时，
@@ -658,7 +737,7 @@ async function downloadMulti(urls, dest, opt = {}) {
     // 所以起点必须与请求一致，总长必须与整包一致；终点以两者交集为界。
     const cr = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(String(res.headers['content-range'] || ''));
     if (!cr) {
-      res.resume();
+      res.destroy();
       throw new Error('分块响应缺少 Content-Range，无法确认数据位置');
     }
     const crStart = Number(cr[1]);
@@ -685,6 +764,8 @@ async function downloadMulti(urls, dest, opt = {}) {
         if (settled) return;
         settled = true;
         clearTimeout(idle);
+        if (signal) signal.removeEventListener('abort', onAbort);
+        res.destroy();
         if (err) reject(err); else resolve();
       };
       // 外部中断：立刻断流抛出（保留了 c.pos 断点，换路重下不浪费已收字节）
@@ -696,6 +777,7 @@ async function downloadMulti(urls, dest, opt = {}) {
         idle = setTimeout(() => { res.destroy(); finish(new Error('连接停滞（无数据超时）')); }, idleMs);
       };
       res.on('data', (buf) => {
+        if (settled || (signal && signal.aborted)) return;
         // 只写到 Content-Range 声明的范围内：服务器多给的数据一律丢弃，
         // 否则会覆盖相邻分块已写好的字节（同样是「长度对、内容错」）。
         const room = limit + 1 - c.pos;
@@ -732,35 +814,32 @@ async function downloadMulti(urls, dest, opt = {}) {
   };
 
   try {
-    await Promise.all(chunks.map(async (c) => {
+    await runWorkers(chunks, async (c, workerSignal) => {
       for (;;) {
         try {
           // eslint-disable-next-line no-await-in-loop
-          if (await fetchChunk(c)) {
+          if (await fetchChunk(c, workerSignal)) {
             doneSet.add(c.start);
             saveMeta();
             return;
           }
           throw new Error('分块未完整返回');
         } catch (e) {
-          // 外部中断（上层判定源太慢换路）：不再重试，立刻保留断点退出
-          if (signal && signal.aborted) {
+          if (workerSignal.aborted) {
             saveMeta();
             throw new Error(`分块失败（${c.start}-${c.end}）：${e.message}`);
           }
           c.tries += 1;
           if (c.tries >= retries) {
-            // 记下已完成的部分（边车），下次从缺的块继续，而不是从头再下 1.4GB
             saveMeta();
             throw new Error(`分块失败（${c.start}-${c.end}）：${e.message}`);
           }
-          // 换一个源再试：一个镜像抽风不该拖垮整个下载
           c.src += 1;
           // eslint-disable-next-line no-await-in-loop
-          await new Promise((r) => setTimeout(r, 600 * c.tries));
+          await waitRetry(600 * c.tries, workerSignal);
         }
       }
-    }));
+    }, signal);
   } catch (e) {
     fs.closeSync(fd);
     throw e;
@@ -784,6 +863,7 @@ async function downloadAnyParallel(urls, dest, opt = {}) {
       const r = await downloadParallel(u, dest, opt);
       return { ...r, url: u };
     } catch (e) {
+      if (opt.signal && opt.signal.aborted) throw e;
       errors.push(`${u} → ${e.message}`);
     }
   }

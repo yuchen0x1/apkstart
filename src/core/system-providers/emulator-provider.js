@@ -41,7 +41,7 @@ class EmulatorProvider extends BaseProvider {
     return {
       installed: !!(env.installed || env.env && env.env.sysimg && env.env.sysimg.ok),
       downloaded: true,
-      running: !!(env.vmRunning && active),
+      running: !!((env.vmRunning || env.deviceOnline) && active),
       version: this.flavor,
       active,
       paths: {},
@@ -76,13 +76,17 @@ class EmulatorProvider extends BaseProvider {
 
   async stop() {
     if (this.backendEngine && typeof this.backendEngine.stop === 'function') {
-      await this.backendEngine.stop();
+      const stopped = await this.backendEngine.stop();
+      if (stopped === false || (stopped && stopped.ok === false)) {
+        return { ok: false, error: stopped.error || '未能确认运行时已停止' };
+      }
     }
     return { ok: true };
   }
 
   async restart() {
-    await this.stop();
+    const result = await this.stop();
+    if (!result.ok) return result;
     return this.start();
   }
 }

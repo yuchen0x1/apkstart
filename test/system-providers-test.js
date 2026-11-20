@@ -88,11 +88,17 @@ atest('Android-x86：可下载 + 真实校验和', async () => {
   assert.strictEqual(info.sha256, 'f7eb8fc56f29ad5432335dc054183acf086c539f3990f0b6e9ff58bd6df4604e');
 });
 
-atest('安装状态持久化：写 manifest + 真实 ISO 后 getLocalStatus 反映', async () => {
+atest('安装状态持久化：真实磁盘和明确确认才算已安装', async () => {
   const p = mk('android-x86');
   fs.mkdirSync(p.downloadsDir, { recursive: true });
-  fs.writeFileSync(p.isoPath(), Buffer.alloc(1024)); // 真实文件存在才算已下载
+  fs.writeFileSync(p.isoPath(), Buffer.alloc(1024));
   p.writeManifest({ installed: true, version: '9.0-r2', downloaded: true });
+  assert.strictEqual((await p.getLocalStatus()).installed, false, '旧 installed 标志或 ISO 不代表磁盘已安装');
+  fs.mkdirSync(p.disksDir, { recursive: true });
+  fs.writeFileSync(p.diskPath(), Buffer.alloc(1024));
+  p.writeManifest({ installationPending: { taskId: 'confirmed-fixture', version: '9.0-r2' } });
+  const result = p.confirmInstallation({ taskId: 'confirmed-fixture', aborted: false }, { confirmed: true });
+  assert.strictEqual(result.ok, true);
   const st = await p.getLocalStatus();
   assert.strictEqual(st.installed, true);
   assert.strictEqual(st.version, '9.0-r2');

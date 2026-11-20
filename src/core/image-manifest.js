@@ -82,6 +82,17 @@ function str(v, max = 300) {
   return String(v == null ? '' : v).trim().slice(0, max);
 }
 
+function unsafeWindowsId(id) {
+  return /[. ]$|[\\/:*?"<>|\x00-\x1f]/.test(id)
+    || /^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³]) *(?:\.|$)/i.test(id)
+    || /^index\.json$/i.test(id);
+}
+
+/** id 同时是目录名：拒绝 Windows 会归一化/保留的名字及索引文件名。 */
+function isSafeId(id) {
+  return typeof id === 'string' && /^[a-z0-9._-]{1,80}$/i.test(id) && !unsafeWindowsId(id);
+}
+
 /** 目录名只能用安全字符：id 会拼进路径 */
 function slug(v) {
   const s = str(v, 80)
@@ -125,7 +136,7 @@ function normalize(raw = {}, fallback = {}) {
   const name = str(r.name || r.id || fallback.name || '自定义镜像', 120) || '自定义镜像';
   return {
     schema: SCHEMA,
-    id: slug(r.id || fallback.id || name),
+    id: typeof r.id === 'string' && unsafeWindowsId(r.id) ? r.id : slug(r.id || fallback.id || name),
     name,
     // 没写 type 不等于「这是手机固件」：默认按模拟器镜像处理。
     // 真正拦住手机固件的是字节体检（见 image-inspect）与 _scan 里的目录特征判断，
@@ -204,6 +215,8 @@ function explainType(m) {
 function validate(m, ctx = {}) {
   const errors = [];
   const warnings = [];
+
+  if (!isSafeId(m.id)) errors.push('清单 id 不是安全目录名（禁止 .、..、尾点/空格、Windows 保留名及 index.json）');
 
   // 1) 类型：手机固件 / recovery 一律拒绝
   const typeWhy = explainType(m);
@@ -339,6 +352,6 @@ function describeSource(src = {}) {
 module.exports = {
   SCHEMA, MANIFEST_NAME, TYPE, ABI_SUPPORT, MACHINES, CJK, SOURCE_LABELS,
   normalize, validate, explainType, fillFromInference, normalizeType,
-  normalizeChecksums, normalizeAbiName: require('./image-inspect').normalizeAbiName,
+  normalizeChecksums, isSafeId, normalizeAbiName: require('./image-inspect').normalizeAbiName,
   emulatorTag, describe, describeSource, looksMiui, slug, str,
 };

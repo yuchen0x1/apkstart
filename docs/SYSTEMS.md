@@ -51,7 +51,7 @@ ApkStart 收录的是官方归档 `BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-
 
 ## 存储位置
 
-每个系统完全独立，禁止混用 userdata：
+每个系统完全独立，禁止混用 userdata。`systems` 跟随当前运行时目录：Windows 默认在 `%APPDATA%\apkstart\runtime` 下，Linux 默认在 `${XDG_DATA_HOME:-~/.local/share}/apkstart/runtime` 下；自定义运行时目录时使用该目录的 `systems` 子目录。
 
 ```
 %APPDATA%\apkstart\runtime\systems\
@@ -86,5 +86,7 @@ virtio 磁盘/网卡、USB 平板+键盘、AC97 音频、OVMF(UEFI)（存在时�
 - 不修改任何 Windows 安全设置。
 - **虚拟机进程启动 ≠ Android 系统启动成功**：必须等 guest 内开启网络 ADB 且
   `getprop sys.boot_completed = 1` 才算就绪；超时会如实报告并保持"未运行"状态。
-- 首次安装默认引导式（guided）：ISO 引导进官方安装器，用户在虚拟机窗口完成安装；
-  Provider 以"磁盘被显著写入"作为客观安装成功证据，绝不假装已安装。
+- 首次安装使用引导式（guided）：ISO 引导进官方安装器，用户在虚拟机窗口完成安装并正常关机，
+  然后在任务行点击「确认安装完成」。Provider 检查虚拟机已退出后才接受明确确认；
+  磁盘增长只表示开始写入，不会据此自动关机或标记已安装。后续启动仍须验证 Android 就绪。
+- 无人值守 auto 尚未实现，选择后会明确拒绝，不会假装已经安装。

@@ -31,6 +31,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { resolveSystemPaths, legacyPathWarnings } = require('./system-paths');
 
 const PROVIDER_IDS = {
   GOOGLE_PLAY: 'google-play',
@@ -59,10 +60,10 @@ class BaseProvider {
     this.taskManager = ctx.taskManager || null;
     this.settingsFn = ctx.settingsFn || (() => ({}));
     this.onLog = ctx.onLog || (() => {});
-    this.dataDir = ctx.dataDir || path.join(
-      process.env.APPDATA || require('os').homedir(),
-      'apkstart', 'runtime', 'systems', this.id
-    );
+    const paths = resolveSystemPaths(ctx);
+    this.dataDir = ctx.dataDir || path.join(paths.systemsDir, this.id);
+    this.pathWarnings = legacyPathWarnings(this.dataDir,
+      paths.legacySystemsDirs.map((dir) => path.join(dir, this.id)));
     this._logs = [];
   }
 

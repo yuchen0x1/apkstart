@@ -150,6 +150,11 @@ function buildManifestAxml(opts = {}) {
     children: [],
   };
   if (o.debuggable) app.attrs.push({ name: 'debuggable', value: true, type: 0x12 });
+  // 用于验证「仅在 Activity 未声明时回退」及 landscape=0 不被 falsy 吞掉。
+  if (typeof o.appOrientation === 'number' || typeof o.appOrientation === 'string') {
+    app.attrs.push(A('screenOrientation', o.appOrientation,
+      typeof o.appOrientation === 'number' ? { type: 0x10 } : {}));
+  }
   for (const l of o.usesLibraries) {
     const item = typeof l === 'string' ? { name: l, required: true } : l;
     app.children.push({

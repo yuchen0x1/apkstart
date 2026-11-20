@@ -16,9 +16,60 @@ const { shellQuote } = require('./adb');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** APK 只有 ARM 原生库（国产 App 绝大多数如此） */
+const ARM_ABIS = new Set(['armeabi', 'armeabi-v7a', 'arm64-v8a']);
+const ANDROID_ABIS = new Set([...ARM_ABIS, 'x86', 'x86_64', 'mips', 'mips64', 'riscv64']);
+const TRANSLATION_CRASH = /DoBadTrampoline|libndk_translation|libhoudini|\bhoudini\b/i;
+const NATIVE_LOAD_FAILURE = /UnsatisfiedLinkError|dlopen failed|couldn't find "lib|\.so.*not found/i;
+
+/** 只有明确的 ARM ABI 才算 ARM-only；MIPS 等未知架构不能误诊为缺少转译层。 */
 function isArmOnly(meta) {
-  return !!(meta && meta.abis && meta.abis.length && !meta.abis.some((a) => /x86/i.test(a)));
+  return !!(Array.isArray(meta && meta.abis) && meta.abis.length && meta.abis.every((a) => ARM_ABIS.has(a)));
+}
+
+/** 每次从运行中的客机取证，不缓存，也不把磁盘镜像标签当作旧快照的能力。 */
+async function runtimeAbiEvidence(client) {
+  const prop = async (key) => {
+    try { return String(await client.shell(`getprop ${key}`, { timeout: 6000 }) || '').trim(); }
+    catch (_) { return ''; }
+  };
+  const parse = (raw) => {
+    const values = raw.split(',').map((a) => a.trim()).filter(Boolean);
+    return values.length && values.every((a) => ANDROID_ABIS.has(a)) ? [...new Set(values)] : [];
+  };
+  const [abiList, nativeBridge] = await Promise.all([
+    prop('ro.product.cpu.abilist'), prop('ro.dalvik.vm.native.bridge'),
+  ]);
+  let abis = parse(abiList);
+  const abiListKnown = abis.length > 0;
+  if (!abiListKnown) abis = parse(await prop('ro.product.cpu.abi'));
+  return { abis, abiListKnown, nativeBridge: nativeBridge.replace(/[\r\n]/g, ' ').slice(0, 80) };
+}
+
+function missingArmAbi(meta, evidence) {
+  // 旧版 cpu.abi 只报主 ABI，不能凭它排除次要 ABI / 转译支持；完整列表未知时让安装器裁决。
+  return isArmOnly(meta) && evidence.abiListKnown
+    && !meta.abis.some((a) => evidence.abis.includes(a));
+}
+
+function describeAbi(evidence) {
+  return `运行中客机实际 ABI：${evidence.abis.join(', ') || '未能确认'}`
+    + (evidence.abiListKnown ? '；' : '（完整 ABI 列表未能确认）；')
+    + `native bridge 属性：${evidence.nativeBridge || '未能确认'}（属性不代表转译已可用）。`;
+}
+
+function abiMismatchError(meta, evidence, cause = null, launching = false) {
+  const err = new Error(
+    `${launching ? '启动' : '安装'}失败：应用原生库 ABI 与当前运行时不匹配`
+    + `（安装包 ABI：${(meta && meta.abis || []).join(', ') || '未知'}）。`
+    + describeAbi(evidence)
+    + '请先保留应用数据冷启动，排除不兼容的旧快照；仍不匹配时，在设置中选择支持所需 ABI 的镜像（可复用已下载镜像）。'
+    + '本次未自动下载或切换镜像，也未清空安卓数据。'
+    + (launching ? '' : '（INSTALL_FAILED_NO_MATCHING_ABIS）'),
+  );
+  err.code = launching ? 'NEEDS_ARM_TRANSLATION' : 'NO_MATCHING_ABIS';
+  err.abiEvidence = evidence;
+  if (cause) err.cause = cause;
+  return err;
 }
 
 /**
@@ -100,57 +151,6 @@ class Installer {
     return [...new Set(out)];
   }
 
-  /** 兼容镜像按「首次遇到 ARM 应用」按需下载，作为共享只读基础层只下一次 */
-  async ensureCompatImage(onProgress) {
-    const prov = this.runtime.provisioner;
-    const current = prov.systemImageInfo();
-    if (current && current.armTranslation && current.armTranslation.enabled) return true;
-    if (prov.playImageInfo().ok) return true;
-    onProgress({ stage: 'runtime', message: '首次安装 ARM 应用：正在下载兼容镜像（约 1.5GB，只需一次）…' });
-    await prov.installPlayImage((p) => onProgress({ stage: 'runtime', message: p.message, percent: p.percent }));
-    if (!prov.playImageInfo().ok) throw new Error('兼容镜像下载失败，请检查网络后重试');
-    return true;
-  }
-
-  /** 切换镜像必须重启运行时；重启后把已装应用从本地 APK 备份重新灌回去 */
-  async switchToCompat(onProgress) {
-    const apps = store.getApps();
-    store.saveSettings({ runtime: { compatImage: true, systemImageFlavor: 'google_apis_playstore' } });
-    onProgress({ stage: 'runtime', message: '正在切换到兼容镜像并重启运行时…' });
-    try { await this.runtime.stop(); } catch (_) { /* ignore */ }
-    // 等旧设备从 adb 列表里消失，避免被 ensure() 当成可复用实例
-    for (let i = 0; i < 12; i += 1) {
-      // eslint-disable-next-line no-await-in-loop
-      const ds = await this.runtime.client().devices().catch(() => []);
-      if (!ds.some((d) => /^emulator-\d+$/.test(d.serial))) break;
-      // eslint-disable-next-line no-await-in-loop
-      await sleep(1000);
-    }
-    const rt = await this.runtime.ensure({ onLog: (m) => onProgress({ stage: 'runtime', message: m }) });
-    if (!rt.ok) {
-      const err = new Error(rt.error || '切换兼容镜像后运行时不可用');
-      err.needsSetup = rt.needsSetup || 'provision';
-      throw err;
-    }
-    for (const app of apps) {
-      if (!app.apkPath || !fs.existsSync(app.apkPath)) continue;
-      try {
-        if (app.bundle) {
-          // eslint-disable-next-line no-await-in-loop
-          const b = await parseBundle(app.apkPath);
-          // eslint-disable-next-line no-await-in-loop
-          await rt.client.installMultiple(b.files);
-          b.cleanup();
-        } else {
-          // eslint-disable-next-line no-await-in-loop
-          await rt.client.install(app.apkPath);
-        }
-        onProgress({ stage: 'runtime', message: `正在恢复已装应用 ${app.label}…` });
-      } catch (_) { /* 单个应用恢复失败不阻塞 */ }
-    }
-    return rt;
-  }
-
   async install(filePath, onProgress = () => {}, { meta: cachedMeta = null } = {}) {
     onProgress({ stage: 'parse', message: '正在解析 APK…' });
     let meta = cachedMeta;
@@ -169,15 +169,8 @@ class Installer {
     });
 
     try {
-      // 零配置：仅含 ARM 库的应用自动补齐带 ARM 翻译层的镜像，用户不用开任何开关
-      const currentImage = this.runtime.provisioner.systemImageInfo();
-      const armReady = !!(currentImage && currentImage.armTranslation && currentImage.armTranslation.enabled);
-      if (isArmOnly(meta) && !armReady) {
-        await this.ensureCompatImage(onProgress);
-        const switched = await this.switchToCompat(onProgress);
-        return this.finishInstall(switched, meta, filePath, bundle, onProgress);
-      }
-
+      // 先准备运行时，再核对客机的实际 ABI。镜像元数据不能证明当前实例/快照带转译层。
+      // 安装失败不能擅自换镜像、重灌应用或下载同一套镜像；先给出可核实的诊断。
       onProgress({ stage: 'runtime', message: '正在准备安卓运行时…' });
       const rt = await this.runtime.ensure({ onLog: (m) => onProgress({ stage: 'runtime', message: m }) });
       if (!rt.ok) {
@@ -191,10 +184,12 @@ class Installer {
     }
   }
 
-  /** 安装本体 + 落盘元数据 + 快捷方式；失败时带一次自动修复重试 */
+  /** 安装本体 + 落盘元数据 + 快捷方式；兼容性检查不自动切镜像或改用户数据。 */
   async finishInstall(rt, meta, filePath, bundle, onProgress) {
     const client = rt.client;
-    const existing = store.getApp(meta.package);
+    let existing = store.getApp(meta.package);
+    const abiEvidence = isArmOnly(meta) ? await runtimeAbiEvidence(client) : null;
+    if (abiEvidence && missingArmAbi(meta, abiEvidence)) throw abiMismatchError(meta, abiEvidence);
     // 装完之后旧 quickboot 快照里的磁盘状态就过期了，留着会导致「装好的应用重启后又不见了」
     try { this.runtime.emulator?.invalidateSnapshot(); } catch (_) { /* ignore */ }
 
@@ -230,18 +225,11 @@ class Installer {
       if (bundle) await client.installMultiple(bundle.files);
       else await client.install(filePath);
     } catch (e) {
-      // 到了这一步还报 ABI 不匹配：说明当前运行时是 AOSP 镜像，自动切兼容镜像再装一次
-      const currentImage = this.runtime.provisioner.systemImageInfo();
-      const armReady = !!(currentImage && currentImage.armTranslation && currentImage.armTranslation.enabled);
-      if (e.code === 'NO_MATCHING_ABIS' && !armReady) {
-        await this.ensureCompatImage(onProgress);
-        const rt2 = await this.switchToCompat(onProgress);
-        onProgress({ stage: 'install', message: '已切换兼容镜像，正在重新安装…' });
-        if (bundle) await rt2.client.installMultiple(bundle.files);
-        else await rt2.client.install(filePath);
-      } else {
-        throw e;
+      if (e.code === 'NO_MATCHING_ABIS' || /INSTALL_FAILED_NO_MATCHING_ABIS/.test(e.message || '')) {
+        // 底层错误文案可能承诺了自动切换/重试；这里只有实际取证，没有安排这些动作。
+        throw abiMismatchError(meta, abiEvidence || await runtimeAbiEvidence(client), e);
       }
+      throw e;
     }
     this.runtime.touch();
 
@@ -294,12 +282,18 @@ class Installer {
       if (resolved) launchActivity = resolved;
     } catch (_) { /* 保留 APK 解析结果 */ }
 
+    // 安装/图标解码期间用户可能刚改过显示偏好，落盘前重读，不能用旧记录盖回去。
+    existing = store.getApp(meta.package) || existing;
     const app = {
+      // 覆盖安装只更新 APK 元数据，保留 lcdPref、显示偏好及其他用户设置；
+      // 返回给调用方/进度事件的记录也必须和 store 一致，不能仅依赖 upsert 合并。
+      ...existing,
       package: meta.package,
       label: meta.label,
       versionName: meta.versionName,
       versionCode: meta.versionCode,
       activity: launchActivity,
+      orientation: meta.orientation === 'landscape' || meta.orientation === 'portrait' ? meta.orientation : '',
       abis: meta.abis,
       minSdk: meta.minSdk,
       sizeBytes: meta.sizeBytes,
@@ -465,6 +459,10 @@ class Installer {
       err.needsSetup = rt.needsSetup;
       throw err;
     }
+    const abiEvidence = isArmOnly(app) ? await runtimeAbiEvidence(rt.client) : null;
+    if (abiEvidence && missingArmAbi(app, abiEvidence)) {
+      throw abiMismatchError(app, abiEvidence, null, true);
+    }
     // 分辨率要在拉起应用之前改，避免 wm size 触发配置变更把刚启动的 Activity 重建
     if (beforeStart) await beforeStart(rt).catch((e) => onLog(`显示适配跳过：${e.message}`));
     // 拉起来之前先看一眼网络：**只等，不重启**。
@@ -492,7 +490,19 @@ class Installer {
       const pkgs = await rt.client.shell(`pm list packages ${shellQuote(pkg)}`, { timeout: 8000 }).catch(() => '');
       if (!new RegExp(`package:${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(pkgs)) {
         onLog('应用尚未安装，正在自动安装…');
-        await rt.client.install(app.apkPath).catch((e) => onLog(`自动安装失败：${e.message}`));
+        try {
+          if (app.bundle) {
+            const b = await parseBundle(app.apkPath);
+            try { await rt.client.installMultiple(b.files); } finally { b.cleanup(); }
+          } else {
+            await rt.client.install(app.apkPath);
+          }
+        } catch (e) {
+          if (e.code === 'NO_MATCHING_ABIS' || /INSTALL_FAILED_NO_MATCHING_ABIS/.test(e.message || '')) {
+            throw abiMismatchError(app, abiEvidence || await runtimeAbiEvidence(rt.client), e);
+          }
+          onLog(`自动安装失败：${e.message}`);
+        }
       }
     }
     // 观察一段时间并要求「连续存活 4 秒」才算启动成功。
@@ -552,9 +562,11 @@ class Installer {
           // eslint-disable-next-line no-await-in-loop
           await start();
         } catch (e) {
-          // 有明确崩溃日志才交给外层（可能要切兼容镜像）；没有证据多半只是启动慢，重试即可
-          if (e.code === 'APP_CRASHED' && e.crash) {
-            if (!cacheRetried) {
+          // 转译/原生库错误先交给外层给出有证据的提示；清缓存并不能补齐 ABI，
+          // 更不能在尚未决定下一步动作时声称正在切镜像或重试。
+          if (e.code === 'APP_CRASHED') {
+            if (!e.crash || TRANSLATION_CRASH.test(e.crash) || NATIVE_LOAD_FAILURE.test(e.crash)) throw e;
+            if (!cacheRetried && attempt < 3) {
               cacheRetried = true;
               onLog('检测到应用启动异常，正在清理临时缓存并重试（不会删除个人数据）…');
               await rt.client.clearCache(pkg).catch(() => {});
@@ -603,37 +615,27 @@ class Installer {
         throw err;
       }
     } catch (e) {
-      // 自定义镜像（多半是纯 x86_64 AOSP）通常没有 houdini/ARM 转译，arm64-only 的应用
-      // （抖音就是）必然崩。这时**不能**走下面「切兼容镜像」：imageChoice() 优先返回
-      // 用户选的自定义镜像，切了也不会生效，只会让用户以为程序在修、其实原地打转。
-      let actImg = null;
-      try { actImg = this.runtime.provisioner.activeImage(); } catch (_) { actImg = null; }
-      if (e.code === 'APP_CRASHED' && actImg && actImg.ok && actImg.custom) {
+      const crash = String(e.crash || '');
+      const unplannedRetry = /(?:会自动|正在自动|已自动).*(?:切换|重试)/.test(e.message || '');
+      if (e.code === 'APP_CRASHED' && (!crash || unplannedRetry || TRANSLATION_CRASH.test(crash) || NATIVE_LOAD_FAILURE.test(crash))) {
+        const evidence = abiEvidence || await runtimeAbiEvidence(rt.client);
+        const reason = TRANSLATION_CRASH.test(crash)
+          ? '崩溃日志涉及 ARM 转译层，应用与当前运行时可能不兼容；尚不能确认切换镜像能否解决。'
+          : NATIVE_LOAD_FAILURE.test(crash)
+            ? '原生库加载失败，也可能是应用自身缺少依赖，不能据此断言缺少 ARM 转译层。'
+            : '现有崩溃证据不足以确认 ARM 转译层故障，尚无已确定的安全镜像修复方案。';
         const err = new Error(
-          `「${(app && app.label) || pkg}」是按 ARM 编译的应用，需要 ARM 转译层；`
-          + `当前使用的自定义镜像「${actImg.name || actImg.id}」没有转译层，所以一启动就退出。`
-          + '请在「设置 → 高级参数 → 自定义安卓镜像」里点「恢复默认镜像」再试（默认镜像带 ARM 转译）。',
+          `「${(app && app.label) || pkg}」启动失败：${reason}` + describeAbi(evidence)
+          + '请检查崩溃日志及镜像兼容性；若实际 ABI 与所选镜像不符，可先保留数据冷启动以排除旧快照。'
+          + '本次未自动下载或切换镜像，也未清空安卓数据。',
         );
-        err.code = 'NEEDS_ARM_TRANSLATION';
+        err.code = e.code;
+        err.crash = e.crash;
+        err.cause = e;
+        err.abiEvidence = evidence;
         throw err;
       }
-      const currentImage = this.runtime.provisioner.systemImageInfo();
-      const armReady = !!(currentImage && currentImage.armTranslation && currentImage.armTranslation.enabled);
-      if (e.code === 'APP_CRASHED' && !armReady) {
-        // 崩溃来自 ARM 翻译层：自动切镜像、重装备份 APK、再启动一次
-        onLog('检测到 ARM 翻译层崩溃，正在自动切换兼容镜像…');
-        await this.ensureCompatImage(onLog ? (m) => onLog(m.message || '') : () => {});
-        const rt2 = await this.switchToCompat((m) => onLog(m.message || ''));
-        if (app && app.apkPath && fs.existsSync(app.apkPath)) {
-          try { await rt2.client.install(app.apkPath); } catch (_) { /* 保留原包 */ }
-        }
-        await rt2.client.startApp(app ? app.package : pkg, app ? app.activity : null, {
-          freeform: settings.freeform,
-          bounds: app ? app.bounds : null,
-        });
-      } else {
-        throw e;
-      }
+      throw e;
     }
     this.runtime.touch();
     if (app) {

@@ -13,6 +13,7 @@ files:
   - package.json
   - LICENSE
   - build/uninstall-data.ps1
+  - build/stop-runtime.ps1
   - "build/vendor/**"
   # 随包资源：谷歌拼音输入法（assets/PinyinIME.apk），开机静默安装，中文输入全靠它
   - "assets/**/*"

@@ -39,6 +39,14 @@ jobs:
       - name: 系统镜像体积闸门
         run: node build/check-no-images.js --git
 
+      - name: 进程归属与窗口范围安全测试
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $out = & .\test\runtime-ownership-agent.ps1
+          $out | ForEach-Object { Write-Host $_ }
+          if (-not ($out -match '^OWNERSHIP_PS_OK:')) { exit 1 }
+
       # 直接驱动 agent.ps1 内嵌 C# 的钩子回调，防止键位映射被改坏
       - name: 鼠标钩子逻辑冒烟测试
         shell: powershell

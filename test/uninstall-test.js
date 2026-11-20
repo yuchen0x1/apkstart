@@ -1,6 +1,6 @@
 'use strict';
 
-/** 卸载清理脚本的 Windows 夹具测试：确认运行时、AVD、共享目录和 TEMP 残留都会被删除。 */
+/** 卸载清理只删除应用管理的文件，保留共享目录与自选目录的其它资料。 */
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -33,6 +33,15 @@ const source = path.join(__dirname, '..', 'build', 'uninstall-data.ps1');
 
 try {
   for (const dir of [data, runtime, avd, shared, tempRoot, leftover, desktop, startMenu, iconDir]) fs.mkdirSync(dir, { recursive: true });
+  const ownedRuntime = path.join(runtime, 'emulator');
+  const ownedAvd = path.join(avd, 'apkstart.avd');
+  for (const dir of [ownedRuntime, ownedAvd]) fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(ownedRuntime, 'emulator.exe'), 'fixture');
+  fs.writeFileSync(path.join(ownedAvd, 'userdata-qemu.img'), 'fixture');
+  fs.writeFileSync(path.join(runtime, 'keep-runtime-notes.txt'), 'personal');
+  fs.writeFileSync(path.join(avd, 'keep-avd-notes.txt'), 'personal');
+  fs.writeFileSync(path.join(shared, 'valuable.txt'), 'personal');
+  fs.writeFileSync(path.join(leftover, 'active-session.txt'), 'personal');
   fs.writeFileSync(desktopShortcut, 'desktop shortcut', 'utf8');
   fs.writeFileSync(startMenuShortcut, 'start menu shortcut', 'utf8');
   fs.writeFileSync(shortcutCreator, [
@@ -69,11 +78,34 @@ try {
   ], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
   assert.strictEqual(r.error, undefined, r.error && r.error.message);
   assert.strictEqual(r.status, 0, `${r.stdout}\n${r.stderr}`);
-  for (const dir of [data, runtime, avd, shared, leftover, desktopShortcut, startMenuShortcut, legacyDesktopShortcut, legacyStartMenuShortcut]) {
+  for (const dir of [data, ownedRuntime, ownedAvd, desktopShortcut, startMenuShortcut, legacyDesktopShortcut, legacyStartMenuShortcut]) {
     assert(!fs.existsSync(dir), `卸载后仍残留：${dir}`);
   }
+  for (const file of [path.join(runtime, 'keep-runtime-notes.txt'), path.join(avd, 'keep-avd-notes.txt'), path.join(shared, 'valuable.txt'), path.join(leftover, 'active-session.txt')]) {
+    assert(fs.existsSync(file), `误删了用户资料或其它会话：${file}`);
+  }
   assert(fs.existsSync(unrelatedShortcut), `误删了非 ApkStart 快捷方式：${unrelatedShortcut}`);
-  console.log('卸载清理测试：1 通过，0 失败');
+
+  // 共享文件夹嵌在缓存内、受管目录是 junction 时，也不能跟随删除用户资料。
+  const nestedData = path.join(root, 'nested-data');
+  const nestedShared = path.join(nestedData, 'cache', 'shared');
+  const external = path.join(root, 'outside');
+  fs.mkdirSync(nestedShared, { recursive: true });
+  fs.mkdirSync(external);
+  fs.writeFileSync(path.join(nestedShared, 'keep.txt'), 'shared');
+  fs.writeFileSync(path.join(external, 'keep.txt'), 'outside');
+  fs.writeFileSync(path.join(nestedData, 'settings.json'), JSON.stringify({ sharedDir: nestedShared }), 'utf8');
+  fs.symlinkSync(external, path.join(nestedData, 'icons'), 'junction');
+  const nested = spawnSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
+    '-DataDir', nestedData, '-TempDir', tempRoot, '-DesktopDir', desktop,
+    '-StartMenuDir', path.dirname(startMenu),
+  ], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
+  assert.strictEqual(nested.status, 0, `${nested.stdout}\n${nested.stderr}`);
+  assert(fs.existsSync(path.join(nestedShared, 'keep.txt')), '嵌在缓存内的共享文件必须保留');
+  assert(fs.existsSync(path.join(external, 'keep.txt')), '不能跟随 junction 删除外部文件');
+  assert(!fs.existsSync(path.join(nestedData, 'settings.json')), '受管设置应被删除');
+  console.log('卸载清理测试：2 通过，0 失败');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
   fs.rmSync(leftover, { recursive: true, force: true });

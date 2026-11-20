@@ -101,6 +101,7 @@ contextBridge.exposeInMainWorld('apkstart', {
   systemDetail: (id) => invoke('system:detail', id),
   systemCatalogRefresh: () => invoke('system:catalogRefresh'),
   systemInstall: (id) => invoke('system:install', id),
+  systemConfirmInstall: (taskId) => invoke('system:confirmInstall', taskId),
   systemSwitch: (payload) => invoke('system:switch', payload || {}),
   systemStop: () => invoke('system:stop'),
   systemPause: (taskId) => invoke('system:pause', taskId),
@@ -183,7 +184,7 @@ contextBridge.exposeInMainWorld('apkstart', {
     const allowed = [
       'install:start', 'install:progress', 'install:done', 'install:error',
       'app:launched', 'runtime:log', 'toast', 'ui:navigate', 'provision:progress',
-      'update:progress', 'update:state', 'system:task', 'system:log',
+      'update:progress', 'update:state', 'system:task', 'system:log', 'theme:changed',
     ];
     if (!allowed.includes(channel)) return () => {};
     const handler = (_e, payload) => cb(payload);

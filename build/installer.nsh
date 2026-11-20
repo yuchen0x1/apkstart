@@ -50,17 +50,13 @@
   Delete "$SMPROGRAMS\ApkStart\ApkStart.lnk"
   RMDir "$SMPROGRAMS\ApkStart"
 
-  DetailPrint "正在结束 ApkStart 残留进程…"
-  ; /F 强杀 /T 连带子进程。进程不存在时 taskkill 返回 128，忽略即可。
-  nsExec::Exec 'taskkill.exe /F /T /IM ApkStart.exe'
-  nsExec::Exec 'taskkill.exe /F /T /IM qemu-system-x86_64.exe'
-  nsExec::Exec 'taskkill.exe /F /T /IM qemu-system-i386.exe'
-  nsExec::Exec 'taskkill.exe /F /T /IM emulator.exe'
-  nsExec::Exec 'taskkill.exe /F /T /IM emulator-check.exe'
-  nsExec::Exec 'taskkill.exe /F /T /IM adb.exe'
-  nsExec::Exec 'taskkill.exe /F /T /IM netsimd.exe'
-  ; 给一点时间让进程真正退出、释放文件句柄
-  Sleep 1500
+  ; customUnInstall runs only after uninstall confirmation. Never kill by image name:
+  ; other SDKs/AVDs/Qt applications may be using the same executable names.
+  ${If} ${FileExists} "$INSTDIR\resources\app\build\stop-runtime.ps1"
+    DetailPrint "正在结束已验证归属的 ApkStart 运行时…"
+    nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\app\build\stop-runtime.ps1" -InstallDir "$INSTDIR" -DataDir "$APPDATA\apkstart"'
+    Pop $R2
+  ${EndIf}
 
   ; 删除 ApkStart 自己产生的数据：应用 APK、运行时镜像、AVD、快照、日志、
   ; 更新缓存、默认共享目录和用户在设置中指定的其它目录。脚本先读取 settings.json，

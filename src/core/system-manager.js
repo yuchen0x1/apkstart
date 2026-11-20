@@ -22,6 +22,7 @@ const path = require('path');
 const providers = require('./system-providers');
 const { PROVIDER_IDS } = providers;
 const { SystemTaskManager, STATUS } = require('./system-task-manager');
+const { resolveSystemPaths, legacyPathWarnings } = require('./system-providers/system-paths');
 
 class SystemManager {
   constructor(opts = {}) {
@@ -32,13 +33,13 @@ class SystemManager {
     this.switchFlavor = opts.switchFlavor || null;     // (flavor) => {ok,...} 现有一档位切换入口
     this.doctor = opts.doctor || null;
     this.settingsFn = opts.settingsFn || (() => this.store.getSettings());
-    this.dataDir = opts.dataDir || path.join(
-      process.env.APPDATA || require('os').homedir(), 'apkstart', 'runtime', 'systems'
-    );
+    const paths = resolveSystemPaths(Object.assign({}, opts, { store: this.store, settingsFn: this.settingsFn }));
+    this.dataDir = opts.dataDir || paths.systemsDir;
+    this.pathWarnings = legacyPathWarnings(this.dataDir, paths.legacySystemsDirs);
     this.onEvent = opts.onEvent || (() => {});
     this.onLog = opts.onLog || (() => {});
 
-    this.taskManager = new SystemTaskManager({ dataDir: this.dataDir, onEvent: this.onEvent });
+    this.taskManager = new SystemTaskManager({ dataDir: this.dataDir, store: this.store, settingsFn: this.settingsFn, onEvent: this.onEvent });
     this._providers = new Map();
     this._current = this._readCurrent();
     this._switching = false;
@@ -71,11 +72,19 @@ class SystemManager {
       backendEngine: this.backendEngine,
       imageStore: this.provisioner ? this.provisioner.images : null,
       settingsFn: this.settingsFn,
+      dataDirBase: this.dataDir,
       onLog: this.onLog,
     };
     const p = providers.createProvider(systemId, shared);
     if (p) this._providers.set(systemId, p);
     return p;
+  }
+
+  _activeInstaller() {
+    for (const [systemId, provider] of this._providers) {
+      if (provider.isInstallerRunning && provider.isInstallerRunning()) return systemId;
+    }
+    return '';
   }
 
   /** 系统卡片列表：内置系统 + 目录系统，每个附 availability + localStatus */
@@ -106,7 +115,8 @@ class SystemManager {
         bootBackend: s.bootBackend || (p && p.backend && p.backend.systemId ? 'QemuBackend' : 'AndroidEmulatorBackend'),
       }));
     }
-    return { systems: result, catalogInfo: catalogList.catalogInfo, currentSystemId: this._current.systemId };
+    return { systems: result, catalogInfo: catalogList.catalogInfo, currentSystemId: this._current.systemId,
+      pathWarnings: this.pathWarnings.concat(this.catalog && this.catalog.pathWarnings || []) };
   }
 
   /** 单系统详情（版本历史、兼容性、日志、状态） */
@@ -136,6 +146,8 @@ class SystemManager {
    * 触发安装/下载流水线（不负责启动切换），返回 taskId 供 UI 跟踪。
    */
   async installSystem(systemId, opts = {}) {
+    const installer = this._activeInstaller();
+    if (installer && installer !== systemId) return { ok: false, error: '另一个系统仍在安装，请完成安装并正常关机后再安装新系统' };
     const p = this.getProvider(systemId);
     if (!p) return { ok: false, error: '未知系统' };
     const avail = await p.getAvailability();
@@ -175,8 +187,11 @@ class SystemManager {
 
       // 3) 检查下载/安装中
       const active = this.taskManager.getActiveTask(systemId);
-      if (active && [STATUS.DOWNLOADING, STATUS.INSTALLING, STATUS.VERIFYING, STATUS.INITIALIZING].includes(active.status)) {
-        return { ok: false, error: '该系统正在下载或安装中，请等待完成', taskId: active.taskId };
+      if (active && [STATUS.DOWNLOADING, STATUS.INSTALLING, STATUS.VERIFYING, STATUS.INITIALIZING, STATUS.AWAITING_CONFIRMATION].includes(active.status)) {
+        return { ok: false, error: '该系统正在下载、安装或等待安装确认，请先完成安装', taskId: active.taskId };
+      }
+      if (this._activeInstaller()) {
+        return { ok: false, error: '引导式安装器仍在运行；完成安装并正常关机后再切换系统。' };
       }
 
       // 2) 检查安装状态（内置档位视作已安装）
@@ -194,9 +209,16 @@ class SystemManager {
             const oldLocal = await old.getLocalStatus();
             if (oldLocal.running || (old.backend && old.backend.running && old.backend.running())) {
               this.onLog(`切换系统：停止 ${old.displayName}`);
-              await old.stop();
+              const stopped = await old.stop();
+              if (stopped === false || (stopped && stopped.ok === false)) {
+                return { ok: false, error: stopped.error || '旧系统未能停止，未启动新系统' };
+              }
+              const after = await old.getLocalStatus();
+              if (after.running || (old.backend && old.backend.running && old.backend.running())) {
+                return { ok: false, error: '旧系统仍在运行，未启动新系统' };
+              }
             }
-          } catch (_) {}
+          } catch (e) { return { ok: false, error: '停止旧系统失败：' + e.message }; }
         }
         // 内置 emulator 档位切换：走现有 imageProfile 校验入口（会切独立 AVD）
         if ([PROVIDER_IDS.GOOGLE_PLAY, PROVIDER_IDS.GOOGLE_APIS, PROVIDER_IDS.AOSP].includes(systemId)) {
@@ -253,10 +275,53 @@ class SystemManager {
     }
   }
 
+  async confirmInstallation(taskId, opts = {}) {
+    const task = this.taskManager.getTask(String(taskId || ''));
+    if (!task) return { ok: false, error: '任务不存在' };
+    if (task.status !== STATUS.AWAITING_CONFIRMATION) {
+      return { ok: false, error: '当前任务不在等待安装确认状态' };
+    }
+    if (task._confirming || task._inFlight) return { ok: false, error: '安装器正在收尾，请片刻后确认安装完成' };
+    const provider = this.getProvider(task.systemId);
+    if (!provider || typeof provider.confirmInstallation !== 'function') {
+      return { ok: false, error: '该系统不支持引导式安装确认' };
+    }
+    task._provider = provider;
+    task._confirming = true;
+    try {
+      const result = await provider.confirmInstallation(task, opts);
+      if (!result || !result.ok) return result || { ok: false, error: '安装确认失败' };
+      if (task.status === STATUS.CANCELLED || task.status === STATUS.PAUSED || task.aborted) {
+        return { ok: false, error: '任务已暂停或取消，未完成安装确认' };
+      }
+      task.setStatus(STATUS.INITIALIZING, '正在初始化设备');
+      const initialized = await provider.initialize(task, { version: task.systemVersion });
+      if (initialized && initialized.ok === false) {
+        task.setStatus(STATUS.FAILED, '初始化失败', { error: initialized.error || '初始化失败' });
+        this.taskManager._release(task);
+        return { ok: false, error: task.error };
+      }
+      task.progress = 100;
+      task.setStatus(STATUS.COMPLETED, '安装已确认完成');
+      this.taskManager._release(task);
+      return Object.assign({}, result, { taskId: task.taskId, status: task.status });
+    } catch (e) {
+      if (task.status !== STATUS.CANCELLED && task.status !== STATUS.PAUSED) {
+        task.setStatus(STATUS.FAILED, '安装确认失败', { error: e.message });
+        this.taskManager._release(task);
+      }
+      return { ok: false, error: e.message };
+    } finally {
+      task._confirming = false;
+    }
+  }
+
   async stopCurrent() {
+    if (this._activeInstaller()) return { ok: false, error: '安装器仍在写入，请在虚拟机内完成安装并正常关机' };
     const p = this.getProvider(this._current.systemId);
     if (!p) return { ok: true };
     const r = await p.stop();
+    if (r === false || (r && r.ok === false)) return r || { ok: false, error: '系统未能停止' };
     try { this._writeCurrent(this._current.systemId, { stopped: true }); } catch (_) {}
     return r;
   }

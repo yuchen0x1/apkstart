@@ -12,6 +12,37 @@
 const zlib = require('zlib');
 const fs = require('fs');
 const path = require('path');
+const { Readable, Transform, pipeline } = require('stream');
+
+/** pipeline 错误时关闭所有流；CRC/长度通过后才算完成。 */
+function pipeEntry(source, entry, dest, opts = {}) {
+  let crc = 0;
+  let bytes = 0;
+  const verify = new Transform({
+    transform(chunk, _encoding, cb) {
+      if (opts.verify) crc = crc32(chunk, crc);
+      bytes += chunk.length;
+      cb(null, chunk);
+    },
+    flush(cb) {
+      if (opts.verify && (crc >>> 0) !== (entry.crc >>> 0)) return cb(new Error(`条目校验失败（CRC 不匹配）: ${entry.name}`));
+      if (opts.verify && bytes !== entry.uncompSize) return cb(new Error(`条目大小不符（${bytes} ≠ ${entry.uncompSize}）: ${entry.name}`));
+      return cb();
+    },
+  });
+  const streams = [source];
+  if (entry.method === 8) streams.push(zlib.createInflateRaw());
+  else if (entry.method !== 0) {
+    source.destroy();
+    dest.destroy();
+    return Promise.reject(new Error(`不支持的压缩方式 ${entry.method}: ${entry.name}`));
+  }
+  streams.push(verify, dest);
+  return new Promise((resolve, reject) => {
+    pipeline(...streams, (err) => err ? reject(err) : resolve(entry.uncompSize));
+  });
+}
+
 
 const EOCD_SIG = 0x06054b50;
 const CEN_SIG = 0x02014b50;
@@ -165,6 +196,7 @@ class ZipArchive {
     if (eocd < 0) throw new Error('不是有效的 ZIP/APK 文件（未找到 EOCD）');
 
     const { total, cdOffset } = readEndOfCentralDirectory(buf, eocd, 0);
+    this.expectedEntries = total;
     let offset = cdOffset;
 
     for (let i = 0; i < total; i++) {
@@ -247,61 +279,7 @@ class ZipArchive {
     const end = start + e.compSize;
     if (end > buf.length) return Promise.reject(new Error(`条目数据越界: ${name}`));
     const raw = buf.subarray(start, end);
-
-    return new Promise((resolve, reject) => {
-      let crc = 0;
-      let bytes = 0;
-      let settled = false;
-      const finish = (err) => {
-        if (settled) return;
-        settled = true;
-        if (err) return reject(err);
-        if (opts.verify && (crc >>> 0) !== (e.crc >>> 0)) {
-          return reject(new Error(`条目校验失败（CRC 不匹配）: ${name}`));
-        }
-        if (opts.verify && bytes !== e.uncompSize) {
-          return reject(new Error(`条目大小不符（${bytes} ≠ ${e.uncompSize}）: ${name}`));
-        }
-        return resolve(e.uncompSize);
-      };
-      dest.on('error', finish);
-      dest.on('finish', () => finish(null));
-
-      if (e.method === 0) {
-        crc = crc32(raw);
-        bytes = raw.length;
-        dest.end(raw);
-        return;
-      }
-      if (e.method !== 8) return finish(new Error(`不支持的压缩方式 ${e.method}: ${name}`));
-
-      const inflater = zlib.createInflateRaw();
-      // 分片喂入，避免一次性把 GB 数据塞进 zlib 缓冲区
-      const SLICE = 1 << 20;
-      let pos = 0;
-      const pump = () => {
-        while (pos < raw.length) {
-          const startPos = pos;
-          pos = Math.min(pos + SLICE, raw.length);
-          if (!inflater.write(raw.subarray(startPos, pos))) {
-            inflater.once('drain', pump);
-            return;
-          }
-        }
-        inflater.end();
-      };
-      inflater.on('error', finish);
-      inflater.on('data', (chunk) => {
-        crc = crc32(chunk, crc);
-        bytes += chunk.length;
-        if (!dest.write(chunk)) {
-          inflater.pause();
-          dest.once('drain', () => inflater.resume());
-        }
-      });
-      inflater.on('end', () => dest.end());
-      pump();
-    });
+    return pipeEntry(Readable.from([raw]), e, dest, opts);
   }
 }
 
@@ -351,6 +329,7 @@ class ZipFile {
     if (eocd < 0) throw new Error('不是有效的 ZIP/APK 文件（未找到 EOCD）');
 
     const { total, cdSize, cdOffset, eocdAbs } = readEndOfCentralDirectory(tail, eocd, tailBase);
+    this.expectedEntries = total;
     if (cdOffset + cdSize > this.size) {
       throw new Error('ZIP 中央目录偏移异常');
     }
@@ -438,54 +417,16 @@ class ZipFile {
     let r;
     try { r = this._range(name); } catch (e) { return Promise.reject(e); }
     const { e, start, end } = r;
-    return new Promise((resolve, reject) => {
-      let crc = 0;
-      let bytes = 0;
-      let settled = false;
-      const finish = (err) => {
-        if (settled) return;
-        settled = true;
-        if (err) return reject(err);
-        if (opts.verify && (crc >>> 0) !== (e.crc >>> 0)) {
-          return reject(new Error(`条目校验失败（CRC 不匹配）: ${name}`));
-        }
-        if (opts.verify && bytes !== e.uncompSize) {
-          return reject(new Error(`条目大小不符（${bytes} ≠ ${e.uncompSize}）: ${name}`));
-        }
-        return resolve(e.uncompSize);
-      };
-      dest.on('error', finish);
-      dest.on('finish', () => finish(null));
-      if (e.compSize === 0) { dest.end(); return undefined; }
-      if (e.method !== 0 && e.method !== 8) return finish(new Error(`不支持的压缩方式 ${e.method}: ${name}`));
-      const src = fs.createReadStream(null, {
-        fd: this.fd, autoClose: false, start, end: Math.max(start, end),
-      });
-      src.on('error', finish);
-      if (e.method === 0) {
-        src.on('data', (chunk) => { crc = crc32(chunk, crc); bytes += chunk.length; });
-        return src.pipe(dest);
-      }
-      const inflater = zlib.createInflateRaw();
-      inflater.on('error', finish);
-      src.on('data', (chunk) => {
-        if (!inflater.write(chunk)) {
-          src.pause();
-          inflater.once('drain', () => src.resume());
-        }
-      });
-      src.on('end', () => inflater.end());
-      inflater.on('data', (chunk) => {
-        crc = crc32(chunk, crc);
-        bytes += chunk.length;
-        if (!dest.write(chunk)) {
-          inflater.pause();
-          dest.once('drain', () => inflater.resume());
-        }
-      });
-      inflater.on('end', () => dest.end());
-      return undefined;
+    if (end >= this.size) {
+      dest.destroy();
+      return Promise.reject(new Error(`条目数据被截断: ${name}`));
+    }
+    const src = e.compSize === 0 ? Readable.from([]) : fs.createReadStream(null, {
+      fd: this.fd, autoClose: false, start, end,
+      // pipeline 失败会 destroy 读流；共享 fd 仍只由 ZipFile.close() 管理。
+      fs: { read: fs.read, close: (_fd, cb) => cb(null) },
     });
+    return pipeEntry(src, e, dest, opts);
   }
 }
 

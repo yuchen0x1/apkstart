@@ -34,18 +34,15 @@ const DISPLAY_NAMES = {
 function createProvider(systemId, sharedCtx = {}) {
   const Cls = REGISTRY[systemId];
   if (!Cls) return null;
-  const os = require('os');
   const path = require('path');
-  const dataDir = path.join(
-    process.env.APPDATA || os.homedir(),
-    'apkstart', 'runtime', 'systems', systemId
-  );
+  const { resolveSystemPaths } = require('./system-paths');
+  const dataDir = sharedCtx.dataDir || path.join(resolveSystemPaths(sharedCtx).systemsDir, systemId);
   return new Cls(Object.assign({
     systemId,
     displayName: DISPLAY_NAMES[systemId] || systemId,
     dataDir,
   }, sharedCtx, {
-    // systemId/displayName/dataDir 以注册表为准，避免被共享上下文覆盖
+    // Identity is registry-owned; explicitly injected dataDir is caller-owned.
     systemId,
     displayName: DISPLAY_NAMES[systemId] || systemId,
     dataDir,

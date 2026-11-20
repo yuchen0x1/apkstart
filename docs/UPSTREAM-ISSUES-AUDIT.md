@@ -1,4 +1,6 @@
-# 上游 issue 逐条核对（RoutineMiku/apkstart，共 36 条）
+# 上游 issue 历史核对（RoutineMiku/apkstart）
+
+> **历史记录，不是当前版本的完整验收证明。** 以下结论基于当时已检查的代码与环境；Issue 开关和版本号不能单独证明缺陷已消除。2026-11-20 的回归审查发现方向元数据、AVD 路径、窗口/进程归属等仍有遗漏，相关修复必须以当前行为测试为准。真实 APK 兼容性和特定硬件上的窗口体验仍需对应环境复验。
 
 > 核对时间：2026-11-15 · 基线：本仓库 `main`（0.4.0 + 上游 v0.4.1 对齐，发版 0.5.0）
 > 上游 issue 列表：<https://github.com/RoutineMiku/apkstart/issues>

@@ -7,7 +7,7 @@
  *  - 所有对安卓的操作统一走 adb，因此引擎可替换
  *  - 虚拟机按需启动，空闲自动回收；启动后常驻复用，装/开应用几乎零等待
  */
-const { spawn, execFile } = require('child_process');
+const { spawn } = require('child_process');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
@@ -21,6 +21,7 @@ const repair = require('./repair');
 const container = require('./container');
 const guest = require('./guest');
 const platform = require('./platform');
+const processOwner = require('./process-owner');
 
 const LOG_DIR = path.join(store.DATA_DIR, 'logs');
 const MONITOR_PORT = 5556;
@@ -496,6 +497,8 @@ class Runtime {
       stdio: ['ignore', out, out],
     });
     this.vmProc = proc;
+    this._vmExe = env.qemu.path;
+    this._vmDisk = disk;
     this.installing = install;
     this.lastActivity = Date.now();
 
@@ -754,69 +757,51 @@ class Runtime {
   async stop({ graceful = true } = {}) {
     // 下次开机要重新做一次 LCD 归一（方向可能被换掉）
     this._lcdNormalized = false;
+    // Attach mode is explicitly somebody else's runtime, not ours to shut down.
+    if (this.settings.engine.mode === 'attach') return false;
     const adbPath = this.adbPath();
-    if (this.emulator.running()) {
-      await this.emulator.stop({ adbPath });
-      return true;
-    }
-    // 接管来的模拟器（adoptExisting）在本进程里没有 proc 句柄，旧逻辑会直接
-    // return false —— 结果空闲看门狗永远关不掉它，容器一直占着 CPU/内存。
-    // 这条路径改用 adb 控制台关机，必要时再按端口强杀兜底。
-    //
-    // 注意：emulator.exe 只是个启动器，spawn 完 qemu 自己就退了，所以「自己拉起来的」
-    // 机器也常常落到这条分支。关机前必须补一次 saveSnapshotNow，否则快照永远存不下来，
-    // 用户每次点开都是全量冷启动（25 秒 vs 8 秒的差别就在这一步）。
-    let online = false;
-    try { online = await this.client().isOnline(); } catch (_) { /* ignore */ }
-    if (online && this.emuSerial) {
-      if (adbPath && this.emulator.snapshotWorthSaving !== false) {
-        await this.emulator.saveSnapshotNow(adbPath, { timeout: 60000 }).catch(() => false);
-      }
-      await this.client().exec(['emu', 'kill'], { timeout: 8000 }).catch(() => {});
-      for (let i = 0; i < 10; i += 1) {
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise((r) => setTimeout(r, 400));
-        // eslint-disable-next-line no-await-in-loop
-        const still = await this.client().isOnline().catch(() => false);
-        if (!still) break;
-      }
-      const still = await this.client().isOnline().catch(() => false);
-      if (still) {
-        const m = /:(\d+)$/.exec(this.emuSerial);
-        const port = m ? Number(m[1]) - 1 : this.emulator.port;
-        const pid = await this.pidOnPort(port);
-        if (pid) {
-          await new Promise((resolve) => {
-            execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve());
-          });
-        }
-      }
+    if (!this.vmProc) {
+      const spawning = this.emulator.running();
+      const serial = spawning ? `emulator-${this.emulator.port}` : String(this.emuSerial || '');
+      const local = /^127\.0\.0\.1:(\d+)$/.exec(serial);
+      const native = /^emulator-(\d+)$/.exec(serial);
+      if (local) this.emulator.port = Number(local[1]) - 1;
+      else if (native) this.emulator.port = Number(native[1]);
+      else return false;
+      const stopped = await this.emulator.stop({ adbPath }).catch(() => false);
+      const online = await this.client(serial).isOnline().catch(() => true);
+      if (!stopped || online || await portAlive(this.emulator.port)) return false;
       this._activeApps.clear();
       return true;
     }
-    if (!this.vmProc) return false;
-    if (graceful) {
-      try { await this.monitorCmd('system_powerdown'); } catch (_) { /* ignore */ }
-      for (let i = 0; i < 16; i++) {
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise((r) => setTimeout(r, 500));
-        if (!this.vmProc) return true;
-      }
-      try { await this.monitorCmd('quit'); } catch (_) { /* ignore */ }
-      await new Promise((r) => setTimeout(r, 800));
-    }
-    if (this.vmProc) {
-      try { this.vmProc.kill(); } catch (_) { /* ignore */ }
-      this.vmProc = null;
-    }
+    const proc = this.vmProc;
+    const info = await processOwner.getProcessInfo(proc.pid);
+    if (!this.ownsQemuProcess(info)) return false;
+    let stopped = await processOwner.terminateOwnedProcess(info, (p) => this.ownsQemuProcess(p), graceful ? 'SIGTERM' : 'SIGKILL');
+    if (!stopped && process.platform === 'linux') stopped = await processOwner.terminateOwnedProcess(info, (p) => this.ownsQemuProcess(p), 'SIGKILL');
+    if (!stopped) return false;
+    if (this.vmProc === proc) this.vmProc = null;
+    const online = await this.client('127.0.0.1:5555').isOnline().catch(() => true);
+    if (online || await portAlive(MONITOR_PORT) || await portAlive(5555)) return false;
+    this._activeApps.clear();
     return true;
+  }
+
+  ownsQemuProcess(info) {
+    if (!info || !info.started || !processOwner.samePath(info.exe, this._vmExe)) return false;
+    const args = info.argv || processOwner.windowsArgv(info.commandLine || '');
+    if (!processOwner.samePath(args[0], info.exe)) return false;
+    const names = processOwner.optionValues(args, '-name');
+    if (names.length !== 1 || names[0] !== 'ApkStart Runtime') return false;
+    const drives = processOwner.optionValues(args, '-drive');
+    return drives.length === 1 && processOwner.samePath(/^file=(.*?),if=/.exec(drives[0])?.[1], this._vmDisk);
   }
 
   // ---------------- QEMU monitor ----------------
 
-  monitorCmd(cmd, { timeout = 4000 } = {}) {
+  monitorCmd(cmd, { timeout = 4000, port = MONITOR_PORT } = {}) {
     return new Promise((resolve, reject) => {
-      const sock = net.connect({ host: '127.0.0.1', port: MONITOR_PORT });
+      const sock = net.connect({ host: '127.0.0.1', port });
       let buf = '';
       let sent = false;
       const done = (err, data) => {
@@ -891,41 +876,20 @@ class Runtime {
    * 找出 qemu 监听的所有 TCP 端口，一个都不会漏。
    */
   async emulatorPorts() {
-    const run = (cmd, args) => new Promise((resolve) => {
-      const { execFile } = require('child_process');
-      execFile(cmd, args, { windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
-        resolve(err ? '' : String(out || ''));
-      });
-    });
     const ports = new Set();
-    try {
-      const tl = await run('tasklist', ['/FO', 'CSV', '/NH']);
-      const pids = new Set();
-      for (const line of tl.split('\n')) {
-        const m = /^"([^"]+)","(\d+)"/.exec(line.trim());
-        if (m && /qemu|emulator/i.test(m[1])) pids.add(m[2]);
+    const owned = new Map();
+    for (const item of await processOwner.listeners()) {
+      if (!item.port) continue;
+      if (!owned.has(item.pid)) {
+        const info = await processOwner.getProcessInfo(item.pid);
+        owned.set(item.pid, !!this.emulator.ownsProcess?.(info, { discoverRoot: true }));
       }
-      if (!pids.size) return [];
-      const ns = await run('netstat', ['-ano', '-p', 'TCP']);
-      for (const line of ns.split('\n')) {
-        const m = /:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i.exec(line);
-        if (m && pids.has(m[2])) ports.add(Number(m[1]));
-      }
-    } catch (_) { /* 退回到端口探测 */ }
-
-    if (ports.size) {
-      // 控制台端口（偶数）和 adb 端口（+1）都会被监听，只保留控制台端口
-      const all = [...ports].sort((a, b) => a - b);
-      const consoles = all.filter((p) => ports.has(p + 1));
-      return consoles.length ? consoles : all;
+      if (owned.get(item.pid)) ports.add(item.port);
     }
-    // 兜底：没有 qemu 进程信息时，直接探测（连接被拒绝会立刻返回，代价很小）
-    const found = [];
-    for (let port = 5554; port <= 5620; port += 2) {
-      // eslint-disable-next-line no-await-in-loop
-      if (await portAlive(port, 120)) found.push(port);
-    }
-    return found;
+    const all = [...ports].sort((a, b) => a - b);
+    // The console and adb ports are adjacent; prefer those with a matching pair.
+    const consoles = all.filter((p) => ports.has(p + 1));
+    return consoles.length ? consoles : all;
   }
 
   async adoptExisting({ onLog = () => {} } = {}) {
@@ -941,6 +905,8 @@ class Runtime {
     await this.client().exec(['kill-server'], { withSerial: false, timeout: 8000 }).catch(() => {});
 
     for (const port of alive) {
+      const target = await this.emulator.ownedProcessOnPort(port);
+      if (!target) continue;
       const serial = `127.0.0.1:${port + 1}`;
       const c = this.client(serial);
       let booted = '';
@@ -959,16 +925,11 @@ class Runtime {
         onLog(`发现上一台运行时（${serial}）但没就绪，先关掉它再重新开机`);
         // AVD 目录有锁：留着这台会让新实例直接退出，表现成"怎么都开不了机"。
         // adb 都连不上了，只能按控制台端口找到进程强杀。
-        const pid = await this.pidOnPort(port);
-        if (pid) {
-          await new Promise((resolve) => {
-            const { execFile } = require('child_process');
-            execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve());
-          });
-        }
+        await processOwner.terminateOwnedProcess(target, (p) => this.emulator.ownsProcess(p, { discoverRoot: true }));
         await new Promise((r) => setTimeout(r, 1200));
         continue;
       }
+      if (!processOwner.sameIdentity(target, await this.emulator.ownedProcessOnPort(port))) continue;
       this.emuSerial = serial;
       this.emulator.port = port;
       store.saveSettings({ device: serial });
@@ -982,15 +943,7 @@ class Runtime {
 
   /** 某个 TCP 端口是哪个进程在监听（用于强杀卡死的模拟器） */
   async pidOnPort(port) {
-    return new Promise((resolve) => {
-      const { execFile } = require('child_process');
-      execFile('netstat', ['-ano', '-p', 'TCP'], { windowsHide: true }, (err, stdout) => {
-        if (err || !stdout) return resolve(0);
-        const line = stdout.split('\n').find((l) => new RegExp(`:${port}\\s`).test(l) && /LISTENING/i.test(l));
-        const m = line && /(\d+)\s*$/.exec(line.trim());
-        return resolve(m ? Number(m[1]) : 0);
-      });
-    });
+    return processOwner.pidOnPort(port);
   }
 
   /**
@@ -1007,32 +960,11 @@ class Runtime {
     const ports = await this.emulatorPorts().catch(() => []);
     if (!ports.length) return [];
     const roots = new Set();
-    const exePath = (pid) => new Promise((resolve) => {
-      const n = Number(pid);
-      if (!Number.isInteger(n) || n <= 0) return resolve('');
-      const command = `$p=Get-Process -Id ${n} -ErrorAction SilentlyContinue; if($p){$p.Path}`;
-      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
-        windowsHide: true,
-        maxBuffer: 1024 * 1024,
-      }, (err, stdout) => resolve(err ? '' : String(stdout || '').trim()));
-    });
-
     for (const port of ports) {
-      // eslint-disable-next-line no-await-in-loop
-      const pid = await this.pidOnPort(port);
-      // eslint-disable-next-line no-await-in-loop
-      const exe = await exePath(pid);
-      if (!exe) continue;
-      let dir = path.dirname(path.resolve(exe));
-      // qemu 的可执行文件位于 runtime/emulator/qemu/...；向上收敛到 runtime，
-      // 这样 emulator.exe 与 qemu 两类窗口都能被同一个作用域命中。
-      for (let i = 0; i < 8 && dir; i += 1) {
-        roots.add(dir);
-        if (/[/\\](?:runtime|engine)$/i.test(dir)) break;
-        const next = path.dirname(dir);
-        if (next === dir) break;
-        dir = next;
-      }
+      const info = await this.emulator.ownedProcessOnPort(port);
+      if (!info) continue;
+      const root = processOwner.emulatorRoot(info.exe);
+      if (root) roots.add(root);
     }
     return [...roots];
   }
@@ -1668,8 +1600,11 @@ class Runtime {
     //  2) 留着它，下次打开 ApkStart 可以直接接管，点应用秒开（WSA / 应用宝电脑版同款行为）。
     // 卸载时另走一条路（app:removeSelf 会显式清理进程）。
     if (this.vmProc) {
-      try { this.vmProc.kill(); } catch (_) { /* ignore */ }
-      this.vmProc = null;
+      const proc = this.vmProc;
+      processOwner.getProcessInfo(proc.pid)
+        .then((info) => processOwner.terminateOwnedProcess(info, (p) => this.ownsQemuProcess(p)))
+        .then((stopped) => { if (stopped && this.vmProc === proc) this.vmProc = null; })
+        .catch(() => {});
     }
   }
 

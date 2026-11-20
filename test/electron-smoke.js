@@ -12,6 +12,8 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const { createFixture } = require('./lib/ui-fixtures');
+const fixture = createFixture();
 
 const SRC = path.join(__dirname, '..', 'src');
 const PAGE = path.join(SRC, 'ui', 'index.html');
@@ -31,7 +33,7 @@ function mockChannels() {
   for (const m of src.matchAll(/ipcRenderer\.(?:on|send)\(\s*'([^']+)'/g)) chans.add(m[1]);
   for (const ch of chans) {
     if (ipcMain.listenerCount(ch) === 0) {
-      try { ipcMain.handle(ch, () => ({})); } catch (_) { /* 已注册过就跳过 */ }
+      try { ipcMain.handle(ch, (_e, payload) => fixture.respond(ch, payload)); } catch (_) { /* 已注册过就跳过 */ }
     }
   }
   return chans.size;

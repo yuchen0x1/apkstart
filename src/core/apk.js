@@ -379,8 +379,8 @@ function parseApkZip(zip, filePath, stat) {
   // 这里把清单里的 screenOrientation 归一成 landscape / portrait / ''（未知）。
   // AXML 里的枚举属性通常是 TYPE_INT_DEC，也可能是字符串，两种都认。
   const ORIENT_INT = {
-    1: 'landscape', 7: 'landscape', 9: 'landscape', 12: 'landscape',
-    2: 'portrait', 8: 'portrait', 10: 'portrait', 13: 'portrait',
+    0: 'landscape', 6: 'landscape', 8: 'landscape', 11: 'landscape',
+    1: 'portrait', 7: 'portrait', 9: 'portrait', 12: 'portrait',
   };
   const ORIENT_STR = {
     landscape: 'landscape', sensorLandscape: 'landscape',
@@ -388,15 +388,13 @@ function parseApkZip(zip, filePath, stat) {
     portrait: 'portrait', sensorPortrait: 'portrait',
     reversePortrait: 'portrait', userPortrait: 'portrait',
   };
-  const orientationOf = (node) => {
-    if (!node) return '';
-    const v = attrValue(node, 'screenOrientation');
-    if (typeof v === 'number') return ORIENT_INT[v] || '';
-    if (typeof v === 'string') return ORIENT_STR[v] || '';
-    return '';
-  };
-  // 启动 Activity 优先；它没声明就看 <application>（游戏常把方向写在 application 上）
-  const orientation = orientationOf(launcher) || orientationOf(app) || '';
+  // 只在启动 Activity 没声明时才回退到 <application>。0 是 landscape，不能用 ||；
+  // 显式 unspecified / sensor / locked 等不表示固定方向，也不能用 application 猜。
+  const orientValue = attrValue(launcher, 'screenOrientation') ?? attrValue(app, 'screenOrientation');
+  const orientation = typeof orientValue === 'number' && Object.hasOwn(ORIENT_INT, orientValue)
+    ? ORIENT_INT[orientValue]
+    : typeof orientValue === 'string' && Object.hasOwn(ORIENT_STR, orientValue)
+      ? ORIENT_STR[orientValue] : '';
 
   // ---- 图标 ----
   let icon = null;

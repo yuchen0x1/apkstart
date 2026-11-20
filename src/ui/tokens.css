@@ -1,0 +1,312 @@
+/* 共享语义主题；theme.js 将系统偏好解析到 data-theme。 */
+:root {
+  color-scheme: light;
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --panel-2: #f1f3f6;
+  --panel-raised: #ffffff;
+  --surface-hover: #e9edf2;
+  --surface-active: #dfe5ec;
+  --text: #20252d;
+  --text-2: #424d5c;
+  --muted: #566170;
+  --faint: #5a6574;
+  --line: #d8dee7;
+  --line-strong: #788595;
+  --control-border: #788595;
+  --transparent: transparent;
+
+  /* 保留橙色品牌；实心控件始终搭配专用的前景色。 */
+  --brand: #b84b00;
+  --brand-hover: #9e3f00;
+  --brand-active: #853500;
+  --brand-dark: #973d00;
+  --brand-soft: #fff0e5;
+  --brand-soft-hover: #ffe3ce;
+  --brand-border: #bf621f;
+  --on-accent: #ffffff;
+  --focus-ring: #9a470d;
+  --focus-halo: rgba(184, 75, 0, .18);
+  --selection-bg: #ffe0c7;
+  --selection-text: #6b2f00;
+  --link: #245fa8;
+  --link-hover: #174477;
+
+  --success: #196746;
+  --success-bg: #eaf7f0;
+  --success-border: #4f8d70;
+  --success-solid: #226f4d;
+  --on-success: #ffffff;
+  --warning: #805200;
+  --warning-bg: #fff5dd;
+  --warning-border: #a07828;
+  --warning-solid: #8b5800;
+  --on-warning: #ffffff;
+  --danger: #b4232c;
+  --danger-bg: #fff0f0;
+  --danger-border: #c76870;
+  --danger-solid: #b4232c;
+  --on-danger: #ffffff;
+  --info: #245ea8;
+  --info-bg: #edf4ff;
+  --info-border: #5f85b7;
+  --mi-red: var(--danger);
+
+  --disabled-bg: #e9edf2;
+  --disabled-text: #626c79;
+  --disabled-border: #a1aab6;
+  --readonly-bg: #edf0f4;
+  --switch-track: #788595;
+  --switch-thumb: #ffffff;
+  --progress-track: #dce3ea;
+  --progress-fill: var(--brand);
+  --progress-end: #cc5c16;
+  --scrollbar: #8793a2;
+  --scrollbar-hover: #687587;
+  --scrim: rgba(20, 26, 33, .38);
+  --drop-scrim: rgba(247, 248, 250, .92);
+  --drop-panel: rgba(255, 255, 255, .94);
+
+  --shadow-ambient: rgba(16, 24, 40, .08);
+  --shadow-elevated: rgba(16, 24, 40, .12);
+  --shadow-floating: rgba(16, 24, 40, .20);
+  --shadow-accent-color: rgba(139, 58, 0, .22);
+  --shadow-thumb-color: rgba(16, 24, 40, .24);
+  --shadow-sm: 0 1px 2px var(--shadow-ambient);
+  --shadow-md: 0 8px 24px var(--shadow-elevated);
+  --shadow-lg: 0 20px 48px var(--shadow-floating);
+  --shadow-accent: 0 1px 2px var(--shadow-accent-color);
+  --shadow-icon: 0 1px 3px var(--shadow-elevated);
+  --shadow-logo: 0 2px 10px var(--shadow-floating);
+  --shadow-thumb: 0 1px 2px var(--shadow-thumb-color);
+  --focus-shadow: 0 0 0 3px var(--focus-halo);
+
+  /* 媒体画布与日志有意固定为深色；不属于应用宿主界面。 */
+  --canvas-bg: #11151b;
+  --canvas-spotlight: #252c36;
+  --canvas-text: #e9edf3;
+  --canvas-muted: #adb9c8;
+  --canvas-track: #4b5666;
+  --canvas-accent: #ffa05c;
+  --canvas-accent-end: #ffc18a;
+  --log-bg: #12161c;
+  --log-text: #c7d3e0;
+  --log-muted: #91a0b1;
+  --log-success: #86dab1;
+  --log-error: #ffaaaa;
+  --icon-on-color: #ffffff;
+
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-strong: 650;
+  --leading-ui: 1.5;
+  --leading-copy: 1.65;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 18px;
+  --r-pill: 999px;
+  --motion-press: 60ms;
+  --motion-fast: 120ms;
+  --motion-normal: 180ms;
+  --motion-slow: 280ms;
+  --motion-spinner: 700ms;
+  --motion-pulse: 1400ms;
+  --motion-notice: 1200ms;
+  --motion-boot: 1150ms;
+  --ease-ui: cubic-bezier(.2, .7, .2, 1);
+  --z-overlay: 100;
+  --z-repair: 120;
+  --z-menu: 140;
+  --z-drop: 160;
+  --z-toast: 200;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #1b1f26;
+  --panel: #242a33;
+  --panel-2: #2c3440;
+  --panel-raised: #303946;
+  --surface-hover: #353f4d;
+  --surface-active: #394452;
+  --text: #e9edf3;
+  --text-2: #d0d7e2;
+  --muted: #adb8c7;
+  --faint: #a5b1c2;
+  --line: #455163;
+  --line-strong: #8795a8;
+  --control-border: #8795a8;
+  --brand: #ffa05c;
+  --brand-hover: #ffb27a;
+  --brand-active: #ff8a38;
+  --brand-dark: #ffb27a;
+  --brand-soft: #3a2b22;
+  --brand-soft-hover: #4a3425;
+  --brand-border: #ba7444;
+  --on-accent: #291500;
+  --focus-ring: #ffb778;
+  --focus-halo: rgba(255, 160, 92, .24);
+  --selection-bg: #674126;
+  --selection-text: #fff0e5;
+  --link: #9ac7ff;
+  --link-hover: #bfddff;
+  --success: #86dab1;
+  --success-bg: #203b32;
+  --success-border: #528e73;
+  --success-solid: #86dab1;
+  --on-success: #11261d;
+  --warning: #f3c467;
+  --warning-bg: #3b3221;
+  --warning-border: #ad8843;
+  --warning-solid: #edbd5e;
+  --on-warning: #2c210a;
+  --danger: #ffaaaa;
+  --danger-bg: #40282d;
+  --danger-border: #ba747c;
+  --danger-solid: #ffaaaa;
+  --on-danger: #31171c;
+  --info: #9ac7ff;
+  --info-bg: #24364e;
+  --info-border: #668bb7;
+  --disabled-bg: #303743;
+  --disabled-text: #a0abba;
+  --disabled-border: #677385;
+  --readonly-bg: #232a34;
+  --switch-track: #758295;
+  --switch-thumb: #e9edf3;
+  --progress-track: #4b5666;
+  --progress-end: #ffbc8c;
+  --scrollbar: #738095;
+  --scrollbar-hover: #95a2b4;
+  --scrim: rgba(8, 12, 18, .68);
+  --drop-scrim: rgba(27, 31, 38, .94);
+  --drop-panel: rgba(41, 48, 59, .96);
+  --shadow-ambient: rgba(5, 9, 15, .20);
+  --shadow-elevated: rgba(5, 9, 15, .32);
+  --shadow-floating: rgba(5, 9, 15, .48);
+  --shadow-accent-color: rgba(8, 12, 18, .26);
+  --shadow-thumb-color: rgba(5, 9, 15, .32);
+}
+
+[hidden] { display: none !important; }
+.sr-only {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+:where(button, input, select, textarea) { font-family: inherit; accent-color: var(--brand); }
+:where(input, select, textarea) { color-scheme: inherit; }
+:root :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+::selection { color: var(--selection-text); background: var(--selection-bg); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (forced-colors: active) {
+  :root, :root[data-theme="dark"] {
+    --bg: Canvas;
+    --panel: Canvas;
+    --panel-2: Canvas;
+    --panel-raised: Canvas;
+    --surface-hover: ButtonFace;
+    --surface-active: ButtonFace;
+    --text: CanvasText;
+    --text-2: CanvasText;
+    --muted: CanvasText;
+    --faint: CanvasText;
+    --line: CanvasText;
+    --line-strong: ButtonText;
+    --control-border: ButtonText;
+    --brand: Highlight;
+    --brand-hover: Highlight;
+    --brand-active: Highlight;
+    --brand-dark: LinkText;
+    --brand-soft: Canvas;
+    --brand-soft-hover: Canvas;
+    --brand-border: Highlight;
+    --on-accent: HighlightText;
+    --focus-ring: Highlight;
+    --link: LinkText;
+    --link-hover: LinkText;
+    --success: CanvasText;
+    --success-bg: Canvas;
+    --success-border: CanvasText;
+    --success-solid: Highlight;
+    --on-success: HighlightText;
+    --warning: CanvasText;
+    --warning-bg: Canvas;
+    --warning-border: CanvasText;
+    --warning-solid: Highlight;
+    --on-warning: HighlightText;
+    --danger: CanvasText;
+    --danger-bg: Canvas;
+    --danger-border: CanvasText;
+    --danger-solid: Highlight;
+    --on-danger: HighlightText;
+    --info: CanvasText;
+    --info-bg: Canvas;
+    --info-border: CanvasText;
+    --disabled-bg: Canvas;
+    --disabled-text: GrayText;
+    --disabled-border: GrayText;
+    --readonly-bg: Canvas;
+    --switch-track: ButtonFace;
+    --switch-thumb: ButtonText;
+    --progress-track: Canvas;
+    --progress-fill: Highlight;
+    --progress-end: Highlight;
+    --scrollbar: ButtonText;
+    --scrollbar-hover: Highlight;
+    --canvas-bg: Canvas;
+    --canvas-spotlight: Canvas;
+    --canvas-text: CanvasText;
+    --canvas-muted: CanvasText;
+    --canvas-track: Canvas;
+    --canvas-accent: Highlight;
+    --canvas-accent-end: Highlight;
+    --log-bg: Canvas;
+    --log-text: CanvasText;
+    --log-muted: CanvasText;
+    --log-success: CanvasText;
+    --log-error: CanvasText;
+    --shadow-sm: none;
+    --shadow-md: none;
+    --shadow-lg: none;
+    --shadow-accent: none;
+    --shadow-icon: none;
+    --shadow-logo: none;
+    --shadow-thumb: none;
+    --focus-shadow: none;
+  }
+  :where(button, input, select, textarea, summary, a) { forced-color-adjust: auto; }
+  :root :focus-visible { outline-color: Highlight; }
+}

@@ -30,6 +30,40 @@ const INDEX_NAME = 'index.json';
 /** ZIP 解压后的暂存目录：要么整体搬到 custom-images/<id>，要么整个删掉 */
 const STAGING_PREFIX = '.staging-';
 
+function inside(root, target, allowRoot = false) {
+  const rel = path.relative(path.resolve(root), path.resolve(target));
+  return (!rel ? allowRoot : rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/** 不只比字符串：所有现有路径组件必须不经过 symlink / Windows junction。 */
+function safePath(root, target, allowRoot = false) {
+  if (!inside(root, target, allowRoot)) throw new Error('镜像路径越界，已拒绝操作');
+  const base = path.resolve(root);
+  let cur = base;
+  const realRoot = fs.realpathSync(base);
+  for (const part of path.relative(base, path.resolve(target)).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    let st;
+    try { st = fs.lstatSync(cur); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+    if (st.isSymbolicLink() || !inside(realRoot, fs.realpathSync(cur), true)) {
+      throw new Error('镜像路径包含符号链接或 junction，已拒绝操作');
+    }
+  }
+  return path.resolve(target);
+}
+
+/** 托管副本不能夹带会在移动后失效/越界的链接。 */
+function checkManagedTree(dir) {
+  if (fs.lstatSync(dir).isSymbolicLink()) throw new Error('镜像暂存目录不能是符号链接或 junction');
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    const st = fs.lstatSync(p);
+    if (st.isSymbolicLink()) throw new Error('托管镜像不能包含符号链接或 junction');
+    if (st.isDirectory()) checkManagedTree(p);
+  }
+}
+
+
 /* ---------------- 来源适配器（可插拔） ---------------- */
 
 /** 在一棵浅目录里找「真正含 system.img 的那一层」（ZIP 常带一层同名顶级目录） */
@@ -92,8 +126,7 @@ const PROVIDERS = [
         e.code = 'NO_EXTRACTOR';
         throw e;
       }
-      const dest = path.join(ctx.stagingRoot, `zip-${Date.now()}`);
-      fs.mkdirSync(dest, { recursive: true });
+      const dest = fs.mkdtempSync(path.join(ctx.ensureStagingRoot(), `${STAGING_PREFIX}zip-`));
       return { dir: dest, managed: true, stagingDir: dest, async prepare() {
         try {
           await ctx.extractZip(p, dest, {});
@@ -137,27 +170,54 @@ class ImageStore {
   get indexFile() { return path.join(this.dir, INDEX_NAME); }
   get stagingRoot() { return path.join(this.root, '_tmp'); }
 
-  _ensureDir() { fs.mkdirSync(this.dir, { recursive: true }); return this.dir; }
+  _ensureDir(dir = this.dir) {
+    fs.mkdirSync(this.root, { recursive: true });
+    safePath(this.root, dir);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
 
-  _records() {
-    let raw = '';
-    try { raw = fs.readFileSync(this.indexFile, 'utf8'); } catch (_) { return []; }
+  _records({ strict = false } = {}) {
     try {
-      const j = JSON.parse(raw.replace(/^\uFEFF/, ''));
-      const list = Array.isArray(j) ? j : (j && Array.isArray(j.records) ? j.records : []);
-      return list.filter((r) => r && typeof r.id === 'string' && r.id);
-    } catch (_) {
-      // 索引坏了不能让整个设置页打不开：原文件改名留现场，按「没有自定义镜像」处理
-      try { fs.renameSync(this.indexFile, `${this.indexFile}.bak-${Date.now()}`); } catch (_) { /* ignore */ }
+      safePath(this.root, this.indexFile);
+      const j = JSON.parse(fs.readFileSync(this.indexFile, 'utf8').replace(/^\uFEFF/, ''));
+      const list = Array.isArray(j) ? j : j && j.records;
+      if (!Array.isArray(list)) throw new Error('自定义镜像索引格式无效');
+      return list.filter((r) => r && manifestLib.isSafeId(r.id));
+    } catch (e) {
+      if (strict && e.code !== 'ENOENT') throw e;
       return [];
     }
   }
 
   _writeRecords(records) {
     this._ensureDir();
-    const tmp = `${this.indexFile}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ schema: 1, records }, null, 2), 'utf8');
-    fs.renameSync(tmp, this.indexFile);
+    safePath(this.root, this.indexFile);
+    const tmp = path.join(this.dir, `${STAGING_PREFIX}${crypto.randomUUID()}.json`);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify({ schema: 1, records }, null, 2), { encoding: 'utf8', flag: 'wx' });
+      fs.renameSync(tmp, this.indexFile);
+    } finally {
+      try { fs.rmSync(tmp, { force: true }); } catch (_) { /* ignore */ }
+    }
+  }
+
+  _managedRoot(rec) {
+    if (!rec || !rec.managed || !rec.dir || !manifestLib.isSafeId(rec.id)) return '';
+    safePath(this.root, this.dir);
+    safePath(this.dir, rec.dir);
+    const first = path.relative(path.resolve(this.dir), path.resolve(rec.dir)).split(path.sep)[0];
+    if (first !== rec.id && !new RegExp(`^${STAGING_PREFIX.replace('.', '\\.')}[0-9a-f-]{36}$`).test(first)) return '';
+    return path.join(this.dir, first);
+  }
+
+  _cleanupStaging(resolved) {
+    if (!resolved.managed) return;
+    try {
+      const dest = safePath(this.root, this.stagingRoot);
+      const target = safePath(dest, resolved.stagingDir || resolved.dir);
+      fs.rmSync(target, { recursive: true, force: true });
+    } catch (_) { /* 不清理无法证实在暂存区内的路径 */ }
   }
 
   _record(id) {
@@ -287,7 +347,11 @@ class ImageStore {
     if (!provider) {
       throw new Error('无法识别的来源：请选择镜像文件夹、ZIP 包，或 apkstart-image.json 清单文件');
     }
-    const out = await provider.read(p, { extractZip: this.extractZip, stagingRoot: this.stagingRoot });
+    const out = await provider.read(p, {
+      extractZip: this.extractZip,
+      stagingRoot: this.stagingRoot,
+      ensureStagingRoot: () => this._ensureDir(this.stagingRoot),
+    });
     if (out && typeof out.prepare === 'function') {
       const prepared = await out.prepare();
       Object.assign(out, prepared);
@@ -301,16 +365,7 @@ class ImageStore {
    */
   async inspectSource(src, { emulatorVersion = '', keepStaging = false } = {}) {
     const resolved = await this._resolve(src);
-    const cleanup = () => {
-      if (!resolved.managed) return;
-      const target = resolved.stagingDir || resolved.dir;
-      // 只删 _tmp 下我们自己建的暂存目录，绝不碰用户的原目录
-      try {
-        if (path.resolve(target).startsWith(path.resolve(this.stagingRoot))) {
-          fs.rmSync(target, { recursive: true, force: true });
-        }
-      } catch (_) { /* ignore */ }
-    };
+    const cleanup = () => this._cleanupStaging(resolved);
     try {
       const report = this._scan(resolved, { emulatorVersion });
       if (!keepStaging) cleanup();
@@ -428,7 +483,17 @@ class ImageStore {
     for (const [name, spec] of entries) {
       i += 1;
       const [algo, want] = String(spec).split(':');
-      const file = path.isAbsolute(name) ? name : path.join(dir, name);
+      let file;
+      try {
+        const normalized = String(name).replace(/\\/g, '/');
+        if (path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized) || normalized.split('/').includes('..')) {
+          throw new Error('校验文件路径越界');
+        }
+        file = safePath(dir, path.resolve(dir, normalized));
+      } catch (e) {
+        errors.push(`${name} 校验路径不安全：${e.message}`);
+        continue;
+      }
       onProgress({
         stage: 'verify',
         message: `校验 ${path.basename(name)}（${algo}）…`,
@@ -458,7 +523,7 @@ class ImageStore {
    */
   async import(src, { onProgress = () => {}, replace = false, emulatorVersion = '' } = {}) {
     const resolved = await this._resolve(src);
-    let keepStaging = false;
+    let pending = '';
     try {
       const report = this._scan(resolved, { emulatorVersion });
       if (!report.ok) {
@@ -477,40 +542,45 @@ class ImageStore {
         throw e;
       }
 
-      // ZIP 解出来的副本要搬到 custom-images/<id>；本地目录直接引用，不复制
+      // 先完整安置新副本，再原子提交索引；替换失败时旧记录/旧目录始终可用。
+      const previous = this._records({ strict: true });
+      const sameId = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
       let id = report.suggestedId || 'custom-image';
-      const taken = (x) => this._records().some((r) => r.id === x);
-      if (taken(id)) {
-        if (replace) {
-          this._drop(id);
-        } else {
-          let n = 2;
-          while (taken(`${id}-${n}`)) n += 1;
-          id = `${id}-${n}`;
-        }
+      if (!manifestLib.isSafeId(id)) throw new Error('清单 id 不是安全目录名');
+      const old = previous.find((r) => sameId(r.id, id));
+      const taken = (x) => previous.some((r) => sameId(r.id, x)) || fs.existsSync(path.join(this.dir, x));
+      if (!replace || !old) {
+        const base = id;
+        let n = 2;
+        while (taken(id)) id = `${base.slice(0, 70)}-${n++}`;
+      } else {
+        id = old.id;
       }
 
       let finalDir = report.dir;
       let managed = false;
       if (report.managed) {
-        // 搬整个暂存目录（而不是只搬「含 system.img 的那一层」）：否则
-        // _tmp 里会留下一堆空壳目录，长期使用会越积越多
-        const moveRoot = resolved.stagingDir || report.dir;
-        const target = path.join(this._ensureDir(), id);
-        fs.rmSync(target, { recursive: true, force: true });
+        const moveRoot = safePath(this.stagingRoot, resolved.stagingDir || report.dir);
+        safePath(moveRoot, report.dir, true);
+        checkManagedTree(moveRoot);
+        for (const file of Object.values(report.manifest.files || {})) {
+          if (file) safePath(moveRoot, path.resolve(report.dir, file));
+        }
+        const target = safePath(this._ensureDir(), old && replace ? path.join(this.dir, `${STAGING_PREFIX}${crypto.randomUUID()}`) : path.join(this.dir, id));
+        // 绝不预先 rm(target)，它可能是未收录的现有目录或 junction。
+        if (fs.existsSync(target)) throw new Error('镜像目标路径已存在，已拒绝覆盖');
         onProgress({ stage: 'move', message: '正在安置镜像文件…', percent: 96 });
         try {
           fs.renameSync(moveRoot, target);
-        } catch (_) {
-          // 跨盘符 rename 会 EXDEV：退化成复制（大文件也要能过去）
+          pending = target;
+        } catch (e) {
+          if (e.code !== 'EXDEV') throw e;
+          fs.mkdirSync(target);
+          pending = target;
           copyDir(moveRoot, target);
-          fs.rmSync(moveRoot, { recursive: true, force: true });
         }
-        finalDir = resolved.stagingDir
-          ? path.join(target, path.relative(resolved.stagingDir, report.dir))
-          : target;
+        finalDir = path.join(target, path.relative(moveRoot, report.dir));
         managed = true;
-        keepStaging = true;  // 已搬走，finally 不要再删
       }
 
       const record = {
@@ -536,21 +606,27 @@ class ImageStore {
         warnings: report.warnings,
         importedAt: new Date().toISOString(),
       };
-      const records = this._records().filter((r) => r.id !== id);
+      const records = previous.filter((r) => !sameId(r.id, id));
       records.push(record);
       this._writeRecords(records);
+      pending = '';
+      if (old && replace && old.managed) {
+        try {
+          const oldRoot = this._managedRoot(old);
+          if (oldRoot && !inside(oldRoot, finalDir, true)) fs.rmSync(oldRoot, { recursive: true, force: true });
+        } catch (_) { /* 索引已提交；旧副本不安全时保留，绝不越界删除 */ }
+      }
       this._invalidate();
       onProgress({ stage: 'done', message: `已导入「${record.name}」，点「启用」后生效`, percent: 100 });
       return { ok: true, record: this.describe(record), warnings: report.warnings, checksums: sums.checked };
     } finally {
-      if (!keepStaging && resolved.managed) {
+      if (pending) {
         try {
-          const target = resolved.stagingDir || resolved.dir;
-          if (path.resolve(target).startsWith(path.resolve(this.stagingRoot))) {
-            fs.rmSync(target, { recursive: true, force: true });
-          }
-        } catch (_) { /* ignore */ }
+          safePath(this.root, this.dir);
+          fs.rmSync(safePath(this.dir, pending), { recursive: true, force: true });
+        } catch (_) { /* 不清理无法证实在托管目录内的路径 */ }
       }
+      this._cleanupStaging(resolved);
     }
   }
 
@@ -580,18 +656,15 @@ class ImageStore {
   }
 
   _drop(id) {
-    const records = this._records();
+    const records = this._records({ strict: true });
     const rec = records.find((r) => r.id === id);
     if (!rec) return false;
-    // 只删「我们自己解出来的副本」；用户自己的目录绝不动
-    if (rec.managed) {
-      const target = path.resolve(rec.dir || '');
-      const root = path.resolve(this.dir);
-      if (target.startsWith(root + path.sep)) {
-        try { fs.rmSync(target, { recursive: true, force: true }); } catch (_) { /* 占用就留着，下次再删 */ }
-      }
-    }
     this._writeRecords(records.filter((r) => r.id !== id));
+    // 只删对应 id 的托管副本；不跟随已有目录中的链接或 junction。
+    try {
+      const target = this._managedRoot(rec);
+      if (target) fs.rmSync(target, { recursive: true, force: true });
+    } catch (_) { /* 占用或不安全时保留 */ }
     return true;
   }
 

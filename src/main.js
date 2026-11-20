@@ -3,13 +3,14 @@
  * ApkStart 主进程
  * 职责：窗口 / 托盘 / 单实例 / 命令行分发（双击 apk、桌面快捷方式启动）/ IPC
  */
-const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, shell, nativeImage, screen, globalShortcut, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, shell, nativeImage, nativeTheme, screen, globalShortcut, clipboard } = require('electron');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const ipcguard = require('./core/ipcguard');
 
 const store = require('./core/store');
+const theme = require('./core/theme');
 const { Runtime } = require('./core/engine');
 const { Installer } = require('./core/installer');
 const { Sharer } = require('./core/sharer');
@@ -17,6 +18,7 @@ const { parseApk } = require('./core/apk');
 const filetype = require('./core/filetype');
 const compat = require('./core/compat');
 const backup = require('./core/backup');
+const { copyDirContents } = require('./core/file-migration');
 const repair = require('./core/repair');
 const feedback = require('./core/report');
 const imageManifest = require('./core/image-manifest');
@@ -536,20 +538,6 @@ function launcherInfo() {
   return { target: process.execPath, args: `"${APP_ROOT}"`, cwd: APP_ROOT };
 }
 
-/** 递归复制目录内容（best-effort，不删源；用于共享目录改路径时一次性搬迁旧文件） */
-function copyDirContents(src, dest) {
-  if (!fs.existsSync(src)) return;
-  fs.mkdirSync(dest, { recursive: true });
-  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-    const s = path.join(src, entry.name);
-    const d = path.join(dest, entry.name);
-    try {
-      if (entry.isDirectory()) copyDirContents(s, d);
-      else fs.copyFileSync(s, d);
-    } catch (_) { /* 单文件失败不影响其余 */ }
-  }
-}
-
 /** 以管理员权限启用一个 Windows 可选功能（如 VirtualMachinePlatform / HypervisorPlatform） */
 function enableWindowsFeature(feature) {
   return new Promise((resolve) => {
@@ -649,6 +637,20 @@ function openWindowsFeatures() {
 
 // ---------------- 主窗口 ----------------
 
+function syncTheme(preference) {
+  nativeTheme.themeSource = theme.normalizePreference(preference);
+  refreshWindowTheme();
+}
+
+function refreshWindowTheme() {
+  const dark = nativeTheme.shouldUseDarkColors;
+  theme.updateWindow(mainWindow, dark, { overlay: process.platform === 'win32' });
+  const state = { preference: nativeTheme.themeSource, resolved: dark ? 'dark' : 'light' };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send('theme:changed', state);
+  }
+}
+
 function createWindow({ show = true } = {}) {
   mainWindow = new BrowserWindow({
     width: 1140,
@@ -656,10 +658,10 @@ function createWindow({ show = true } = {}) {
     minWidth: 900,
     minHeight: 560,
     show: false,
-    backgroundColor: '#f7f8fa',
+    backgroundColor: theme.nativePalette(nativeTheme.shouldUseDarkColors).background,
     frame: false,
     titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#f7f8fa', symbolColor: '#2b3138', height: 44 },
+    titleBarOverlay: { color: theme.nativePalette(nativeTheme.shouldUseDarkColors).background, symbolColor: theme.nativePalette(nativeTheme.shouldUseDarkColors).foreground, height: 44 },
     icon: nativeImage.createFromBuffer(ICON_PNG),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -1638,9 +1640,9 @@ function registerIpc() {
     const doctor = require('./core/doctor');
     const switchFlavor = async (flavor) => {
       const profile = runtime.provisioner.imageProfile(String(flavor || ''));
-      if (runtime.vmRunning) {
-        await runtime.stop();
-        if (runtime.vmRunning) return { ok: false, error: '当前安卓运行时未能停止，未切换系统' };
+      if (runtime.vmRunning || await runtime.client().isOnline()) {
+        const stopped = await runtime.stop();
+        if (!stopped || runtime.vmRunning || await runtime.client().isOnline()) return { ok: false, error: '当前安卓运行时未能停止，未切换系统' };
       }
       store.saveSettings({ runtime: {
         systemImageFlavor: profile.id,
@@ -1666,6 +1668,7 @@ function registerIpc() {
     isDev: IS_DEV,
     dataDir: store.DATA_DIR,
     runtimeDir: runtime.provisioner.paths().root,
+    avdHome: runtime.provisioner.paths().avdHome,
     diskFreeMB: (() => {
       try { return require('./core/doctor').freeDiskMB(runtime.provisioner.paths().root); } catch (_) { return 0; }
     })(),
@@ -1795,19 +1798,19 @@ function registerIpc() {
 
   // ── 备份 / 导出 ────────────────────────────────────────────
   ipcMain.handle('app:exportApk', async (_e, pkg) => {
-    const app = store.getApp(pkg);
-    if (!app) throw new Error('应用不存在');
-    if (!app.apkPath || !fs.existsSync(app.apkPath)) {
+    const record = store.getApp(pkg);
+    if (!record) throw new Error('应用不存在');
+    if (!record.apkPath || !fs.existsSync(record.apkPath)) {
       throw new Error('找不到这个应用的安装包（可能安装后被清理过）');
     }
-    const name = `${backup.sanitizeName(app.label || pkg, 40)}-${backup.sanitizeName(app.versionName || '1.0', 20)}.apk`;
+    const name = `${backup.sanitizeName(record.label || pkg, 40)}-${backup.sanitizeName(record.versionName || '1.0', 20)}.apk`;
     const { canceled, filePath } = await dialog.showSaveDialog(mainWindow || undefined, {
       title: '导出 APK',
       defaultPath: path.join(app.getPath('downloads'), name),
       filters: [{ name: 'Android 安装包', extensions: ['apk'] }],
     });
     if (canceled || !filePath) return { ok: false, canceled: true };
-    fs.copyFileSync(app.apkPath, filePath);
+    fs.copyFileSync(record.apkPath, filePath);
     return { ok: true, path: filePath };
   });
 
@@ -1861,6 +1864,7 @@ function registerIpc() {
       safePatch = { ...patch, runtime: rest };
     }
     const next = store.saveSettings(safePatch);
+    if (safePatch && safePatch.theme !== undefined) syncTheme(next.theme);
     if (safePatch && safePatch.autoStart !== undefined) applyAutoStart();
     // 语言变了（upstream #38）：主进程的菜单/对话框是下次打开才读到新语言，
     // 托盘菜单得重建一次，否则托盘里还是旧语言直到重启。
@@ -1909,9 +1913,9 @@ function registerIpc() {
         return { ok: true, flavor: profile.id, profile, stoppedVm: false, changed: false };
       }
       let stoppedVm = false;
-      if (runtime.vmRunning) {
-        await runtime.stop();
-        if (runtime.vmRunning) throw new Error('当前安卓运行时未能停止，未切换系统镜像');
+      if (runtime.vmRunning || await runtime.client().isOnline()) {
+        const stopped = await runtime.stop();
+        if (!stopped || runtime.vmRunning || await runtime.client().isOnline()) throw new Error('当前安卓运行时未能停止，未切换系统镜像');
         stoppedVm = true;
       }
       store.saveSettings({ runtime: {
@@ -1955,6 +1959,22 @@ function registerIpc() {
   ipcMain.handle('system:install', async (_e, systemId) => {
     try { return await getSystemManager().installSystem(String(systemId || '')); }
     catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  ipcMain.handle('system:confirmInstall', async (_e, taskId) => {
+    try {
+      const mgr = getSystemManager();
+      const task = mgr.taskManager.getTask(String(taskId || ''));
+      if (!task || task.status !== 'awaiting_confirmation') return { ok: false, error: '此任务不在等待安装确认状态' };
+      const { response } = await dialog.showMessageBox(mainWindow || undefined, {
+        type: 'question', title: '确认系统安装完成',
+        message: '已在虚拟机里完成官方安装器，并正常关闭虚拟机了吗？',
+        detail: '磁盘开始写入不代表安装完成。仅在安装器明确提示成功并关机后确认；未完成请取消并返回虚拟机继续。',
+        buttons: ['尚未完成', '安装完成并已关机'], defaultId: 0, cancelId: 0,
+      });
+      if (response !== 1) return { ok: false, cancelled: true };
+      return await mgr.confirmInstallation(task.taskId, { confirmed: true });
+    } catch (e) { return { ok: false, error: e.message }; }
   });
 
   /** 统一切换系统（真实停旧启新 + Android 就绪检查） */
@@ -2093,10 +2113,11 @@ function registerIpc() {
    */
   ipcMain.handle('settings:setSharedDir', async (_e, dir) => {
     if (!dir || !dir.trim()) return { ok: false, error: '目录不能为空' };
+    if (sharer && sharer.status().busy) return { ok: false, error: '共享同步正在进行，请完成后再迁移目录' };
     const newDir = dir.trim();
     const oldDir = store.getSettings().sharedDir;
     try {
-      if (oldDir && oldDir !== newDir) copyDirContents(oldDir, newDir);
+      copyDirContents(oldDir, newDir);
       fs.mkdirSync(newDir, { recursive: true });
       store.saveSettings({ sharedDir: newDir });
       return { ok: true, oldDir, newDir };
@@ -2741,8 +2762,13 @@ function registerIpc() {
     };
   });
   ipcMain.handle('runtime:stop', async () => {
-    await runtime.stop();
-    return { ok: true };
+    try {
+      const stopped = await runtime.stop();
+      if (!stopped || runtime.vmRunning || await runtime.client().isOnline()) {
+        return { ok: false, error: '运行时未确认停止；未结束无法验证归属的进程。' };
+      }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; }
   });
   ipcMain.handle('runtime:log', () => runtime.bootLog);
 
@@ -3435,17 +3461,15 @@ function registerIpc() {
    * 停的时候走正常路径，快照照常保存，切回来还是秒开。
    */
   async function stopVmForImageSwitch() {
-    if (!runtime || !runtime.vmRunning) return false;
+    if (!runtime) return false;
+    if (!runtime.vmRunning && !(await runtime.client().isOnline())) return false;
     try {
-      await runtime.stop();
-      // runtime.stop() 的某些后端会吞掉关机异常；不能只看 Promise 没拒绝，
-      // 还要确认旧进程真的已经离线，否则改完 activeImageId 后仍可能被
-      // adoptExisting() 原样接管成旧镜像。
-      if (runtime.vmRunning) throw new Error('运行时仍在运行');
+      const stopped = await runtime.stop();
+      if (!stopped || runtime.vmRunning || await runtime.client().isOnline()) throw new Error('运行时仍在运行');
       return true;
     } catch (e) {
       appLog(`stop before image switch failed: ${e && e.message}`);
-      return false;
+      throw e;
     }
   }
 
@@ -3611,8 +3635,11 @@ function registerIpc() {
    * 3) 便携版（旁加载 / 免安装）：没有卸载器时复制清理脚本到 TEMP，退出后自动删除程序与数据目录
    */
   ipcMain.handle('app:removeSelf', async () => {
+    if (process.platform !== 'win32') {
+      return { ok: false, error: '请通过系统软件管理器卸载 deb；AppImage 可退出后删除应用文件，用户数据与共享文件不会自动删除。' };
+    }
+    if (!app.isPackaged) return { ok: false, error: '开发模式不执行自卸载，请手动管理项目目录。' };
     try {
-      try { await assoc.unregisterAssociation(); } catch (_) { /* 取消关联失败不影响卸载 */ }
       const exeDir = path.dirname(process.execPath);
       // electron-builder NSIS 默认生成的是「Uninstall ApkStart.exe」，旧版只找
       // uninstaller.exe，导致安装版被误判成便携版、卸载按钮实际什么也没做（#51）。
@@ -3623,14 +3650,16 @@ function registerIpc() {
       const uninstallerName = entries.find((name) => /^Uninstall .*\.exe$/i.test(name))
         || entries.find((name) => /^(uninstall|uninst)[^\\/]*\.exe$/i.test(name));
       const uninstaller = uninstallerName ? path.join(exeDir, uninstallerName) : '';
+      if (uninstaller) {
+        // 清理由卸载向导在确认后执行。不能提前启动旁路脚本，否则取消卸载也会丢数据。
+        const error = await shell.openPath(uninstaller);
+        if (error) return { ok: false, error };
+        return { ok: true, portable: false, awaitingConfirmation: true };
+      }
       const { spawn } = require('child_process');
-      const os = require('os');
-      const settings = store.getSettings();
       const paths = runtime.provisioner.paths();
       const cleanupSource = path.join(APP_ROOT, 'build', 'uninstall-data.ps1');
       if (!fs.existsSync(cleanupSource)) throw new Error('缺少卸载清理脚本');
-      // 脚本复制到 TEMP，避免便携版删除程序目录时把正在执行的脚本一起锁住；
-      // 安装版也复制一份，避免 NSIS 与清理脚本同时删除 resources/app。
       const cleanupScript = path.join(os.tmpdir(), `apkstart-uninstall-${process.pid}-${Date.now()}.ps1`);
       fs.copyFileSync(cleanupSource, cleanupScript);
       const cleanupArgs = [
@@ -3639,30 +3668,28 @@ function registerIpc() {
         '-DataDir', store.DATA_DIR,
         '-RuntimeDir', paths.root,
         '-AvdDir', paths.avdHome,
-        '-SharedDir', settings.sharedDir || '',
         '-TempDir', os.tmpdir(),
         '-WaitPid', String(process.pid),
+        '-RemoveInstallDir', '-InstallDir', exeDir,
       ];
-      // 卸载前先收掉常驻的模拟器：qemu 会锁住 resources\runtime 里的 exe/dll，
-      // NSIS 删不掉就会留下半个安装目录。这里只针对「真的在卸载」，不影响日常退出。
-      try { await runtime?.emulator?.killOrphanProcesses(); } catch (_) { /* ignore */ }
-      const portable = !fs.existsSync(uninstaller);
-      if (portable && app.isPackaged) {
-        cleanupArgs.push('-RemoveInstallDir', '-InstallDir', exeDir);
+      try {
+        await runtime.stop();
+        const online = await runtime.client().isOnline();
+        if (online || runtime.vmRunning) throw new Error('运行时仍在运行，请正常关闭安卓后再卸载');
+      } catch (e) {
+        try { fs.unlinkSync(cleanupScript); } catch (_) { /* 保留原程序与数据 */ }
+        return { ok: false, error: e.message || '无法确认运行时已停止，未执行清理' };
       }
-      spawn('powershell.exe', cleanupArgs, {
-        cwd: os.tmpdir(), detached: true, stdio: 'ignore', windowsHide: true,
-      }).unref();
-      if (portable) {
-        setTimeout(() => app.quit(), 300);
-        return { ok: true, portable: true, automatic: true, dataDir: store.DATA_DIR, exeDir };
-      }
-      // 先让本程序退出，再由一个独立进程延迟 2 秒拉起卸载器：
-      // 运行中的 exe 会锁住安装目录里的文件，直接拉起卸载器容易删不干净。
-      const cmd = `ping 127.0.0.1 -n 3 >nul & start "" "${uninstaller}"`;
-      spawn('cmd.exe', ['/c', cmd], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      await new Promise((resolve, reject) => {
+        const child = spawn('powershell.exe', cleanupArgs, {
+          cwd: os.tmpdir(), detached: true, stdio: 'ignore', windowsHide: true,
+        });
+        child.once('error', reject);
+        child.once('spawn', () => { child.unref(); resolve(); });
+      });
+      try { await assoc.unregisterAssociation(); } catch (_) { /* 不影响已启动的卸载 */ }
       setTimeout(() => app.quit(), 300);
-      return { ok: true, portable: false };
+      return { ok: true, portable: true, automatic: true, dataDir: store.DATA_DIR, exeDir };
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -3922,6 +3949,8 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     store.ensureDirs();
+    syncTheme(store.getSettings().theme);
+    nativeTheme.on('updated', refreshWindowTheme);
     runtime = new Runtime(APP_ROOT);
     // 启动即留一行痕迹：出问题时用户把 app.log 发过来就能看到版本与数据目录
     appLog(`start v${app.getVersion()} data=${store.DATA_DIR} pid=${process.pid}`);

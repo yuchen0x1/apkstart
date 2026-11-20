@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { normalizePreference } = require('./theme');
 
 // Linux 不能落 ~/AppData/Roaming：XDG 约定的数据目录是 ~/.local/share
 // （实测记录见 docs/PLATFORM-LINUX-VALIDATION.md 缺口 #2）
@@ -152,6 +153,7 @@ const DEFAULT_SETTINGS = {
   // 界面语言（upstream #38）：auto = 跟随系统；zh-CN / en-US = 明确指定。
   // 中文是源语言，英文靠 src/i18n/en-US.json 的词典覆盖；缺条目时回落中文原文。
   language: 'auto',
+  theme: 'system',           // system | light | dark：原生标题栏与全部渲染窗口共用
   autoDeploy: true,          // 首次运行自动完成全部部署，不再分 1~5 步
   wizardDone: false,         // 首次运行引导向导：完成或跳过后置 true，不再弹出
   wizardVersion: '',         // 最近一次完成引导的 ApkStart 版本；升级后重新展示关键步骤
@@ -285,6 +287,7 @@ const store = {
 
   getSettings() {
     const s = deepMerge(DEFAULT_SETTINGS, readJson(SETTINGS_FILE, {}));
+    s.theme = normalizePreference(s.theme);
     // 旧版曾把「兼容模式」保存成 google_apis + compatImage=true，实际却应使用
     // Google Play 镜像。只迁移这一种矛盾组合；显式关闭兼容模式的高级档位不改写。
     if (s.runtime && s.runtime.systemImageFlavor === 'google_apis' && s.runtime.compatImage === true) {
@@ -306,6 +309,7 @@ const store = {
     // runtime.*Url 之外的键）一律丢弃，避免配置文件被塞进任意内容。
     const safe = filterKnown(DEFAULT_SETTINGS, patch);
     const next = deepMerge(this.getSettings(), safe);
+    next.theme = normalizePreference(next.theme);
     // 只改了「资源策略」时，把它翻译成具体的三个开关，避免两套配置各说各话
     if (safe && safe.engine && safe.engine.resourceMode) {
       Object.assign(next.engine, resourcePreset(next.engine.resourceMode));

@@ -13,7 +13,7 @@ const store = require('./store');
 const doctor = require('./doctor');
 const platform = require('./platform');
 const { download, downloadAny, downloadAnyParallel, head } = require('./download');
-const { ZipArchive, ZipFile } = require('./zip');
+const { ZipArchive, ZipFile, crc32 } = require('./zip');
 const { Sources } = require('./sources');
 const { ImageStore } = require('./images');
 
@@ -342,7 +342,9 @@ class Provisioner {
     // （6~24GB 数据分区 + 2~3GB 快照），只挪运行时、不挪它，C 盘一样会满。
     const explicitAvd = String(store.getSettings().runtime.avdDir || '').trim();
     const writable = explicitAvd || path.join(store.DATA_DIR, 'avd');
-    const insideData = root.toLowerCase().startsWith(store.DATA_DIR.toLowerCase());
+    const dataRel = path.relative(path.resolve(store.DATA_DIR), path.resolve(root));
+    const insideData = dataRel === '' || (dataRel !== '..'
+      && !dataRel.startsWith(`..${path.sep}`) && !path.isAbsolute(dataRel));
     // 系统镜像放哪儿：**运行时目录优先**。
     // 之前的顺序是「用户数据目录优先」，后果是——用户把运行时目录改到 D 盘省 C 盘空间，
     // 1.4GB 的整包解到 D 盘以后，materializeImages 又把 3.3GB 的 system.img 展开回
@@ -374,7 +376,7 @@ class Provisioner {
       sysImgDir: path.join(sysRoot, `android-${sysApi}`, sysTag, sysAbi),
       // 自定义镜像的索引与（ZIP 导入时）副本都放这里，绝不与默认镜像目录混在一起
       customImagesDir: path.join(root, 'custom-images'),
-      avdHome: insideData ? path.join(root, 'avd') : writable,
+      avdHome: explicitAvd || (insideData ? path.join(root, 'avd') : writable),
       aehdDir: path.join(root, 'aehd'),
       imagesDir: path.join(root, 'images'),
       iso: path.join(root, 'images', 'android-x86.iso'),
@@ -740,60 +742,134 @@ class Provisioner {
     // zip-slip 防护：压缩包条目名是不受信任输入，`../`、绝对路径、盘符都能把
     // 写入点搬到目标目录之外。所有条目一律先规范化并确认落在 destDir 内。
     const destRoot = path.resolve(destDir);
+    const within = (root, target) => {
+      const rel = path.relative(root, target);
+      return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+    };
+    const assertNoLinks = (target) => {
+      let cur = destRoot;
+      for (const part of ['', ...path.relative(destRoot, target).split(path.sep).filter(Boolean)]) {
+        if (part) cur = path.join(cur, part);
+        try {
+          if (fs.lstatSync(cur).isSymbolicLink()) throw new Error(`解压路径包含符号链接或 junction：${cur}`);
+        } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      }
+    };
+    const readVerified = (name) => {
+      const data = zip.read(name);
+      const entry = zip.entries.get(name);
+      if (data.length !== entry.uncompSize) throw new Error(`条目大小不符：${name}`);
+      if (crc32(data) !== entry.crc) throw new Error(`条目校验失败（CRC 不匹配）：${name}`);
+      return data;
+    };
     const safeTarget = (name) => {
       const cleaned = String(name).replace(/\\/g, '/');
       if (/^[a-zA-Z]:/.test(cleaned) || cleaned.startsWith('/')) {
         throw new Error(`压缩包内含绝对路径条目，已拒绝解压：${name}`);
       }
       const parts = cleaned.split('/').filter((s) => s.length > 0);
-      if (parts.some((s) => s === '..')) {
-        throw new Error(`压缩包内含上溯路径条目，已拒绝解压：${name}`);
+      if (parts.some((s) => s === '..' || (IS_WIN && (/[. ]$|[:<>"|?*\x00-\x1f]/.test(s)
+        || /^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(?:\.|$)/i.test(s))))) {
+        throw new Error(`压缩包内含不安全的路径条目，已拒绝解压：${name}`);
       }
       const target = path.resolve(destRoot, ...parts);
-      if (target !== destRoot && !target.startsWith(destRoot + path.sep)) {
+      if (!within(destRoot, target) || (target === destRoot && !name.endsWith('/'))) {
         throw new Error(`压缩包条目越界，已拒绝解压：${name}`);
       }
       return target;
     };
 
+    const dirs = [];
+    const files = [];
+    const targets = new Set();
+    const key = (p) => IS_WIN ? p.toLowerCase() : p;
     try {
-      for (const name of zip.names()) {
-        if (name.endsWith('/')) {
-          fs.mkdirSync(safeTarget(name), { recursive: true });
-          continue;
-        }
-        const target = safeTarget(name);
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        const e = zip.entries.get(name);
-        const eAttrs = e || {};
-        if (eAttrs.symlink && !IS_WIN) {
-          // Linux 包里的符号链接条目：内容就是链接目标。zip-slip 防护同样适用。
-          const link = String(zip.read(name));
-          if (/^[a-zA-Z]:/.test(link) || path.isAbsolute(link)) {
-            throw new Error(`压缩包内含绝对路径符号链接，已拒绝解压：${name} → ${link}`);
+      if (total !== zip.expectedEntries) throw new Error('ZIP 中央目录不完整或包含重复条目');
+      assertNoLinks(destRoot);
+      fs.mkdirSync(destRoot, { recursive: true });
+      const stage = fs.mkdtempSync(path.join(destRoot, '.apkstart-extract-'));
+      const committed = [];
+      const createdDirs = [];
+      let keepStage = false;
+      const mkdir = (dir) => {
+        if (dir === destRoot) return;
+        assertNoLinks(dir);
+        mkdir(path.dirname(dir));
+        try { fs.mkdirSync(dir); createdDirs.push(dir); }
+        catch (e) { if (e.code !== 'EEXIST' || !fs.lstatSync(dir).isDirectory()) throw e; }
+      };
+      try {
+        for (const name of zip.names()) {
+          const target = safeTarget(name);
+          assertNoLinks(target);
+          if (targets.has(key(target))) throw new Error(`压缩包目标路径重复：${name}`);
+          targets.add(key(target));
+          const e = zip.entries.get(name);
+          const temp = path.join(stage, `entry-${done}`);
+          if (name.endsWith('/') && !e.uncompSize && !e.symlink) {
+            readVerified(name);
+            dirs.push(target);
+          } else if (name.endsWith('/')) {
+            throw new Error(`压缩包目录条目不合法：${name}`);
+          } else if (e.symlink && !IS_WIN) {
+            const link = String(readVerified(name));
+            const resolved = path.resolve(path.dirname(target), link);
+            if (!link || /^[a-zA-Z]:/.test(link) || path.isAbsolute(link) || !within(destRoot, resolved)) {
+              throw new Error(`压缩包内符号链接越界，已拒绝解压：${name} → ${link}`);
+            }
+            assertNoLinks(resolved);
+            fs.symlinkSync(link, temp);
+            files.push({ temp, target });
+          } else {
+            if (e.uncompSize > STREAM_THRESHOLD) {
+              // eslint-disable-next-line no-await-in-loop
+              await zip.pipeTo(name, fs.createWriteStream(temp, { flags: 'wx' }), { verify: true });
+            } else {
+              fs.writeFileSync(temp, readVerified(name), { flag: 'wx' });
+            }
+            if (!IS_WIN && (e.unixMode & 0o111)) fs.chmodSync(temp, e.unixMode & 0o777);
+            files.push({ temp, target });
           }
-          const resolved = path.resolve(path.dirname(target), link);
-          if (resolved !== destRoot && !resolved.startsWith(destRoot + path.sep)) {
-            throw new Error(`压缩包内符号链接越界，已拒绝解压：${name} → ${link}`);
-          }
-          try { fs.unlinkSync(target); } catch (_) { /* 不存在则不用清 */ }
-          fs.symlinkSync(link, target);
-        } else if ((eAttrs.uncompSize || 0) > STREAM_THRESHOLD) {
-          // eslint-disable-next-line no-await-in-loop
-          await zip.pipeTo(name, fs.createWriteStream(target));
-        } else {
-          fs.writeFileSync(target, zip.read(name));
+          done += 1;
+          if (opts.onEntry) opts.onEntry(name, done, total);
         }
-        // Linux：恢复 unix 权限位 —— 不补的话 adb/emulator/qemu 等二进制解出来
-        // 全是不可执行（Windows 上没有权限概念，跳过）。
-        if (!IS_WIN && eAttrs.unixMode) {
-          const mode = eAttrs.unixMode & 0o7777;
-          if (mode & 0o111) {
-            try { fs.chmodSync(target, mode); } catch (_) { /* 已可写时失败无害 */ }
+
+        // 校验完成才发布；遇到提交错误则还原此前移动的原文件。
+        for (const dir of dirs) mkdir(dir);
+        for (const { temp, target } of files) {
+          assertNoLinks(target);
+          mkdir(path.dirname(target));
+          const saved = path.join(stage, `old-${committed.length}`);
+          const change = { target, saved: '', installed: false };
+          committed.push(change);
+          let old;
+          try { old = fs.lstatSync(target); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+          if (old) {
+            if (!old.isFile()) throw new Error(`解压目标不是普通文件：${target}`);
+            fs.renameSync(target, saved);
+            change.saved = saved;
           }
+          fs.renameSync(temp, target);
+          change.installed = true;
         }
-        done += 1;
-        if (opts.onEntry) opts.onEntry(name, done, total);
+      } catch (e) {
+        const rollbackErrors = [];
+        for (const { target, saved, installed } of committed.reverse()) {
+          try {
+            if (installed) fs.rmSync(target, { force: true });
+            if (saved) fs.renameSync(saved, target);
+          } catch (err) { rollbackErrors.push(err); }
+        }
+        for (const dir of createdDirs.reverse()) {
+          try { fs.rmdirSync(dir); } catch (_) { /* 只删本次新建且仍为空的目录 */ }
+        }
+        if (rollbackErrors.length) {
+          keepStage = true;
+          throw new AggregateError([e, ...rollbackErrors], `解压失败且回滚不完整，原文件保留在 ${stage}`);
+        }
+        throw e;
+      } finally {
+        if (!keepStage) fs.rmSync(stage, { recursive: true, force: true, maxRetries: 3 });
       }
     } finally {
       if (zip.close) zip.close();

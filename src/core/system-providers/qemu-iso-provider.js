@@ -26,12 +26,14 @@ class QemuIsoProvider extends BaseProvider {
     this.logsDir = this.dir('logs');
     this.snapshotsDir = this.dir('snapshots');
     this.userdataDir = this.dir('userdata');
-    this.backend = new QemuBackend({
+    this.backend = ctx.qemuBackend || ctx.backend || new QemuBackend({
       provisioner: this.provisioner,
       settingsFn: () => this.settings,
       onLog: (m) => this.log(m),
       systemId: this.id,
     });
+    this._installSessionActive = false;
+    this._installWaitIntervalMs = Number(ctx.installWaitIntervalMs) || 1000;
   }
 
   isoPath() { return path.join(this.downloadsDir, this.isoFileName || (this.id + '.iso')); }
@@ -44,7 +46,9 @@ class QemuIsoProvider extends BaseProvider {
     try { isoSize = fs.statSync(this.isoPath()).size; } catch (_) {}
     try { diskSize = fs.statSync(this.diskPath()).size; } catch (_) {}
     return {
-      installed: !!m.installed,
+      installed: this._hasInstallationEvidence(m),
+      installationPending: m.installationPending || null,
+      needsInstallationConfirmation: !!m.installed && !this._hasInstallationEvidence(m),
       downloaded: isoSize > 0 && !!m.downloaded,
       running: this.backend.running(),
       version: m.version || '',
@@ -132,61 +136,131 @@ class QemuIsoProvider extends BaseProvider {
     }
   }
 
-  /**
-   * 首次安装：live-boot ISO + 引导用户/自动脚本把系统写入 qcow2。
-   * 真实标记 installed 只在以下条件满足时写入：磁盘已被显著写入（>阈值）。
-   */
+  /** 只认可与当前虚拟磁盘绑定的明确完成证据。 */
+  _hasInstallationEvidence(m) {
+    const e = m && m.installationEvidence;
+    try {
+      const s = fs.statSync(this.diskPath());
+      return !!(m.installed && e && e.disk === this.diskPath() && s.isFile() && s.size > 0
+        && ((e.type === 'guided-user-confirmation' && e.confirmedAt && e.taskId && e.installerStopped === true)
+          || (e.type === 'user-restored-backup' && e.restoredAt)));
+    } catch (_) { return false; }
+  }
+
+  isInstallerRunning() {
+    const m = this.readManifest() || {};
+    return !!((this._installSessionActive || m.installationPending) && this.backend.running());
+  }
+
+  /** 引导安装绝不因超时、暂停或取消而强行关闭安装器。 */
   async install(task, ctx = {}) {
+    const stopped = () => !!(task && (task.aborted || task.signal && task.signal.aborted));
+    if (stopped()) return { ok: false, interrupted: true };
     const disk = this.diskPath();
     const iso = this.isoPath();
-    const created = await this.createDevice(ctx);
-    if (!created.ok) return created;
-
-    const accel = await this.backend.accelInfo();
-    const installMode = (this.settings.runtime && this.settings.runtime.installMode) || 'guided';
-    this.log(`首次安装（${installMode}）：ISO 引导到 qcow2 虚拟磁盘 ${disk}`);
-
-    if (installMode === 'auto') {
-      // 实验性无人值守：Android-x86 支持在 cmdline 传 INSTALL 自动安装，
-      // 但不同 ISO 行为不一致，不能保证成功。超时后明确失败，不伪造 installed。
-      this.log('auto 模式为实验特性；若未能自动完成，请改用引导式安装。');
+    const m = this.readManifest() || {};
+    if (this._hasInstallationEvidence(m)) return { ok: true, disk, reused: true };
+    const installMode = ctx.installMode || (this.settings.runtime && this.settings.runtime.installMode) || 'guided';
+    if (installMode !== 'guided') {
+      return { ok: false, code: 'AUTO_INSTALL_UNSUPPORTED', needsUserInstall: true,
+        error: '尚未实现无人值守安装，请改用引导式安装（installMode=guided）。' };
     }
 
-    const vm = await this.backend.startVM({
-      disk, iso, install: true, uefi: true,
-      memoryMB: (this.settings.engine && this.settings.engine.memoryMB) || 4096,
-      cores: (this.settings.engine && this.settings.engine.cores) || 4,
-      accel,
-    });
-    if (!vm.ok) return { ok: false, error: 'ISO 引导失败：' + vm.error };
+    // 旧版仅按磁盘大小写出的 installed 不能当证据，也不能因此自动重装已有磁盘。
+    if (m.installed && !m.installationPending && fs.existsSync(disk)) {
+      this.writeManifest({ installed: false, installationPending: {
+        mode: 'guided', taskId: task && task.taskId || '', version: m.version || '',
+        startedAt: new Date().toISOString(), legacyReview: true,
+      } });
+      if (task && task.setStatus) task.setStatus('awaiting_confirmation', '旧安装记录需要确认；请先检查系统已完成安装并正常关机');
+      return { ok: true, awaitingConfirmation: true, disk, legacyReview: true };
+    }
 
-    // 等待磁盘被写入。guided 模式给用户时间在安装器内操作；
-    // 以磁盘体积相对空 qcow2 的显著增长作为"已写入"的客观证据。
+    // 暂停/取消后接续已有安装器，不重复启动或覆盖正在使用的磁盘。
+    if (this.backend.running() && !this.isInstallerRunning()) {
+      return { ok: false, error: '虚拟机正在运行，请先正常关闭后安装。' };
+    }
+    if (!this.backend.running() && !m.installationPending) {
+      const created = await this.createDevice(ctx);
+      if (stopped()) return { ok: false, interrupted: true };
+      if (!created.ok) return created;
+      if (!fs.existsSync(iso)) return { ok: false, error: 'ISO 文件不存在' };
+      const accel = await this.backend.accelInfo();
+      if (stopped()) return { ok: false, interrupted: true };
+      const pending = this.writeManifest({ installed: false, installationEvidence: null,
+        installationPending: { mode: 'guided', taskId: task && task.taskId || '',
+          startedAt: new Date().toISOString(), version: ctx.version || m.version || '' } });
+      if (!pending) return { ok: false, error: '无法记录安装会话' };
+      this._installSessionActive = true;
+      const vm = await this.backend.startVM({
+        disk, iso, install: true, uefi: true,
+        memoryMB: (this.settings.engine && this.settings.engine.memoryMB) || 4096,
+        cores: (this.settings.engine && this.settings.engine.cores) || 4, accel,
+      });
+      if (stopped()) return { ok: false, interrupted: true };
+      if (!vm.ok) {
+        if (!this.backend.running()) this.writeManifest({ installationPending: null });
+        this._installSessionActive = this.backend.running();
+        return { ok: false, error: 'ISO 引导失败：' + vm.error };
+      }
+    }
+    if (stopped()) return { ok: false, interrupted: true };
+    const pending = this.readManifest() || {};
+    if (!pending.installationPending) return { ok: false, error: '安装会话不存在' };
+    this._installSessionActive = true;
+    this.writeManifest({ installationPending: Object.assign({}, pending.installationPending, {
+      taskId: task && task.taskId || '', version: ctx.version || pending.installationPending.version || '',
+    }) });
+    if (task && task.setStatus) task.setStatus('awaiting_confirmation',
+      '请在虚拟机内完成安装并正常关机，再点击「确认安装完成」');
+    // 磁盘增长仅代表写入活动，不能用作安装完成证据。
     const baseline = fs.existsSync(disk) ? fs.statSync(disk).size : 0;
-    const waitMs = Number(ctx.installWaitMs) || 0; // 由上层/测试注入；默认交给引导模式轮询
-    const deadline = Date.now() + (waitMs || (installMode === 'guided' ? 20 * 60 * 1000 : 5 * 60 * 1000));
-    let written = false;
-    while (Date.now() < deadline) {
-      if (task && task.aborted) break;
+    const deadline = Number(ctx.installWaitMs) > 0 ? Date.now() + Number(ctx.installWaitMs) : Infinity;
+    while (!stopped()) {
+      if (!this.isInstallerRunning()) {
+        return { ok: true, awaitingConfirmation: true, disk, method: 'guided' };
+      }
+      if (Date.now() >= deadline) return { ok: false, needsUserInstall: true,
+        error: '等待安装确认超时；安装器仍保留，请继续完成安装并正常关机。' };
       try {
-        const now = fs.statSync(disk).size;
-        if (now > baseline + 32 * 1024 * 1024) { written = true; break; }
+        const bytes = Math.max(0, fs.statSync(disk).size - baseline);
+        if (task && task.updateProgress) task.updateProgress({
+          percent: bytes > 0 ? 95 : 90, diskWrittenBytes: bytes,
+        });
       } catch (_) {}
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((resolve) => {
+        const signal = task && task.signal;
+        const done = () => { clearTimeout(timer); if (signal) signal.removeEventListener('abort', done); resolve(); };
+        const timer = setTimeout(done, this._installWaitIntervalMs);
+        if (signal) signal.addEventListener('abort', done, { once: true });
+        if (stopped()) done();
+      });
     }
-    await this.backend.stop();
+    return { ok: false, interrupted: true };
+  }
 
-    if (!written) {
-      return {
-        ok: false,
-        needsUserInstall: true,
-        error: installMode === 'guided'
-          ? '已在虚拟机中打开官方安装器，但未检测到磁盘被写入。请在虚拟机窗口内完成安装后重试。'
-          : '无人值守安装未能完成磁盘写入，请改用引导式安装（installMode=guided）。',
-      };
+  /** 只有安装虚拟机已退出，才接受用户明确确认完成。 */
+  confirmInstallation(task, opts = {}) {
+    if (opts.confirmed !== true) return { ok: false, error: '需要用户明确确认安装完成' };
+    if (!task || task.aborted || task.signal && task.signal.aborted) return { ok: false, error: '任务已暂停或取消，请先继续任务' };
+    const m = this.readManifest() || {};
+    if (!m.installationPending || m.installationPending.taskId !== task.taskId) {
+      return { ok: false, error: '没有与此任务匹配的安装会话' };
     }
-    this.writeManifest({ installed: true, version: (ctx.version || this.readManifest() || {}).version || '', installedMethod: installMode, installedAt: new Date().toISOString() });
-    return { ok: true, disk, method: installMode };
+    if (this.backend.running()) return { ok: false, code: 'INSTALLER_RUNNING',
+      error: '安装器仍在运行，请完成安装并在虚拟机内正常关机后确认；不会自动停止安装器。' };
+    let stat;
+    try { stat = fs.statSync(this.diskPath()); } catch (_) {}
+    if (!stat || !stat.isFile() || stat.size === 0) return { ok: false, error: '安装磁盘不存在或为空' };
+    const confirmedAt = new Date().toISOString();
+    const evidence = { type: 'guided-user-confirmation', confirmedAt,
+      installerStopped: true, disk: this.diskPath(), taskId: task.taskId };
+    const saved = this.writeManifest({ installed: true, installationPending: null,
+      installationEvidence: evidence, installedAt: confirmedAt, installedMethod: 'guided',
+      version: m.installationPending.version || m.version || '', running: false });
+    if (!saved) return { ok: false, error: '无法保存安装完成证据' };
+    this._installSessionActive = false;
+    return { ok: true, disk: this.diskPath(), method: 'guided', installationEvidence: evidence };
   }
 
   async initialize(task, ctx = {}) {
@@ -200,7 +274,7 @@ class QemuIsoProvider extends BaseProvider {
   /** 从已安装的 qcow2 磁盘启动；返回 VM 进程状态 + backend 供上层做 Android 就绪检查 */
   async start(ctx = {}) {
     const m = this.readManifest() || {};
-    if (!m.installed) return { ok: false, error: '系统尚未安装，请先完成安装。' };
+    if (!this._hasInstallationEvidence(m)) return { ok: false, error: '系统尚未确认安装完成，请先完成安装确认。' };
     const disk = this.diskPath();
     if (!fs.existsSync(disk)) return { ok: false, error: '虚拟磁盘不存在。' };
     const accel = await this.backend.accelInfo();
@@ -238,12 +312,17 @@ class QemuIsoProvider extends BaseProvider {
   }
 
   async restore(srcDir) {
+    if (this.backend.running()) return { ok: false, error: '系统仍在运行，不能覆盖虚拟磁盘' };
     try {
       const src = path.join(srcDir, 'system.qcow2');
       if (!fs.existsSync(src)) return { ok: false, error: '备份中缺少 system.qcow2' };
       fs.mkdirSync(this.disksDir, { recursive: true });
+      const stat = fs.statSync(src);
+      if (!stat.isFile() || stat.size === 0) return { ok: false, error: '备份磁盘为空或不是文件' };
       fs.copyFileSync(src, this.diskPath());
-      this.writeManifest({ installed: true });
+      this.writeManifest({ installed: true, installationPending: null, installationEvidence: {
+        type: 'user-restored-backup', restoredAt: new Date().toISOString(), disk: this.diskPath(),
+      } });
       return { ok: true };
     } catch (e) { return { ok: false, error: e.message }; }
   }

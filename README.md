@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.8.0**（2026-11-18）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.9.0**（2026-11-21）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,13 +46,16 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.8.0
+### v0.9.0
 
-> Windows 和 Linux 从同一个发行页获取各自的在线安装包。已有运行时整包仍可从本地导入。
+> 双主题界面、无障碍交互与运行时安全加固。从上游审计确认的缺陷在本版本集中修复。
 
-- **首次部署**从官方源获取缺少的组件。Windows 安装版和便携版均单独分发桌面程序。
-- **软件更新**按安装形态选择下载文件，并核对发行签名和 SHA-256。新装默认提示更新，已有设置沿用。
-- **Linux 更新**支持 AppImage 替换与启动失败恢复；deb 下载完成后交给系统安装器确认。
+- 新增浅色、深色和跟随系统外观；主窗口、应用外壳与原生标题栏同步，组件改用共享语义 Token。
+- 提升文字与按钮对比度，补齐焦点和禁用状态、表单名称、菜单键盘操作、弹窗焦点约束及返回焦点。
+- 改善最小窗口和文字缩放下的设置、向导、修复面板与长路径布局，支持减少动态效果。
+- 修复搜索无结果提示、设置入口定位、部署期间重复操作和应用窗口断线后的加载反馈。
+- 系统目录增加读取忙碌、错误与重试反馈，刷新异常不再被旧列表掩盖；按平台能力禁用不支持的 Windows 集成动作。
+- 修复向导默认推荐盘只预览不落盘、运行状态轮询丢失焦点，以及应用外壳迟到快照覆盖较新就绪事件的问题；重新打开向导保留已有自选路径。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

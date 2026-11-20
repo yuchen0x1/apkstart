@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' file: data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
 <title>ApkStart</title>
+<script src="theme.js"></script>
 <link rel="stylesheet" href="shell.css" />
 </head>
 <body>
@@ -28,8 +29,8 @@
   </button>
 </header>
 
-<main class="stage" id="stage">
-  <div class="boot" id="boot">
+<main class="stage" id="stage" aria-label="安卓应用画面" aria-busy="true">
+  <div class="boot" id="boot" role="status" aria-live="polite" aria-atomic="true">
     <img class="boot-ico" id="bootIcon" alt="" draggable="false" />
     <div class="boot-name" id="bootName"></div>
     <div class="boot-bar"><i></i></div>

@@ -9,6 +9,7 @@ const path = require('path');
 
 const TMP = path.join(os.tmpdir(), `apkstart-auto-test-${Date.now()}`);
 process.env.APPDATA = TMP;
+process.env.XDG_DATA_HOME = TMP;
 fs.mkdirSync(path.join(TMP, 'apkstart'), { recursive: true });
 
 let passed = 0;
@@ -1077,8 +1078,10 @@ const { adbKeyHint } = require('../src/core/engine');
       return parseApk(p);
     };
     // AXML 里枚举属性是整数，也有应用写成字符串 —— 两种都要认
-    const land = write('land-int.apk', { packageName: 'com.example.land', orientation: 1 });
-    assert(land.orientation === 'landscape', `整数枚举应解析为 landscape，实际 "${land.orientation}"`);
+    const land = write('land-int.apk', { packageName: 'com.example.land', orientation: 0 });
+    assert(land.orientation === 'landscape', `整数 0 应解析为 landscape，实际 "${land.orientation}"`);
+    const portInt = write('port-int.apk', { packageName: 'com.example.portint', orientation: 1 });
+    assert(portInt.orientation === 'portrait', `整数 1 应解析为 portrait，实际 "${portInt.orientation}"`);
     const port = write('port-str.apk', { packageName: 'com.example.port', orientation: 'portrait' });
     assert(port.orientation === 'portrait', `字符串应解析为 portrait，实际 "${port.orientation}"`);
     const none = write('none-orient.apk', { packageName: 'com.example.none' });
@@ -1759,17 +1762,21 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(m.assets.length === 1 && m.assets[0].url === 'gh://a', '旧版本同名资产不能覆盖新版本');
   });
 
-  await test('窗口代理：scope 用分号拼目录、滤空项（窗口归属判定的唯一输入）', async () => {
+  await test('窗口代理：scope 仅接受真实模拟器目录，滤掉空项和宽泛路径', async () => {
     const { WinAgent } = require('../src/core/agent');
+    const { realPath } = require('../src/core/process-owner');
     const a = new WinAgent();
     const sent = [];
-    // 不真起代理进程：只验证发给它的协议内容
+    // 不真起代理进程；输入必须有模拟器结构，不能仅凭目录名授予窗口控制权。
+    const root = path.join(TMP, 'scope-runtime');
+    const emu = path.join(root, 'emulator');
+    fs.mkdirSync(path.join(emu, 'qemu'), { recursive: true });
+    fs.writeFileSync(path.join(emu, process.platform === 'win32' ? 'emulator.exe' : 'emulator'), 'fixture');
     a.call = async (obj) => { sent.push(obj); return { ok: true, n: 1 }; };
-    const r = await a.scope(['C:////runtime', '', null, 'D:////repo////engine']);
+    const r = await a.scope([root, '', null, emu, path.parse(root).root, 'D:/nonexistent/engine']);
     assert(sent.length === 1 && sent[0].cmd === 'scope', `只应发一条 scope，实际 ${JSON.stringify(sent)}`);
-    assert(sent[0].dirs === 'C:////runtime;D:////repo////engine', `空项要滤掉，实际 ${sent[0].dirs}`);
+    assert(sent[0].dirs === realPath(emu), `只可信任模拟器自身目录且去重，实际 ${sent[0].dirs}`);
     assert(r.ok === true, 'scope 成功要返回 ok');
-    // 传空数组也不能抛：那等于「什么都不压制」，由调用方决定要不要告警
     const empty = await a.scope([]);
     assert(sent[1].dirs === '' && empty.ok === true, '空范围也要能下发（代理收到后一个窗口都不动）');
   });

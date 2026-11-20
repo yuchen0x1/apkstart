@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$DataDir = '',
   [string]$RuntimeDir = '',
   [string]$AvdDir = '',
@@ -26,7 +26,7 @@ function Is-ProtectedPath([string]$Value) {
     (Resolve-PathText $env:USERPROFILE),
     (Resolve-PathText ([Environment]::GetFolderPath('Desktop'))),
     (Resolve-PathText ([Environment]::GetFolderPath('MyDocuments'))),
-    (Resolve-PathText ([Environment]::GetFolderPath('Downloads'))),
+    (Resolve-PathText (Join-Path $env:USERPROFILE 'Downloads')),
     (Resolve-PathText $env:WINDIR),
     (Resolve-PathText $env:ProgramFiles),
     (Resolve-PathText ${env:ProgramFiles(x86)}),
@@ -62,6 +62,15 @@ if ($settingsFile -and (Test-Path -LiteralPath $settingsFile)) {
     if (-not $AvdDir) { $AvdDir = [string]$settings.runtime.avdDir }
     if (-not $SharedDir) { $SharedDir = [string]$settings.sharedDir }
   } catch { }
+}
+
+# 等主进程真正退出才开始清理；超时则保留数据，不能边运行边删除。
+if ($WaitPid -gt 0) {
+  for ($i = 0; $i -lt 30; $i++) {
+    if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 500
+  }
+  if (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue) { exit 1 }
 }
 
 # apps.json 记录了 ApkStart 为每个应用创建的桌面/开始菜单快捷方式。
@@ -117,35 +126,57 @@ foreach ($shortcutPath in $removeShortcutPaths) {
   Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
 }
 
-$targets = New-Object 'System.Collections.Generic.List[string]'
-Add-Target $targets $DataDir
-Add-Target $targets $RuntimeDir
-Add-Target $targets $AvdDir
+# 共享目录是用户文件，不属于可自动删除的数据；也不按 TEMP 前缀批量清理其它会话。
 if (-not $SharedDir) { $SharedDir = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'ApkStartShared' }
-Add-Target $targets $SharedDir
+$sharedPath = Resolve-PathText $SharedDir
 
-# 下载中断、更新失败和旧版自解压可能在 TEMP 留下残片；只匹配 ApkStart 自己的前缀。
-Get-ChildItem -LiteralPath $TempDir -Force -ErrorAction SilentlyContinue | Out-Null
-Get-ChildItem -LiteralPath $TempDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^apkstart([-.]|$)' } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-
-if ($WaitPid -gt 0) {
-  for ($i = 0; $i -lt 30; $i++) {
-    if (-not (Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)) { break }
-    Start-Sleep -Milliseconds 500
+# 不跟随 junction/symlink；即使共享目录位于数据树内也必须保留。
+function Remove-OwnedTree([string]$Value) {
+  $p = Resolve-PathText $Value
+  if (-not $p -or (Is-ProtectedPath $p)) { return }
+  if ($sharedPath -and ($p.Equals($sharedPath, [StringComparison]::OrdinalIgnoreCase) -or $p.StartsWith($sharedPath + '\', [StringComparison]::OrdinalIgnoreCase))) { return }
+  $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+  if (-not $item) { return }
+  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return }
+  if ($item.PSIsContainer) {
+    foreach ($child in @(Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue)) {
+      Remove-OwnedTree $child.FullName
+    }
+    try { [IO.Directory]::Delete($p, $false) } catch { }
+  } else {
+    Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
   }
 }
 
-foreach ($target in $targets) {
-  if (Test-Path -LiteralPath $target) {
-    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+function Remove-KnownChildren([string]$Root, [string[]]$Names) {
+  $p = Resolve-PathText $Root
+  if (-not $p -or (Is-ProtectedPath $p)) { return }
+  $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+  if (-not $item -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return }
+  foreach ($name in $Names) { Remove-OwnedTree (Join-Path $p $name) }
+  try { [IO.Directory]::Delete($p, $false) } catch { }
+}
+
+# 自选运行时/AVD 目录可能同时放了其它资料，只删除明确属于 ApkStart 的子项。
+if (-not $RuntimeDir) { $RuntimeDir = Join-Path $DataDir 'runtime' }
+$avdRoots = @($AvdDir, (Join-Path $RuntimeDir 'avd'), (Join-Path $DataDir 'avd')) | Where-Object { $_ } | Select-Object -Unique
+foreach ($avdRoot in $avdRoots) {
+  $avd = Resolve-PathText $avdRoot
+  if ($avd -and -not (Is-ProtectedPath $avd)) {
+    $avdItem = Get-Item -LiteralPath $avd -Force -ErrorAction SilentlyContinue
+    if ($avdItem -and (($avdItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
+      foreach ($child in @(Get-ChildItem -LiteralPath $avd -Force -ErrorAction SilentlyContinue)) {
+        if ($child.Name -match '^apkstart(?:[-_.][a-zA-Z0-9_.-]+)?\.(avd|ini)$') { Remove-OwnedTree $child.FullName }
+      }
+      try { [IO.Directory]::Delete($avd, $false) } catch { }
+    }
   }
 }
+Remove-KnownChildren $RuntimeDir @('platform-tools', 'emulator', 'qemu', 'system-images', 'custom-images', 'systems', 'aehd', 'images', '_tmp')
+Remove-KnownChildren $DataDir @('apps.json', 'settings.json', 'icons', 'apks', 'logs', 'cache', 'update', 'system-images', 'shared-state.json', 'shared-state.json.tmp', 'Cache', 'GPUCache', 'Local Storage', 'Session Storage', 'Preferences', 'Local State')
 
 if ($RemoveInstallDir -and $InstallDir) {
-  $install = Resolve-PathText $InstallDir
-  if ($install -and -not (Is-ProtectedPath $install) -and (Test-Path -LiteralPath $install)) {
-    Remove-Item -LiteralPath $install -Recurse -Force -ErrorAction SilentlyContinue
-  }
+  Remove-KnownChildren $InstallDir @('ApkStart.exe', 'resources', 'locales', 'swiftshader', 'chrome_100_percent.pak', 'chrome_200_percent.pak', 'resources.pak', 'icudtl.dat', 'snapshot_blob.bin', 'v8_context_snapshot.bin', 'libEGL.dll', 'libGLESv2.dll', 'ffmpeg.dll', 'd3dcompiler_47.dll', 'vulkan-1.dll', 'vk_swiftshader.dll', 'vk_swiftshader_icd.json', 'chrome_crashpad_handler.exe', 'LICENSE', 'LICENSES.chromium.html')
 }
 
 # 便携版把脚本复制到 TEMP，安装目录删除后这里也要自删；源码和 NSIS 资源脚本保留。

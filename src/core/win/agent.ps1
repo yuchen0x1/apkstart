@@ -190,17 +190,64 @@ public class ApkAgent
     // Scope is set by the JS side before anything is hidden ("scope" command).
     // With no scope the agent refuses to touch any window: leaving one black console
     // around is a cosmetic bug, hiding a user's WeChat window is not.
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetFinalPathNameByHandleW(IntPtr h, StringBuilder name, uint size, uint flags);
+
+    static string RealPath(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || !System.IO.Path.IsPathRooted(name)) return "";
+        IntPtr h = CreateFileW(name, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+        if (h == new IntPtr(-1)) return "";
+        try
+        {
+            StringBuilder b = new StringBuilder(32768);
+            uint n = GetFinalPathNameByHandleW(h, b, (uint)b.Capacity, 0);
+            if (n == 0 || n >= b.Capacity) return "";
+            string p = b.ToString();
+            if (p.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) p = @"\\" + p.Substring(8);
+            else if (p.StartsWith(@"\\?\", StringComparison.Ordinal)) p = p.Substring(4);
+            return p.TrimEnd('\\').ToLowerInvariant();
+        }
+        catch { return ""; }
+        finally { CloseHandle(h); }
+    }
+
+    static string NarrowDirectory(string name)
+    {
+        string d = RealPath(name);
+        if (d.Length == 0 || !System.IO.Directory.Exists(d)) return "";
+        string root = System.IO.Path.GetPathRoot(d).TrimEnd('\\');
+        if (string.Equals(d, root, StringComparison.OrdinalIgnoreCase)) return "";
+        string leaf = System.IO.Path.GetFileName(d);
+        if (System.Text.RegularExpressions.Regex.IsMatch(leaf, @"^(users|home|root|usr|bin|sbin|opt|var|tmp|windows|program files( \(x86\))?|programdata|appdata|desktop|downloads|documents)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) return "";
+        foreach (string key in new string[] { "USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "ProgramFiles", "ProgramData", "SystemRoot", "TEMP", "TMP" })
+        {
+            string env = Environment.GetEnvironmentVariable(key);
+            if (!string.IsNullOrEmpty(env) && d == RealPath(env)) return "";
+        }
+        return d;
+    }
+
+    static string EmulatorScope(string name)
+    {
+        string d = NarrowDirectory(name);
+        if (d.Length == 0) return "";
+        string exe = RealPath(System.IO.Path.Combine(d, "emulator.exe"));
+        if (exe.Length == 0 || System.IO.Path.GetDirectoryName(exe) != d || !System.IO.Directory.Exists(System.IO.Path.Combine(d, "qemu"))) return "";
+        return d + "\\";
+    }
+
     static void SetScope(string raw)
     {
         _scopeDirs.Clear();
         string[] pieces = (raw == null ? "" : raw).Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
         foreach (string piece in pieces)
         {
-            string d = piece.Trim();
+            string d = NarrowDirectory(piece.Trim());
             if (d.Length == 0) continue;
-            try { d = System.IO.Path.GetFullPath(d); } catch { }
-            if (!d.EndsWith("\\")) d += "\\";
-            _scopeDirs.Add(d.ToLowerInvariant());
+            string scope = EmulatorScope(d);
+            if (scope.Length == 0) scope = EmulatorScope(System.IO.Path.Combine(d, "emulator"));
+            if (scope.Length > 0 && !_scopeDirs.Contains(scope)) _scopeDirs.Add(scope);
         }
         lock (_oursCache) { _oursCache.Clear(); }
     }
@@ -208,34 +255,20 @@ public class ApkAgent
     static bool IsOurs(uint pid)
     {
         if (pid == 0 || _scopeDirs.Count == 0) return false;
-        lock (_oursCache)
-        {
-            bool hit;
-            if (_oursCache.TryGetValue(pid, out hit)) return hit;
-        }
-        bool ours = false;
+        // Do not cache by PID: Windows can recycle it for an unrelated Qt process.
         try
         {
             using (Process p = Process.GetProcessById((int)pid))
             {
-                string file = null;
-                try { file = p.MainModule.FileName; } catch { file = null; }
-                if (!string.IsNullOrEmpty(file))
-                {
-                    string low = file.ToLowerInvariant();
-                    for (int i = 0; i < _scopeDirs.Count; i++)
-                        if (low.StartsWith(_scopeDirs[i], StringComparison.Ordinal)) { ours = true; break; }
-                }
+                string file = RealPath(p.MainModule.FileName);
+                string name = System.IO.Path.GetFileName(file);
+                if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^(emulator|emulator-check|qemu-system-(x86_64|i386|aarch64|armel)|netsimd)\.exe$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) return false;
+                for (int i = 0; i < _scopeDirs.Count; i++)
+                    if (file.StartsWith(_scopeDirs[i], StringComparison.Ordinal)) return true;
             }
         }
-        catch { ours = false; }
-        lock (_oursCache)
-        {
-            // PIDs get recycled; a bounded cache is enough (one entry per live process).
-            if (_oursCache.Count > 400) _oursCache.Clear();
-            _oursCache[pid] = ours;
-        }
-        return ours;
+        catch { }
+        return false;
     }
 
     static uint ParentOf(uint pid)
@@ -271,14 +304,8 @@ public class ApkAgent
     {
         uint pid;
         GetWindowThreadProcessId(h, out pid);
-        if (IsOurs(pid) || ConsoleOwnedByUs(pid)) return true;
-        if (_scopeDirs.Count == 0) return false;
-        // Windows titles a console with the image path it launched, so the runtime
-        // directory shows up verbatim. Precise enough to never match a stray terminal.
-        string title = TitleOf(h).ToLowerInvariant();
-        for (int i = 0; i < _scopeDirs.Count; i++)
-            if (title.IndexOf(_scopeDirs[i], StringComparison.Ordinal) >= 0) return true;
-        return false;
+        // Window titles are arbitrary text, never process ownership evidence.
+        return IsOurs(pid) || ConsoleOwnedByUs(pid);
     }
 
     // ------------------------------------------------------------------ window discovery
@@ -1117,8 +1144,30 @@ public class ApkAgent
         int i = line.IndexOf(pat, StringComparison.Ordinal);
         if (i < 0) return "";
         i += pat.Length;
-        int j = line.IndexOf('"', i);
-        return j < 0 ? "" : line.Substring(i, j - i);
+        StringBuilder value = new StringBuilder();
+        while (i < line.Length)
+        {
+            char c = line[i++];
+            if (c == '"') return value.ToString();
+            if (c < 32) return "";
+            if (c != '\\') { value.Append(c); continue; }
+            if (i >= line.Length) return "";
+            c = line[i++];
+            if (c == '"' || c == '\\' || c == '/') value.Append(c);
+            else if (c == 'b') value.Append('\b');
+            else if (c == 'f') value.Append('\f');
+            else if (c == 'n') value.Append('\n');
+            else if (c == 'r') value.Append('\r');
+            else if (c == 't') value.Append('\t');
+            else if (c == 'u')
+            {
+                int code;
+                if (i + 4 > line.Length || !int.TryParse(line.Substring(i, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out code)) return "";
+                value.Append((char)code); i += 4;
+            }
+            else return "";
+        }
+        return "";
     }
 
     static void Reply(Socket s, string json)

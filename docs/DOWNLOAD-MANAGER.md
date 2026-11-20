@@ -23,7 +23,7 @@ startedAt · updatedAt · error · retryCount · steps[]
 ```
 
 状态：`waiting → preparing → downloading → verifying → installing → initializing → starting → completed`；
-旁路状态：`failed` / `paused` / `cancelled`。
+旁路状态：`failed` / `paused` / `cancelled`；引导安装进入 `awaiting_confirmation` 等待用户完成安装、正常关机并明确确认。
 
 任务类型：`system-catalog` / `system-download` / `system-verify` / `system-extract` /
 `system-install` / `system-initialize` / `system-start` / `system-stop` /
@@ -51,7 +51,7 @@ startedAt · updatedAt · error · retryCount · steps[]
 
 ## 任务持久化与异常恢复
 
-任务状态写在 `%APPDATA%\apkstart\runtime\systems\_tasks.json`（tmp + rename 原子写）。
+任务状态写在当前运行时目录下的 `systems/_tasks.json`（tmp + rename 原子写）。Windows 默认根为 `%APPDATA%\apkstart\runtime`；Linux 使用 XDG 数据目录下的 `apkstart/runtime`。
 阶段状态变化即落盘，高频进度不落盘。下次启动：
 
 - 已完成/失败/取消的任务保留原状态；

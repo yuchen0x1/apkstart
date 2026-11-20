@@ -16,6 +16,7 @@ const net = require('net');
 const path = require('path');
 const fs = require('fs');
 const { EventEmitter } = require('events');
+const { emulatorScopes } = require('./process-owner');
 
 const SCRIPT = path.join(__dirname, 'win', 'agent.ps1');
 const CALL_TIMEOUT = 6000;
@@ -147,7 +148,8 @@ class WinAgent extends EventEmitter {
    *        并以此为据决定「鼠标事件的当前窗口是不是我们的」（防止句柄被回收复用）
    */
   async scope(dirs, appPid) {
-    const list = (Array.isArray(dirs) ? dirs : [dirs]).filter(Boolean);
+    const list = emulatorScopes(dirs);
+    // Native paths are JSON-encoded exactly once by call(); never pre-escape slashes.
     const req = { cmd: 'scope', dirs: list.join(';') };
     if (Number(appPid) > 0) req.pid = Number(appPid);
     return this.call(req, 4000).catch(() => ({ ok: false, n: 0 }));

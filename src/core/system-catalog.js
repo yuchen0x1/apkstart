@@ -19,9 +19,7 @@ const DEFAULT_URL = 'https://raw.githubusercontent.com/yuchen0x1/apkstart/main/s
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时
 const MAX_BYTES = 2 * 1024 * 1024;       // 目录本身不应超过 2MB
 
-function appDataDir() {
-  return process.env.APPDATA || path.join(require('os').homedir(), '.apkstart');
-}
+const { resolveSystemPaths, legacyPathWarnings } = require('./system-providers/system-paths');
 
 function readJsonSafe(file) {
   try {
@@ -102,7 +100,9 @@ class SystemCatalog {
   constructor(opts = {}) {
     this.url = opts.url || DEFAULT_URL;
     this.appRoot = opts.appRoot || path.join(__dirname, '..', '..');
-    this.dataDir = opts.dataDir || path.join(appDataDir(), 'apkstart', 'system-catalog');
+    const paths = resolveSystemPaths(opts);
+    this.dataDir = opts.dataDir || paths.catalogDir;
+    this.pathWarnings = legacyPathWarnings(this.dataDir, paths.legacyCatalogDirs);
     this.cacheFile = path.join(this.dataDir, 'catalog.json');
     this.metaFile = path.join(this.dataDir, 'meta.json');
     this.builtInPath = opts.builtInPath || null;

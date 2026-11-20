@@ -18,6 +18,28 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { parseApk } = require('./apk');
+
+const PACKAGE_RE = /^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/;
+
+/** 当前备份格式只使用固定文件名，且文件的真实路径必须仍在备份根内。 */
+function backupFile(dir, name, expected, { optional = false } = {}) {
+  if (name !== expected) throw new Error(`备份路径不安全：${expected} 必须使用固定相对路径`);
+  const root = fs.realpathSync(dir);
+  const file = path.join(root, expected);
+  let st;
+  try { st = fs.lstatSync(file); } catch (e) {
+    if (optional && e.code === 'ENOENT') return '';
+    throw new Error(`备份里缺少 ${expected}`);
+  }
+  const real = fs.realpathSync(file);
+  const rel = path.relative(root, real);
+  if (st.isSymbolicLink() || !st.isFile() || !rel || rel === '..'
+    || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new Error(`备份文件越界或包含符号链接：${expected}`);
+  }
+  return file;
+}
 
 /** Windows / POSIX 都不合法的字符，统一换成下划线 */
 function sanitizeName(s, max = 60) {
@@ -56,10 +78,11 @@ function writeMeta(dir, meta) {
 }
 
 function readMeta(dir) {
-  const file = path.join(dir, 'meta.json');
-  if (!fs.existsSync(file)) throw new Error('这不是一个 ApkStart 备份目录（缺少 meta.json）');
+  const file = backupFile(dir, 'meta.json', 'meta.json');
   const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
-  if (!meta || !meta.package) throw new Error('备份信息不完整（缺少 package）');
+  if (!meta || typeof meta.package !== 'string' || !PACKAGE_RE.test(meta.package)) {
+    throw new Error('备份信息不完整（缺少合法的 package）');
+  }
   return meta;
 }
 
@@ -146,13 +169,19 @@ async function backupApp({ app, client, dir, onLog = () => {} }) {
  */
 async function restoreApp({ dir, installer, client, onLog = () => {} }) {
   const meta = readMeta(dir);
-  const apk = path.join(dir, meta.apk || 'app.apk');
-  if (!fs.existsSync(apk)) throw new Error('备份里缺少 app.apk');
+  const apk = backupFile(dir, meta.apk == null || meta.apk === '' ? 'app.apk' : meta.apk, 'app.apk');
+  // 所有路径与包名检查必须在安装及任何设备数据操作前完成。
+  const tar = meta.data == null ? '' : backupFile(dir, meta.data, 'data.tar', { optional: true });
+  const parsed = parseApk(apk);
+  if (parsed.package !== meta.package) throw new Error('备份 APK 包名与 meta.package 不一致，已拒绝恢复');
 
   onLog('正在重新安装应用…');
   const r = await installer.install(apk, (p) => { if (p && p.message) onLog(p.message); });
+  if (!r || !r.app || r.app.package !== meta.package) {
+    throw new Error('安装结果包名与备份不一致，已停止恢复数据');
+  }
 
-  if (!meta.data || !fs.existsSync(path.join(dir, meta.data))) {
+  if (!tar) {
     return {
       app: r.app || null,
       dataRestored: false,
@@ -166,7 +195,6 @@ async function restoreApp({ dir, installer, client, onLog = () => {} }) {
   }
 
   onLog('正在还原应用数据…');
-  const tar = path.join(dir, meta.data);
   const remote = `/data/local/tmp/apkstart-restore-${Date.now()}.tar`;
   await client.push(tar, remote);
   try {

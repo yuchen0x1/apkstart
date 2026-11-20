@@ -30,6 +30,7 @@ window.addEventListener('keydown', (e) => {
   else if (e.altKey && e.key === 'ArrowRight') { e.preventDefault(); api.shell.forward(); }
 });
 
+let bootTimer = null;
 function applyState(s) {
   if (!s) return;
   $('appName').textContent = s.label || '应用';
@@ -40,15 +41,26 @@ function applyState(s) {
     $('bootIcon').src = icon;
   }
   $('bootTip').textContent = s.tip || '';
-  if (s.ready) {
-    const boot = $('boot');
+  const boot = $('boot');
+  if (s.ready === true || s.ready === false) {
+    clearTimeout(bootTimer);
+    $('stage').setAttribute('aria-busy', String(!s.ready));
     if (boot) {
-      boot.classList.add('out');
-      setTimeout(() => { boot.style.display = 'none'; }, 420);
+      boot.setAttribute('aria-hidden', String(s.ready));
+      if (s.ready) {
+        boot.classList.add('out');
+        bootTimer = setTimeout(() => { boot.hidden = true; }, 420);
+      } else {
+        boot.hidden = false;
+        boot.classList.remove('out');
+      }
     }
-    document.body.style.background = '#0b0c0e';
   }
 }
 
-api.shell.onState(applyState);
-api.shell.state().then(applyState).catch(() => {});
+let receivedState = false;
+api.shell.onState((s) => { receivedState = true; applyState(s); });
+api.shell.state().then((s) => {
+  // 推送比启动时的快照更新，迟到的初始回复不能重新盖住已就绪的画面。
+  if (!receivedState) applyState(s);
+}).catch(() => {});
