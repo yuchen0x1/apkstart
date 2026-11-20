@@ -360,8 +360,7 @@ async function main() {
     assert(stopAt > -1 && stopAt < runAt, '强制结束要在启动安装器之前');
     assert(/failed\.json/.test(script), '失败要落标记，下次启动告诉用户');
     assert(/payload kept for manual install/.test(script), '失败时应保留安装包，重试不用重下 1.4GB');
-    // 收尾清理必须以「没有失败标记」为前提
-    assert(/if \(-not \(Test-Path [^)]*failed\.json/.test(script), '失败时不能把载荷删掉');
+    assert(/if \(-not \$ok\) \{ exit 1 \}[\s\S]*Remove-Item -LiteralPath/.test(script), '验证未通过不得清除载荷');
   });
 
   await test('已经下好的安装包会被复用，不会因为上次装失败又重下 1.4GB', async () => {
@@ -401,90 +400,320 @@ async function main() {
 
   });
 
-  console.log('\n[安装版脚本真机执行：模拟「装完目录被清空」]');
+  console.log('\n[Windows PowerShell：用临时目录验证安装判定与回滚]');
 
-  /**
-   * 用真 PowerShell 跑一遍生成的脚本，把 Start-Process 安装器换成「删掉安装目录」，
-   * 复现 0.6.1→0.6.2 那次事故（NSIS 卸旧成功、解新失败），验证回滚真的把程序救回来。
-   */
-  function runScript(script) {
+  function runInstallFixture(root, script, installer, failCopy, denyParent) {
     const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    const b64 = Buffer.from(script, 'utf16le').toString('base64');
+    const fixture = path.join(root, 'fixture.ps1');
+    const prelude = [
+      // 不访问宿主进程；仅用系统 cmd 产生确定的退出码。
+      'function Wait-Process {}',
+      'function Get-Process {}',
+      'function Stop-Process { throw "unexpected stop" }',
+      'function Start-Sleep {}',
+      'function Start-Process {',
+      '  param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$Wait, $ErrorAction)',
+      '  if (-not $PassThru) { Note "fixture restart"; return }',
+      '  Note "fixture installer"',
+      ...installer,
+      '}',
+    ];
+    if (failCopy) {
+      prelude.push(
+        '$script:copyCount = 0',
+        'function robocopy {',
+        '  $script:copyCount++',
+        `  if ($script:copyCount -eq ${failCopy}) { $script:LASTEXITCODE = 8; return }`,
+        '  & robocopy.exe @args',
+        '  $script:LASTEXITCODE = $LASTEXITCODE',
+        '}',
+      );
+    }
+    if (denyParent) {
+      const parent = `'${root.replace(/'/g, "''")}'`;
+      prelude.push(
+        "$ErrorActionPreference = 'Stop'",
+        // 固定运行 Windows PowerShell 5.1 的 .NET Framework API，不受 pwsh 的 PSModulePath 影响。
+        `$aclDir = [IO.DirectoryInfo]::new(${parent})`,
+        '$aclAccess = [Security.AccessControl.AccessControlSections]::Access',
+        '$savedDacl = $aclDir.GetAccessControl().GetSecurityDescriptorSddlForm($aclAccess)',
+        '$parentAcl = $aclDir.GetAccessControl()',
+        `$rule = [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User, [Security.AccessControl.FileSystemRights]::CreateDirectories, [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Deny)`,
+      );
+      // 仅修改此临时夹具父目录的 ACL；设置、探测及生成脚本均在 finally 的保护范围内。
+      script = [
+        'try {',
+        '  $parentAcl.AddAccessRule($rule)',
+        '  $aclDir.SetAccessControl($parentAcl)',
+        `  $aclProbe = Join-Path ${parent} ('.fixture-acl-' + [guid]::NewGuid().ToString('N'))`,
+        '  $denied = $false',
+        '  try { [void][IO.Directory]::CreateDirectory($aclProbe) } catch [UnauthorizedAccessException] { $denied = $true }',
+        "  if (-not $denied) { [IO.Directory]::Delete($aclProbe); throw 'fixture ACL deny not effective' }",
+        "  Write-Output 'fixture ACL deny verified'",
+        script,
+        '} finally {',
+        // 重新载入原 DACL，显式标记修改；原样 SetAccessControl(GetAccessControl()) 不会写回。
+        '  $restoreAcl = $aclDir.GetAccessControl()',
+        '  $restoreAcl.SetSecurityDescriptorSddlForm($savedDacl, $aclAccess)',
+        '  $aclDir.SetAccessControl($restoreAcl)',
+        "  if ($aclDir.GetAccessControl().GetSecurityDescriptorSddlForm($aclAccess) -cne $savedDacl) { throw 'fixture ACL restore mismatch' }",
+        "  Write-Output 'fixture ACL restored'",
+        '}',
+      ].join('\r\n');
+    }
+    fs.writeFileSync(fixture, '\ufeff' + prelude.join('\r\n') + '\r\n' + script);
     return spawnSync(ps, [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64,
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixture,
     ], { encoding: 'utf8', timeout: 60000 });
   }
 
-  function makeInstallDir(root, version) {
-    const app = path.join(root, 'app');
-    fs.mkdirSync(path.join(app, 'resources', 'app'), { recursive: true });
-    fs.mkdirSync(path.join(app, 'resources', 'runtime'), { recursive: true });
-    // 占位主程序用「某个真实存在的二进制」：Windows 上是 whoami.exe（真实 PE，
-    // Start-Process 起来会立刻退出）；Linux 上没有 System32，用 node 自己。
-    const placeholder = process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'whoami.exe')
-      : process.execPath;
-    fs.copyFileSync(placeholder, path.join(app, 'ApkStart.exe'));
-    fs.writeFileSync(path.join(app, 'resources', 'app', 'package.json'), JSON.stringify({ version }), 'utf8');
-    fs.writeFileSync(path.join(app, 'resources', 'runtime', 'big.bin'), 'x'.repeat(1024));
-    return app;
+  const cmdExit = (n) => `  Microsoft.PowerShell.Management\\Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\\cmd.exe') -ArgumentList '/c exit ${n}' -PassThru -Wait`;
+  const writeNew = `  [IO.File]::WriteAllText($pkg, '{"version":"9.9.9","description":"安卓应用运行器"}')`;
+  const scenarios = [
+    { name: '目录被清空', installer: ['Remove-Item -LiteralPath $dst -Recurse -Force', cmdExit(0)], rollback: 'restored' },
+    { name: '退出非零，即使版本正确', installer: [writeNew, cmdExit(1)], rollback: 'restored' },
+    { name: '退出为零，但无版本文件', installer: ['Remove-Item -LiteralPath $pkg', cmdExit(0)], rollback: 'restored' },
+    { name: '退出为零，但版本文件损坏', installer: ["[IO.File]::WriteAllText($pkg, '{')", cmdExit(0)], rollback: 'restored' },
+    { name: '无法启动安装器', installer: ["throw 'fixture launch failure'"], rollback: 'restored' },
+    { name: '取消 UAC 不回写未变的原文件', installer: ['throw ([ComponentModel.Win32Exception]::new(1223))'], rollback: 'not-started', noRestore: true },
+    { name: '原程序只读时不启动安装器', installer: [writeNew, cmdExit(0)], readonly: true, rollback: 'not-attempted' },
+    { name: '可写安装目录但父目录不允许重建', installer: [writeNew, cmdExit(0)], denyParent: true, rollback: 'not-attempted' },
+    { name: '备份复制失败', installer: [writeNew, cmdExit(0)], failCopy: 1, rollback: 'not-attempted' },
+    { name: '回滚复制失败', installer: [writeNew, cmdExit(1)], failCopy: 2, rollback: 'unverified' },
+    { name: '失败记录无法落盘', installer: ["[void](New-Item -ItemType Directory -Path (Join-Path (Split-Path $log) 'failed.json'))", cmdExit(1)], rollback: 'restored', failMarker: true },
+    { name: '退出为零且版本匹配', installer: [writeNew, cmdExit(0)] },
+  ];
+
+  if (process.platform !== 'win32') console.log('  跳过：需要 Windows PowerShell 与 robocopy');
+  for (const row of process.platform === 'win32' ? scenarios : []) {
+    await test(`★ 安装版更新：${row.name}`, () => {
+      const root = mkTmp();
+      try {
+        const u = mkUpdater(root);
+        const pkg = path.join(u.installDir, 'resources', 'app', 'package.json');
+        const runtime = path.join(u.installDir, 'resources', 'runtime');
+        const pending = path.join(u.updateDir, 'pending.json');
+        const failure = path.join(u.updateDir, 'failed.json');
+        const downloadDir = path.join(u.updateDir, '9.9.9');
+        const earlierBackup = 'backup-9.9.9-earlier';
+        fs.mkdirSync(path.dirname(pkg), { recursive: true });
+        fs.mkdirSync(runtime, { recursive: true });
+        fs.mkdirSync(downloadDir, { recursive: true });
+        fs.mkdirSync(path.join(u.updateDir, earlierBackup));
+        fs.writeFileSync(u.exePath, 'fixture old exe');
+        if (row.readonly) fs.chmodSync(u.exePath, 0o444);
+        fs.writeFileSync(pkg, '{"version":"0.6.2"}');
+        fs.writeFileSync(path.join(runtime, 'big.bin'), 'runtime fixture');
+        const payload = fakeExe(path.join(downloadDir, 'ApkStart-9.9.9-Setup.exe'));
+        const script = u.apply({ mode: 'setup', payload, version: '9.9.9' }, { spawn: false });
+        const r = runInstallFixture(root, script, row.installer, row.failCopy, row.denyParent);
+        if (row.denyParent) {
+          assert(r.stdout.includes('fixture ACL deny verified'), `父目录拒绝规则必须实际生效：${r.error || r.stderr}`);
+          assert(r.stdout.includes('fixture ACL restored'), `必须读回确认原 DACL 已恢复：${r.error || r.stderr}`);
+        }
+        const log = fs.readFileSync(path.join(u.updateDir, 'update.log'), 'utf8');
+        eq(r.status, row.rollback ? 1 : 0, `${log}\n${r.error || r.stderr}`);
+        eq(log.includes('fixture installer'), row.failCopy !== 1 && !row.readonly && !row.denyParent, '应只在备份和写权限检查通过后启动安装器');
+        if (row.noRestore) assert(!log.includes('rolling back'), '取消 UAC 不应改写安装目录');
+        eq(new Updater({ dataDir: u.dataDir }).autoApplyBlocked('9.9.9'), true, '跨进程持久阻止同版本自动重试');
+        eq(log.includes('fixture restart'), row.rollback !== 'unverified', '未确认回滚时不得重启');
+        eq(fs.existsSync(payload), !!row.rollback, '仅成功时清理下载的安装包');
+        eq(fs.existsSync(pending), !!row.rollback, '仅成功时清理待安装凭条');
+        eq(fs.existsSync(failure) && fs.statSync(failure).isFile(), !!row.rollback && !row.failMarker, '能写标记时应提供可读的失败记录');
+        if (row.failMarker) assert(log.includes('could not write update failure marker'), '应记录写入失败');
+        assert(fs.existsSync(path.join(u.updateDir, earlierBackup)), '不得清理上一次尝试的恢复目录');
+        if (row.rollback) {
+          const backupName = fs.readdirSync(u.updateDir).find(name => /^backup-9\.9\.9-[0-9a-f]{16}$/.test(name));
+          if (!row.failMarker) {
+            const info = JSON.parse(fs.readFileSync(failure, 'utf8'));
+            eq(info.version, '9.9.9');
+            eq(info.rollback, row.rollback);
+            if (row.failCopy !== 1) eq(info.backup, path.join(u.updateDir, backupName));
+          }
+          if (row.failCopy !== 1) {
+            const backup = path.join(u.updateDir, backupName);
+            const backedUpPkg = path.join(backup, 'resources', 'app', 'package.json');
+            eq(JSON.parse(fs.readFileSync(backedUpPkg, 'utf8')).version, '0.6.2');
+            assert(!fs.existsSync(path.join(backup, 'resources', 'runtime')), '安装备份不应重复复制运行时');
+          }
+        } else {
+          eq(fs.readdirSync(u.updateDir).filter(name => name.startsWith('backup-')).join(','), earlierBackup);
+        }
+        const expected = !row.rollback || row.rollback === 'unverified' ? '9.9.9' : '0.6.2';
+        eq(JSON.parse(fs.readFileSync(pkg, 'utf8')).version, expected, '检查安装目录中的最终版本');
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
   }
 
-  /** 把「跑安装器」换成「删掉安装目录」，模拟安装器失败 */
-  function sabotageInstaller(script) {
-    return script.replace(/^[ \t]*\$p = Start-Process .*$/m, [
-      `  $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\\cmd.exe') -ArgumentList '/c exit 0' -PassThru -Wait`,
-      `  Remove-Item -LiteralPath $dst -Recurse -Force`,
-    ].join('\r\n'));
+  console.log('\n[短路径：8.3 短名与解析长路径混用]');
+
+  /** 直接取目录短名，避免 cmd 的二次引号解析改变返回路径。 */
+  function shortPath(p) {
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const code = `$ErrorActionPreference = 'Stop'; $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder('${p.replace(/'/g, "''")}').ShortPath; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($short))`;
+    const r = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    eq(r.status, 0, `${r.error || r.stderr}`);
+    const result = Buffer.from(String(r.stdout || '').trim(), 'base64').toString('utf8');
+    assert(path.isAbsolute(result) && !result.includes('"') && fs.statSync(result).isDirectory(), `无效的短路径：${result}`);
+    return result;
   }
 
-  // 真机执行需要 Windows PowerShell：Linux/macOS 上跳过这两条（脚本生成逻辑
-  // 已由其它用例覆盖，执行行为由 Windows 侧的 npm test 负责）
-  const CAN_RUN_PS = process.platform === 'win32';
-
-  await test('★ 安装器把目录删空 → 脚本从备份还原，程序仍可启动', async () => {
-    if (!CAN_RUN_PS) { console.log('  跳过：真机执行需要 Windows PowerShell'); return; }
+  if (process.platform !== 'win32') console.log('  跳过：8.3 短名需要 Windows');
+  for (const rollback of process.platform === 'win32' ? [false, true] : []) {
     const root = mkTmp();
-    const app = makeInstallDir(root, '0.6.2');
-    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
-    const u = mkUpdater(root);
-    const script = sabotageInstaller(u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false, waitPid: 999999 }));
-    // 防止「替换没生效、其实跑的是真安装器」导致用例假通过
-    assert(!/Start-Process -FilePath '[^']*Setup\.exe'/.test(script), '测试应替换掉真实的安装器调用');
-    assert(/Remove-Item -LiteralPath \$dst -Recurse/.test(script), '测试应注入「删空目录」的故障');
-    const r = runScript(script);
-    const log = fs.readFileSync(path.join(root, 'data', 'update', 'update.log'), 'utf8');
-    eq(r.status, 0, `脚本应正常退出（实际 ${r.status}）`);
-    assert(fs.existsSync(path.join(app, 'ApkStart.exe')), '主程序应被回滚恢复');
-    assert(fs.existsSync(path.join(app, 'resources', 'app', 'package.json')), 'resources\\app 应被恢复');
-    eq(JSON.parse(fs.readFileSync(path.join(app, 'resources', 'app', 'package.json'), 'utf8')).version, '0.6.2', '回滚后仍是旧版本');
-    assert(/rolling back to previous version/.test(log), '日志应记录回滚');
-    assert(/backup ok=True/.test(log), '日志应记录备份成功');
-  }, 90000);
+    try {
+      const short = shortPath(root);
+      if (short.toLowerCase() === fs.realpathSync.native(root).toLowerCase()) {
+        assert(!process.env.CI, 'Windows CI 必须实际执行 8.3 短名回归');
+        console.log('  跳过：此卷没有 8.3 短名，未执行短路径回归');
+        continue;
+      }
+      await test(`★ 8.3 短名备份根与长名子项：${rollback ? '失败后恢复' : '成功安装'}（CI RUNNER~1 回归）`, () => {
+        const u = mkUpdater(short);
+        const pkg = path.join(u.installDir, 'resources', 'app', 'package.json');
+        const downloadDir = path.join(u.updateDir, '9.9.9');
+        const emptyDir = path.join(u.installDir, 'resources', 'empty folder');
+        fs.mkdirSync(path.dirname(pkg), { recursive: true });
+        fs.mkdirSync(emptyDir);
+        fs.mkdirSync(downloadDir, { recursive: true });
+        fs.writeFileSync(u.exePath, 'fixture old exe');
+        fs.writeFileSync(pkg, '{"version":"0.6.2"}');
+        const payload = fakeExe(path.join(downloadDir, 'ApkStart-9.9.9-Setup.exe'));
+        let script = u.apply({ mode: 'setup', payload, version: '9.9.9' }, { spawn: false });
+        // 确认真实 PowerShell 文件系统提供程序确实触发旧偏移缺陷，不只比较 Node/COM 路径。
+        const rootLine = '    $bakRoot = (Get-Item -LiteralPath $bak -Force -ErrorAction Stop).FullName';
+        assert(script.includes(rootLine), '应能定位备份根解析语句');
+        script = script.replace(rootLine, [rootLine,
+          "    $items = @(Get-ChildItem -LiteralPath $bak -Recurse -Force -ErrorAction Stop | Where-Object { $_.Name -in @('package.json', 'empty folder') })",
+          "    if ($items.Count -ne 2) { throw 'fixture missing file or empty directory' }",
+          '    foreach ($item in $items) {',
+          "      $expected = if ($item.Name -eq 'package.json') { 'resources\\app\\package.json' } else { 'resources\\empty folder' }",
+          "      if ($item.FullName.Substring($bakRoot.Length).TrimStart('\\') -cne $expected) { throw 'fixture resolved root mismatch' }",
+          "      if ($item.FullName.Substring($bak.Length).TrimStart('\\') -ceq $expected) { throw 'fixture did not exercise old offset defect' }",
+          '    }',
+          "    Note 'fixture short/long mismatch verified'",
+        ].join('\r\n'));
+        const r = runInstallFixture(root, script, rollback ? ['Remove-Item -LiteralPath $dst -Recurse -Force', cmdExit(1)] : [writeNew, cmdExit(0)]);
+        const log = fs.readFileSync(path.join(u.updateDir, 'update.log'), 'utf8');
+        eq(r.status, rollback ? 1 : 0, `${log}\n${r.error || r.stderr}`);
+        assert(log.includes('backup ok=True'), `短名备份必须判为成功：${log}`);
+        assert(log.includes('fixture short/long mismatch verified'), '文件与空目录均必须实际触发旧偏移缺陷');
+        assert(log.includes('fixture installer'), '写权限预检误判会让安装器根本不运行');
+        assert(log.includes('fixture restart'), '成功安装或已确认恢复后应允许重启');
+        eq(JSON.parse(fs.readFileSync(pkg, 'utf8')).version, rollback ? '0.6.2' : '9.9.9');
+        assert(fs.statSync(emptyDir).isDirectory(), '应保留或恢复空目录');
+        eq(fs.existsSync(payload), rollback, '仅成功后删除安装包');
+        eq(fs.existsSync(path.join(u.updateDir, 'pending.json')), rollback, '仅成功后清理待安装凭条');
+        if (rollback) eq(JSON.parse(fs.readFileSync(path.join(u.updateDir, 'failed.json'), 'utf8')).rollback, 'restored');
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
 
-  await test('★ 安装器成功写入新版本 → 校验通过、备份被清理', async () => {
-    if (!CAN_RUN_PS) { console.log('  跳过：真机执行需要 Windows PowerShell'); return; }
+  console.log('\n[启动通知：保留实际恢复状态，兼容旧标记编码]');
+
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const notifySource = mainSource.match(/function notifyUpdateFailure\(\) \{[\s\S]*?\n\}/);
+  assert(notifySource, '应能定位真实启动通知，不加载产品主进程');
+  for (const row of [
+    { name: '恢复成功', rollback: 'restored', expected: '已恢复旧版程序文件' },
+    { name: '回滚未确认', rollback: 'unverified', expected: '未能确认旧版已恢复' },
+    { name: '装前中止', rollback: 'not-attempted', expected: '未运行安装程序' },
+    { name: '用户取消', rollback: 'not-started', expected: '安装程序已取消' },
+    { name: '旧版 BOM 标记', bom: '\ufeff', expected: '没有装成功' },
+  ]) {
+    await test(`更新失败通知：${row.name}`, () => {
+      const root = mkTmp();
+      try {
+        const u = mkUpdater(root);
+        fs.mkdirSync(u.updateDir, { recursive: true });
+        fs.writeFileSync(path.join(u.updateDir, 'pending.json'), '{"version":"9.9.9"}');
+        fs.writeFileSync(path.join(u.updateDir, 'update.log'), 'app exited, applying');
+        const failure = path.join(u.updateDir, 'failed.json');
+        fs.writeFileSync(failure, (row.bom || '') + JSON.stringify({ version: '9.9.9', rollback: row.rollback }));
+        const notices = [];
+        require('vm').runInNewContext(notifySource[0] + '\nnotifyUpdateFailure();', {
+          fs, path, updater: u, appLog() {}, send: (channel, value) => notices.push({ channel, value }),
+        });
+        eq(notices.length, 1, '应显示一次真实的失败通知');
+        eq(notices[0].channel, 'toast');
+        assert(notices[0].value.message.includes(row.expected), notices[0].value.message);
+        if (row.rollback !== 'restored') assert(!notices[0].value.message.includes('已恢复旧版程序文件'));
+        assert(!fs.existsSync(failure), '读过后清除失败标记');
+        assert(!fs.existsSync(path.join(u.updateDir, 'pending.json')), '读过后清除旧凭条，避免重复提示');
+        assert(u.autoApplyBlocked('9.9.9'), '即使消费掉旧失败标记也不应再次自动安装');
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+  }
+
+  console.log('\n[自动重试限制：持久化阻止循环，保留手动入口]');
+
+  await test('自动更新的三个入口均检查重试凭条，手动更新仍可安装', async () => {
     const root = mkTmp();
-    const app = makeInstallDir(root, '0.6.2');
-    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
-    const u = mkUpdater(root);
-    // 模拟成功安装：写入 9.9.9 的 package.json
-    const okScript = u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false, waitPid: 999999 })
-      .replace(/^[ \t]*\$p = Start-Process .*$/m, [
-        `  $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\\cmd.exe') -ArgumentList '/c exit 0' -PassThru -Wait`,
-        // 故意写成「真实产物那样的 UTF-8 无 BOM + 中文」：PS 5.1 默认按 GBK 读会把
-        // JSON 结构读坏、版本号读成空，从而让「装后核对」这一步静默失效。
-        `  $body = '{"name":"apkstart","version":"9.9.9","description":"极致轻量的 Windows 安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行"}'`,
-        `  [IO.File]::WriteAllText($pkg, $body, (New-Object System.Text.UTF8Encoding($false)))`,
-      ].join('\r\n'));
-    assert(!/Start-Process -FilePath '[^']*Setup\.exe'/.test(okScript), '测试应替换掉真实的安装器调用');
-    const r = runScript(okScript);
-    const log = fs.readFileSync(path.join(root, 'data', 'update', 'update.log'), 'utf8');
-    eq(r.status, 0, `脚本应正常退出（实际 ${r.status}）`);
-    assert(/after install: exe=\d+ ver=9\.9\.9/.test(log), `应识别出新版本（日志：${log}）`);
-    assert(!/rolling back/.test(log), '成功路径不应回滚');
-    assert(!fs.existsSync(path.join(root, 'data', 'update', 'backup-9.9.9')), '成功后备份应被删除');
-  }, 90000);
+    try {
+      const u = mkUpdater(root);
+      u.blockAutoApply('v9.9.9');
+      let prepares = 0;
+      let installs = 0;
+      const job = { mode: 'setup', version: '9.9.9', payload: 'fixture' };
+      u.prepare = async () => { prepares++; return job; };
+      const info = { version: '9.9.9', tag: 'v9.9.9', hasUpdate: true, canAutoApply: true, flavor: 'setup', asset: { name: 'fixture' } };
+      const context = {
+        updater: u, updateBusy: false, applyingUpdate: false, autoUpdateJob: null, autoUpdateTag: '', updateInfo: null,
+        info, job, notify() {}, send() {}, appLog() {}, app: { getVersion: () => '0.0.1' },
+        store: { getSettings: () => ({ update: { autoUpdate: true } }) },
+        startApplyUpdate: () => { installs++; return true; },
+      };
+      const vm = require('vm');
+      vm.createContext(context);
+      const functions = ['applyAutoUpdate', 'autoUpdateFlow', 'handleUpdateFound', 'runUpdate'].map(name => {
+        const found = mainSource.match(new RegExp('(async )?function ' + name + '\\([^\\n]*\\) \\{[\\s\\S]*?\\n\\}'));
+        assert(found, `应定位真实函数 ${name}`);
+        return found[0];
+      }).join('\n');
+      vm.runInContext(functions, context);
+      vm.runInContext('handleUpdateFound(info)', context);
+      await vm.runInContext('autoUpdateFlow(info)', context);
+      context.autoUpdateJob = job;
+      eq(vm.runInContext('applyAutoUpdate()', context), false);
+      eq(prepares, 0, '启动检查、直接 flow、窗口关闭后的队列都不能重复自动下载');
+      eq(installs, 0, '自动入口不应重复安装');
+      const result = await vm.runInContext('runUpdate()', context);
+      eq(result.ok, true, '显式手动更新应仍可继续');
+      eq(prepares, 1);
+      eq(installs, 1);
+      eq(new Updater({ dataDir: u.dataDir }).autoApplyBlocked('9.9.9'), true, '限制应跨进程保留');
+      eq(u.autoApplyBlocked('10.0.0'), false, '新版本不受旧失败版本影响');
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  await test('重试凭条损坏时自动路径失败关闭，手动尝试可修复且不重复记录', () => {
+    const root = mkTmp();
+    try {
+      const u = mkUpdater(root);
+      fs.mkdirSync(u.updateDir, { recursive: true });
+      const file = path.join(u.updateDir, 'auto-attempts.json');
+      fs.writeFileSync(file, '{');
+      assert(u.autoApplyBlocked('9.9.9'));
+      u.blockAutoApply('9.9.9');
+      u.blockAutoApply('v9.9.9');
+      eq(JSON.parse(fs.readFileSync(file, 'utf8')).versions.length, 1);
+      assert(u.autoApplyBlocked('9.9.9'));
+      eq(u.autoApplyBlocked('10.0.0'), false);
+      const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+      assert(u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false }).includes('run installer'), '手动安装生成不受自动重试限制影响');
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  await test('自动重试凭条无法持久化时不生成安装脚本', async () => {
+    const root = mkTmp();
+    try {
+      const u = mkUpdater(root);
+      fs.mkdirSync(path.join(u.updateDir, 'auto-attempts.json'), { recursive: true });
+      const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+      await expectThrow(() => u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, { spawn: false }), /EISDIR|EPERM|EACCES/);
+      assert(!fs.existsSync(path.join(u.updateDir, 'apply.log.ps1')));
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
 
   console.log('\n[升级脚本启动：必须比 App 活得久（0.6.15 用户现场）]');
 

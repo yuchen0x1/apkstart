@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.9.1**（2026-11-21）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.9.2**（2026-11-21）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,10 +46,14 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.9.1
+### v0.9.2
 
-- 流式 ZIP 解压校验失败后，等待目标文件流关闭再清理暂存目录，避免 Windows 文件句柄竞态。
-- 发布前测试增加 Windows Node 20 矩阵，与支持的最低 Node 版本保持一致。
+- Windows 安装版更新必须同时确认安装器退出成功、主程序非空且版本精确匹配，缺失或损坏的版本文件不再视为更新成功。
+- 安装前验证备份完成及当前用户的恢复写权限，失败时停止安装；每次使用独立恢复目录，重试不会覆盖上一次的备份。
+- 用户取消 UAC 时不改写未变的旧版文件；同版本安装尝试写入持久凭条，阻止失败后自动循环安装及备份膨胀，保留显式手动重试。
+- 更新失败时保留安装包、待安装凭条及备份；即使失败记录写入失败，也不会触发成功清理。回滚未经确认时不自动重启。
+- 更新失败通知兼容旧版 UTF-8 BOM 记录，区分已恢复、未安装和恢复未确认，不再一概宣称已回到旧版。
+- 增加 Windows PowerShell 临时目录执行用例，覆盖安装失败、版本缺失或损坏、备份/回滚失败及失败记录无法落盘；补齐启动通知回归。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。
