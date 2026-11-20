@@ -7,7 +7,7 @@
 - 基线：已发布的 `v0.9.1`（`accb6ca`）。巡检期间主分支前进，更新器补丁已重放到该基线，不重复纳入先前 UI/运行时加固提交。
 - 候选版本：`0.9.2`（PATCH），Windows 安装版更新失败处理和恢复文件保护。
 - 实施分支：`fix/windows-updater-rollback`。使用独立 Git worktree，未覆盖最初工作区改动。
-- 状态：[PR #14](https://github.com/yuchen0x1/apkstart/pull/14) 首轮 Windows Node 20/22 CI 失败、Linux Node 22 通过。CI 暴露的 8.3 短名/长路径偏移缺陷已在本地修复并补回归；Windows 全量重测通过，仍须修正后提交的远端 CI 全绿才能合并发布。此处不提前宣称已正式发布。
+- 状态：[PR #14](https://github.com/yuchen0x1/apkstart/pull/14) 尚待全部 CI 通过。首轮 Windows CI 的短路径偏移缺陷已修复；次轮 `d324019` 中两项短名回归均通过，但 ACL 夹具模块加载失败，Windows 仍为 55/1，Linux 全量通过。已改用 .NET ACL API 并增加实际拒绝及原 DACL 恢复读回断言；修正后的精确提交仍须 CI 全绿才能合并发布。此处不提前宣称已正式发布。
 
 ## 架构与交付
 

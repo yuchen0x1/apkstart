@@ -41,6 +41,13 @@
 - 独立静态复核指出并确认修复测试编码、失配未断言两项缺口；最终本轮范围未见新增阻塞。静态复核不代替远端 Node 20/22 CI。
 - 冻结树 `f621aaa6c2b39ca69b8e487dbbf97c79fc94d013` 导出到独立 Linux 目录，`npm ci` 后在只有 loopback 的网络 namespace 完成全量回归、退出 0（更新器 42/0，Windows 专属用例跳过）。Windows 沙箱冒烟再次 20/0，no-images 与 README 一致性门禁通过。后续只回填文档证据，代码与该冻结树一致。
 
+### CI ACL 夹具兼容性
+
+- 次轮 head `d324019` 的 [CI 44796259254](https://github.com/yuchen0x1/apkstart/actions/runs/44796259254)：两个 Windows job 的短路径成功/回滚均通过，但更新器仍为 55/1；Linux 全量通过。唯一失败是 ACL 夹具的 `Get-Acl/Set-Acl` 无法加载 `Microsoft.PowerShell.Security`，拒绝规则未施加，不能把该用例跳过或当作产品权限检查通过。
+- 仅调整测试：使用固定 Windows PowerShell 5.1 的 .NET Framework `DirectoryInfo` ACL API，避免模块搜索路径影响；夹具 setup 失败即停止。实际尝试在父目录建子目录，必须得到拒绝才继续运行生成脚本。
+- 独立复核又指出，原样传回未修改的 ACL 对象不会写入恢复。已改为保存原 DACL 的 SDDL、在 finally 中显式载入并写回、重新读取精确比较，Node 同时断言“拒绝生效”和“原权限恢复”两个标记。所有操作仅限本次临时夹具根目录，未放宽产品权限判断。
+- 包含 DACL 显式恢复及读回断言的最终 Windows 全量再次退出 0，更新器 56/0；独立只读复核确认两项标记可以区分预期更新失败与夹具恢复失败。产品源码保持 `d324019` 不变，继续等待新 head 的远端完整验收。
+
 ### 交付状态
 
 本段写入时：短路径修正完成本地 Windows 验收，尚待修正后精确提交的 PR CI、主分支合并和签名 Release 流水线。正式结果回填 [RELEASE_HISTORY.md](RELEASE_HISTORY.md)。未把 Issue #13、原生 Linux 桌面、真实设备升级或签名证书标记为已验证。

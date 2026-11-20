@@ -15,7 +15,8 @@
 - [x] Electron 沙箱冒烟、内存 fixture UI 回归、Windows 便携/NSIS 构建。
 - [x] 更新 package/lock、CHANGELOG、README 和网站版本文字；建立六份自主记录。
 - [x] 排查 PR 首轮 Windows CI 失败：统一备份根与枚举子项的长路径基准；增加真实短名成功/回滚及旧偏移必错断言；Windows 全量重测通过、专项 56/0，独立静态复核无新增阻塞。
-- [ ] 修正后的精确 PR 提交在 Windows Node 20/22、Linux Node 22 和依赖审查中全部通过（不得把首轮失败当作通过）。
+- [x] 修复次轮 CI 的 ACL 夹具模块加载问题；.NET API 施加拒绝后实际探测，finally 显式恢复原 DACL 并读回比较；Windows 全量再次退出 0（更新器 56/0），独立静态复核无新增阻塞。
+- [ ] 最终修正后的精确 PR 提交在 Windows Node 20/22、Linux Node 22 和依赖审查中全部通过（不得把前两轮失败当作通过）。
 - [ ] 合并经审查的精确提交，核验远程 main。
 - [ ] 推送唯一 `v0.9.2` Tag，由既有流水线完成四类资产和签名清单。
 - [ ] 验证正式 Release、签名、资产及版本一致，回填发布记录。

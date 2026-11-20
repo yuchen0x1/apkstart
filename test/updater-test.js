@@ -432,14 +432,34 @@ async function main() {
     if (denyParent) {
       const parent = `'${root.replace(/'/g, "''")}'`;
       prelude.push(
-        `$savedAcl = Get-Acl -LiteralPath ${parent}`,
-        `$parentAcl = Get-Acl -LiteralPath ${parent}`,
+        "$ErrorActionPreference = 'Stop'",
+        // 固定运行 Windows PowerShell 5.1 的 .NET Framework API，不受 pwsh 的 PSModulePath 影响。
+        `$aclDir = [IO.DirectoryInfo]::new(${parent})`,
+        '$aclAccess = [Security.AccessControl.AccessControlSections]::Access',
+        '$savedDacl = $aclDir.GetAccessControl().GetSecurityDescriptorSddlForm($aclAccess)',
+        '$parentAcl = $aclDir.GetAccessControl()',
         `$rule = [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User, [Security.AccessControl.FileSystemRights]::CreateDirectories, [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Deny)`,
-        '$parentAcl.AddAccessRule($rule)',
-        `Set-Acl -LiteralPath ${parent} -AclObject $parentAcl -ErrorAction Stop`,
       );
-      // 仅修改此临时夹具父目录的 ACL；即使生成脚本 exit 也用 finally 还原。
-      script = 'try {\r\n' + script + `\r\n} finally { Set-Acl -LiteralPath ${parent} -AclObject $savedAcl -ErrorAction Stop }`;
+      // 仅修改此临时夹具父目录的 ACL；设置、探测及生成脚本均在 finally 的保护范围内。
+      script = [
+        'try {',
+        '  $parentAcl.AddAccessRule($rule)',
+        '  $aclDir.SetAccessControl($parentAcl)',
+        `  $aclProbe = Join-Path ${parent} ('.fixture-acl-' + [guid]::NewGuid().ToString('N'))`,
+        '  $denied = $false',
+        '  try { [void][IO.Directory]::CreateDirectory($aclProbe) } catch [UnauthorizedAccessException] { $denied = $true }',
+        "  if (-not $denied) { [IO.Directory]::Delete($aclProbe); throw 'fixture ACL deny not effective' }",
+        "  Write-Output 'fixture ACL deny verified'",
+        script,
+        '} finally {',
+        // 重新载入原 DACL，显式标记修改；原样 SetAccessControl(GetAccessControl()) 不会写回。
+        '  $restoreAcl = $aclDir.GetAccessControl()',
+        '  $restoreAcl.SetSecurityDescriptorSddlForm($savedDacl, $aclAccess)',
+        '  $aclDir.SetAccessControl($restoreAcl)',
+        "  if ($aclDir.GetAccessControl().GetSecurityDescriptorSddlForm($aclAccess) -cne $savedDacl) { throw 'fixture ACL restore mismatch' }",
+        "  Write-Output 'fixture ACL restored'",
+        '}',
+      ].join('\r\n');
     }
     fs.writeFileSync(fixture, '\ufeff' + prelude.join('\r\n') + '\r\n' + script);
     return spawnSync(ps, [
@@ -487,6 +507,10 @@ async function main() {
         const payload = fakeExe(path.join(downloadDir, 'ApkStart-9.9.9-Setup.exe'));
         const script = u.apply({ mode: 'setup', payload, version: '9.9.9' }, { spawn: false });
         const r = runInstallFixture(root, script, row.installer, row.failCopy, row.denyParent);
+        if (row.denyParent) {
+          assert(r.stdout.includes('fixture ACL deny verified'), `父目录拒绝规则必须实际生效：${r.error || r.stderr}`);
+          assert(r.stdout.includes('fixture ACL restored'), `必须读回确认原 DACL 已恢复：${r.error || r.stderr}`);
+        }
         const log = fs.readFileSync(path.join(u.updateDir, 'update.log'), 'utf8');
         eq(r.status, row.rollback ? 1 : 0, `${log}\n${r.error || r.stderr}`);
         eq(log.includes('fixture installer'), row.failCopy !== 1 && !row.readonly && !row.denyParent, '应只在备份和写权限检查通过后启动安装器');
