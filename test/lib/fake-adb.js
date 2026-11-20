@@ -139,7 +139,8 @@ class FakeAdb {
 
 /** 建一套临时环境：Windows 目录 / Android 目录 / 数据目录 / 假客户端 */
 function makeEnv(prefix = 'apkstart-test-') {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  // Windows CI 的 TEMP 可能含 8.3 短名；夹具使用规范路径，真实共享边界仍拒绝别名。
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   const localDir = path.join(root, 'win');
   const remoteDir = path.join(root, 'android');
   const dataDir = path.join(root, 'data');

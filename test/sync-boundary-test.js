@@ -27,6 +27,29 @@ const junction = (target, link) => fs.symlinkSync(target, link, process.platform
 const denied = (r) => assert(r.error || r.errors.length, '应报告边界错误');
 
 (async () => {
+  await test('临时目录夹具解析系统 TEMP 别名，不放松真实共享目录边界', async (t) => {
+    const os = require('os');
+    const realTemp = path.join(t.root, 'real-temp');
+    const aliasTemp = path.join(t.root, 'alias-temp');
+    fs.mkdirSync(realTemp);
+    junction(realTemp, aliasTemp);
+    const tmpdir = os.tmpdir;
+    let nested;
+    try {
+      os.tmpdir = () => aliasTemp;
+      nested = makeEnv('alias-');
+    } finally { os.tmpdir = tmpdir; }
+    assert.strictEqual(nested.root, fs.realpathSync.native(nested.root));
+    assert.strictEqual(path.dirname(nested.root), fs.realpathSync.native(realTemp));
+    writeStable(path.join(nested.remoteDir, 'ok.txt'), 'SAFE');
+    const sharer = new Sharer({ client: () => nested.fake }, {
+      dataDir: nested.dataDir,
+      settings: () => ({ sharedDir: nested.localDir, deviceSharedDir: nested.remoteDir }),
+    });
+    const r = await sharer.sync();
+    assert.strictEqual(r.pulled, 1, JSON.stringify(r));
+    assert.strictEqual(fs.readFileSync(path.join(nested.localDir, 'ok.txt'), 'utf8'), 'SAFE');
+  });
   await test('stat 列表拒绝遍历、绝对路径、Windows 别名和反斜杠；正常文件仍同步', async (t) => {
     const bad = [
       '../outside/sentinel.txt', 'a/../../outside/sentinel.txt', '/absolute.txt', '//server/share/file',
