@@ -51,6 +51,7 @@
     "test:security": "node test/security-test.js",
     "test:compat": "node test/compat-test.js",
     "test:backup": "node test/backup-test.js",
+    "test:packaged": "node --test test/store-packaged-test.js",
     "test:electron": "node test/run-electron.js smoke",
     "test:ui": "node test/run-electron.js ui",
     "test:app": "node test/run-electron.js selftest",
