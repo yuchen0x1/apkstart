@@ -66,6 +66,7 @@
 - 测试中预期的 IPC 失败注入会输出错误行，不代表未捕获页面脚本错误。
 - 本机截图来自真实 Chromium 渲染，但应用列表和 Android 能力由 fixture 提供；不是运行 Android 应用的证明。
 - 本轮未测试屏幕阅读器、物理多显示器 DPI、真实 Android 启动/安装与 Linux 原生桌面会话。
+- 已保留两张实际渲染截图：[浅色应用库](screenshots/store-integrity/light-library.png)、[深色性能设置](screenshots/store-integrity/dark-settings-performance.png)。它们使用 fixture 数据，不代表真实 Android 工作负载。
 
 ## 6. 开源项目研究
 
@@ -104,13 +105,14 @@
 | Windows 便携构建 | 成功，最终核心提交后重建 |
 | Windows NSIS 构建 | 成功，最终核心提交后重建；没有代码签名证书 |
 | 两类构建目录模块验收 | 2/2；源码哈希、版本、内置 Node 隔离保存均通过 |
+| 远程 CI（代码提交 `df70d97`） | Windows / Node 20、Windows / Node 22、Linux / Node 22 三项全部成功；[运行记录](https://github.com/yuchen0x1/apkstart/actions/runs/44829208385) |
 | `git diff --check` | 通过 |
 | 生产依赖 npm audit | 官方 registry 返回 0 个已知漏洞；不等于整个软件无漏洞 |
 | audit 首次失败 | 本机 npmmirror 不实现审计接口，返回 404；改用官方 registry 后成功，未修改机器配置 |
 
 ### 未执行或不能据此声称通过的项目
 
-- Linux 本地构建、Linux 原生 GUI、KVM 与文件权限验收：本机为 Windows；需 CI / 对应环境。
+- Linux 安装产物构建、Linux 原生 GUI、KVM 与真实文件权限验收：未运行；本机为 Windows。Linux Node 自动测试已在远程 CI 通过，但不替代这些验收。
 - 用户真实 Android 的安装、启动、共享、备份恢复：为保护已有模拟器，没有运行可能接管它的产品主进程自检。
 - NSIS 交互安装、真实已安装旧版升级、杀软/文件锁环境和卸载：只构建与检查展开包，未改变本机正式安装。
 - 系统断电、跨进程竞争与全部文件系统语义：不在本轮自动化保证内。
@@ -129,14 +131,18 @@
 - 远程已核验：`github.com/yuchen0x1/apkstart`，默认分支 `main`。
 - 本轮核心提交：`5b09ea7bab674efaf53b6788df407a20330cfc67`，父提交为已发布 v0.9.2。
 - 未改动原工作区，也未把其它会话的 runtime/IPC/UI 修复归为本轮成果。
-- main 整合、远程推送和最终 SHA 在实际完成后核验，不在此预写成功。
+- 核心修复及构建包验收已快进进入 `main`，并成功推送到远程：`df70d97ef90fbcc43af29859bbcff2e71a0ad575`。
+- `git ls-remote` 与 GitHub 分支 API 均确认该远端代码提交；对应三平台/Node 组合 CI 全部成功。
+- 本报告后续的文档/截图记录提交会在此代码提交之后，不改变已经验收的生产模块。
 
 ## 9. 版本发布结果
 
 - 不复用已发布 `v0.9.2` Tag。
 - 本机 `0.9.2` 名称的构建仅用于新提交的构建验证，**不是重新发布旧版，不得上传覆盖旧资产**。
 - 新版需要唯一版本号、相应 README/CHANGELOG、测试、平台构建与更新元数据签名。
-- 目前没有把本轮产物冒充新的正式 Release；正式发布状态以 GitHub 查询与交付答复为准。
+- 本轮 **尚未发布新的正式版，没有创建新 Tag 或上传资产**；核验时最新正式版仍为 [v0.9.2](https://github.com/yuchen0x1/apkstart/releases/tag/v0.9.2)。
+- 发版协调阻塞：另一个活动 worktree 正在编辑 v0.9.3 候选，协调消息尚未获得发布归属确认；一处会话投递返回 `heldQueueDispositionRequired`，不得绕过待处置队列或竞争相同版本。
+- 本轮代码已经进入主线，不需要重复 cherry-pick。后续发布会话应从最新 `origin/main` 安全整合，再确认唯一版本、精确 Tag 目标与正式发布操作。
 
 ## 10. 下一轮自主升级计划
 
