@@ -14,7 +14,21 @@ const fs = require('fs');
 const path = require('path');
 const { Readable, Transform, pipeline } = require('stream');
 
-/** pipeline 错误时关闭所有流；CRC/长度通过后才算完成。 */
+function waitForClose(stream) {
+  if (!stream || stream.closed || stream.emitClose === false
+    || stream.autoClose === false || stream.autoDestroy === false) return Promise.resolve();
+  return new Promise((resolve) => {
+    if (stream.closed) resolve();
+    else stream.once('close', resolve);
+  });
+}
+
+function rejectDestination(dest, error) {
+  if (dest && typeof dest.destroy === 'function' && !dest.destroyed) dest.destroy();
+  return waitForClose(dest).then(() => { throw error; });
+}
+
+/** pipeline 错误时关闭所有流；CRC/长度通过且目标关闭后才算完成。 */
 function pipeEntry(source, entry, dest, opts = {}) {
   let crc = 0;
   let bytes = 0;
@@ -34,12 +48,14 @@ function pipeEntry(source, entry, dest, opts = {}) {
   if (entry.method === 8) streams.push(zlib.createInflateRaw());
   else if (entry.method !== 0) {
     source.destroy();
-    dest.destroy();
-    return Promise.reject(new Error(`不支持的压缩方式 ${entry.method}: ${entry.name}`));
+    return rejectDestination(dest, new Error(`不支持的压缩方式 ${entry.method}: ${entry.name}`));
   }
   streams.push(verify, dest);
   return new Promise((resolve, reject) => {
-    pipeline(...streams, (err) => err ? reject(err) : resolve(entry.uncompSize));
+    const closed = waitForClose(dest);
+    pipeline(...streams, (err) => {
+      closed.then(() => (err ? reject(err) : resolve(entry.uncompSize)), reject);
+    });
   });
 }
 
@@ -267,17 +283,17 @@ class ZipArchive {
    */
   pipeTo(name, dest, opts = {}) {
     const e = this.entries.get(name);
-    if (!e) return Promise.reject(new Error(`条目不存在: ${name}`));
+    if (!e) return rejectDestination(dest, new Error(`条目不存在: ${name}`));
     const buf = this.buf;
-    if (e.localOffset + 30 > buf.length) return Promise.reject(new Error(`本地文件头越界: ${name}`));
+    if (e.localOffset + 30 > buf.length) return rejectDestination(dest, new Error(`本地文件头越界: ${name}`));
     if (buf.readUInt32LE(e.localOffset) !== LOC_SIG) {
-      return Promise.reject(new Error(`本地文件头损坏: ${name}`));
+      return rejectDestination(dest, new Error(`本地文件头损坏: ${name}`));
     }
     const nameLen = buf.readUInt16LE(e.localOffset + 26);
     const extraLen = buf.readUInt16LE(e.localOffset + 28);
     const start = e.localOffset + 30 + nameLen + extraLen;
     const end = start + e.compSize;
-    if (end > buf.length) return Promise.reject(new Error(`条目数据越界: ${name}`));
+    if (end > buf.length) return rejectDestination(dest, new Error(`条目数据越界: ${name}`));
     const raw = buf.subarray(start, end);
     return pipeEntry(Readable.from([raw]), e, dest, opts);
   }
@@ -415,11 +431,10 @@ class ZipFile {
    */
   pipeTo(name, dest, opts = {}) {
     let r;
-    try { r = this._range(name); } catch (e) { return Promise.reject(e); }
+    try { r = this._range(name); } catch (e) { return rejectDestination(dest, e); }
     const { e, start, end } = r;
     if (end >= this.size) {
-      dest.destroy();
-      return Promise.reject(new Error(`条目数据被截断: ${name}`));
+      return rejectDestination(dest, new Error(`条目数据被截断: ${name}`));
     }
     const src = e.compSize === 0 ? Readable.from([]) : fs.createReadStream(null, {
       fd: this.fd, autoClose: false, start, end,

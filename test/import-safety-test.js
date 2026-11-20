@@ -155,6 +155,23 @@ function poisonedZip(name, data, { deflate = false, badSize = false } = {}) {
       const out = path.join(dir, 'out'); await new Provisioner(ROOT).extractZip(zip, out);
       assert.equal(fs.readFileSync(path.join(out, 'platform-tools/adb.bin'), 'utf8'), 'normal fixture');
     });
+    await test('streamed ZIP validation waits for destination close before cleanup', async () => {
+      const dir = temp('zip'); const zipPath = path.join(dir, 'bad.zip');
+      fs.writeFileSync(zipPath, buildZip([{ name: 'bad', data: 'damaged', crc: 123 }]));
+      const zip = new ZipFile(zipPath);
+      let closeCompleted = false;
+      const dest = new Writable({
+        write(_data, _encoding, callback) { callback(); },
+        destroy(error, callback) {
+          setTimeout(() => { closeCompleted = true; callback(error); }, 25);
+        },
+      });
+      try {
+        await assert.rejects(zip.pipeTo('bad', dest, { verify: true }), /CRC/);
+        assert.equal(closeCompleted, true);
+        assert.equal(dest.closed, true);
+      } finally { zip.close(); }
+    });
     await test('large streamed entry CRC failure leaves no output or staging files', async () => {
       const dir = temp('zip'); const zip = path.join(dir, 'big.zip'); const data = Buffer.alloc(65 * 1048576, 0x41);
       const bytes = buildZip([{ name: 'system.img', data }]); bytes[30 + Buffer.byteLength('system.img')] ^= 1;
