@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { randomUUID } = require('crypto');
 const { normalizePreference } = require('./theme');
 
 // Linux 不能落 ~/AppData/Roaming：XDG 约定的数据目录是 ~/.local/share
@@ -204,53 +205,75 @@ function ensureDirs() {
   }
 }
 
-function readJson(file, fallback) {
-  let text = '';
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function readJson(file, fallback, validate = isRecord) {
+  let text;
   try {
     text = fs.readFileSync(file, 'utf8');
-  } catch (_) {
-    return fallback;
+  } catch (e) {
+    // 不存在才是首次使用；权限 / I/O 错误必须向上传递，不能用默认值覆写原配置。
+    if (e.code === 'ENOENT') return fallback;
+    throw e;
   }
   try {
-    // 带 BOM 的文件（部分编辑器「UTF-8 with BOM」另存 / Set-Content -Encoding utf8BOM）
-    // 以前会让 JSON.parse 抛错 → 走默认值分支 → 再把默认值写回磁盘，
-    // 用户看到的就是「所有配置被静默重置」。strip 掉 BOM 后正常解析。
-    return JSON.parse(text.replace(/^\uFEFF/, ''));
-  } catch (_) {
-    // 真损坏：把原文件改名保留现场（不再覆写），返回默认值。
-    // 用户能拿 .bak 找回原配置，而不是「东西没了」。
-    try { fs.renameSync(file, `${file}.bak-${Date.now()}`); } catch (_) { /* ignore */ }
-    return fallback;
+    // 兼容 UTF-8 BOM；语法正确的 null / 数组也不是合法配置或清单。
+    const value = JSON.parse(text.replace(/^\uFEFF/, ''));
+    if (validate(value)) return value;
+  } catch (e) {
+    if (!(e instanceof SyntaxError)) throw e;
   }
+  // 先成功保留恢复副本才允许回退。随机后缀避免同毫秒内重复恢复覆盖旧副本。
+  fs.renameSync(file, `${file}.bak-${Date.now()}-${randomUUID()}`);
+  return fallback;
 }
 
 function writeJson(file, data) {
+  const text = JSON.stringify(data, null, 2);
   ensureDirs();
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmp, file);
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  // 独占创建同目录暂存文件，不跟随已有 .tmp 链接；写入并刷新后再原子替换。
+  let fd = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    fs.writeFileSync(fd, text, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmp, file);
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) { /* 保留原始写入错误 */ }
+    }
+    try { fs.unlinkSync(tmp); } catch (_) { /* 已替换或清理失败，不掩盖原始错误 */ }
+  }
 }
 
 function deepMerge(base, patch) {
-  const out = { ...base };
-  for (const [k, v] of Object.entries(patch || {})) {
-    if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object') {
-      out[k] = deepMerge(base[k], v);
-    } else {
-      out[k] = v;
-    }
+  const out = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (isRecord(v)) out[k] = deepMerge(v, {});
+    else out[k] = Array.isArray(v) ? structuredClone(v) : v;
+  }
+  for (const [k, v] of Object.entries(filterKnown(base, patch))) {
+    out[k] = isRecord(v) ? deepMerge(base[k], v) : v;
   }
   return out;
 }
 
-/** 递归丢弃默认值里没有声明的键（未知键一律不落盘） */
+/** 只接受默认值声明的自有键和类型，不能把整个分区替换成 null / 数组。 */
 function filterKnown(base, patch) {
   const out = {};
-  for (const [k, v] of Object.entries(patch || {})) {
-    if (!(k in base)) continue;
-    if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object' && !Array.isArray(base[k])) {
-      out[k] = filterKnown(base[k], v);
-    } else {
+  if (!isRecord(patch)) return out;
+  for (const [k, v] of Object.entries(patch)) {
+    if (!Object.hasOwn(base, k)) continue;
+    if (isRecord(base[k])) {
+      if (isRecord(v)) out[k] = filterKnown(base[k], v);
+    } else if (Array.isArray(base[k])) {
+      if (Array.isArray(v) && v.every((item) => typeof item === 'string')) out[k] = [...v];
+    } else if (typeof v === typeof base[k] && (typeof v !== 'number' || Number.isFinite(v))) {
       out[k] = v;
     }
   }
@@ -319,8 +342,15 @@ const store = {
   },
 
   getApps() {
-    const data = readJson(APPS_FILE, { apps: [] });
-    return Array.isArray(data.apps) ? data.apps : [];
+    const data = readJson(APPS_FILE, { apps: [] }, (value) => isRecord(value) && Array.isArray(value.apps));
+    const apps = data.apps.filter((app) => isRecord(app) && typeof app.package === 'string' && app.package.length > 0);
+    if (apps.length !== data.apps.length) {
+      // 单条坏记录不隐藏其它应用；先复制原始清单，再原子保存可恢复的记录。
+      // 备份或保存失败均报错，原文件仍保留，不能默默丢掉无法识别的元数据。
+      fs.copyFileSync(APPS_FILE, `${APPS_FILE}.bak-${Date.now()}-${randomUUID()}`, fs.constants.COPYFILE_EXCL);
+      writeJson(APPS_FILE, { ...data, apps });
+    }
+    return apps;
   },
 
   saveApps(apps) {
