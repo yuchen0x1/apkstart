@@ -929,6 +929,7 @@ function notifyUpdateFailure() {
   //            这种情况重试同一个按钮仍然没用，必须引导用户手动装。
   try {
     const p = typeof updater.pendingApply === 'function' ? updater.pendingApply() : { state: 'none' };
+    if (p.state !== 'none' && p.version) updater.blockAutoApply(p.version);
     if (p.state === 'stalled') {
       appLog(`previous update stalled at v${p.version}: apply script never ran`);
       send('toast', {
@@ -945,12 +946,14 @@ function notifyUpdateFailure() {
     if (!fs.existsSync(f)) return;
     // 也兼容旧脚本和便携更新写出的 UTF-8 BOM。
     const raw = JSON.parse(fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, '')) || {};
+    const v = String(raw.version || '').replace(/^v/i, '');
+    if (v) updater.blockAutoApply(v);
     fs.rmSync(f, { force: true });
     updater.clearPending();
-    const v = String(raw.version || '').replace(/^v/i, '');
     const detail = raw.rollback === 'restored' ? '已恢复旧版程序文件。'
-      : raw.rollback === 'not-attempted' ? '备份检查未通过，未运行安装程序。'
-        : raw.rollback === 'unverified' ? '未能确认旧版已恢复，请查看更新日志。' : '';
+      : raw.rollback === 'not-attempted' ? '安装前检查未通过，未运行安装程序。'
+        : raw.rollback === 'not-started' ? '安装程序已取消，旧版文件未改动。'
+          : raw.rollback === 'unverified' ? '未能确认旧版已恢复，请查看更新日志。' : '';
     appLog(`previous update failed: v${v} rollback=${raw.rollback || 'unknown'} log=${raw.log || ''}`);
     send('toast', {
       type: 'warn',
@@ -1001,11 +1004,12 @@ function applyAutoUpdate() {
   if (!autoUpdateJob || applyingUpdate) return false;
   const job = autoUpdateJob;
   autoUpdateJob = null;
+  if (updater.autoApplyBlocked(job.version)) return false;
   return startApplyUpdate(job, autoUpdateTag);
 }
 
 async function autoUpdateFlow(info) {
-  if (updateBusy || autoUpdateJob) return;
+  if (updateBusy || autoUpdateJob || updater.autoApplyBlocked(info.version || info.tag)) return;
   notify('发现新版本', `ApkStart ${info.tag}，正在自动下载（完成后自动重启安装）…`);
   send('update:state', info);
   updateBusy = true;
@@ -1040,7 +1044,8 @@ function handleUpdateFound(info) {
   send('update:state', info);
   if (!info.hasUpdate) return;
   appLog(`update available ${info.tag} (current v${app.getVersion()}, asset=${info.asset ? info.asset.name : 'none'})`);
-  if (info.canAutoApply && info.flavor !== 'deb' && store.getSettings().update.autoUpdate === true) {
+  if (info.canAutoApply && info.flavor !== 'deb' && store.getSettings().update.autoUpdate === true
+      && !updater.autoApplyBlocked(info.version || info.tag)) {
     autoUpdateFlow(info).catch((e) => appLog(`auto update error: ${e.message}`));
   } else {
     notify('发现新版本', 'ApkStart ' + info.tag + ' 已发布，可在设置中查看更新详情');

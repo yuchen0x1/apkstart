@@ -84,6 +84,29 @@ class Updater {
     return path.join(this.dataDir, 'update');
   }
 
+  /** 一次安装尝试后不自动重试同版本；手动更新仍可调用 apply。 */
+  autoApplyBlocked(version) {
+    try {
+      const receipt = JSON.parse(fs.readFileSync(path.join(this.updateDir, 'auto-attempts.json'), 'utf8'));
+      return !Array.isArray(receipt.versions) || receipt.versions.some(v => typeof v !== 'string')
+        || receipt.versions.includes(String(version || '').replace(/^v/i, ''));
+    } catch (error) { return error.code !== 'ENOENT'; }
+  }
+
+  blockAutoApply(version) {
+    const want = String(version || '').replace(/^v/i, '');
+    if (!/^\d+\.\d+\.\d+$/.test(want)) throw new Error('更新尝试版本号无效');
+    const file = path.join(this.updateDir, 'auto-attempts.json');
+    let versions = [];
+    try {
+      const receipt = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (Array.isArray(receipt.versions)) versions = receipt.versions.filter(v => typeof v === 'string');
+    } catch (_) { /* 手动尝试可修复损坏凭条；自动路径对损坏凭条失败关闭 */ }
+    if (!versions.includes(want)) versions.push(want);
+    fs.mkdirSync(this.updateDir, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ versions }), 'utf8');
+  }
+
   /**
    * 检查更新：GitHub / Gitee 并发问，取版本号更高的，资产取并集。
    * 具体下载地址在 prepare() 里再做一次真实测速排序。
@@ -510,6 +533,8 @@ class Updater {
       // 后台若又查到了更新的版本，latest 已经换成别人的大小了。
       this._assertSetup(job.payload, { size: job.size });
     }
+    // 先持久化再交给外部脚本；即使脚本没跑起来或故障标记写失败，也不自动循环。
+    this.blockAutoApply(job.version);
 
     const lines = [
       `$ErrorActionPreference = 'SilentlyContinue'`,
@@ -616,6 +641,34 @@ class Updater {
         `$before = Read-Version $pkg`,
         `$beforeSize = Exe-Size $probe`,
         `$canRestart = ($beforeSize -gt 0 -and $before -ne '')`,
+        // 不改写原文件，先确认当前用户能打开全部程序文件并创建/删除同目录文件。
+        // 安装器可能提权，而本 helper 不会；只读 Program Files 不能仅凭可读就放行。
+        `function Test-InstallWritable {`,
+        `  $dirs = New-Object 'System.Collections.Generic.HashSet[string]'`,
+        `  try {`,
+        `    foreach ($file in Get-ChildItem -LiteralPath $bak -Recurse -File -Force -ErrorAction Stop) {`,
+        `      $target = Join-Path $dst ($file.FullName.Substring($bak.Length).TrimStart('\\'))`,
+        `      $stream = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)`,
+        `      $stream.Dispose()`,
+        `      [void]$dirs.Add((Split-Path -Parent $target))`,
+        `    }`,
+        `    [void]$dirs.Add($dst)`,
+        `    [void]$dirs.Add((Split-Path -Parent $dst))`,
+        `    foreach ($folder in Get-ChildItem -LiteralPath $bak -Recurse -Directory -Force -ErrorAction Stop) {`,
+        `      [void]$dirs.Add((Join-Path $dst ($folder.FullName.Substring($bak.Length).TrimStart('\\'))))`,
+        `    }`,
+        `    foreach ($folder in $dirs) {`,
+        `      $testFile = Join-Path $folder ('.apkstart-write-' + [guid]::NewGuid().ToString('N'))`,
+        `      $stream = [IO.File]::Open($testFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)`,
+        `      $stream.Dispose()`,
+        `      Remove-Item -LiteralPath $testFile -Force -ErrorAction Stop`,
+        // 根目录可能被提权安装器删掉，恢复还需要在父目录重建，而非仅能写旧文件。
+        `      [void][IO.Directory]::CreateDirectory($testFile)`,
+        `      [IO.Directory]::Delete($testFile)`,
+        `    }`,
+        `    return $true`,
+        `  } catch { Note ('install directory not writable: ' + $_.Exception.Message); return $false }`,
+        `}`,
         `Note ("installer: backup first: " + $bak)`,
         `$LASTEXITCODE = $null`,
         `$null = robocopy $dst $bak /E /XJ /XD ${psq(runtimeDir)} /NFL /NDL /NJH /NJS /R:1 /W:1`,
@@ -625,19 +678,31 @@ class Updater {
         // robocopy 用位标志报告结果，8 以上表示至少一个复制错误。
         `$hasBak = ($null -ne $backupExit -and $backupExit -lt 8 -and $canRestart -and $beforeSize -eq $backupSize -and $before -ceq $backupVersion)`,
         `Note ("backup ok=" + $hasBak + " exit=" + $backupExit)`,
-        `if ($hasBak) {`,
+        `$writable = $false`,
+        `if ($hasBak) { $writable = Test-InstallWritable }`,
+        `if ($hasBak -and $writable) {`,
         `  Note 'run installer'`,
         `  $installerExit = $null`,
+        `  $launchCancelled = $false`,
         `  try {`,
         `    $p = Start-Process -FilePath ${psq(job.payload)} -ArgumentList '/S' -PassThru -Wait -ErrorAction Stop`,
         `    $installerExit = $p.ExitCode`,
-        `  } catch { Note ("installer launch failed: " + $_.Exception.Message) }`,
+        `  } catch {`,
+        `    Note ("installer launch failed: " + $_.Exception.Message)`,
+        `    for ($err = $_.Exception; $null -ne $err; $err = $err.InnerException) {`,
+        `      if ($err -is [ComponentModel.Win32Exception] -and $err.NativeErrorCode -eq 1223) { $launchCancelled = $true }`,
+        `    }`,
+        `  }`,
         `  Note ("installer exit " + $installerExit)`,
         `  $gotVer = Read-Version $pkg`,
         `  $size = Exe-Size $probe`,
         `  Note ("after install: exe=" + $size + " ver=" + $gotVer)`,
         `  $ok = (0 -eq $installerExit -and $size -gt 0 -and $want -ne '' -and $gotVer -ceq $want)`,
-        `  if (-not $ok) {`,
+        `  if ($launchCancelled) {`,
+        `    $canRestart = ($size -eq $beforeSize -and $gotVer -ceq $before)`,
+        `    if ($canRestart) { $rollback = 'not-started'; Note 'installer cancelled, original files unchanged' }`,
+        `    else { $rollback = 'unverified'; Note 'installer cancelled, original files changed' }`,
+        `  } elseif (-not $ok) {`,
         `    Note 'verify failed, rolling back to previous version'`,
         `    $LASTEXITCODE = $null`,
         // 即使新旧文件大小和修改时间相同，也用备份覆盖；不镜像清除未知文件。
