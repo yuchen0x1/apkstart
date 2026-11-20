@@ -646,8 +646,12 @@ class Updater {
         `function Test-InstallWritable {`,
         `  $dirs = New-Object 'System.Collections.Generic.HashSet[string]'`,
         `  try {`,
+        // Get-ChildItem 返回解析后的长路径；$bak 可能是 8.3 短名（RUNNER~1），
+        // 直接用 $bak.Length 截相对路径会算错层级。用同来源的解析根。
+        `    $bakRoot = (Get-Item -LiteralPath $bak -Force -ErrorAction Stop).FullName`,
         `    foreach ($file in Get-ChildItem -LiteralPath $bak -Recurse -File -Force -ErrorAction Stop) {`,
-        `      $target = Join-Path $dst ($file.FullName.Substring($bak.Length).TrimStart('\\'))`,
+        `      $rel = $file.FullName.Substring($bakRoot.Length).TrimStart('\\')`,
+        `      $target = Join-Path $dst $rel`,
         `      $stream = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)`,
         `      $stream.Dispose()`,
         `      [void]$dirs.Add((Split-Path -Parent $target))`,
@@ -655,7 +659,8 @@ class Updater {
         `    [void]$dirs.Add($dst)`,
         `    [void]$dirs.Add((Split-Path -Parent $dst))`,
         `    foreach ($folder in Get-ChildItem -LiteralPath $bak -Recurse -Directory -Force -ErrorAction Stop) {`,
-        `      [void]$dirs.Add((Join-Path $dst ($folder.FullName.Substring($bak.Length).TrimStart('\\'))))`,
+        `      $rel = $folder.FullName.Substring($bakRoot.Length).TrimStart('\\')`,
+        `      [void]$dirs.Add((Join-Path $dst $rel))`,
         `    }`,
         `    foreach ($folder in $dirs) {`,
         `      $testFile = Join-Path $folder ('.apkstart-write-' + [guid]::NewGuid().ToString('N'))`,

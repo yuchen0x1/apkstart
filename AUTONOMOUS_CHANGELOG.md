@@ -31,9 +31,19 @@
 - 首次 NSIS 构建下载 Electron 超时：使用已安装、相同版本的 Electron runtime 重试后成功；没有重复安装软件或发布半成品。
 - 夹具 UI 的注入故障日志属于预期负向用例；截图暂时失败仅重试截图本身。
 
+### CI 短路径回归与修正
+
+- [PR #14](https://github.com/yuchen0x1/apkstart/pull/14) 首轮 head `aecad3e` 的 [CI 44791289048](https://github.com/yuchen0x1/apkstart/actions/runs/44791289048)：Windows Node 20/22 均失败，Linux Node 22 通过；失败时未合并或发布。
+- 原因：备份根使用 `RUNNER~1` 等 8.3 短名，而 PowerShell `Get-ChildItem.FullName` 返回长名。直接截取 `$bak.Length` 得到了错误相对路径，恢复写权限预检错误中止。
+- 修正：通过同一文件系统提供程序 `Get-Item.FullName` 解析备份根，再用于文件和目录相对路径；不为掩盖错误而创建映射目录，也不放宽恢复权限。
+- 新增 2 项真实 8.3 成功安装及安装根被删除后的恢复场景。PowerShell 实际枚举文件、空目录并断言新偏移正确、旧偏移错误；CI 不支持短名时失败，非 CI 明确跳过且不计通过。短名辅助函数用 Base64 传回 UTF-8 路径，避免 PowerShell 5.1 代码页损坏中文。
+- 首次新增夹具因 cmd 引号处理返回无效路径而失败（54/1）；已修正，没有把管道掩盖的退出码 0 当作通过。修正后专项 56/0，两项短路径均实际执行；Windows 全量再次退出 0。
+- 独立静态复核指出并确认修复测试编码、失配未断言两项缺口；最终本轮范围未见新增阻塞。静态复核不代替远端 Node 20/22 CI。
+- 冻结树 `f621aaa6c2b39ca69b8e487dbbf97c79fc94d013` 导出到独立 Linux 目录，`npm ci` 后在只有 loopback 的网络 namespace 完成全量回归、退出 0（更新器 42/0，Windows 专属用例跳过）。Windows 沙箱冒烟再次 20/0，no-images 与 README 一致性门禁通过。后续只回填文档证据，代码与该冻结树一致。
+
 ### 交付状态
 
-本段写入时：本地验收完成，尚待 PR CI、主分支合并和签名 Release 流水线。正式结果回填 [RELEASE_HISTORY.md](RELEASE_HISTORY.md)。未把 Issue #13、原生 Linux 桌面、真实设备升级或签名证书标记为已验证。
+本段写入时：短路径修正完成本地 Windows 验收，尚待修正后精确提交的 PR CI、主分支合并和签名 Release 流水线。正式结果回填 [RELEASE_HISTORY.md](RELEASE_HISTORY.md)。未把 Issue #13、原生 Linux 桌面、真实设备升级或签名证书标记为已验证。
 
 ### 开源研究
 

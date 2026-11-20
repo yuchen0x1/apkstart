@@ -7,7 +7,7 @@
 - 基线：已发布的 `v0.9.1`（`accb6ca`）。巡检期间主分支前进，更新器补丁已重放到该基线，不重复纳入先前 UI/运行时加固提交。
 - 候选版本：`0.9.2`（PATCH），Windows 安装版更新失败处理和恢复文件保护。
 - 实施分支：`fix/windows-updater-rollback`。使用独立 Git worktree，未覆盖最初工作区改动。
-- 状态：本地验收完成；待 PR CI、合并及既有签名发布流水线验收。此处不提前宣称已正式发布。
+- 状态：[PR #14](https://github.com/yuchen0x1/apkstart/pull/14) 首轮 Windows Node 20/22 CI 失败、Linux Node 22 通过。CI 暴露的 8.3 短名/长路径偏移缺陷已在本地修复并补回归；Windows 全量重测通过，仍须修正后提交的远端 CI 全绿才能合并发布。此处不提前宣称已正式发布。
 
 ## 架构与交付
 
@@ -20,8 +20,8 @@
 
 | 检查 | 结果与限制 |
 | --- | --- |
-| Windows `npm test` | 退出 0；Node 26.13.1；更新器专项 54 通过、0 失败 |
-| Linux `npm test` | WSL Ubuntu / Node 22.22.1，独立网络 namespace，仅 loopback；退出 0 |
+| Windows `npm test` | 短路径修正后重测退出 0；Node 26.13.1；更新器专项 56 通过、0 失败，含 2 项真实 8.3 成功/回滚场景 |
+| Linux `npm test` | 短路径修正后冻结树 `f621aaa` 在 WSL Ubuntu / Node 22.22.1 重测，独立网络 namespace、仅 loopback；退出 0，更新器 42/0；Windows 专属用例明确跳过 |
 | Electron 冒烟 | 20 通过、0 失败；fixture IPC，不加载产品主进程 |
 | `test:ui` | 退出 0；406 次渲染/状态采样，无汇总脚本错误、无名称缺失及常规窗口溢出；不是 406 个独立页面或完整无障碍认证 |
 | Windows 便携版 | 构建及 160 MiB 体积门禁通过，约 142.96 MiB |

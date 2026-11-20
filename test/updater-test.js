@@ -521,6 +521,70 @@ async function main() {
     });
   }
 
+  console.log('\n[短路径：8.3 短名与解析长路径混用]');
+
+  /** 直接取目录短名，避免 cmd 的二次引号解析改变返回路径。 */
+  function shortPath(p) {
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const code = `$ErrorActionPreference = 'Stop'; $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder('${p.replace(/'/g, "''")}').ShortPath; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($short))`;
+    const r = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    eq(r.status, 0, `${r.error || r.stderr}`);
+    const result = Buffer.from(String(r.stdout || '').trim(), 'base64').toString('utf8');
+    assert(path.isAbsolute(result) && !result.includes('"') && fs.statSync(result).isDirectory(), `无效的短路径：${result}`);
+    return result;
+  }
+
+  if (process.platform !== 'win32') console.log('  跳过：8.3 短名需要 Windows');
+  for (const rollback of process.platform === 'win32' ? [false, true] : []) {
+    const root = mkTmp();
+    try {
+      const short = shortPath(root);
+      if (short.toLowerCase() === fs.realpathSync.native(root).toLowerCase()) {
+        assert(!process.env.CI, 'Windows CI 必须实际执行 8.3 短名回归');
+        console.log('  跳过：此卷没有 8.3 短名，未执行短路径回归');
+        continue;
+      }
+      await test(`★ 8.3 短名备份根与长名子项：${rollback ? '失败后恢复' : '成功安装'}（CI RUNNER~1 回归）`, () => {
+        const u = mkUpdater(short);
+        const pkg = path.join(u.installDir, 'resources', 'app', 'package.json');
+        const downloadDir = path.join(u.updateDir, '9.9.9');
+        const emptyDir = path.join(u.installDir, 'resources', 'empty folder');
+        fs.mkdirSync(path.dirname(pkg), { recursive: true });
+        fs.mkdirSync(emptyDir);
+        fs.mkdirSync(downloadDir, { recursive: true });
+        fs.writeFileSync(u.exePath, 'fixture old exe');
+        fs.writeFileSync(pkg, '{"version":"0.6.2"}');
+        const payload = fakeExe(path.join(downloadDir, 'ApkStart-9.9.9-Setup.exe'));
+        let script = u.apply({ mode: 'setup', payload, version: '9.9.9' }, { spawn: false });
+        // 确认真实 PowerShell 文件系统提供程序确实触发旧偏移缺陷，不只比较 Node/COM 路径。
+        const rootLine = '    $bakRoot = (Get-Item -LiteralPath $bak -Force -ErrorAction Stop).FullName';
+        assert(script.includes(rootLine), '应能定位备份根解析语句');
+        script = script.replace(rootLine, [rootLine,
+          "    $items = @(Get-ChildItem -LiteralPath $bak -Recurse -Force -ErrorAction Stop | Where-Object { $_.Name -in @('package.json', 'empty folder') })",
+          "    if ($items.Count -ne 2) { throw 'fixture missing file or empty directory' }",
+          '    foreach ($item in $items) {',
+          "      $expected = if ($item.Name -eq 'package.json') { 'resources\\app\\package.json' } else { 'resources\\empty folder' }",
+          "      if ($item.FullName.Substring($bakRoot.Length).TrimStart('\\') -cne $expected) { throw 'fixture resolved root mismatch' }",
+          "      if ($item.FullName.Substring($bak.Length).TrimStart('\\') -ceq $expected) { throw 'fixture did not exercise old offset defect' }",
+          '    }',
+          "    Note 'fixture short/long mismatch verified'",
+        ].join('\r\n'));
+        const r = runInstallFixture(root, script, rollback ? ['Remove-Item -LiteralPath $dst -Recurse -Force', cmdExit(1)] : [writeNew, cmdExit(0)]);
+        const log = fs.readFileSync(path.join(u.updateDir, 'update.log'), 'utf8');
+        eq(r.status, rollback ? 1 : 0, `${log}\n${r.error || r.stderr}`);
+        assert(log.includes('backup ok=True'), `短名备份必须判为成功：${log}`);
+        assert(log.includes('fixture short/long mismatch verified'), '文件与空目录均必须实际触发旧偏移缺陷');
+        assert(log.includes('fixture installer'), '写权限预检误判会让安装器根本不运行');
+        assert(log.includes('fixture restart'), '成功安装或已确认恢复后应允许重启');
+        eq(JSON.parse(fs.readFileSync(pkg, 'utf8')).version, rollback ? '0.6.2' : '9.9.9');
+        assert(fs.statSync(emptyDir).isDirectory(), '应保留或恢复空目录');
+        eq(fs.existsSync(payload), rollback, '仅成功后删除安装包');
+        eq(fs.existsSync(path.join(u.updateDir, 'pending.json')), rollback, '仅成功后清理待安装凭条');
+        if (rollback) eq(JSON.parse(fs.readFileSync(path.join(u.updateDir, 'failed.json'), 'utf8')).rollback, 'restored');
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
+
   console.log('\n[启动通知：保留实际恢复状态，兼容旧标记编码]');
 
   const mainSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
