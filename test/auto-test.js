@@ -618,7 +618,16 @@ const { adbKeyHint } = require('../src/core/engine');
     const p = doctor.autoProfile({ ...common, settings: { engine: { autoMemory: true, gpuMode: 'auto', memoryMB: 0, cores: 0 } } });
     const text = doctor.describeProfile(p);
     assert(p.gpu === 'host', `应为 host（失败降级），实际 ${p.gpu}`);
-    assert(p.accelOk === true && text.includes('硬件加速'), text);
+    assert(p.accelOk === true && text.includes('检测到加速器（本次运行待确认）'), text);
+    assert(!text.includes('硬件加速'), '检测通过不能冒充本次运行已确认');
+    const confirmed = doctor.describeProfile({ ...p, acceleration: { confirmed: true } });
+    assert(confirmed.includes('硬件加速（运行日志已确认）') && !confirmed.includes('待确认'), confirmed);
+    const unconfirmed = doctor.describeProfile({ ...p, acceleration: { confirmed: false } });
+    assert(unconfirmed.includes('运行日志未确认硬件加速') && !unconfirmed.includes('运行日志已确认'), unconfirmed);
+    const off = doctor.describeProfile({ ...p, accel: 'off' });
+    assert(off.includes('请求软件模拟') && !off.includes('检测到加速器') && !off.includes('硬件加速'), off);
+    const unavailable = doctor.describeProfile({ ...p, accelOk: false });
+    assert(unavailable.includes('未检测到可用加速器') && !unavailable.includes('硬件加速'), unavailable);
     assert(!text.includes('swiftshader_indirect'), text);
     assert(text.includes('端口 5562'), text);
 
@@ -985,11 +994,19 @@ const { adbKeyHint } = require('../src/core/engine');
   await test('嵌入窗口必须挂到网页层之下，且不能再设 window region', () => {
     const file = path.join(__dirname, '..', 'src', 'core', 'win', 'agent.ps1');
     const src = fs.readFileSync(file, 'utf8');
-    assert(/FindChromeRender\(host\)/.test(src), '必须查找 Chromium 渲染子窗口');
-    assert(/SetParent\(emu, parent\)/.test(src), 'embed 必须挂到 FindChromeRender 找到的父窗口');
-    assert(/EnsureReparent\(\)/.test(src), '网页层建好之前的嵌入要能补挂');
+    const embed = src.slice(src.indexOf('static bool Embed('), src.indexOf('static bool Fit('));
+    const reparent = src.slice(src.indexOf('static bool Reparent('), src.indexOf('static bool SetStyle('));
+    const fit = src.slice(src.indexOf('static bool Fit('), src.indexOf('static void Raise('));
+    assert(/IntPtr parent = FindChromeRender\(host\);\s*if \(parent == IntPtr\.Zero\) parent = host;/.test(embed),
+      'embed 必须优先使用 Chromium 渲染子窗口，仅未就绪时暂挂宿主');
+    assert(/style \|= WS_CHILD \| WS_CLIPCHILDREN \| WS_CLIPSIBLINGS;[\s\S]*if \(!Reparent\(emu, parent\)\)\s*\{[^}]*return false;/.test(embed),
+      '必须以子窗口样式调用 Reparent，失败不能宣告嵌入成功');
+    assert(/SetLastError\(0\);\s*SetParent\(child, parent\);\s*int error = Marshal\.GetLastWin32Error\(\);\s*if \(!IsWindow\(child\) \|\| GetParent\(child\) != parent\)\s*return WindowFailure\("set-parent-failed", error\);/.test(reparent),
+      'Reparent 必须核验实际父窗口，不能用 SetParent 返回的旧父句柄判断成败');
+    assert(/IntPtr cr = FindChromeRender\(_host\);\s*if \(cr != IntPtr\.Zero && ep != cr && !Reparent\(_emu, cr\)\)\s*\{\s*ShowWindow\(_emu, 0\);\s*return false;/.test(fit),
+      '网页层建好后 Fit 必须补挂，失败应隐藏窗口且返回 false');
     assert(!/CreateRectRgn\(0, clipTop/.test(src), '不能给嵌入窗口设裁剪 region');
-    assert(/SetWindowRgn\(emu, IntPtr\.Zero/.test(src), 'embed 时要清掉旧版本残留的 region');
+    assert(/SetWindowRgn\(emu, IntPtr\.Zero/.test(embed), 'embed 时要清掉旧版本残留的 region');
   });
 
   // 三个「只在真机上才炸」的坑，用源码断言钉住（本机没有部署 build/runtime，
@@ -1141,9 +1158,16 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(/已在「Android Emulator」窗口打开/.test(mainSrc), '要把「去哪看画面」说清楚');
     assert(/async standalone\(\)/.test(appwinSrc), 'appwin 要提供一步到位的独立窗口方法');
     assert(/this\._hidden = true/.test(appwinSrc), '独立窗口模式下必须藏掉黑壳宿主窗口');
-    assert(/static bool Detach\(\)/.test(ps1) && /SetForegroundWindow\(_emu\)/.test(ps1),
-      '摘出来的窗口必须自己抢前台，否则会被黑壳盖住');
-    assert(/bool detached = Detach\(\)/.test(ps1), 'detach 找不到窗口时要如实回 false');
+    const release = ps1.slice(ps1.indexOf('static bool ReleaseEmulator('), ps1.indexOf('static bool Detach()'));
+    assert(/static bool Detach\(\)\s*\{\s*return ReleaseEmulator\(true\);\s*\}/.test(ps1),
+      'detach 必须走显示独立窗口的释放链路');
+    assert(/IntPtr e = _emu;\s*if \(e == IntPtr\.Zero\)\s*\{[^}]*return show \? WindowFailure\("emu=0", 0\) : true;/.test(release),
+      'detach 找不到窗口时必须如实失败，不能继续抢前台');
+    assert(/if \(GetParent\(e\) != IntPtr\.Zero && !Reparent\(e, IntPtr\.Zero\)\) return false;/.test(release),
+      '摘出父窗口失败时不能继续显示或报告成功');
+    assert(/if \(show\)\s*\{[^}]*ShowWindow\(e, IsIconic\(e\) \? 9 : 5\);[^}]*SetForegroundWindow\(e\);\s*\}\s*_emu = IntPtr\.Zero;/.test(release),
+      '仅独立显示路径应在清理句柄前用捕获的窗口抢前台，不能让 park 弹窗');
+    assert(/bool detached = Detach\(\)/.test(ps1), 'detach 必须将真实结果返回调用者');
   });
 
   // 启动路径上绝不能做破坏性动作：等网络可以，停掉虚拟机再冷启动不行 ——
@@ -2443,17 +2467,31 @@ const { adbKeyHint } = require('../src/core/engine');
   await test('每轮启动只用本轮日志做诊断（上一轮的崩溃不能污染下一轮）', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
-    emu._log = [
-      { t: 1, line: 'Graphics backend: gfxstream' },
-      { t: 2, line: 'emulator exit 3221225477' },        // 第 1 轮：0xC0000005
-      { t: 3, line: '--- 第 2 轮 ---' },
-      { t: 4, line: 'Address already in use' },          // 第 2 轮：端口被占
-    ];
-    assert(doctor.diagnose(emu._attemptLines(0, 80)).code === 'ACCESS_VIOLATION', '第 1 轮应判崩溃');
-    assert(doctor.diagnose(emu._attemptLines(2, 80)).code === 'PORT_BUSY', '第 2 轮应判端口占用');
-    // 本轮没有任何日志时退回整体尾部，不能直接 UNKNOWN
-    const fallback = emu._attemptLines(emu._log.length, 80);
-    assert(fallback.length === emu._log.length, `空轮次应退回整体日志，实际 ${fallback.length} 行`);
+    // 使用生产日志入口分配 seq，不能绕过协议直接注入无序号的 _log。
+    const first = emu._logSeq;
+    emu.log('Graphics backend: gfxstream');
+    emu.log('emulator exit 3221225477');
+    assert(doctor.diagnose(emu._attemptLines(first, 80)).code === 'ACCESS_VIOLATION', '第 1 轮应判崩溃');
+    const second = emu._logSeq;
+    emu.log('--- 第 2 轮 ---');
+    emu.log('Address already in use');
+    assert(doctor.diagnose(emu._attemptLines(second, 80)).code === 'PORT_BUSY', '第 2 轮应判端口占用');
+    assert(emu._attemptLines(second, 1).join('\n') === 'Address already in use', '只应取本轮最后 max 行');
+    assert(emu._attemptLines(emu._logSeq, 80).length === 0, '空轮次绝不能回借上轮崩溃/加速证据');
+
+    // 环形数组达到 600 条后长度不再增长；旧崩溃仍在尾部也不能污染新一轮。
+    for (let i = 0; i < 650; i += 1) emu.log(`previous attempt ${i}`);
+    emu.log('emulator exit 3221225477');
+    const afterWrap = emu._logSeq;
+    assert(emu._log.length === 600 && afterWrap > emu._log.length, '应真实触发 600 条环形截断');
+    emu.log('Address already in use');
+    assert(emu._log.length === 600 && emu._logSeq === afterWrap + 1, '截断后序号仍须严格递增');
+    assert(emu._attemptLines(afterWrap, 80).join('\n') === 'Address already in use', '截断后边界仍应隔离上轮');
+    assert(doctor.diagnose(emu._attemptLines(afterWrap, 80)).code === 'PORT_BUSY', '环形截断后也应判端口占用');
+    assert(emu._attemptLines(emu._logSeq, 80).length === 0, '截断后的空轮次也不能借用旧日志');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'emulator.js'), 'utf8');
+    assert(/const logStart = this\._logSeq;[\s\S]*this\._attemptLines\(logStart, 80\)/.test(src),
+      '生产启动循环必须传单调序号边界，不能再用环形数组长度');
   });
 
   await test('启动组件拼接：完整组件不能重复拼包名（否则点图标只看到安卓桌面）', () => {
