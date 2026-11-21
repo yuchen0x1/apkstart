@@ -23,7 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # 需要 完整历史 才能正确计算 merge-base 与 rev-list 计数（默认 depth=1 会失真）
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - name: 审计所有远程分支并生成报告
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,7 +48,7 @@ jobs:
             branch="${ref#origin/}"
             [ "$branch" = "main" ] && continue
             case "$branch" in
-              HEAD) continue ;;
+              HEAD|origin) continue ;;
             esac
 
             ahead=$(git rev-list --count "origin/main..$ref" 2>/dev/null || echo "?")
