@@ -1050,9 +1050,9 @@
               <label for="setReportAuto">失败时自动生成诊断报告</label>
               <div class="row">
                 <input type="checkbox" id="setReportAuto" class="switch" />
-                <span class="inline-note" style="margin-left:8px;">未配置收集接口时只保存在本机</span>
+                <span class="inline-note" style="margin-left:8px;">默认只保存在本机，不会自动发送</span>
               </div>
-              <span class="sub">开机失败时自动整理一份摘要（CPU、加速状态、每轮尝试、日志末尾），路径里的用户名会替换成 %USERPROFILE%。配置了收集接口（发行版内置或 settings.json 的 report.endpoint）会直接发给作者；否则在修复窗口点「上报给作者」提交到 GitHub Issues。</span>
+              <span class="sub">开机失败时整理诊断摘要（CPU、加速状态、尝试记录、日志末尾），过滤用户名路径与常见凭证。点「上报给作者」并确认后才发送到收集接口，或打开 GitHub 提交页。完整报告只留在本机，手动分享前仍需检查内容。高级自动发送须在 settings.json 中单独授权同一个 HTTPS 地址。</span>
               <div class="row" style="margin-top:6px;">
                 <button class="btn ghost sm" id="btnReportFolder">打开报告目录</button>
                 <span class="inline-note">logs\reports</span>

@@ -4439,7 +4439,7 @@ async function openRepair(started) {
   }
   if (repairRunning) return;
   hideMenu(false);
-  renderRepairPlan(plan);
+  renderRepairPlan(started?.reportDraft ? { ...plan, reportDraft: started.reportDraft } : plan);
   a11y.open($('repairMask'), { opener });
 }
 
@@ -4471,12 +4471,25 @@ function renderRepairPlan(plan) {
   // 报告是自动生成的（脱敏、只落本机）：说清楚它已经在哪、什么时候发出去由用户决定
   const draft = $('repairDraft');
   if (draft) {
-    const has = !!(plan.reportDraft && plan.reportDraft.file);
+    const info = plan.reportDraft || {};
+    const has = !!info.file;
     draft.hidden = !has;
-    draft.textContent = !has ? ''
-      : (plan.reportDraft.sent
-        ? '失败报告已自动上报（已脱敏）：作者会收到这次的机器信息、尝试记录与日志末尾。'
-        : '失败报告已自动生成并保存在本机（路径里的用户名已替换为 %USERPROFILE%）。点「上报给作者」才会发送。');
+    let text = '';
+    if (has) {
+      if (info.sent) {
+        // 自动上报只带机器信息、加速状态和尝试记录，不含日志末尾，别把范围说大。
+        text = '失败报告摘要已自动上报给配置的收集接口（已脱敏）：作者会收到机器信息、加速状态和尝试记录，不含日志末尾。';
+      } else if (info.skipped === 'uncertain') {
+        text = '上一次自动上报的结果不确定，可能已经被接收；为避免重复，这次没有重发。摘要已保存在本机。';
+      } else if (info.skipped === 'recent') {
+        text = '这份失败报告 24 小时内已经自动上报过，这次没有重复发送。摘要已保存在本机。';
+      } else if (info.skipped === 'receipt-error' || info.sendError) {
+        text = '自动上报没有完成，摘要已保存在本机：' + (info.sendError || '投递回执无法读写，已停止自动上报。');
+      } else {
+        text = '失败报告已自动生成并保存在本机（路径里的用户名已替换为 %USERPROFILE%）。点「上报给作者」才会发送。';
+      }
+    }
+    draft.textContent = text;
   }
   $('repairWhy').innerHTML = (plan.why || []).map((t) => `<p>${esc(t)}</p>`).join('');
   // 跑不了的情况，默认就把原因摊开；能修的先收起，别让人一上来读六百字
@@ -4631,8 +4644,7 @@ function bindRepairUI() {
 
 /**
  * 上报失败报告。
- * 配了收集接口 → 直接 POST；没配 → 弹出摘要让用户看一眼，再打开 GitHub 提交页
- * （客户端里不能塞 token，所以最后一下必须由用户点）。
+ * 主进程先显示预览，用户确认后才发送摘要或打开 GitHub 提交页。
  */
 async function sendFailureReport() {
   const t = toast({ title: '正在准备失败报告…', sticky: true, spinner: true });
@@ -4643,7 +4655,7 @@ async function sendFailureReport() {
     return;
   }
   if (r.channel === 'endpoint') {
-    t.update({ title: '已自动上报', body: '报告已发送给作者，感谢反馈。', type: 'ok' });
+    t.update({ title: '摘要已发送', body: '报告已发送给作者，感谢反馈。', type: 'ok' });
   } else if (r.channel === 'local') {
     t.update({ title: '已导出报告', body: '文件已在资源管理器中打开，可手动发给我。', type: 'ok' });
   } else {

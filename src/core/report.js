@@ -7,16 +7,43 @@
  *  - 客户端里不能塞 GitHub token（反编译即泄露），所以「自动」只能做到
  *    「自动生成 + 自动填好提交页」，最后那一下由用户点。
  *  - 想做到全自动，把 settings.report.endpoint 指向自己的收集接口，
- *    打开 report.auto 后失败即 POST（同样先脱敏）。
+ *    另行设置 autoSend 与同一 HTTPS 地址的 autoSendTo 才允许自动发送。
  *
  * 本模块保持纯函数（除 contact() 读 package.json），便于单测。
  */
 const os = require('os');
-const path = require('path');
 const crypto = require('crypto');
 
 const MAX_ISSUE_BODY = 5200;   // GitHub 的 new-issue URL 有长度上限，留足余量
 const MAX_SUMMARY = 6000;
+const MAX_ATTEMPTS = 12;
+
+function clipText(value, limit) {
+  return String(value || '').toWellFormed().slice(0, limit).replace(/[\uD800-\uDBFF]$/, '');
+}
+
+/** 收集端和日志属于不同信任边界，出站摘要只保留诊断所需的信息。 */
+function publicFacts(facts, clean) {
+  const accel = facts.accel || {};
+  const image = facts.image || {};
+  const num = (value) => Number.isFinite(value) ? value : 0;
+  return {
+    platform: facts.platform === 'linux' ? 'linux' : (facts.platform === 'win32' ? 'win32' : ''),
+    osRelease: clean(facts.osRelease),
+    arch: clean(facts.arch),
+    cpuModel: clean(facts.cpuModel),
+    vendor: clean(facts.vendor),
+    vm: !!facts.vm,
+    cores: num(facts.cores),
+    totalMB: num(facts.totalMB),
+    freeMB: num(facts.freeMB),
+    freeDiskMB: num(facts.freeDiskMB),
+    emulatorVersion: clean(facts.emulatorVersion),
+    accel: { ok: !!accel.ok, kind: clean(accel.kind), suspect: !!accel.suspect },
+    image: { api: clean(image.api), tag: image.custom ? '' : clean(image.tag), compat: !!image.compat, custom: !!image.custom },
+    tuned: !!facts.tuned,
+  };
+}
 
 /** 作者的联系方式：仓库与邮箱都从 package.json 的 feedback 读，便于发布方自行改 */
 function contact() {
@@ -28,7 +55,7 @@ function contact() {
   return {
     repo: String(fb.repo || repoFromUrl || '').trim(),
     email: String(fb.email || '').trim(),
-    // 发行版可以内置收集地址：用户装完即自动上报，不需要挨个配置
+    // 发行版可以提供手动上报目的地；这不是自动发送许可。
     endpoint: String(fb.endpoint || '').trim(),
     version: String((pkg && pkg.version) || '').trim(),
     name: String((pkg && pkg.productName) || 'ApkStart').trim(),
@@ -40,7 +67,7 @@ function contact() {
  * 日志里最常见的是 `C:\Users\lenmo\AppData\...`，直接发出去等于把用户名公开。
  */
 function redact(text, { home = os.homedir(), tmp = os.tmpdir(), extra = [] } = {}) {
-  let out = String(text == null ? '' : text);
+  let out = String(text == null ? '' : text).replace(ANSI, '');
   const pairs = [];
   const push = (from, to) => { if (from && String(from).length > 3) pairs.push([String(from), to]); };
   push(home, '%USERPROFILE%');
@@ -57,7 +84,17 @@ function redact(text, { home = os.homedir(), tmp = os.tmpdir(), extra = [] } = {
   }
   // 兜底：任何残留的 C:\Users\<name>（换了 shell / 短路径写法）
   out = out.replace(/[A-Za-z]:\\Users\\[^\\\s"']+/g, '%USERPROFILE%');
-  out = out.replace(/\/Users\/[^/\s"']+/g, '%USERPROFILE%');
+  out = out.replace(/[A-Za-z]:\/Users\/[^/\s"']+/gi, '%USERPROFILE%');
+  out = out.replace(/\/(?:Users|home)\/[^/\s"']+/g, '%USERPROFILE%');
+  // 先擦凭证再裁剪：短 token、带引号的 JSON 及 URL 查询参数也不能进入报告。
+  out = out.replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g, '[REDACTED PRIVATE KEY]');
+  out = out.replace(/(https?:\/\/)[^\s/@]+(?::[^\s/@]*)?@/gi, '$1[REDACTED]@');
+  out = out.replace(/(\b(?:Bearer|Basic)\s+)[A-Za-z0-9+/=._~-]+/gi, '$1[REDACTED]');
+  out = out.replace(/(["'](?:set-cookie|cookie|authorization|proxy-authorization)["']\s*:\s*)\[\s*(?:(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')(?:\s*,\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'))*\s*)?\]/gi, '$1"[REDACTED]"');
+  out = out.replace(/(\b(?:set-cookie|cookie|authorization|proxy-authorization):[ \t]*)[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*/gi, '$1[REDACTED]');
+  out = out.replace(/([?&][^?=&\s]*(?:token|secret|key|password|signature|sig|credential)\s*=)[^&#\s"'<>]+/gi, '$1[REDACTED]');
+  out = out.replace(/(["']?[\w.-]*(?:pubkey|api[_-]?key|access[_-]?key|token|secret|password|passwd|authorization|cookie)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;<>]+)/gi,
+    '$1[REDACTED]');
   return out;
 }
 
@@ -121,7 +158,7 @@ function buildSummary({ facts = {}, diagnosis = {}, attempts = [], exitCode = nu
   const rows = [
     ['版本', c.version || extra.appVersion || '未知'],
     ['结论', `${d.code || 'UNKNOWN'}：${d.title || '未判定'}`],
-    ['系统', `Windows ${f.osRelease || '?'} ${f.arch || ''}`.trim()],
+    ['系统', `${(f.platform || process.platform) === 'linux' ? 'Linux' : 'Windows'} ${f.osRelease || '?'} ${f.arch || ''}`.trim()],
     ['CPU', `${f.cpuModel || '未识别'}${f.cores ? ` · ${f.cores} 核` : ''}`],
     ['内存', `${mb(f.totalMB)}${f.freeMB ? `（可用 ${mb(f.freeMB)}）` : ''}`],
     ['硬件加速', accel],
@@ -167,16 +204,25 @@ function issueUrl({ summary, repo, version }) {
   const r = repo || contact().repo;
   if (!r) return '';
   const title = `[自动上报] 开机失败 · ${contact().name} ${version || ''}`.replace(/\s+/g, ' ').trim();
-  const body = String(summary || '').slice(0, MAX_ISSUE_BODY);
-  return `https://github.com/${r}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  const prefix = `https://github.com/${r}/issues/new?title=${encodeURIComponent(title)}&body=`;
+  // URL 预算按编码后的长度算，中文和 emoji 不能按 JS 字符数直接截断。
+  const chars = Array.from(clipText(summary, MAX_ISSUE_BODY));
+  let lo = 0;
+  let hi = chars.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (prefix.length + encodeURIComponent(chars.slice(0, mid).join('')).length <= 7800) lo = mid;
+    else hi = mid - 1;
+  }
+  return prefix + encodeURIComponent(chars.slice(0, lo).join(''));
 }
 
-/** 邮件兜底：没有 GitHub 账号的用户也能发（不带附件，正文含摘要与本地报告路径） */
-function mailtoUrl({ summary, email, version, reportFile }) {
+/** 邮件兜底：没有 GitHub 账号的用户也能发（不带附件及本地报告路径） */
+function mailtoUrl({ summary, email, version }) {
   const to = email || contact().email;
   if (!to) return '';
   const subject = `[ApkStart ${version || ''}] 开机失败报告`.replace(/\s+/g, ' ').trim();
-  const body = [String(summary || '').slice(0, 3500), '', reportFile ? `完整报告：${reportFile}` : ''].join('\n');
+  const body = clipText(summary, 3500);
   return `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 }
 
@@ -188,17 +234,40 @@ function buildBundle(ctx = {}) {
   const c = contact();
   const home = ctx.home || os.homedir();
   const tmp = ctx.tmp || os.tmpdir();
-  const facts = ctx.facts || {};
-  const diagnosis = ctx.diagnosis || {};
+  const rawFacts = ctx.facts || {};
+  const extra = [...(ctx.redactPaths || []), rawFacts.runtimeDir].filter((s) => typeof s === 'string');
+  const clean = (value) => redact(typeof value === 'string' || typeof value === 'number' ? String(value) : '', { home, tmp, extra });
+  const bounded = (value, limit) => clipText(clean(value), limit);
+  const facts = publicFacts(rawFacts, (value) => bounded(value, 300));
+  const diagnosis = {
+    code: bounded(ctx.diagnosis && ctx.diagnosis.code, 32),
+    title: bounded(ctx.diagnosis && ctx.diagnosis.title, 200),
+    hint: bounded(ctx.diagnosis && ctx.diagnosis.hint, 600),
+  };
+  const attempts = (Array.isArray(ctx.attempts) ? ctx.attempts : []).filter((a) => a && typeof a === 'object').slice(-MAX_ATTEMPTS).map((a) => ({
+    plan: bounded(a.plan, 300),
+    diagnosis: bounded(a.diagnosis, 300),
+    timeout: !!a.timeout,
+    exitCode: Number.isFinite(a.exitCode) ? a.exitCode : null,
+  }));
+  const exitCode = Number.isFinite(ctx.exitCode) ? ctx.exitCode : null;
   const rawSummary = buildSummary({
-    facts, diagnosis, attempts: ctx.attempts || [], exitCode: ctx.exitCode,
-    logLines: ctx.logLines || [], extra: ctx.extra || {},
+    facts, diagnosis, attempts, exitCode,
+    logLines: clean((Array.isArray(ctx.logLines) ? ctx.logLines : []).join('\n')).split(/\r?\n/),
+    extra: ctx.extra || {},
   });
-  const summary = redact(rawSummary, { home, tmp, extra: ctx.redactPaths || [] }).slice(0, MAX_SUMMARY);
+  const summary = clipText(clean(rawSummary), MAX_SUMMARY);
   const sig = signature({ facts, diagnosis, version: c.version });
+  const at = new Date().toISOString();
+  const payload = { signature: sig, version: c.version, at, code: diagnosis.code || 'UNKNOWN', title: diagnosis.title || '', facts, attempts, exitCode, summary };
+  // 无人确认的自动发送不包含自由格式的日志末尾，也不发送日志里的额外上下文。
+  const automaticPayload = {
+    ...payload,
+    summary: clean(buildSummary({ facts, diagnosis, attempts, exitCode, extra: ctx.extra || {} })).slice(0, MAX_SUMMARY),
+  };
   return {
-    id: `${new Date().toISOString().replace(/[:.]/g, '-')}-${sig}`,
-    at: new Date().toISOString(),
+    id: `${at.replace(/[:.]/g, '-')}-${sig}`,
+    at,
     signature: sig,
     code: diagnosis.code || 'UNKNOWN',
     title: diagnosis.title || '开机失败',
@@ -208,18 +277,8 @@ function buildBundle(ctx = {}) {
     mailtoUrl: mailtoUrl({ summary, email: c.email, version: c.version, reportFile: ctx.reportFile || '' }),
     reportFile: ctx.reportFile || '',
     contact: c,
-    // 直传接口要的字段：只放结构化信息，日志已脱敏
-    payload: {
-      signature: sig,
-      version: c.version,
-      at: new Date().toISOString(),
-      code: diagnosis.code || 'UNKNOWN',
-      title: diagnosis.title || '',
-      facts,
-      attempts: ctx.attempts || [],
-      exitCode: ctx.exitCode == null ? null : ctx.exitCode,
-      summary,
-    },
+    payload,
+    automaticPayload,
   };
 }
 

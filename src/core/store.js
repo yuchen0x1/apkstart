@@ -183,11 +183,10 @@ const DEFAULT_SETTINGS = {
     // 开机失败时在本机自动生成一份「脱敏诊断报告」，供用户一键上报。
     // 只落到本地，不会自己发出去 —— 报告里有用户名路径和机器信息，得让用户看一眼再决定。
     auto: true,
-    // 配了收集接口时是否直接发出去（仍然先脱敏）。默认开：
-    // 发行版一旦内置了 feedback.endpoint，就等于「失败自动上报」，用户可在设置里关。
-    autoSend: true,
-    // 有自己的收集接口时填这里；填了以后失败会直接 POST（仍然先脱敏），
-    // 没填就走 GitHub issue 预填页（不需要 token）。
+    // 自动发送须明确填入同一个 HTTPS 收集地址；旧版默认的 autoSend=true 不代表许可。
+    autoSend: false,
+    autoSendTo: '',
+    // 可选的手动发送地址；没填就走发行版配置或 GitHub Issues 预填页。
     endpoint: '',
   },
   display: {

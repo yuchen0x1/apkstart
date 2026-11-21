@@ -52,12 +52,14 @@ https://apkstart-reports.<你的子域>.workers.dev
    }
    ```
 
-   这样所有用户装完即生效，失败时自动上报（用户可在「设置 → 问题反馈」关掉）。
+   提供手动上报目的地，不代表上传许可。客户端默认只在本机生成报告；手动上报先展示目的地与脱敏摘要，用户确认后才发送。打开修复窗口或准备报告不会联网发送。
 
 2. **单机调试**：`%APPDATA%\apkstart\settings.json`
    ```json
    { "report": { "endpoint": "https://apkstart-reports.xxx.workers.dev" } }
    ```
+
+   确需自动发送时，在 `report` 下设置 `auto: true`、`autoSend: true`，并将 `autoSendTo` 填为与实际收集接口完全相同的 HTTPS URL。历史设置只有 `autoSend: true` 不会自动发送；更换目的地后要重新授权。自动发送不包含日志尾部，完整诊断文件始终保存在本机。关闭 `autoSend` 或清除 `autoSendTo` 可禁用联网自动发送。
 
 ## 自测
 

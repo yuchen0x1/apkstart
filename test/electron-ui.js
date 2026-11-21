@@ -586,6 +586,9 @@ app.whenReady().then(async () => {
     for (const section of ['general','runtime','performance','display','android','integration','update','advanced','about']) {
       await js(`openSettingsSection(${JSON.stringify(section)})`);
       await shot(theme + '-settings-' + section);
+      if (section === 'update') {
+        check(theme + '问题反馈明确默认只保存在本机且不会自动发送', await js("(() => { const group=document.getElementById('reportGroup'); const note=group?.querySelector('.inline-note'); const text=group?.textContent||''; const visible=!!(group && group.getClientRects().length && getComputedStyle(group).visibility!=='hidden'); return visible && note?.textContent.includes('默认只保存在本机，不会自动发送') && text.includes('完整报告只留在本机') && text.includes('确认后才发送'); })()"));
+      }
       await scanScrollable(theme + '-settings-' + section, '#settingsMask .set-body');
     }
     await js("openSettingsSection('android'); loadSystems()");

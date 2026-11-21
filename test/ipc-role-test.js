@@ -31,6 +31,7 @@ function harness() {
     path, __dirname: ROOT, ipcguard, ipcMain, console: { warn() {} },
     currentSystemStatus: null,
     channelMode: require('../src/core/runtime-actions').channelMode,
+    createReportDelivery: require('../src/core/report-delivery').createReportDelivery,
     runtimeActions: { run: (_channel, action) => action() },
     mainWindow, appWin: { win: shellWindow, isOpen: false, state: { label: 'App' },
       scheduleFit() {}, rotate: () => calls.shell.push('rotate'), close: () => calls.shell.push('close') },

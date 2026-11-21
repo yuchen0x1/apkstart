@@ -55,6 +55,8 @@ const guest = require('./core/guest');
 const { SystemCatalog } = require('./core/system-catalog');
 const { SystemManager } = require('./core/system-manager');
 const { RuntimeActions, channelMode } = require('./core/runtime-actions');
+const { createReportDelivery } = require('./core/report-delivery');
+const { writeJsonAtomicSync } = require('./core/atomic-json');
 
 // Windows 下窗口被遮挡时 capturePage 会拿到旧帧，自动化截图需要禁用遮挡计算
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
@@ -2382,9 +2384,14 @@ function registerIpc() {
     // 失败即自动落一份脱敏报告：用户不用再翻 %APPDATA% 找文件，
     // 作者也能在用户点「上报」时拿到完整上下文。重复签名 24 小时内不重复写。
     try {
-      const rep = await prepareFailureReport();
+      const rep = await prepareFailureReport({ automatic: true });
       if (rep) {
-        out.reportDraft = { file: rep.draft, sent: !!rep.sent, skipped: rep.skipped || '' };
+        out.reportDraft = {
+          file: rep.draft,
+          sent: !!rep.sent,
+          skipped: rep.skipped || '',
+          sendError: rep.sendError || '',
+        };
       }
     } catch (_) { /* 生成失败不影响开机错误本身 */ }
     return out;
@@ -2573,6 +2580,26 @@ function registerIpc() {
   // ---------------- 失败报告 ----------------
 
   const REPORTS_DIR = path.join(store.DATA_DIR, 'logs', 'reports');
+  const deliveryReceipt = path.join(REPORTS_DIR, '.delivery.json');
+  const reportDelivery = createReportDelivery({
+    post: postJson,
+    loadReceipts: () => JSON.parse(fs.readFileSync(deliveryReceipt, 'utf8')),
+    // 回执写失败必须让投递层知道（它会因此取消自动上报），不能吞掉。
+    saveReceipts: (receipts) => writeJsonAtomicSync(deliveryReceipt, receipts),
+    confirm: async ({ endpoint, payload }) => {
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'question',
+        title: i18n.t('发送诊断摘要'),
+        message: i18n.t('是否将诊断摘要发送到此收集接口？'),
+        detail: `${feedback.redact(endpoint)}\n\n${JSON.stringify(payload, null, 2)}\n\n${i18n.t('完整报告只保存在本机，不会随摘要上传。')}`,
+        buttons: [i18n.t('取消'), i18n.t('发送摘要')],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      return response === 1;
+    },
+  });
 
   /** 收集接口：用户设置优先，其次发行版内置（package.json → feedback.endpoint） */
   function resolveReportEndpoint() {
@@ -2589,7 +2616,7 @@ function registerIpc() {
     let logLines = [];
     try { logLines = runtime.emulator.recentLog(160) || []; } catch (_) { /* 没有日志也能出摘要 */ }
     return feedback.buildBundle({
-      facts: await repairFacts(),
+      facts: { ...await repairFacts(), platform: process.platform },
       diagnosis: lastDiagnosis() || (lf && lf.diagnosis) || null,
       attempts,
       exitCode: runtime.emulator.lastExitCode != null ? runtime.emulator.lastExitCode : (lf && lf.exitCode),
@@ -2600,7 +2627,7 @@ function registerIpc() {
   }
 
   /** 落盘：摘要 .md + 复制一份完整诊断 .txt（都在 logs/reports 下） */
-  function saveFailureDraft(bundle) {
+  function saveFailureDraft(bundle, receipt) {
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
     const md = path.join(REPORTS_DIR, `${bundle.id}.md`);
     fs.writeFileSync(md, bundle.summary, 'utf8');
@@ -2612,49 +2639,41 @@ function registerIpc() {
       }
     } catch (_) { /* 完整报告复制失败不影响摘要 */ }
     try {
-      fs.writeFileSync(path.join(REPORTS_DIR, '.last.json'),
-        JSON.stringify({ at: bundle.at, signature: bundle.signature, file: md }), 'utf8');
+      if (receipt) fs.writeFileSync(receipt, JSON.stringify({ at: bundle.at, signature: bundle.signature, file: md }), 'utf8');
     } catch (_) { /* ignore */ }
     return { md, txt };
   }
 
   /** 同一签名 24 小时内只自动生成一次，避免反复失败把磁盘刷满、把用户烦到 */
-  function recentlyReported(sig, hours = 24) {
+  function recentFailureDraft(receipt, signature) {
     try {
-      const last = JSON.parse(fs.readFileSync(path.join(REPORTS_DIR, '.last.json'), 'utf8'));
-      if (last && last.signature === sig) {
-        return Date.now() - new Date(last.at).getTime() < hours * 3600e3;
-      }
+      const last = JSON.parse(fs.readFileSync(receipt, 'utf8'));
+      if (last && last.signature === signature && Date.now() - new Date(last.at).getTime() < 24 * 3600e3) return last.file;
     } catch (_) { /* 没有历史记录 */ }
-    return false;
+    return '';
   }
 
-  async function prepareFailureReport({ force = false } = {}) {
+  async function prepareFailureReport({ force = false, automatic = false } = {}) {
+    if (!force && !store.getSettings().report?.auto) return null;
     const bundle = await buildFailureBundle();
-    const settings = store.getSettings();
-    if (!force && !(settings.report && settings.report.auto)) return null;
-    if (!force && recentlyReported(bundle.signature)) {
-      let file = '';
-      try { file = JSON.parse(fs.readFileSync(path.join(REPORTS_DIR, '.last.json'), 'utf8')).file; } catch (_) { /* ignore */ }
-      return { bundle, draft: file, skipped: 'recent' };
-    }
-    const saved = saveFailureDraft(bundle);
-    // 配了收集接口 + 允许自动发送 → 直接 POST（已经脱敏）。失败不抛，回落到手动上报。
+    // 草稿去重与投递去重分开：先前未授权的失败不能阻止后来明确授权的发送。
+    const receipt = force ? '' : path.join(REPORTS_DIR, `.draft-${bundle.signature}.json`);
+    const recent = receipt ? recentFailureDraft(receipt, bundle.signature) : '';
+    const saved = recent ? { md: recent, txt: '' } : saveFailureDraft(bundle, receipt);
+    // 只有真实失败事件能进入自动发送；预览、导出和手动提交的准备阶段均只落本机。
     let sent = false;
     let sendError = '';
+    let skipped = '';
     const endpoint = resolveReportEndpoint();
-    if (endpoint && settings.report && settings.report.autoSend !== false) {
-      // 自动发送用较短超时：不能让「开机失败」的提示卡在上报网络上
-      const r = await postJson(endpoint, bundle.payload, 6000).catch((e) => ({ ok: false, error: e.message }));
+    if (automatic) {
+      const r = await reportDelivery.send({ bundle, endpoint, automatic: true, settings: store.getSettings().report || {} });
       sent = !!r.ok;
-      sendError = sent ? '' : (r.error || `HTTP ${r.status || '?'}`);
-      try {
-        const lastFile = path.join(REPORTS_DIR, '.last.json');
-        const last = JSON.parse(fs.readFileSync(lastFile, 'utf8'));
-        fs.writeFileSync(lastFile, JSON.stringify({ ...last, sent, sendError }), 'utf8');
-      } catch (_) { /* 记录失败不影响结果 */ }
+      skipped = r.skipped || '';
+      // 回执读写失败要让用户看见原因，其它跳过状态（recent/uncertain）由界面按状态说明。
+      sendError = sent || (r.skipped && r.skipped !== 'receipt-error')
+        ? '' : (r.error || `HTTP ${r.status || '?'}`);
     }
-    return { bundle, draft: saved.md, full: saved.txt, sent, sendError };
+    return { bundle, draft: saved.md, full: saved.txt, sent, sendError, skipped };
   }
 
   /** 直传收集接口（配置了 report.endpoint 才会走） */
@@ -2703,45 +2722,77 @@ function registerIpc() {
   });
 
   /**
-   * 上报：配了收集接口就直接 POST（全自动）；没配就把摘要摆给用户看，
-   * 确认后才打开 GitHub 提交页 —— 客户端里不能塞 token，这是没有服务端时唯一的正路。
+   * 手动上报：预览并确认后才发送；收集端失败时仍可选择 GitHub、邮件或本地报告。
    */
   ipcMain.handle('report:submit', async () => {
     const rep = await prepareFailureReport({ force: true }).catch(() => null);
     if (!rep) return { ok: false, error: '还没有可上报的失败记录' };
     const b = rep.bundle;
+    const contact = b.contact || {};
+    const repoUrl = contact.repo ? `https://github.com/${contact.repo}` : '';
     const endpoint = resolveReportEndpoint();
+    let endpointNote = '';
     if (endpoint) {
-      const r = await postJson(endpoint, b.payload);
+      const r = await reportDelivery.send({ bundle: b, endpoint });
       if (r.ok) return { ok: true, channel: 'endpoint', file: rep.draft };
+      if (r.cancelled) return r;
+      // 结果不确定时不能说“没收到”：服务端可能已经入库，重复提交会产生重复报告。
+      const reason = feedback.redact(r.error || `HTTP ${r.status || '?'}`);
+      endpointNote = r.uncertain
+        ? `收集接口（${feedback.redact(endpoint)}）的投递结果不确定（${reason}），可能已经被接收；`
+          + '再从下面任一渠道提交，作者可能收到重复报告。'
+        : `未完成向收集接口（${feedback.redact(endpoint)}）发送：${reason}。可以换下面的渠道。`;
     }
 
-    const buttons = ['取消', '打开提交页'];
-    if (b.mailtoUrl) buttons.push('用邮件发送');
-    buttons.push('先导出到本地');
-    const localIdx = buttons.length - 1;
+    const actions = ['cancel'];
+    if (b.issueUrl) actions.push('github');
+    if (b.mailtoUrl) actions.push('email');
+    actions.push('local');
+    const labels = {
+      cancel: '取消',
+      github: '打开 GitHub 提交页',
+      email: '用邮件发送',
+      local: '先导出到本地',
+    };
+    // 摘要已由 report.js 脱敏和限长，这里只做显示上限，超出部分明确告知去哪看。
+    const preview = b.summary.slice(0, 2400);
+    const hidden = b.summary.length - preview.length;
+    const lines = [];
+    if (endpointNote) lines.push(endpointNote, '');
+    lines.push(
+      '目的地：',
+      `• 收集接口：${endpoint ? feedback.redact(endpoint) : '未配置'}`,
+      `• GitHub：${repoUrl || '未配置'}`
+        + `${repoUrl ? `（提交页里的说明最多 ${feedback.MAX_ISSUE_BODY} 字，超出部分不会带进网页）` : ''}`,
+      `• 邮件：${contact.email || '未配置'}${contact.email ? '（邮件正文最多 3500 字）' : ''}`,
+      '',
+      '提交给作者的内容（用户名路径与常见凭证已替换）：',
+      preview + (hidden > 0 ? `\n…（还有 ${hidden} 字没显示，完整摘要见下面这份本机报告）` : ''),
+      '',
+      `本机报告：${rep.draft}`,
+      '',
+      '注意：打开 GitHub 提交页或邮件，会把上面的摘要预填给对应网站；只有你自己点提交才会发出去。',
+    );
     const { response } = await dialog.showMessageBox(mainWindow, {
       type: 'info',
       title: '上报失败报告',
-      message: '会把下面这份摘要提交给作者',
-      detail: `${b.summary.slice(0, 1500)}${b.summary.length > 1500 ? '\n…' : ''}\n\n`
-        + '摘要里的用户名路径已替换为 %USERPROFILE%；完整报告只保存在你本机。',
-      buttons,
-      defaultId: 1,
+      message: '把这份摘要交给作者',
+      detail: lines.join('\n'),
+      buttons: actions.map((action) => labels[action]),
+      defaultId: actions.length > 1 ? 1 : 0,
       cancelId: 0,
       noLink: true,
     });
-    if (response === 0) return { ok: false, cancelled: true };
-    if (response === localIdx) {
+    const chosen = actions[response] || 'cancel';
+    if (chosen === 'cancel') return { ok: false, cancelled: true };
+    if (chosen === 'local') {
       shell.showItemInFolder(rep.draft);
       return { ok: true, channel: 'local', file: rep.draft };
     }
     // 打开网页前把摘要放进剪贴板：浏览器没带上预填内容时还能直接粘贴
     try { clipboard.writeText(b.summary); } catch (_) { /* ignore */ }
-    const url = response === 1 ? (b.issueUrl || b.mailtoUrl) : b.mailtoUrl;
-    if (!url) return { ok: false, error: '没有可用的上报渠道（仓库地址或邮箱未配置）' };
-    await shell.openExternal(url);
-    return { ok: true, channel: response === 1 ? 'github' : 'email', file: rep.draft, copied: true };
+    await shell.openExternal(chosen === 'github' ? b.issueUrl : b.mailtoUrl);
+    return { ok: true, channel: chosen, file: rep.draft, copied: true, endpointNote };
   });
 
   ipcMain.handle('report:folder', async () => {

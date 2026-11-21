@@ -100,11 +100,22 @@ test('issue 地址：仓库正确、标题正文编码、总长可控', () => {
   assert(!/\s/.test(url), '地址里不能有裸空格');
 });
 
+test('中文和 emoji 报告按编码后的 URL 长度截断，保留可读正文', () => {
+  const summary = '诊断摘要🧪'.repeat(1500);
+  const url = report.issueUrl({ summary, repo: 'yuchen0x1/apkstart', version: '1.2.3' });
+  assert(url.length <= 7800);
+  const body = new URL(url).searchParams.get('body');
+  assert(body.length > 500 && summary.startsWith(body));
+  assert(!body.includes('\ufffd'));
+});
+
 test('邮件兜底：没配邮箱就不给 mailto', () => {
   assert.strictEqual(report.mailtoUrl({ summary: 'x', email: '' }), '');
   const url = report.mailtoUrl({ summary: '内容', email: 'dev@example.com', version: '0.6.1' });
   assert(url.startsWith('mailto:dev%40example.com?'), url);
   assert(url.includes('subject='), '缺主题');
+  const clipped = new URL(report.mailtoUrl({ email: 'dev@example.com', summary: 'x'.repeat(3499) + '🧪' })).searchParams.get('body');
+  assert.strictEqual(clipped, 'x'.repeat(3499), '不能截断 emoji 产生替代字符');
 });
 
 test('签名稳定：同机同结论一致，换结论/换机器就变', () => {
@@ -141,6 +152,82 @@ test('空上下文也能产出（不能因为没日志就崩）', () => {
   const b = report.buildBundle({});
   assert(b.id && b.summary && b.code === 'UNKNOWN');
   assert(b.issueUrl.startsWith('https://github.com/'), '仓库地址应从 package.json 兜底');
+});
+
+test('出站结构化字段采用白名单，完整路径和自定义镜像来源仅留本机', () => {
+  const privatePath = 'D:\\PrivateVault\\runtime';
+  const input = {
+    facts: { ...facts, runtimeDir: privatePath, unexpected: 'NOT_FOR_NETWORK', image: { api: '34', custom: true, name: 'Private image', tag: 'private-label', source: 'https://private.example/image?token=short', reason: privatePath } },
+    diagnosis: { ...diagnosis, title: `${privatePath} 启动失败` },
+    attempts: [{ plan: '软件渲染', diagnosis: `${privatePath} 未就绪`, args: ['SECRET_ARG'], log: 'SECRET_LOG', exitCode: 1, timeout: true }],
+    logLines: [`ERROR ${privatePath}\\emulator.log`],
+  };
+  const before = JSON.stringify(input);
+  const b = report.buildBundle(input);
+  const outgoing = JSON.stringify(b.payload);
+  for (const value of [privatePath, 'NOT_FOR_NETWORK', 'private.example', 'Private image', 'private-label', 'SECRET_ARG', 'SECRET_LOG']) assert(!outgoing.includes(value), value);
+  assert.strictEqual(b.payload.attempts[0].exitCode, 1);
+  assert(b.payload.attempts[0].timeout);
+  assert.strictEqual(b.payload.facts.image.api, '34');
+  assert.strictEqual(JSON.stringify(input), before, '不能修改本地完整诊断信息');
+});
+
+test('脱敏覆盖 JSON、短凭证、认证头、URL 凭证与私钥', () => {
+  const values = ['short-secret', 'short-token', 'abc123', 'bearer-key', 'basic-key', 'credential-user', 'credential-pass', 'signed-value', 'PRIVATE-MATERIAL', 'second-cookie', 'quoted-tail', 'signed-v4'];
+  const raw = [
+    'password="short-secret"', '{"token":"short-token"}', 'api_key=abc123',
+    'Authorization: Bearer bearer-key', 'Authorization: Basic basic-key',
+    'Cookie: session=first-cookie; auth=second-cookie',
+    '{"password":"prefix\\\" quoted-tail"}',
+    'https://example.org/image?X-Amz-Signature=signed-v4',
+    'https://credential-user:credential-pass@example.org/file?signature=signed-value&ok=yes',
+    '-----BEGIN PRIVATE KEY-----\nPRIVATE-MATERIAL\n-----END PRIVATE KEY-----',
+  ].join('\n');
+  const out = report.redact(raw);
+  for (const value of values) assert(!out.includes(value), value);
+  assert(out.includes('ok=yes'), '保留非敏感诊断信息');
+  assert(out.includes('[REDACTED]'));
+});
+
+test('Cookie 的 JSON 数组、折行和 ANSI 格式在出站摘要前整段擦除', () => {
+  const raw = [
+    JSON.stringify({ 'set-cookie': ['sid=first-private; HttpOnly', 'sid=second-private; HttpOnly'], keep: 'diagnostic-value' }),
+    '{"cookie": [\n  "session=array-private",\n  "other=array-other-private"\n]}',
+    'Cookie: first=fold-private;\r\n\tsecond=fold-second-private\r\nnext diagnostic',
+    'Cookie\u001b[0m: session=ansi-private',
+  ];
+  const b = report.buildBundle({ logLines: raw });
+  const out = JSON.stringify(b.payload);
+  for (const secret of ['first-private', 'second-private', 'array-private', 'array-other-private', 'fold-private', 'fold-second-private', 'ansi-private']) assert(!out.includes(secret), secret);
+  assert(out.includes('diagnostic-value'));
+  assert(out.includes('next diagnostic'));
+});
+
+test('摘要、payload、预填链接全部脱敏且不暴露邮件里的本地附件路径', () => {
+  const b = report.buildBundle({
+    facts: { ...facts, cpuModel: '/home/alex/private-cpu' },
+    diagnosis: { code: 'ERROR', title: 'password=short-value' },
+    attempts: [{ plan: 'token=short-token' }],
+    logLines: ['https://u:p@example.org/x?access_token=private-token', 'C:/Users/other/AppData/log'],
+    reportFile: '/private/LOCAL-FULL-REPORT.txt',
+  });
+  for (const value of ['alex', 'other', 'short-value', 'short-token', 'private-token', 'LOCAL-FULL-REPORT']) {
+    const outgoing = JSON.stringify({ summary: b.summary, payload: b.payload, issue: decodeURIComponent(b.issueUrl), mail: decodeURIComponent(b.mailtoUrl) });
+    assert(!outgoing.includes(value), value);
+  }
+  const mail = report.mailtoUrl({ summary: b.summary, email: 'dev@example.org', reportFile: '/private/LOCAL-FULL-REPORT.txt' });
+  assert(!decodeURIComponent(mail).includes('LOCAL-FULL-REPORT'));
+  assert.strictEqual(b.reportFile, '/private/LOCAL-FULL-REPORT.txt', '完整本地报告仍可找到');
+});
+
+test('报告限制尝试数量、异常字段与非有限数字，支持 Linux 系统名', () => {
+  const b = report.buildBundle({ facts: { platform: 'linux', accel: null, image: null, cores: Infinity }, attempts: [null, ...Array.from({ length: 30 }, () => ({ plan: 'x'.repeat(2000), secret: 'never-send' }))], exitCode: NaN });
+  assert.strictEqual(b.payload.attempts.length, 12);
+  assert.strictEqual(b.payload.facts.cores, 0);
+  assert.strictEqual(b.payload.exitCode, null);
+  assert(b.summary.includes('Linux'));
+  assert(!b.summary.includes('Windows'));
+  assert(b.payload.attempts.every((a) => a.plan.length <= 300 && !('secret' in a)));
 });
 
 if (fails.length) {
