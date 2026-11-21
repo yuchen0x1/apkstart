@@ -1,0 +1,86 @@
+name: Branch Governance
+
+# 每周自动审计分支：识别已并入 main、长期停滞、与 main 差距过大的分支，生成治理报告。
+# 本工作流只读：仅输出报告与清理建议，不自动删除、不自动合并任何分支。
+# 需要人工依据报告确认后再执行清理，避免误删仍在进行的开发分支。
+run-name: 分支治理审计
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # 每周一 03:00 UTC（北京时间 11:00）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-governance
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: 分支审计与治理报告
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: 审计所有远程分支并生成报告
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin --prune
+          {
+            echo "## 分支治理审计报告"
+            echo ""
+            echo "生成时间：$(date -u '+%Y-%m-%d %H:%M UTC')　基线：origin/main @ $(git rev-parse --short origin/main)"
+            echo ""
+            echo "| 分支 | 最后提交 | 独立提交 | 落后 main | 已并入 main | 建议分类 |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+          } > "$GITHUB_STEP_SUMMARY"
+
+          stale_days=30
+          report="$GITHUB_STEP_SUMMARY"
+
+          while IFS='|' read -r ref date_unix subject; do
+            branch="${ref#origin/}"
+            [ "$branch" = "main" ] && continue
+            case "$branch" in
+              HEAD) continue ;;
+            esac
+
+            ahead=$(git rev-list --count "origin/main..$ref" 2>/dev/null || echo "?")
+            behind=$(git rev-list --count "$ref..origin/main" 2>/dev/null || echo "?")
+            age_days=$(( ( $(date -u +%s) - date_unix ) / 86400 ))
+            date_human=$(date -u -d "@$date_unix" '+%Y-%m-%d')
+
+            if git merge-base --is-ancestor "$ref" origin/main 2>/dev/null; then
+              cls='D（建议清理：已完全并入 main）'
+            elif [ "$ahead" = "0" ] || [ "$ahead" = "?" ]; then
+              cls='D（候选：无独立提交，请人工复核）'
+            elif [ "$age_days" -ge "$stale_days" ]; then
+              cls='C（停滞 '"$age_days"' 天：人工确认是否继续）'
+            elif [ "$behind" -ge 20 ]; then
+              cls='B（落后 main '"$behind"' 个提交：建议变基或重新评估）'
+            else
+              cls='C（保留：有独立提交且在活跃期）'
+            fi
+
+            echo "| \`$branch\` | $date_human | $ahead | $behind | $(git merge-base --is-ancestor "$ref" origin/main 2>/dev/null && echo 是 || echo 否) | $cls |" >> "$report"
+          done < <(git for-each-ref refs/remotes/origin --format '%(refname:short)|%(committerdate:unix)|%(subject)')
+
+          {
+            echo ""
+            echo "### 开放中的 Pull Request"
+            echo ""
+            pr_count=$(gh pr list --state open --json number --jq 'length' 2>/dev/null || echo 0)
+            if [ "$pr_count" = "0" ]; then
+              echo "无"
+            else
+              gh pr list --state open --json number,title,headRefName \
+                --jq '.[] | "- #\(.number) \(.title)（head: `\(.headRefName)`）"'
+            fi
+            echo ""
+            echo "> 清理守则：D 类分支须确认无独立有效提交后方可删除；C 类分支不得擅自合并或删除。"
+          } >> "$report"
+
+          cat "$report"
