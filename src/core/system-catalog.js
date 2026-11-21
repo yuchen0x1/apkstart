@@ -17,6 +17,7 @@ const { openStream } = require('./download');
 
 const DEFAULT_URL = 'https://raw.githubusercontent.com/yuchen0x1/apkstart/main/system-catalog/catalog.json';
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时
+const RETRY_COOLDOWN_MS = 60 * 1000;    // 离线读取冷却，显式刷新可绕过
 const MAX_BYTES = 2 * 1024 * 1024;       // 目录本身不应超过 2MB
 
 const { resolveSystemPaths, legacyPathWarnings } = require('./system-providers/system-paths');
@@ -96,6 +97,7 @@ class SystemCatalog {
    *   - dataDir    缓存目录（默认 %APPDATA%\apkstart\system-catalog）
    *   - builtInPath 内置索引相对路径（可选）
    *   - fetchJson  自定义读取函数（测试注入），签名 async (url)=>obj
+   *   - now        时钟（测试注入），默认 Date.now
    */
   constructor(opts = {}) {
     this.url = opts.url || DEFAULT_URL;
@@ -107,8 +109,10 @@ class SystemCatalog {
     this.metaFile = path.join(this.dataDir, 'meta.json');
     this.builtInPath = opts.builtInPath || null;
     this._fetchJson = opts.fetchJson || null;
+    this._now = opts.now || Date.now;
     this._memory = null; // { catalog, cachedAt, source, stale }
     this._inflight = null;
+    this._retryAt = 0;
   }
 
   /** 从远程读取 JSON（带 UA / 超时 / 体积上限 / 重定向，复用 download.openStream） */
@@ -151,12 +155,12 @@ class SystemCatalog {
     });
   }
 
-  _writeCache(catalog) {
+  _writeCache(catalog, cachedAt) {
     try {
       fs.mkdirSync(this.dataDir, { recursive: true });
       fs.writeFileSync(this.cacheFile, JSON.stringify(catalog, null, 2), 'utf8');
       fs.writeFileSync(this.metaFile, JSON.stringify({
-        cachedAt: new Date().toISOString(),
+        cachedAt,
         source: this.url,
         updatedAt: catalog.updatedAt || '',
       }, null, 2), 'utf8');
@@ -187,40 +191,57 @@ class SystemCatalog {
     };
   }
 
+  _isFresh(result, now = this._now()) {
+    if (!result || result.stale) return false;
+    const age = now - Date.parse(result.cachedAt);
+    return Number.isFinite(age) && age >= 0 && age < CACHE_TTL_MS;
+  }
+
   /**
-   * 加载目录：优先远程（成功即刷新缓存），失败回退缓存，再失败回退内置索引。
+   * 加载目录：新鲜内存缓存优先；到期刷新，失败回退最近成功结果，再回退内置索引。
+   * 离线冷却只限制自动读取，不延迟显式刷新；并发读取共用同一个远程请求。
    * @param {object} opts { force=false }
    * @returns {Promise<{ok, catalog, cachedAt, source, stale, warnings, error}>}
    */
   async load(opts = {}) {
     const force = !!(opts && opts.force);
-    if (!force && this._memory && !this._memory.stale) {
+    if (this._inflight) return this._inflight;
+    const now = this._now();
+    const retryIn = this._retryAt - now;
+    const coolingDown = this._memory && this._memory.stale
+      && retryIn > 0 && retryIn <= RETRY_COOLDOWN_MS;
+    if (!force && (this._isFresh(this._memory, now) || coolingDown)) {
       return Object.assign({ ok: true, warnings: [] }, this._memory);
     }
-    if (this._inflight) return this._inflight;
 
     this._inflight = (async () => {
       try {
         const obj = await this._remoteJson();
         const n = normalizeCatalog(obj);
         if (!n.ok) throw new Error(n.warnings.join('; '));
-        this._writeCache(n.catalog);
+        const cachedAt = new Date(this._now()).toISOString();
+        this._writeCache(n.catalog, cachedAt);
         const result = {
           ok: true,
           catalog: n.catalog,
-          cachedAt: new Date().toISOString(),
+          cachedAt,
           source: this.url,
           stale: false,
           warnings: n.warnings,
         };
         this._memory = result;
+        this._retryAt = 0;
         return result;
       } catch (e) {
-        const cache = this._loadCache();
-        const result = cache
-          ? Object.assign({ ok: true, warnings: [], error: e.message }, cache)
-          : Object.assign({ ok: true, warnings: [], error: e.message }, this._loadBuiltIn());
+        // 写缓存失败不能使下一次离线读取丢掉刚取得的目录。
+        const cache = this._memory && this._memory.source !== 'built-in'
+          ? this._memory : this._loadCache();
+        const result = Object.assign({ ok: true, warnings: [] }, cache || this._loadBuiltIn(), {
+          stale: true,
+          error: e.message,
+        });
         this._memory = result;
+        this._retryAt = this._now() + RETRY_COOLDOWN_MS;
         return result;
       } finally {
         this._inflight = null;
@@ -269,7 +290,7 @@ class SystemCatalog {
   /** 缓存新鲜度（供 UI 显示"目录更新时间"） */
   cacheInfo() {
     const mem = this._memory;
-    if (mem) return { cachedAt: mem.cachedAt, source: mem.source, stale: mem.stale, updatedAt: mem.catalog.updatedAt };
+    if (mem) return { cachedAt: mem.cachedAt, source: mem.source, stale: !this._isFresh(mem), updatedAt: mem.catalog.updatedAt };
     const cache = this._loadCache();
     if (cache) return { cachedAt: cache.cachedAt, source: cache.source, stale: true, updatedAt: cache.catalog.updatedAt };
     return { cachedAt: '', source: 'built-in', stale: true, updatedAt: '' };
@@ -280,6 +301,7 @@ module.exports = {
   SystemCatalog,
   DEFAULT_URL,
   CACHE_TTL_MS,
+  RETRY_COOLDOWN_MS,
   normalizeCatalog,
   builtInCatalog,
 };

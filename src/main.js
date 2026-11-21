@@ -123,6 +123,18 @@ const APP_ROOT = path.join(__dirname, '..');
 const IS_DEV = process.argv.includes('--dev');
 
 /**
+ * 构造 VC++ 安装器的 PowerShell 调用。
+ * 路径必须通过环境变量传递，不能插进 -Command 的双引号字符串；否则
+ * Windows 路径中的 `$()` / 反引号会被 PowerShell 当成表达式执行。
+ */
+function buildVcRedistLaunch(file) {
+  return {
+    command: "Start-Process -FilePath $env:APKSTART_VC_REDIST -ArgumentList '/quiet','/norestart' -Verb RunAs -Wait",
+    env: { ...process.env, APKSTART_VC_REDIST: String(file) },
+  };
+}
+
+/**
  * 轻量文件日志：打包后没有控制台，出问题时用户可以把 app.log 发过来。
  * 只记关键节点和异常，正常路径几千行也不会撑爆。
  */
@@ -2912,10 +2924,12 @@ function registerIpc() {
     if (!file) return { ok: false, reason: 'no-installer' };
     const { spawn } = require('child_process');
     await new Promise((resolve) => {
-      // 用 RunAs 提权安装（VC++ 是系统级组件，需要管理员）；/quiet 静默 /norestart 不重启
-      const ps = spawn('powershell.exe', ['-NoProfile', '-Command',
-        `Start-Process -FilePath "${file}" -ArgumentList '/quiet','/norestart' -Verb RunAs -Wait`],
-      { windowsHide: true, stdio: 'ignore' });
+      // 用 RunAs 提权安装（VC++ 是系统级组件，需要管理员）；/quiet 静默 /norestart 不重启。
+      // 路径作为环境变量传给 PowerShell，避免路径中的 `$()` / 反引号被解释。
+      const launch = buildVcRedistLaunch(file);
+      const ps = spawn('powershell.exe', ['-NoProfile', '-Command', launch.command], {
+        windowsHide: true, stdio: 'ignore', env: launch.env,
+      });
       ps.on('exit', () => resolve());
       ps.on('error', () => resolve());
     });

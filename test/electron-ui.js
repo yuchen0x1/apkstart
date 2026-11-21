@@ -61,7 +61,9 @@ app.whenReady().then(async () => {
   const mainWin = makeWindow('main');
   let win = mainWin;
   mainWin.webContents.session.webRequest.onBeforeRequest((details, done) => done({ cancel: !/^(file:|data:|devtools:)/.test(details.url) }));
-  const js = code => win.webContents.executeJavaScript(code);
+  const js = code => win.webContents.executeJavaScript(code).catch((error) => {
+    throw new Error(`${error.message}\nRenderer script: ${String(code).slice(0, 500)}`);
+  });
   const settle = () => js('new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))');
   const waitFor = expression => js(`new Promise((resolve, reject) => {
     const deadline = performance.now() + 5000;
@@ -255,14 +257,40 @@ app.whenReady().then(async () => {
       await waitFor("[...document.querySelectorAll('.toast.error')].some(e=>e.textContent.includes('快捷方式创建失败'))");
       check('快捷方式后端返回 ok:false 不伪报创建成功', fixture.calls.slice(shortcutStart).some(c=>c.channel==='app:shortcut') && await js("![...document.querySelectorAll('.toast')].some(e=>e.querySelector('.t-title-text').textContent==='桌面快捷方式已创建')"));
     }
+    await js('hideMenu()');
+    const cardDoubleClickStart = fixture.calls.length;
+    const cardPoint = await js("(() => { const r=document.querySelector('.card-launch').getBoundingClientRect(); return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}; })()");
+    for (const clickCount of [1, 2]) {
+      win.webContents.sendInputEvent({ type: 'mouseDown', x: cardPoint.x, y: cardPoint.y, button: 'left', clickCount });
+      win.webContents.sendInputEvent({ type: 'mouseUp', x: cardPoint.x, y: cardPoint.y, button: 'left', clickCount });
+    }
+    await settle();
+    const cardDoubleClickCalls = fixture.calls.slice(cardDoubleClickStart);
+    check('应用卡片真实双击不会隐式创建桌面快捷方式', !cardDoubleClickCalls.some(c => c.channel === 'app:shortcut'));
+    check('应用卡片双击序列只保留首次普通点击的启动', cardDoubleClickCalls.filter(c => c.channel === 'app:launch').length === 1);
     fixture.clearResponse('app:shortcut');
-    await js("hideMenu(); document.getElementById('toastWrap').innerHTML=''");
+    await js("hideMenu(); closeSettings(); document.getElementById('settingsMask').classList.remove('on'); document.getElementById('toastWrap').innerHTML=''");
+    const hiddenPollStart = fixture.calls.length;
+    await js('pollSystems()');
+    const hiddenPollCalls = fixture.calls.slice(hiddenPollStart);
+    check('系统设置隐藏时轮询不请求系统目录或任务快照', !hiddenPollCalls.some(c => c.channel === 'system:list' || c.channel === 'system:tasks'));
+    const reopenStart = fixture.calls.length;
+    await js("openSettings({section:'runtime'}); void 0");
+    await waitFor('!sysUI.loading && !!sysUI.data');
+    const reopenCalls = fixture.calls.slice(reopenStart);
+    check('重新打开运行状态面板立即刷新系统目录与任务快照', reopenCalls.filter(c => c.channel === 'system:list').length === 1 && reopenCalls.filter(c => c.channel === 'system:tasks').length === 1);
+    await js('closeSettings()');
+    await waitFor('!sysUI.loading');
+    await js("openSettings({section:'runtime'}); void 0");
     await waitFor('!sysUI.loading');
     let releaseSnapshot, snapshotRequested;
     const snapshotPending = new Promise(resolve => { snapshotRequested = resolve; });
     fixture.setResponse('system:tasks', () => new Promise(resolve => { releaseSnapshot = resolve; snapshotRequested(); }));
+    const pendingPollStart = fixture.calls.length;
     await js('window.uiSnapshotPending=loadSystems(); void 0');
     await snapshotPending;
+    await js('pollSystems()');
+    check('可见面板的慢快照期间周期轮询不会排队重复刷新', await js('!sysUI.reloadPending') && fixture.calls.slice(pendingPollStart).filter(c=>c.channel==='system:list').length===1 && fixture.calls.slice(pendingPollStart).filter(c=>c.channel==='system:tasks').length===1);
     const pushedTask = { taskId:'ui-new-task', systemId:'android-x86', status:'downloading', progress:77, updatedAt:'2026-01-02T00:00:00Z' };
     mainWin.webContents.send('system:task', pushedTask);
     await settle();
@@ -397,6 +425,7 @@ app.whenReady().then(async () => {
         local:{ ...s.local, installed:s.id==='android-x86' || s.local.installed, running:s.id===currentId && running } })) }));
     fixture.setResponse('system:tasks', () => ({ ok:true, tasks:[] }));
     await js("openSettingsSection('android'); loadSystems()");
+    await waitFor("!sysUI.loading && !!document.querySelector('#sysCards [data-sys=android-x86] [data-act=switch]')");
     await js("document.getElementById('toastWrap').innerHTML=''");
     let releaseSwitch, switchRequested;
     const pendingSwitch = new Promise(resolve => { switchRequested = resolve; });
@@ -512,19 +541,33 @@ app.whenReady().then(async () => {
     setSession({ current:{ running:true, vmStarted:true, stopped:false } });
     let cancelledTask = false, releaseCancel, cancelRequested;
     const pendingCancel = new Promise(resolve => { cancelRequested=resolve; });
-    fixture.setResponse('system:tasks', () => ({ok:true,tasks:[{taskId:'ui-cancel-installer',systemId:'android-x86',status:cancelledTask?'cancelled':'awaiting_confirmation',currentStep:cancelledTask?'已取消（不停止安装器，保留当前安装会话）':'等待安装完成确认'}]}));
+    let holdCancelSnapshot = false, releaseCancelSnapshot, cancelSnapshotRequested;
+    const pendingCancelSnapshot = new Promise(resolve => { cancelSnapshotRequested=resolve; });
+    fixture.setResponse('system:tasks', () => {
+      const task = {taskId:'ui-cancel-installer',systemId:'android-x86',status:cancelledTask?'cancelled':'awaiting_confirmation',currentStep:cancelledTask?'已取消（不停止安装器，保留当前安装会话）':'等待安装完成确认'};
+      if (holdCancelSnapshot) {
+        holdCancelSnapshot = false;
+        return new Promise(resolve => { releaseCancelSnapshot=resolve; cancelSnapshotRequested(); });
+      }
+      return {ok:true,tasks:[task]};
+    });
     fixture.setResponse('system:cancel', () => new Promise(resolve => { releaseCancel=resolve; cancelRequested(); }));
     await js("document.getElementById('toastWrap').innerHTML=''; loadSystems()");
+    await waitFor("!sysUI.loading && sysUI.tasks.some(t=>t.taskId==='ui-cancel-installer' && t.status==='awaiting_confirmation')");
+    holdCancelSnapshot = true;
+    await js("openSettingsSection('runtime')");
+    await pendingCancelSnapshot;
     const taskCancelStart = fixture.calls.length;
     await js(`(() => {
-      openSettingsSection('runtime');
       const b=document.querySelector('#sysTaskList [data-tact=cancel]');
       b.focus(); b.click(); document.querySelector('#sysTaskList [data-tact=cancel]').click();
     })()`);
     await pendingCancel;
     check(theme + '取消安装任务保持原 taskId 与去重忙碌语义，并明确不会停安装器', fixture.calls.slice(taskCancelStart).filter(c=>c.channel==='system:cancel' && c.payload==='ui-cancel-installer').length===1 && await js("document.activeElement.matches('#sysTaskList [data-tact=cancel]') && document.activeElement.getAttribute('aria-busy')==='true' && document.activeElement.title==='仅取消任务，不停止安装器，也不删除系统数据'"));
     cancelledTask=true; releaseCancel({ok:true});
-    await waitFor('!sysUI.taskBusy.size && !sysUI.loading');
+    await waitFor('sysUI.reloadPending===true');
+    releaseCancelSnapshot({ok:true,tasks:[{taskId:'ui-cancel-installer',systemId:'android-x86',status:'awaiting_confirmation',currentStep:'等待安装完成确认'}]});
+    await waitFor('!sysUI.taskBusy.size && !sysUI.loading && sysUI.tasks[0]?.status===\'cancelled\'');
     check(theme + '任务取消与系统停止严格分离，不停止安装器也不假改运行状态', !fixture.calls.slice(taskCancelStart).some(c=>['system:stop','runtime:stop'].includes(c.channel)) && await js("sysUI.status.current.running && sysUI.tasks[0].status==='cancelled' && document.getElementById('toastWrap').textContent.includes('仅取消任务，不停止安装器，也不删除系统数据') && !!document.querySelector('#sysCards [data-sys=android-x86] [data-act=stop]')"));
     for (const channel of ['system:list','system:tasks','system:switch','system:stop','system:cancel','system:status']) fixture.clearResponse(channel);
     fixture.setSystemState({ ...baseline, current:{...baseline.current,stopped:false}, switching:false, stopping:false });
@@ -604,14 +647,38 @@ app.whenReady().then(async () => {
     check(theme + '刷新异常不会被旧目录静默掩盖', await js("!!document.querySelector('#sysCards [data-act=retryCatalog]') && /读取连接中断/.test(document.getElementById('sysCards').textContent) && document.getElementById('sysDetail').hidden"));
     fixture.clearResponse('system:list');
     await js('loadSystems()');
+    await js("openSettingsSection('runtime'); void 0");
+    await waitFor('!sysUI.loading');
     await js(`(() => {
       window.uiSavedTasks=sysUI.tasks;
       sysUI.tasks=[{...sysUI.tasks[0],status:'downloading',progress:42,speed:4*2**20,eta:60,currentStep:'正在下载，支持暂停'}];
-      renderSysTasks(); openSettingsSection('runtime');
+      renderSysTasks();
     })()`);
     await shot(theme + '-task-progress');
     check(theme + '下载进度具有名称和真实百分比语义', await js("document.querySelector('#sysTaskList [role=progressbar]')?.getAttribute('aria-valuenow')==='42' && !!document.querySelector('#sysTaskList button[data-tact=pause]')"));
-    await js("sysUI.tasks=[{...sysUI.tasks[0],status:'failed',error:'UI 测试：连接中断，保留断点',currentStep:'下载失败'}]; renderSysTasks()");
+    check(theme + '任务状态公告节点具有状态、礼貌播报和原子语义', await js("(() => { const e=document.getElementById('sysTaskAnnouncement'); return e?.getAttribute('role')==='status' && e.getAttribute('aria-live')==='polite' && e.getAttribute('aria-atomic')==='true'; })()"));
+    const phaseTask = { ...await js('sysUI.tasks[0]'), status:'verifying', progress:42, updatedAt:'2026-05-01T00:00:00Z', currentStep:'正在校验文件' };
+    mainWin.webContents.send('system:task', phaseTask);
+    await settle();
+    check(theme + '事件驱动的任务阶段更新公告校验状态', await js("document.getElementById('sysTaskAnnouncement').textContent.includes('文件校验中')"));
+    const phaseAnnouncement = await js("document.getElementById('sysTaskAnnouncement').textContent");
+    mainWin.webContents.send('system:task', { ...phaseTask, progress:43, currentStep:'下载速度变化', updatedAt:'2026-05-01T00:00:01Z' });
+    await settle();
+    check(theme + '任务仅更新百分比时不重复播报', await js(`document.getElementById('sysTaskAnnouncement').textContent===${JSON.stringify(phaseAnnouncement)}`));
+    mainWin.webContents.send('system:task', { ...phaseTask, status:'completed', progress:100, currentStep:'下载完成', updatedAt:'2026-05-01T00:00:02Z' });
+    await settle();
+    check(theme + '任务完成阶段会更新状态公告', await js("document.getElementById('sysTaskAnnouncement').textContent.includes('已完成')"));
+    mainWin.webContents.send('system:task', { ...phaseTask, status:'failed', error:'UI 测试：连接中断，保留断点', currentStep:'下载失败', updatedAt:'2026-05-01T00:00:03Z' });
+    await settle();
+    check(theme + '任务失败阶段会公告错误原因', await js("document.getElementById('sysTaskAnnouncement').textContent.includes('连接中断，保留断点')"));
+    await js("changeLanguage('en-US')");
+    mainWin.webContents.send('system:task', { ...phaseTask, status:'verifying', updatedAt:'2026-05-01T00:00:04Z' });
+    await settle();
+    check(theme + '任务阶段公告使用当前英文界面语言', await js("document.getElementById('sysTaskAnnouncement').textContent==='Android-x86: Verifying files'"));
+    await js("changeLanguage('zh-CN')");
+    check(theme + '任务状态公告随语言切换恢复中文', await js("document.getElementById('sysTaskAnnouncement').textContent==='Android-x86：文件校验中'"));
+    mainWin.webContents.send('system:task', { ...phaseTask, status:'failed', error:'UI 测试：连接中断，保留断点', updatedAt:'2026-05-01T00:00:05Z' });
+    await settle();
     await shot(theme + '-task-failed');
     check(theme + '任务失败有原因和重试动作', await js("/保留断点/.test(document.getElementById('sysTaskList').textContent) && !!document.querySelector('#sysTaskList button[data-tact=retry]')"));
     await js("sysUI.tasks=window.uiSavedTasks; delete window.uiSavedTasks; renderSysTasks()");

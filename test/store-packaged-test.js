@@ -11,11 +11,16 @@ const { test } = require('node:test');
 const ROOT = path.resolve(__dirname, '..');
 const digest = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 for (const rel of ['dist/ApkStart-win64-portable', 'dist/release/win-unpacked']) {
-  test(`构建包配置模块与源码一致且可在内置 Node 中运行：${rel}`, { skip: process.platform !== 'win32' }, () => {
+  test(`构建包关键源码与版本一致且配置模块可在内置 Node 中运行：${rel}`, { skip: process.platform !== 'win32' }, () => {
     const dir = path.join(ROOT, rel);
     assert.ok(fs.existsSync(dir), '先运行 npm run pack 和 npm run build:exe');
     const app = path.join(dir, 'resources', 'app');
-    assert.equal(digest(path.join(app, 'src', 'core', 'store.js')), digest(path.join(ROOT, 'src', 'core', 'store.js')));
+    for (const source of [
+      'src/core/store.js', 'src/core/system-catalog.js', 'src/main.js',
+      'src/ui/app.js', 'src/ui/index.html',
+    ]) {
+      assert.equal(digest(path.join(app, source)), digest(path.join(ROOT, source)), `构建包源码不同：${source}`);
+    }
     assert.equal(require(path.join(app, 'package.json')).version, require('../package.json').version);
     const data = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-packaged-store-'));
     try {

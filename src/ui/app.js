@@ -399,6 +399,14 @@ function renderRuntimeStatus() {
     if (sysUI.data) renderSysCards();
 }
 
+function systemPanelVisible() {
+  if (!$('settingsMask')?.classList.contains('on')) return false;
+  return ['runtime', 'android'].some((sec) => {
+    const panel = document.querySelector(`.set-sec[data-sec="${sec}"]`);
+    return panel && !panel.hidden;
+  });
+}
+
 /* ---------------- 运行时部署（固定在设置里） ---------------- */
 
 /**
@@ -1550,6 +1558,7 @@ function openSettingsSection(secId) {
   if ($('setSearch')) $('setSearch').value = '';
   if ($('setHits')) { $('setHits').hidden = true; $('setHits').innerHTML = ''; }
   if ($('setBody')) $('setBody').scrollTop = 0;
+  if (['runtime', 'android'].includes(settingsSec) && systemPanelVisible()) loadSystems();
 }
 
 /** 每次使用当前语言的标签，避免语言切换后还搜旧文案。 */
@@ -1739,6 +1748,7 @@ async function openSettings({ section = settingsSec, opener, focusId } = {}) {
   hideMenu(false);
   openSettingsSection(section);
   a11y.open(mask, { opener: restore, initial: focusId ? $(focusId) : undefined });
+  if (['runtime', 'android'].includes(settingsSec)) loadSystems();
   loading.hidden = false;
   loading.textContent = '正在读取设置…';
   body.inert = true;
@@ -2106,6 +2116,7 @@ async function changeLanguage(value) {
     state.settings = settings;
     const payload = await api.i18n();
     window.apkI18n?.retranslate(payload);
+    refreshSysTaskAnnouncement();
   } catch (err) {
     toast({ title: '切换语言失败', body: err?.message || '请稍后重试。', type: 'error' });
   } finally {
@@ -2987,11 +2998,6 @@ function bindEvents() {
     openCardMenu(card.querySelector('.card-menu-btn'), e.target);
   });
 
-  $('grid').addEventListener('dblclick', (e) => {
-    const card = e.target.closest('.card');
-    if (card && !e.target.closest('.card-menu-btn')) createShortcut(card.dataset.pkg);
-  });
-
   const menu = $('ctxmenu');
   menu.addEventListener('click', (e) => {
     const item = e.target.closest('.item');
@@ -3582,12 +3588,16 @@ const sysUI = {
   statusError: '',
   runtimeError: '',
   statusRequest: 0,
+  lastAnnouncedTaskId: '',
   switchOp: null,
   stopBusy: false,
   bound: false,
   loading: false,
+  loadPromise: null,
+  reloadPending: false,
   error: '',
 };
+const sysTaskAnnouncements = new Map();
 
 // system:status 决定当前 Provider；runtime:status 只描述旧内置运行时，不能冒充非内置系统。
 function sysSession() {
@@ -3905,6 +3915,35 @@ async function refreshSysLogs() {
   } catch (_) { /* 保留该系统上次成功读取的日志 */ }
 }
 
+const SYS_STATUS_ANNOUNCEMENT_EN = {
+  waiting: 'Waiting', preparing: 'Preparing', downloading: 'Downloading', verifying: 'Verifying files',
+  extracting: 'Extracting', installing: 'Installing', initializing: 'Initialising', starting: 'Starting',
+  completed: 'Completed', failed: 'Failed', paused: 'Paused', cancelled: 'Cancelled',
+  awaiting_confirmation: 'Waiting for installation confirmation',
+};
+
+function announceSysTask(task, previous, force = false) {
+  const live = $('sysTaskAnnouncement');
+  if (!live || !task) return;
+  const phaseChanged = !previous || task.status !== previous.status;
+  const errorChanged = !!task.error && task.error !== previous?.error;
+  if (!force && !phaseChanged && !errorChanged) return;
+  const system = (sysUI.data?.systems || []).find((item) => item.id === task.systemId);
+  const english = window.apkI18n?.lang === 'en-US';
+  const translate = (text) => window.apkI18n?.translateOne(text) || text;
+  const name = translate(system?.name || task.systemId);
+  const label = english
+    ? (SYS_STATUS_ANNOUNCEMENT_EN[task.status] || translate(SYS_STATUS_LABEL[task.status] || task.status || '状态已更新'))
+    : (SYS_STATUS_LABEL[task.status] || task.status || '状态已更新');
+  const error = task.error ? `, ${translate(task.error)}` : '';
+  live.textContent = english ? `${name}: ${label}${error}` : `${name}：${label}${task.error ? `，${task.error}` : ''}`;
+}
+
+function refreshSysTaskAnnouncement() {
+  const task = sysUI.tasks.find((item) => item.taskId === sysUI.lastAnnouncedTaskId);
+  if (task) announceSysTask(task, task, true);
+}
+
 function renderSysTasks() {
   const wrap = $('sysTaskWrap');
   const list = $('sysTaskList');
@@ -3912,10 +3951,15 @@ function renderSysTasks() {
   const tasks = sysUI.tasks || [];
   if (!tasks.length) {
     if (list.contains(document.activeElement)) a11y.focus($('setTitle'));
+    sysTaskAnnouncements.clear();
     wrap.hidden = true;
     return;
   }
   wrap.hidden = false;
+  const taskIds = new Set(tasks.map((task) => task.taskId));
+  for (const taskId of sysTaskAnnouncements.keys()) {
+    if (!taskIds.has(taskId)) sysTaskAnnouncements.delete(taskId);
+  }
   const html = tasks.map((t) => {
     const name = (sysUI.data && (sysUI.data.systems || []).find((s) => s.id === t.systemId)) || {};
     const running = ACTIVE_TASK_STATUS.includes(t.status);
@@ -3950,17 +3994,11 @@ function renderSysTasks() {
   a11y.replace(list, html, () => $('btnSysTaskRefresh'));
 }
 
-async function loadSystems() {
-  if (sysUI.loading) return;
-  sysUI.loading = true;
+async function loadSystemsSnapshot() {
   // system:task 可能在目录/任务快照 IPC 之间到达，先暂存推送，避免快照把新任务抹掉。
   const pushes = new Map();
   sysUI.snapshotPushes = pushes;
-  const cards = $('sysCards');
-  cards?.setAttribute('aria-busy', 'true');
-  if (!sysUI.data && cards) a11y.replace(cards, '<div class="sys-loading" role="status">正在读取系统目录…</div>', () => $('setTitle'));
   const catalogTime = $('sysCatalogTime');
-  if (catalogTime) catalogTime.textContent = '正在读取系统目录…';
   try {
     const r = await api.systemList();
     if (r && r.ok) { sysUI.data = r; sysUI.error = ''; }
@@ -3986,10 +4024,35 @@ async function loadSystems() {
     renderSysCards();
     renderSysDetail();
   } finally {
-    sysUI.loading = false;
     sysUI.snapshotPushes = null;
-    cards?.setAttribute('aria-busy', 'false');
     if (sysUI.error && catalogTime) catalogTime.textContent = '读取系统目录失败';
+  }
+}
+
+async function loadSystems() {
+  if (sysUI.loading) {
+    // Keep mutations/reopens from being lost behind an older in-flight snapshot.
+    sysUI.reloadPending = true;
+    return sysUI.loadPromise;
+  }
+  sysUI.loading = true;
+  const cards = $('sysCards');
+  cards?.setAttribute('aria-busy', 'true');
+  if (!sysUI.data && cards) a11y.replace(cards, '<div class="sys-loading" role="status">正在读取系统目录…</div>', () => $('setTitle'));
+  const catalogTime = $('sysCatalogTime');
+  if (catalogTime) catalogTime.textContent = '正在读取系统目录…';
+  sysUI.loadPromise = (async () => {
+    do {
+      sysUI.reloadPending = false;
+      await loadSystemsSnapshot();
+    } while (sysUI.reloadPending);
+  })();
+  try {
+    await sysUI.loadPromise;
+  } finally {
+    sysUI.loading = false;
+    sysUI.loadPromise = null;
+    cards?.setAttribute('aria-busy', 'false');
   }
 }
 
@@ -4057,6 +4120,11 @@ async function sysTaskAction(tid, act) {
       renderSysTasks();
     }
   }
+}
+
+function pollSystems() {
+  if (!systemPanelVisible() || sysUI.loading) return Promise.resolve(false);
+  return loadSystems();
 }
 
 function bindSystems() {
@@ -4130,17 +4198,25 @@ function bindSystems() {
     api.on('system:task', (task) => {
       if (!task || !task.taskId) return;
       if (sysUI.snapshotPushes) {
-        const previous = sysUI.snapshotPushes.get(task.taskId);
-        if (!previous || (task.updatedAt || '') >= (previous.updatedAt || '')) sysUI.snapshotPushes.set(task.taskId, task);
+        const pending = sysUI.snapshotPushes.get(task.taskId);
+        if (!pending || (task.updatedAt || '') >= (pending.updatedAt || '')) sysUI.snapshotPushes.set(task.taskId, task);
+      }
+      const previous = sysTaskAnnouncements.get(task.taskId)
+        || sysUI.tasks.find((item) => item.taskId === task.taskId);
+      const current = sysUI.tasks.find((item) => item.taskId === task.taskId);
+      const isCurrent = !current || (task.updatedAt || '') >= (current.updatedAt || '');
+      if (isCurrent) {
+        announceSysTask(task, previous);
+        sysUI.lastAnnouncedTaskId = task.taskId;
       }
       sysUI.tasks = mergeSysTasks(sysUI.tasks, [task]);
+      if (isCurrent) sysTaskAnnouncements.set(task.taskId, { status: task.status, error: task.error || '' });
       renderSysCards();
       renderSysTasks();
     });
     api.on('system:log', scheduleSysLogs);
   }
-  loadSystems();
-  setInterval(loadSystems, 12000);
+  setInterval(pollSystems, 12000);
 }
 
 /* ---------------- 环境自检 ---------------- */
