@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { windowsPowerShellEnv } = require('./lib/windows-powershell-env');
 
 if (process.platform !== 'win32') {
   console.log('卸载清理测试：非 Windows，跳过');
@@ -57,7 +58,7 @@ try {
     const result = spawnSync('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', shortcutCreator,
       '-Path', shortcutPath, '-Target', targetPath, '-Arguments', args, '-Icon', iconPath,
-    ], { windowsHide: true, encoding: 'utf8' });
+    ], { windowsHide: true, encoding: 'utf8', env: windowsPowerShellEnv() });
     assert.strictEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
   };
   createShortcut(legacyDesktopShortcut, path.join(root, 'ApkStart.exe'), '--launch "legacy.desktop"', path.join(iconDir, 'legacy.ico'));
@@ -75,7 +76,7 @@ try {
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
     '-DataDir', data, '-TempDir', tempRoot, '-DesktopDir', desktop,
     '-StartMenuDir', path.dirname(startMenu),
-  ], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
+  ], { windowsHide: true, encoding: 'utf8', timeout: 30000, env: windowsPowerShellEnv() });
   assert.strictEqual(r.error, undefined, r.error && r.error.message);
   assert.strictEqual(r.status, 0, `${r.stdout}\n${r.stderr}`);
   for (const dir of [data, ownedRuntime, ownedAvd, desktopShortcut, startMenuShortcut, legacyDesktopShortcut, legacyStartMenuShortcut]) {
@@ -100,7 +101,7 @@ try {
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
     '-DataDir', nestedData, '-TempDir', tempRoot, '-DesktopDir', desktop,
     '-StartMenuDir', path.dirname(startMenu),
-  ], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
+  ], { windowsHide: true, encoding: 'utf8', timeout: 30000, env: windowsPowerShellEnv() });
   assert.strictEqual(nested.status, 0, `${nested.stdout}\n${nested.stderr}`);
   assert(fs.existsSync(path.join(nestedShared, 'keep.txt')), '嵌在缓存内的共享文件必须保留');
   assert(fs.existsSync(path.join(external, 'keep.txt')), '不能跟随 junction 删除外部文件');

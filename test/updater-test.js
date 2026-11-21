@@ -7,6 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { windowsPowerShellEnv } = require('./lib/windows-powershell-env');
 
 // download/proxy 会间接载入 store；即使模块初始化查询数据目录也只能看到临时 fixture。
 const fixtureHome = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-upd-home-'));
@@ -115,7 +116,7 @@ function runPortableFixture(root, script, fault = '') {
   ];
   fs.writeFileSync(fixture, '\ufeff' + prelude.join('\r\n') + '\r\n' + script);
   return spawnSync(ps, ['-NoProfile', '-NonInteractive', '-File', fixture], {
-    encoding: 'utf8', timeout: 60000, windowsHide: true,
+    encoding: 'utf8', timeout: 60000, windowsHide: true, env: windowsPowerShellEnv(),
   });
 }
 
@@ -127,7 +128,7 @@ function windowsFixturesAllowed() {
   const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const probe = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-Command',
     '@{ policy = [string](Get-ExecutionPolicy); language = [string]$ExecutionContext.SessionState.LanguageMode } | ConvertTo-Json -Compress',
-  ], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+  ], { encoding: 'utf8', timeout: 30000, windowsHide: true, env: windowsPowerShellEnv() });
   assert(probe.status === 0, `无法探测 PowerShell 策略：${probe.error || probe.stderr}`);
   const info = JSON.parse(probe.stdout.trim());
   if (info.language !== 'FullLanguage' || !['RemoteSigned', 'Unrestricted', 'Bypass'].includes(info.policy)) {
@@ -138,6 +139,26 @@ function windowsFixturesAllowed() {
 }
 
 async function main() {
+  await test('Windows PowerShell 子进程仅重建模块路径，不污染父环境或改变策略限制', () => {
+    const source = Object.freeze({
+      PSModulePath: 'C:\\Program Files\\PowerShell\\7\\Modules',
+      pSmOdUlEpAtH: 'other inherited modules',
+      PSExecutionPolicyPreference: 'Restricted',
+      __PSLockdownPolicy: '4',
+      PATH: 'original path',
+      SystemRoot: 'C:\\Windows',
+    });
+    const before = JSON.stringify(source);
+    const env = windowsPowerShellEnv(source);
+    assert(env !== source, '必须创建独立子进程环境');
+    assert(!Object.keys(env).some(key => key.toLowerCase() === 'psmodulepath'), '应删除全部大小写变体');
+    eq(Object.keys(env).length, Object.keys(source).length - 2, '只移除模块路径');
+    for (const key of ['PSExecutionPolicyPreference', '__PSLockdownPolicy', 'PATH', 'SystemRoot']) {
+      eq(env[key], source[key], `${key} 必须原样保留`);
+    }
+    eq(JSON.stringify(source), before, '不得修改传入的父环境');
+  });
+
   console.log('\n[zip.js 路径边界]');
 
   await test('safeEntryPath：正常相对路径被解析到目标目录内', () => {
@@ -375,8 +396,9 @@ async function main() {
     const file = path.join(root, 'apply-check.ps1');
     fs.writeFileSync(file, script, 'utf8');
     const powershell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+    const env = process.platform === 'win32' ? windowsPowerShellEnv() : process.env;
     const probe = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'], {
-      encoding: 'utf8', timeout: 30000,
+      encoding: 'utf8', timeout: 30000, env,
     });
     if (probe.error && probe.error.code === 'ENOENT') {
       console.log('  跳过：当前环境未提供 ' + powershell + ' 语法解析器');
@@ -386,7 +408,7 @@ async function main() {
     const r = spawnSync(powershell, [
       '-NoProfile', '-NonInteractive', '-Command',
       `$err = $null; [void][System.Management.Automation.Language.Parser]::ParseInput(([IO.File]::ReadAllText('${file.replace(/'/g, "''")}', [Text.Encoding]::UTF8)), [ref]$null, [ref]$err); if ($err -and $err.Count) { exit 1 }`,
-    ], { encoding: 'utf8', timeout: 30000 });
+    ], { encoding: 'utf8', timeout: 30000, env });
     assert(r.status === 0, `脚本语法错误：${r.stdout || ''}${r.stderr || ''}`);
   });
 
@@ -764,7 +786,7 @@ async function main() {
     fs.writeFileSync(fixture, '\ufeff' + prelude.join('\r\n') + '\r\n' + script);
     return spawnSync(ps, [
       '-NoProfile', '-NonInteractive', '-File', fixture,
-    ], { encoding: 'utf8', timeout: 60000 });
+    ], { encoding: 'utf8', timeout: 60000, env: windowsPowerShellEnv() });
   }
 
   const cmdExit = (n) => `  Microsoft.PowerShell.Management\\Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\\cmd.exe') -ArgumentList '/c exit ${n}' -PassThru -Wait`;
@@ -850,7 +872,7 @@ async function main() {
   function shortPath(p) {
     const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     const code = `$ErrorActionPreference = 'Stop'; $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder('${p.replace(/'/g, "''")}').ShortPath; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($short))`;
-    const r = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    const r = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 30000, windowsHide: true, env: windowsPowerShellEnv() });
     eq(r.status, 0, `${r.error || r.stderr}`);
     const result = Buffer.from(String(r.stdout || '').trim(), 'base64').toString('utf8');
     assert(path.isAbsolute(result) && !result.includes('"') && fs.statSync(result).isDirectory(), `无效的短路径：${result}`);
