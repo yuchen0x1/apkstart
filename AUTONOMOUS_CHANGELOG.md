@@ -1,6 +1,6 @@
 # 自主开发记录
 
-## 2026-11-21 · A001 · 更新失败保护（候选 0.9.2）
+## 2026-11-21 · A001 · 更新失败保护（v0.9.2 已发布）
 
 ### 发现与范围
 
@@ -50,7 +50,14 @@
 
 ### 交付状态
 
-本段写入时：短路径修正完成本地 Windows 验收，尚待修正后精确提交的 PR CI、主分支合并和签名 Release 流水线。正式结果回填 [RELEASE_HISTORY.md](RELEASE_HISTORY.md)。未把 Issue #13、原生 Linux 桌面、真实设备升级或签名证书标记为已验证。
+- 最终 head `a34ccb94cd05146055aedba7a81a7602178c8745` 的 [CI 44797597010](https://github.com/yuchen0x1/apkstart/actions/runs/44797597010) 与依赖审查全通过，才合并 [PR #14](https://github.com/yuchen0x1/apkstart/pull/14)。Squash 提交 `6c1b6a288e1b1e821bd2a93fd53b8d74d9cc1369` 与验收 head 文件树完全一致；未绕过保护、未强推。
+- `v0.9.2` Tag 固定到该 main 提交；[Release 44798205362](https://github.com/yuchen0x1/apkstart/actions/runs/44798205362) 的版本归属、Windows Node 20/22、Linux Node 22、四类构建、草稿校验、签名和公开全部成功。正式 API 发布时间 `2026-11-20T19:05:44Z`。
+- 逐项下载全部 7 项正式资产，每个文件放独立新空目录；本地摘要和大小等于 GitHub 元数据，四个程序包等于签名清单，使用随客户端公钥验证 Ed25519，JSON/sig 与发行说明隐藏清单逐字节一致。验收脚本经独立复核，补上清单重复/额外项和 SHA256SUMS 重复/漏项拒绝。
+- Portable ZIP 内部 package、deb 控制/内部 package、AppImage 内部 package 均为 0.9.2；NSIS PE ProductVersion/FileVersion 均为 0.9.2。仅用 ZipFile、dpkg-deb/tarfile、unsquashfs 和 PE 元数据读取，不执行下载程序。
+- Tag 源码本地重打包、no-images 与静态暴露复测通过：113 文件，原始启发式 69/C，0 新增/0 加重，4 个原信号不变；主程序过大和 Android 画像仍未检查，未把限制或信息性信号伪装成安全认证。
+- 原工作区在交付阶段出现 4 个修改和 1 个新增测试，本轮未暂存、覆盖或同步它们；每小时自动化仍保持暂停。六份交付记录通过单独文档分支回填，不移动已公开的版本 Tag，也不为文档单独制造新版本。
+
+正式资产表及摘要见 [RELEASE_HISTORY.md](RELEASE_HISTORY.md)。Issue #13、原生 Linux 桌面、真实设备升级、断电/杀软和 Authenticode 证书仍未验证或完成。
 
 ### 开源研究
 

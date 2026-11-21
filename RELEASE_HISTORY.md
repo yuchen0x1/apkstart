@@ -1,16 +1,43 @@
 # 正式发布历史与交付记录
 
-更新：2026-11-21。已有 Release 通过 GitHub API 核验；候选不得计作正式发布。
+更新：2026-11-21。仅记录已核验的正式发布与实际证据；候选、失败运行不计作发布成功。
 
-## v0.9.2 · 候选，尚未发布
+## v0.9.2 · 已正式发布并核验
 
+- [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.9.2)：非草稿、非预发行，GitHub API `published_at = 2026-11-20T19:05:44Z`。
 - 类型：PATCH；基线 `v0.9.1` / `accb6ca`。
-- 内容：Windows 更新结果严格校验、独立备份、失败载荷保护、真实回滚通知与 BOM 兼容。
-- 本地：首轮 Windows/Linux 全量回归、更新器 54 项、Electron 冒烟/fixture UI、Windows portable/NSIS 构建通过；CI 短路径修正后 Windows/Linux 冻结代码全量再次通过，Windows 更新器增至 56 项，真实执行新增 2 项短名场景；Linux 更新器为 42 项平台适用用例。详见 [PROJECT_STATUS.md](PROJECT_STATUS.md)。
-- [PR #14](https://github.com/yuchen0x1/apkstart/pull/14)：首轮 `aecad3e` 的 CI `44791289048` 为 Windows Node 20/22 失败、Linux Node 22 通过；未合并或发布。已修复短名根路径偏移，待修正后精确提交重新通过全部门禁。
-- 次轮 `d324019` / CI `44796259254`：短路径回归均通过，Linux 全量通过；Windows 因 ACL 夹具安全模块加载失败而为 55/1。已修复夹具的模块依赖及 DACL 恢复读回；依然未合并或发布失败提交。
-- 待完成：最终修正后 PR CI → 精确提交合并 main → 唯一 Tag → 原有签名工作流 → 四类资产与清单验证。
-- 尚无本轮正式发布成功声明；完成后回填精确提交、PR、工作流、Release URL 与资产核对结果。
+- 内容：Windows 更新结果严格校验、独立备份、恢复权限预检、失败载荷保护、持久化自动重试限制、真实回滚通知及 BOM 兼容。
+- [PR #14](https://github.com/yuchen0x1/apkstart/pull/14) 最终验收 head：`a34ccb94cd05146055aedba7a81a7602178c8745`。Windows Node 20/22、Linux Node 22 的 [CI 44797597010](https://github.com/yuchen0x1/apkstart/actions/runs/44797597010) 与[依赖审查 44797596942](https://github.com/yuchen0x1/apkstart/actions/runs/44797596942) 全通过后合并。
+- main 的 squash/Tag 源码提交：`6c1b6a288e1b1e821bd2a93fd53b8d74d9cc1369`。与验收 head 文件树完全相同；唯一 `v0.9.2` Tag 的 peeled commit 与之相符。
+- [Release 流水线 44798205362](https://github.com/yuchen0x1/apkstart/actions/runs/44798205362)：版本/主分支归属、Windows Node 20/22、Linux Node 22、portable/NSIS/AppImage/deb、清单签名、草稿核对和公开全部成功。[合并后 main CI 44798028579](https://github.com/yuchen0x1/apkstart/actions/runs/44798028579) 也通过。
+- 本地：Windows 全量再次退出 0（更新器 56/0，含实际短名成功/恢复与 ACL 拒绝/恢复读回）；Linux 冻结代码树全量退出 0（更新器 42/0，Windows 专属执行跳过）；Electron 冒烟 20/0。fixture UI 与真实运行环境的边界见 [PROJECT_STATUS.md](PROJECT_STATUS.md)。
+
+### 正式资产逐项核对
+
+以下 7 项均从正式 Release 逐文件下载至独立新空目录，本地大小与 SHA-256 均等于 GitHub REST 元数据。未执行任何下载程序。
+
+| 资产 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `ApkStart-v0.9.2-win64-portable.zip` | 149909919 | `bf8b3cdb2acd28f654ba429e66b5f6b750caef568ee48f81c7d296ca64776daa` |
+| `ApkStart-0.9.2-Setup.exe` | 121207451 | `13e57fbb2f2cd7fab3a4627c624d0b41e011122838482935ba5077797e1d310d` |
+| `ApkStart-0.9.2-x86_64.AppImage` | 134937664 | `8abf1c8ad88b35146be8a73b0eceebc0ce8eee8c274a27ba7c2f3e2238c3b457` |
+| `ApkStart-0.9.2-amd64.deb` | 109041956 | `02bc07217ee14e32892e1fa837e4982e533975df24fd976548b01c70a6f89d80` |
+| `ApkStart-update.json` | 623 | `7b4fe26204966f1cbaa5bcbb2010616a0a8be6130ae39b7883a0798b3b9f0238` |
+| `ApkStart-update.json.sig` | 64 | `40f35fdc57f79fd156e2e2c271df67ed15bb8202e93a1e84eddc54dc819d3f22` |
+| `SHA256SUMS` | 380 | `361921469b59511e7ea143a5478814fc048bd031203d9c5eb3a19f56aedb6f2a` |
+
+- 四个程序包的大小/摘要与 Ed25519 签名清单精确匹配，验签使用客户端随附公钥 `src/core/release-public.pem`。
+- 下载的 JSON/原始签名与发行说明隐藏清单逐字节一致；签名清单精确包含四个唯一程序资产，SHA256SUMS 也精确覆盖四项，拒绝重复/额外/漏项。
+- Portable ZIP 内部 `resources/app/package.json` 为 `apkstart@0.9.2`。
+- deb 的 Package/Version 为 `apkstart` / `0.9.2`，并从数据 tar 流读取内部 package 版本 0.9.2；AppImage 只用 `unsquashfs -cat` 读取内部 package，版本 0.9.2（SquashFS offset 188392）。
+- NSIS 只读取 PE 资源，ProductVersion/FileVersion 均为 `0.9.2`。这不是实际安装成功证明，也不是 Authenticode 签名。
+- Portable 正式 ZIP 约 142.97 MiB，160 MiB 门禁通过。后续文档回填不移动 Tag，不重新发布或重复打包该版本。
+
+### 失败运行没有被掩盖
+
+- 首轮 `aecad3e` / CI `44791289048`：Windows Node 20/22 失败、Linux 通过。备份根短名与子项长名混用，修正提供程序解析后的根路径并增加实际 8.3 成功/回滚回归。
+- 次轮 `d324019` / CI `44796259254`：短路径回归均通过，Windows 更新器 55/1，Linux 全量通过。唯一失败是 ACL 夹具模块加载；改用 .NET Framework ACL API，并加入拒绝生效和原 DACL 恢复读回断言。
+- 两个失败 head 均未直接合并或发布；等待最终 head 全绿后才合并。细节见 [AUTONOMOUS_CHANGELOG.md](AUTONOMOUS_CHANGELOG.md)。
 
 ## 已核验基线
 
@@ -20,7 +47,7 @@
 | [v0.9.0](https://github.com/yuchen0x1/apkstart/releases/tag/v0.9.0) | `f7e7cdf` | 2026-11-20T16:57:53Z | 正式；本轮未再次核算全部二进制摘要 |
 | [v0.8.0](https://github.com/yuchen0x1/apkstart/releases/tag/v0.8.0) | `a3e3e4a` | 2026-11-19T17:33:54Z | 巡检初始正式版；资产清单已读取 |
 
-CHANGELOG 使用本地发布日期，以上 publishedAt 保留 API UTC 原值，二者跨日并不表示版本日期被回退。既有版本不是本轮创建，不能认领为本轮交付。
+CHANGELOG 使用本地发布日期，以上 publishedAt 保留 API UTC 原值，二者跨日不表示版本日期被回退。既有版本不是本轮创建，不能认领为本轮交付。
 
 ## 不可省略的发布门禁
 

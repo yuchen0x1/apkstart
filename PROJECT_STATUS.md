@@ -1,13 +1,13 @@
-# 项目状态
+# v0.9.2 历史项目状态
 
-更新时间：2026-11-21。本记录仅描述已核验事实；发布状态见 [RELEASE_HISTORY.md](RELEASE_HISTORY.md)。
+本页仅保留 v0.9.2 交付时的核验记录，不代表当前版本。当前版本见 [README](README.md)，历史发布见 [RELEASE_HISTORY.md](RELEASE_HISTORY.md)。
 
-## 当前批次
+## v0.9.2 交付批次
 
 - 基线：已发布的 `v0.9.1`（`accb6ca`）。巡检期间主分支前进，更新器补丁已重放到该基线，不重复纳入先前 UI/运行时加固提交。
-- 候选版本：`0.9.2`（PATCH），Windows 安装版更新失败处理和恢复文件保护。
-- 实施分支：`fix/windows-updater-rollback`。使用独立 Git worktree，未覆盖最初工作区改动。
-- 状态：[PR #14](https://github.com/yuchen0x1/apkstart/pull/14) 尚待全部 CI 通过。首轮 Windows CI 的短路径偏移缺陷已修复；次轮 `d324019` 中两项短名回归均通过，但 ACL 夹具模块加载失败，Windows 仍为 55/1，Linux 全量通过。已改用 .NET ACL API 并增加实际拒绝及原 DACL 恢复读回断言；修正后的精确提交仍须 CI 全绿才能合并发布。此处不提前宣称已正式发布。
+- 正式版本：[`v0.9.2`](https://github.com/yuchen0x1/apkstart/releases/tag/v0.9.2)（PATCH），Windows 安装版更新失败处理和恢复文件保护。
+- 实施分支：`fix/windows-updater-rollback`；交付记录分支：`docs/v0.9.2-delivery-record`。使用独立 Git worktree，未覆盖原工作区改动。
+- 状态：[PR #14](https://github.com/yuchen0x1/apkstart/pull/14) 最终 head `a34ccb9` 的三平台 CI 与依赖审查全通过后 squash 合并。Tag 指向 main 提交 `6c1b6a288e1b1e821bd2a93fd53b8d74d9cc1369`，[Release 流水线 44798205362](https://github.com/yuchen0x1/apkstart/actions/runs/44798205362) 全部成功，正式资产已下载并核验。前两轮失败及修复过程保留在自主开发记录，不将失败结果计为通过。
 
 ## 架构与交付
 
@@ -16,7 +16,7 @@
 - `build/pack.js` 构建 Windows 便携版；electron-builder 构建 NSIS、Linux AppImage/deb。
 - `release.yml` 验证 Windows Node 20/22、Linux Node 22，检查版本与主分支归属，构建四类资产，再签署清单、核对草稿资产后公开。
 
-## 本地验收（候选 0.9.2）
+## 本地验收（0.9.2）
 
 | 检查 | 结果与限制 |
 | --- | --- |
@@ -30,6 +30,16 @@
 | 一致性 | package/lock/README/更新日志一致；语法及 `git diff --check` 通过 |
 
 Windows 的 ensure 空环境用例因宿主 5554/5556 已被真实实例占用而跳过，未终止它们；隔离 Linux 执行了相应用例。外部 APK 夹具未提供；Linux 不执行 Windows PowerShell/卸载器用例。真实设备升级、UAC、断电和杀软环境未实测。CI 的 Windows Node 20/22 验收不可由本机 Node 26 代替。
+
+## 最终交付核验
+
+- [最终 PR CI 44797597010](https://github.com/yuchen0x1/apkstart/actions/runs/44797597010)：Windows Node 20/22、Linux Node 22 全通过；[依赖审查 44797596942](https://github.com/yuchen0x1/apkstart/actions/runs/44797596942) 通过。合并后的 main CI 与 Tag 的 Release 验证再次通过。
+- 正式公开时间：`2026-11-20T19:05:44Z`（GitHub API UTC；本地为 2026-11-21），非草稿、非预发行。
+- 7 项资产均逐文件下载至独立空目录；本地大小/SHA-256 与 GitHub 一致，4 个程序资产与 Ed25519 签名清单一致；SHA256SUMS 精确覆盖四项，发行说明隐藏清单与 JSON/sig 资产字节一致。
+- Windows portable 内部 package、deb 控制字段及内部 package、AppImage 内部 package、NSIS PE 版本资源均为 `0.9.2`。只用数据读取器检查，没有运行下载资产；不将元数据验证等同于真实安装测试。
+- 便携 ZIP 正式大小 `149,909,919` 字节（约 142.97 MiB），160 MiB 门禁通过。完整资产表见发布历史。
+- 按 Tag 源码重建的本地包静态暴露复测：113 文件，原始启发式分数 69/C，0 新增、0 加重；主程序过大及 Android 画像仍未检查，限制见安全记录。
+- 原工作区交付阶段出现 4 个修改文件和 1 个新增测试，均不属于本轮；未暂存、覆盖或同步该工作区。原有每小时自动任务继续保持暂停。
 
 ## 后续重点
 
