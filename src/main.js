@@ -2586,12 +2586,15 @@ function registerIpc() {
     loadReceipts: () => JSON.parse(fs.readFileSync(deliveryReceipt, 'utf8')),
     // 回执写失败必须让投递层知道（它会因此取消自动上报），不能吞掉。
     saveReceipts: (receipts) => writeJsonAtomicSync(deliveryReceipt, receipts),
-    confirm: async ({ endpoint, payload }) => {
+    confirm: async ({ endpoint, payload, previousDelivery }) => {
+      const warning = previousDelivery === 'uncertain'
+        ? i18n.t('上一次自动上报可能已被接收，再次发送可能产生重复报告。')
+        : (previousDelivery === 'sent' ? i18n.t('这份摘要已自动上报，再次发送可能产生重复报告。') : '');
       const { response } = await dialog.showMessageBox(mainWindow, {
         type: 'question',
         title: i18n.t('发送诊断摘要'),
         message: i18n.t('是否将诊断摘要发送到此收集接口？'),
-        detail: `${feedback.redact(endpoint)}\n\n${JSON.stringify(payload, null, 2)}\n\n${i18n.t('完整报告只保存在本机，不会随摘要上传。')}`,
+        detail: `${feedback.redact(endpoint)}\n\n${warning ? `${warning}\n\n` : ''}${JSON.stringify(payload, null, 2)}\n\n${i18n.t('完整报告只保存在本机，不会随摘要上传。')}`,
         buttons: [i18n.t('取消'), i18n.t('发送摘要')],
         defaultId: 0,
         cancelId: 0,

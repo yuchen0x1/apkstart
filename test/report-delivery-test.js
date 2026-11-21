@@ -269,6 +269,24 @@ test('不确定的自动 POST 不盲目重放，明确拒收不算成功', async
   assert.equal(calls, 3);
 });
 
+test('自动投递结果不确定时，重启后手动发送仍先提示可能重复，默认取消', async () => {
+  const f = ipcFixture(new Map(), () => ({ ok: false, error: '上报超时' }));
+  Object.assign(f.settings.report, { autoSend: true, autoSendTo: endpoint });
+  await f.start();
+  assert.equal(f.sent.length, 1);
+
+  const restarted = ipcFixture(f.files);
+  assert.equal((await restarted.handlers.get('report:submit')()).cancelled, true);
+  assert.equal(restarted.sent.length, 0);
+  const prompt = restarted.prompts.at(-1);
+  assert.match(prompt.detail, /可能已被接收.*重复报告/);
+  assert.equal(prompt.defaultId, 0);
+  assert.equal(prompt.cancelId, 0);
+  restarted.approve();
+  assert.equal((await restarted.handlers.get('report:submit')()).channel, 'endpoint');
+  assert.equal(restarted.sent.length, 1);
+});
+
 test('兜底预览写明真实渠道、目的地和可检查摘要', async () => {
   const f = ipcFixture(new Map(), () => ({ ok: false, error: 'offline' }));
   f.settings.report.endpoint = endpoint;

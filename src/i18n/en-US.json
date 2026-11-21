@@ -4,6 +4,8 @@
   "发送诊断摘要": "Send diagnostic summary",
   "是否将诊断摘要发送到此收集接口？": "Send the diagnostic summary to this collector?",
   "发送摘要": "Send summary",
+  "上一次自动上报可能已被接收，再次发送可能产生重复报告。": "The collector may have received the previous automatic report. Sending again may create a duplicate.",
+  "这份摘要已自动上报，再次发送可能产生重复报告。": "This summary was already sent automatically. Sending again may create a duplicate.",
   "摘要已发送": "Summary sent",
   "完整报告只保存在本机，不会随摘要上传。": "The full report stays on this computer and is not uploaded with the summary.",
   "在 Windows 上，已注册 .apk 关联时，在资源管理器里双击 APK 也会直接装到 ApkStart。": "On Windows, associate .apk files to install them into ApkStart by double-clicking in File Explorer.",

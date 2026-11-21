@@ -59,8 +59,8 @@ function createReportDelivery({ post, confirm, loadReceipts = () => [], saveRece
     }
     const payload = automatic ? bundle.automaticPayload : bundle.payload;
     const { at: _at, ...content } = payload;
-    const receiptKey = automatic
-      ? createHash('sha256').update(JSON.stringify([url.href, bundle.signature])).digest('hex') : '';
+    const deliveryKey = createHash('sha256').update(JSON.stringify([url.href, bundle.signature])).digest('hex');
+    const receiptKey = automatic ? deliveryKey : '';
     const key = receiptKey || JSON.stringify([endpoint, content]);
     if (pending.has(key)) return pending.get(key);
     const recent = receiptKey && recentReceipt(receiptKey);
@@ -75,8 +75,12 @@ function createReportDelivery({ post, confirm, loadReceipts = () => [], saveRece
     }
 
     const task = Promise.resolve().then(async () => {
-      if (!automatic && !await confirm({ endpoint, summary: bundle.summary, payload })) {
-        return { ok: false, cancelled: true };
+      if (!automatic) {
+        const previous = recentReceipt(deliveryKey);
+        const previousDelivery = pending.has(deliveryKey) ? 'uncertain' : previous?.state;
+        if (!await confirm({ endpoint, summary: bundle.summary, payload, previousDelivery })) {
+          return { ok: false, cancelled: true };
+        }
       }
       if (receiptKey) {
         // POST 之前先落盘“结果不确定”：请求途中进程退出也不会在重启后重发。
