@@ -922,8 +922,8 @@ class InstanceManager {
         child.once('spawn', onSpawn);
         child.once('error', onError);
         child.once('exit', onExit);
+        // Keep the deadline referenced until this awaited launch has a result.
         timer = setTimeout(() => finish('timeout'), this.spawnTimeoutMs);
-        timer.unref?.();
       });
       if (outcome === 'timeout' || outcome === 'unobservable') {
         const e = errorWithCode(
