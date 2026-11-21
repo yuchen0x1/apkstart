@@ -269,6 +269,45 @@ function isoProvider(backend) {
     assert.strictEqual(p.backend.alive, false);
   });
 
+  await test('current.json 替换失败保留旧文件和真实进程归属，恢复后可以停机并保存', async () => {
+    const p = fakeQemuProvider('qemu-persistence', { ready: true });
+    const m = managerWith([p]);
+    fs.mkdirSync(m.dataDir, { recursive: true });
+    const file = path.join(m.dataDir, 'current.json');
+    const previous = '{"systemId":"prior","running":false}';
+    fs.writeFileSync(file, previous);
+    const renameSync = fs.renameSync;
+    fs.renameSync = (from, to) => {
+      if (to === file) throw Object.assign(new Error('synthetic disk failure'), { code: 'EIO' });
+      return renameSync(from, to);
+    };
+    try {
+      const start = await m.switchTo(p.id);
+      assert.equal(start.ok, false);
+      assert.equal(start.androidReady, true);
+      assert.match(start.persistenceError, /current\.json.*EIO/);
+      assert.equal((await m.getStatus()).current.systemId, p.id);
+      assert.equal((await m.getStatus()).current.running, true);
+      assert.equal(fs.readFileSync(file, 'utf8'), previous);
+      const stop = await m.stopCurrent();
+      assert.equal(stop.ok, false);
+      assert.equal(stop.running, false);
+      assert.equal(p.backend.alive, false);
+      assert.equal(p.backend.stops, 1);
+      assert.equal((await m.getStatus()).current.running, false);
+      assert.match((await m.getStatus()).persistenceError, /EIO/);
+      assert.equal(fs.readFileSync(file, 'utf8'), previous);
+      assert.deepEqual(fs.readdirSync(m.dataDir), ['current.json']);
+    } finally { fs.renameSync = renameSync; }
+    const retry = await m.stopCurrent();
+    assert.equal(retry.ok, true);
+    assert.equal(p.backend.stops, 1, '已确认退出的进程不应被重复停止');
+    assert.equal((await m.getStatus()).persistenceError, undefined);
+    const current = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(current.systemId, p.id);
+    assert.equal(current.stopped, true);
+  });
+
   await test('未就绪实例再次 switch 不重复 spawn，且切到其它系统前先停止旧实例', async () => {
     const a = fakeQemuProvider('qemu-a');
     const b = { id: 'qemu-b', displayName: 'qemu-b', starts: 0, alive: false,

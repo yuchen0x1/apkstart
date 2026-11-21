@@ -19,6 +19,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { writeJsonAtomicSync } = require('./atomic-json');
 const providers = require('./system-providers');
 const { PROVIDER_IDS } = providers;
 const { SystemTaskManager, STATUS } = require('./system-task-manager');
@@ -42,6 +43,7 @@ class SystemManager {
     this.taskManager = new SystemTaskManager({ dataDir: this.dataDir, store: this.store, settingsFn: this.settingsFn, onEvent: this.onEvent });
     this._providers = new Map();
     this._current = this._readCurrent();
+    this._currentWriteError = '';
     this._switching = false;
     this._switchGeneration = 0;
     this._switchOp = null;
@@ -58,12 +60,23 @@ class SystemManager {
   }
 
   _writeCurrent(systemId, extra = {}) {
+    // 即使磁盘不可写，也不能丢掉已启动或已停止的进程归属。
     this._current = Object.assign({ systemId, updatedAt: new Date().toISOString() }, extra);
     try {
-      fs.mkdirSync(this.dataDir, { recursive: true });
-      fs.writeFileSync(this._currentFile(), JSON.stringify(this._current, null, 2), 'utf8');
-    } catch (_) {}
+      writeJsonAtomicSync(this._currentFile(), this._current);
+      this._currentWriteError = '';
+    } catch (e) {
+      this._currentWriteError = `当前系统状态未保存（current.json）：${e.code || e.message}`;
+      this.onLog(this._currentWriteError);
+    }
     return this._current;
+  }
+
+  _withCurrentWriteResult(result) {
+    if (!this._currentWriteError) return result;
+    const persistenceError = this._currentWriteError;
+    return { ...result, ok: false, persistenceError,
+      error: result.error ? `${result.error}；${persistenceError}` : persistenceError };
   }
 
   getProvider(systemId) {
@@ -343,7 +356,7 @@ class SystemManager {
         check();
         const error = sr && sr.error || '启动失败';
         if (stillRunning) this._recordRunning(systemId, p, { startupError: error });
-        return { ok: false, systemId, vmStarted: stillRunning, androidReady: false, error };
+        return this._withCurrentWriteResult({ ok: false, systemId, vmStarted: stillRunning, androidReady: false, error });
       }
 
       const endpoints = this._backendEndpoints(p) || {};
@@ -360,7 +373,7 @@ class SystemManager {
         const running = await this._providerRunning(p);
         check();
         if (running) this._recordRunning(systemId, p, { startupError: 'ADB 端口归属无法确认' });
-        return { ok: false, systemId, vmStarted: running, androidReady: false, error: '无法确认启动的 QEMU 实例及 ADB 端口' };
+        return this._withCurrentWriteResult({ ok: false, systemId, vmStarted: running, androidReady: false, error: '无法确认启动的 QEMU 实例及 ADB 端口' });
       }
       // 进程启动后先登记，再等待 ADB；等待期内 stopCurrent 无需等待 ADB 才能停机。
       this._recordRunning(systemId, p, { adbPort, monitorPort });
@@ -403,8 +416,8 @@ class SystemManager {
             this._recordStopped(systemId, { startupError: error });
             try { p.writeManifest && p.writeManifest({ running: false, androidReady: false }); } catch (_) {}
           }
-          return { ok: false, vmStarted: true, androidReady: false, systemId, serial, adbPort, error,
-            note: owned ? '虚拟机仍由当前 Provider 持有，可通过停止当前系统清理。' : '' };
+          return this._withCurrentWriteResult({ ok: false, vmStarted: true, androidReady: false, systemId, serial, adbPort, error,
+            note: owned ? '虚拟机仍由当前 Provider 持有，可通过停止当前系统清理。' : '' });
         }
       }
 
@@ -414,7 +427,7 @@ class SystemManager {
         vmStarted: true, running: true, startedAt: new Date().toISOString(), stopped: false,
       });
       try { p.writeManifest && p.writeManifest({ running: true, androidReady: true }); } catch (_) {}
-      return { ok: true, androidReady: true, serial, adbPort, vmStarted: true, systemId };
+      return this._withCurrentWriteResult({ ok: true, androidReady: true, serial, adbPort, vmStarted: true, systemId });
     } catch (e) {
       if (op.controller.signal.aborted || e.code === 'START_CANCELLED') {
         return { ok: false, code: 'START_CANCELLED', systemId, error: '系统启动已取消' };
@@ -509,7 +522,7 @@ class SystemManager {
           const result = await this._stopProvider(systemId, p);
           if (!result.ok) return result;
         }
-        return { ok: true, running: false };
+        return this._withCurrentWriteResult({ ok: true, running: false });
       } catch (e) { return { ok: false, error: '停止系统失败：' + e.message }; }
     });
     this._stopPromise = promise;
@@ -523,6 +536,7 @@ class SystemManager {
   async getStatus() {
     return {
       current: this._current,
+      ...(this._currentWriteError ? { persistenceError: this._currentWriteError } : {}),
       switching: this._switching,
       stopping: !!this._stopPromise,
       tasks: this.taskManager.listTasks(10),
