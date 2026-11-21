@@ -96,8 +96,9 @@ function runPortableFixture(root, script, fault = '') {
     'function Copy-Item {',
     '  [CmdletBinding()] param([string]$LiteralPath, [string]$Destination, [switch]$Force)',
     '  $source = [IO.Path]::GetFullPath($LiteralPath)',
-    '  $fromPayload = $source.StartsWith($src + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)',
-    '  $fromBackup = $source.StartsWith($bak + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)',
+    // .NET Framework 可将 RUNNER~1 展开为长路径；比较两侧必须使用相同的规范化。
+    '  $fromPayload = $source.StartsWith([IO.Path]::GetFullPath($src) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)',
+    '  $fromBackup = $source.StartsWith([IO.Path]::GetFullPath($bak) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)',
     '  $main = $source.EndsWith("src\\main.js")',
     '  if ($script:fault -eq "unchanged-copy-error" -and ($fromPayload -or $fromBackup)) { Write-Error "fixture unchanged file denied"; return }',
     '  if ($script:fault -eq "backup-error" -and -not $fromPayload -and -not $fromBackup -and $main) { Write-Error "fixture backup error"; return }',
