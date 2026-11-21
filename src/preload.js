@@ -41,6 +41,23 @@ if (isMain) contextBridge.exposeInMainWorld('apkstart', {
   compatApk: (p) => invoke('apk:compat', p),
   installApk: (p) => invoke('apk:install', p),
   launch: (pkg) => invoke('app:launch', pkg),
+  instances: {
+    list: () => invoke('instances:list'),
+    create: (payload) => invoke('instances:create', payload),
+    launch: (id, pkg) => invoke('instances:launch', { id, package: pkg }),
+  },
+  peripherals: {
+    webcams: () => invoke('peripherals:webcams'),
+    refresh: () => invoke('peripherals:refresh'),
+  },
+  automation: {
+    target: () => invoke('automation:target'),
+    status: () => invoke('automation:status'),
+    validate: (payload) => invoke('automation:validate', payload),
+    run: (payload) => invoke('automation:run', payload),
+    action: (payload) => invoke('automation:action', payload),
+    cancel: () => invoke('automation:cancel'),
+  },
   uninstall: (pkg) => invoke('app:uninstall', pkg),
   createShortcut: (pkg) => invoke('app:shortcut', pkg),
   clearData: (pkg) => invoke('app:clearData', pkg),
@@ -212,7 +229,7 @@ if (isMain) contextBridge.exposeInMainWorld('apkstart', {
     const allowed = [
       'install:start', 'install:progress', 'install:done', 'install:error',
       'app:launched', 'runtime:log', 'toast', 'ui:navigate', 'provision:progress',
-      'update:progress', 'update:state', 'system:task', 'system:log', 'theme:changed',
+      'update:progress', 'update:state', 'system:task', 'system:log', 'theme:changed', 'automation:state',
     ];
     if (!allowed.includes(channel)) return () => {};
     const handler = (_e, payload) => cb(payload);

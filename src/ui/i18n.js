@@ -5,13 +5,13 @@
  * 为什么不给每个元素加 `data-i18n="key"`：
  *   界面里有 250 多条静态文案、再加上动态生成的卡片与 toast，逐个加 key 意味着
  *   几百处改动，改漏一处就是一句中文夹在英文界面里；而且以后新写的文案默认就没 key。
- *   这里改成「按中文原文查词典」：遍历文本节点 + 几个常见属性，命中的换成英文，
- *   没命中的保持中文。新文案自然降级为中文，不会显示成 key 或空白。
+ *   这里改成「按中文原文查词典」：遍历文本节点 + 几个常见属性，命中的换成目标语言，
+ *   没命中的保持中文或英文回落。新文案不会显示成 key 或空白。
  *
  * 数字与模板：运行时文本里的数字会被归一成占位符再查表，
  * 所以 `共 3 个应用` 能命中词典里 `共 {n} 个应用` 那条，回填时数字原样还原。
  *
- * 性能：只在英文环境启用；一次遍历 + MutationObserver 增量翻译，
+ * 性能：只在翻译环境启用；一次遍历 + MutationObserver 增量翻译，
  * 命中不了的文本直接跳过（不写 DOM，避免 observer 自激）。
  */
 (() => {
@@ -47,6 +47,7 @@
     [N + ' · 已停止']: N + ' · Stopped',
   };
 
+  const LANG_TAGS = { 'zh-CN': 'zh-CN', 'en-US': 'en', 'es-ES': 'es-ES', 'vi-VN': 'vi-VN', 'ru-RU': 'ru-RU' };
   let dict = {};
   let lang = 'zh-CN';
   let observer = null;
@@ -103,12 +104,12 @@
     if (s.includes('、')) {
       const parts = s.split('、');
       const done = parts.map((p) => translateOne(p));
-      return done.join('、');
+      return done.join(lang === 'zh-CN' ? '、' : ', ');
     }
     return translateOne(s);
   }
 
-  /** 单条文本翻译：命中返回英文（保留原有首尾空白），否则返回原串 */
+  /** 单条文本翻译：命中返回译文（保留原有首尾空白），否则原样作为清晰回落 */
   function translateOne(input) {
     if (typeof input !== 'string' || !input || !CJK.test(input)) return input;
     const m = /^(\s*)([\s\S]*?)(\s*)$/.exec(input);
@@ -241,14 +242,20 @@
     });
   }
 
-  /** 初次翻译整页（由 main 的 i18n 载荷驱动） */
+  /** 初次翻译整页（由 main 的 i18n 载荷驱动）；有效 locale 均以中文原文为查找源。 */
   function apply(payload) {
     try {
-      lang = (payload && payload.lang) === 'en-US' ? 'en-US' : 'zh-CN';
-      dict = lang === 'en-US' ? { ...SESSION_EN, ...payload?.dict } : (payload && payload.dict) || {};
+      const requested = payload && payload.lang;
+      // apply 也可能由宿主直接调用；先停掉旧 observer，再恢复源文，避免恢复动作自触发。
+      if (observer) { observer.disconnect(); observer = null; }
+      // 直接 apply 新语言也要从中文源文重来；否则已翻译过的节点会被当成源文跳过。
+      if (lang !== 'zh-CN') restoreAll(document.body);
+      lang = Object.prototype.hasOwnProperty.call(LANG_TAGS, requested) ? requested : 'zh-CN';
+      // SESSION_EN 覆盖 renderer 临时文案；IPC 载荷中 locale 译文覆盖英语基线。
+      dict = lang === 'zh-CN' ? {} : { ...SESSION_EN, ...(payload && payload.dict) };
       buildTemplates();
-      document.documentElement.setAttribute('lang', lang === 'en-US' ? 'en' : 'zh-CN');
-      if (lang !== 'en-US') {
+      document.documentElement.setAttribute('lang', LANG_TAGS[lang]);
+      if (lang === 'zh-CN') {
         if (observer) { observer.disconnect(); observer = null; }
         restoreAll(document.body); reveal(); return;
       }

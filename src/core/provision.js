@@ -19,7 +19,7 @@ const { ImageStore } = require('./images');
 
 const IS_WIN = process.platform === 'win32';
 const IS_LINUX = process.platform === 'linux';
-// dl.google.com 的包名按宿主系统分叉（platform-tools-latest-<host>.zip / emulator-<host>_64-N.zip）
+// emulator 的包名按宿主系统分叉；platform-tools 的宿主/版本/摘要由官方索引绑定。
 const HOST_TAG = IS_WIN ? 'windows' : IS_LINUX ? 'linux' : 'mac';
 
 // 提权包的版本和 SHA-256 必须由发布方独立核验并一同固定，不能取自镜像、设置或缓存。
@@ -27,9 +27,7 @@ const AEHD_ARCHIVE_URL = 'https://dl.google.com/android/repository/aehd-windows_
 const AEHD_ARCHIVE_SHA256 = ''; // 尚无可信摘要；保持禁用。
 
 const SOURCES = {
-  adb: [
-    `https://dl.google.com/android/repository/platform-tools-latest-${HOST_TAG}.zip`,
-  ],
+  adbIndex: 'https://dl.google.com/android/repository/repository2-3.xml',
   qemuIndex: 'https://qemu.weilnetz.de/w64/',
   qemuFallback: [
     'https://qemu.weilnetz.de/w64/qemu-w64-setup-20260811.exe',
@@ -231,6 +229,57 @@ function statKey(p) {
   } catch (_) { return ''; }
 }
 
+// 实例角色固定于进程启动；之后清理/修改环境变量不能让子实例变成维护主实例。
+// instance-context.current() 只从启动时的此标识派生实例，主实例无需提前加载它。
+const HAS_INSTANCE_ID = !!(process.env && Object.prototype.hasOwnProperty.call(process.env, 'APKSTART_INSTANCE_ID'));
+function childRuntimeContext() {
+  if (!HAS_INSTANCE_ID) return null;
+  const context = require('./instance-context').current();
+  return context.isChild ? context : null;
+}
+function runtimeReadOnly(operation) {
+  const err = new Error(`子实例的共享运行时只读，不能${operation}；请回主实例维护运行时后重试。`);
+  err.code = 'INSTANCE_RUNTIME_READ_ONLY';
+  return err;
+}
+function assertRuntimeWritable(operation) {
+  if (childRuntimeContext()) throw runtimeReadOnly(operation);
+}
+function insidePath(root, target) {
+  const rel = path.relative(path.resolve(root), path.resolve(target));
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+function canonicalFuturePath(target) {
+  let cur = path.resolve(target);
+  const tail = [];
+  while (!fs.lstatSync(cur, { throwIfNoEntry: false })) {
+    const parent = path.dirname(cur);
+    if (parent === cur) throw runtimeReadOnly('解析独立数据目录');
+    tail.unshift(path.basename(cur));
+    cur = parent;
+  }
+  return path.join(fs.realpathSync(cur), ...tail);
+}
+function assertPrivateInstancePath(context, target) {
+  // 即使旧配置/链接仍指向父实例，也不能利用“准备目录/环境缓存”写穿隔离边界。
+  if (!context.dataDir || !context.avdDir || !context.instancesDir
+    || !path.isAbsolute(context.dataDir) || !path.isAbsolute(context.avdDir)
+    || path.relative(path.resolve(context.dataDir), path.resolve(store.DATA_DIR)) !== ''
+    || path.relative(path.resolve(context.instancesDir), path.dirname(path.resolve(context.dataDir))) !== ''
+    || !fs.lstatSync(context.instancesDir, { throwIfNoEntry: false })?.isDirectory()
+    || !insidePath(context.dataDir, context.avdDir) || !insidePath(context.dataDir, target)) {
+    throw runtimeReadOnly('使用非本实例的数据目录');
+  }
+  const rel = path.relative(path.resolve(context.dataDir), path.resolve(target));
+  let cur = path.resolve(context.dataDir);
+  const candidates = [path.resolve(context.instancesDir), cur];
+  for (const part of rel.split(path.sep).filter(Boolean)) { cur = path.join(cur, part); candidates.push(cur); }
+  for (const candidate of candidates) {
+    const stat = fs.lstatSync(candidate, { throwIfNoEntry: false });
+    if (stat && stat.isSymbolicLink()) throw runtimeReadOnly('通过符号链接或 junction 修改数据');
+  }
+}
+
 class Provisioner {
   constructor(appRoot) {
     this.appRoot = appRoot;
@@ -287,6 +336,8 @@ class Provisioner {
 
   envCacheGet(exe) {
     try {
+      const context = childRuntimeContext();
+      if (context) assertPrivateInstancePath(context, envCacheFile());
       const j = JSON.parse(fs.readFileSync(envCacheFile(), 'utf8'));
       if (!j || j.key !== this._envKey(exe)) return null;
       return j;
@@ -295,6 +346,8 @@ class Provisioner {
 
   envCacheSet(exe, patch) {
     try {
+      const context = childRuntimeContext();
+      if (context) assertPrivateInstancePath(context, envCacheFile());
       const key = this._envKey(exe);
       let cur = {};
       try { cur = JSON.parse(fs.readFileSync(envCacheFile(), 'utf8')) || {}; } catch (_) { /* 首次 */ }
@@ -308,7 +361,11 @@ class Provisioner {
   /** 开机失败（加速/镜像类问题）时调用：下次启动重新探测，避免一直用错的结论 */
   invalidateEnvCache() {
     this._cache = { adbVersion: '', qemuVersion: '' };
-    try { fs.rmSync(envCacheFile(), { force: true }); } catch (_) { /* ignore */ }
+    try {
+      const context = childRuntimeContext();
+      if (context) assertPrivateInstancePath(context, envCacheFile());
+      fs.rmSync(envCacheFile(), { force: true });
+    } catch (_) { /* 缓存失败不影响探测，但不能写穿实例边界 */ }
   }
 
   // ---------------- 路径 ----------------
@@ -395,6 +452,26 @@ class Provisioner {
 
   ensureDirs() {
     const p = this.paths();
+    const context = childRuntimeContext();
+    if (context) {
+      assertPrivateInstancePath(context, context.dataDir);
+      assertPrivateInstancePath(context, context.avdDir);
+      if (path.relative(path.resolve(context.avdDir), path.resolve(p.avdHome)) !== ''
+        || insidePath(p.root, context.dataDir) || insidePath(context.dataDir, p.root)
+        || !fs.statSync(p.root, { throwIfNoEntry: false })?.isDirectory()) {
+        throw runtimeReadOnly('创建或修复共享运行时目录/非独立 AVD');
+      }
+      const shared = fs.realpathSync(p.root);
+      const privateData = canonicalFuturePath(context.dataDir);
+      if (insidePath(shared, privateData) || insidePath(privateData, shared)) {
+        throw runtimeReadOnly('使用与共享运行时重叠的数据目录');
+      }
+      // 不为共享 root 创建 qemu/platform-tools/images/_tmp，连 mkdir 的 no-op 也不做。
+      fs.mkdirSync(context.dataDir, { recursive: true });
+      assertPrivateInstancePath(context, context.avdDir);
+      fs.mkdirSync(context.avdDir, { recursive: true });
+      return p;
+    }
     for (const d of [p.root, p.qemuDir, p.adbDir, p.imagesDir, p.tmp, p.avdHome]) {
       fs.mkdirSync(d, { recursive: true });
     }
@@ -412,6 +489,10 @@ class Provisioner {
     // opengl32sw.dll 是给「窗口嵌入」兜底用的 Windows DLL；Linux 不做嵌入，无需此补丁
     if (!IS_WIN) return false;
     const target = path.join(p.emulatorDir, 'opengl32sw.dll');
+    if (childRuntimeContext()) {
+      if (fs.existsSync(p.emulatorExe) && fileSize(target) > 1024 * 1024) return true;
+      throw runtimeReadOnly('补齐共享 emulator/OpenGL 组件');
+    }
     if (!fs.existsSync(p.emulatorExe)) return false;
     if (fileSize(target) > 1024 * 1024) return true;
     const candidates = [
@@ -585,7 +666,10 @@ class Provisioner {
     const diskPath = s.runtime.diskPath || p.disk;
     const iso = this.inspectIso(isoPath);
     const diskSize = fileSize(diskPath);
-    const sysimg = this.systemImageInfo();
+    const image = this.systemImageInfo();
+    const sysimg = childRuntimeContext() && (!image.ok || image.pendingExtract)
+      ? { ...image, ok: false, note: '共享系统镜像尚未就绪，子实例不会下载或展开；请回主实例维护后重试' }
+      : image;
     // 自定义镜像的状态单独给出：ok=false + custom=true 表示「用户启用了自定义镜像，
     // 但它现在不可用（目录被移走/文件缺失）」，此时运行时会回落默认镜像。
     const activeImage = this.activeImage();
@@ -652,37 +736,46 @@ class Provisioner {
   // ---------------- adb ----------------
 
   async installAdb(onProgress = () => {}) {
+    assertRuntimeWritable('安装 adb');
+    const { resolveAdbComponent, verifyComponent } = require('./runtime-integrity');
+    onProgress({ stage: 'resolve', message: '读取 Google 官方 platform-tools 版本及校验值…', percent: 1 });
+    // 不读取设置/镜像/旧缓存里的摘要，也不回退到没有摘要的 latest URL。
+    const component = await resolveAdbComponent(process.platform, process.arch);
+    if (component.size < MIN_SIZE.adb) throw new Error('Google 官方 platform-tools 归档大小异常，已拒绝安装');
     const p = this.ensureDirs();
     await this.guardDisk('adb', p.root);
-    const zipPath = path.join(p.tmp, 'platform-tools.zip');
-    onProgress({ stage: 'download', message: '下载 Android platform-tools（约 8MB）…', percent: 2 });
-
-    await downloadAny(SOURCES.adb, zipPath, {
-      onProgress: (pr) => onProgress({
-        stage: 'download',
-        message: `下载 adb… ${(pr.got / 1048576).toFixed(1)}MB / ${(pr.total / 1048576).toFixed(1)}MB`,
-        percent: pr.percent,
-        speed: pr.speed,
-      }),
-    });
-
-    if (fileSize(zipPath) < MIN_SIZE.adb) throw new Error('adb 安装包下载不完整');
-
-    onProgress({ stage: 'extract', message: '解压 adb…', percent: 92 });
-    await this.extractZip(zipPath, p.root);
-
-    const v = await this.adbVersion();
-    if (!v.ok) {
-      throw new Error(IS_WIN
-        ? 'adb 解压后无法运行，请检查是否被杀毒软件拦截'
-        : 'adb 解压后无法运行：请确认解压目录可写、文件有执行权限（可重试一次安装）');
+    const stage = fs.mkdtempSync(path.join(p.tmp, 'adb-'));
+    const zipPath = path.join(stage, 'platform-tools.zip');
+    try {
+      onProgress({ stage: 'download', message: `下载 Android platform-tools ${component.version}…`, percent: 2 });
+      await downloadAny(this._downloadUrls(component.url), zipPath, {
+        expectSha1: component.checksum.algorithm === 'sha1' ? component.checksum.value : undefined,
+        expectSha256: component.checksum.algorithm === 'sha256' ? component.checksum.value : undefined,
+        onProgress: (pr) => onProgress({
+          stage: 'download',
+          message: `下载 adb… ${(pr.got / 1048576).toFixed(1)}MB / ${(pr.total / 1048576).toFixed(1)}MB`,
+          percent: pr.percent,
+          speed: pr.speed,
+        }),
+      });
+      onProgress({ stage: 'extract', message: '校验并解压 adb…', percent: 92 });
+      // 在解压边界强制校验，不能只依赖下载器的可选 expectSha* 参数。
+      await verifyComponent(zipPath, component);
+      await this.extractZip(zipPath, p.root);
+      this._adbCache = null;
+      const v = await this.adbVersion();
+      if (!v.ok || v.path !== p.adbExe) {
+        throw new Error(IS_WIN
+          ? 'adb 解压后无法运行，请检查是否被杀毒软件拦截'
+          : 'adb 解压后无法运行：请确认解压目录可写、文件有执行权限（可重试一次安装）');
+      }
+      store.saveSettings({ adbPath: v.path });
+      this._cache.adbVersion = v.version;
+      onProgress({ stage: 'done', message: `adb ${v.version} 就绪`, percent: 100 });
+      return v;
+    } finally {
+      fs.rmSync(stage, { recursive: true, force: true, maxRetries: 3 });
     }
-
-    fs.rmSync(zipPath, { force: true });
-    store.saveSettings({ adbPath: v.path });
-    this._cache.adbVersion = v.version;
-    onProgress({ stage: 'done', message: `adb ${v.version} 就绪`, percent: 100 });
-    return v;
   }
 
   /**
@@ -690,6 +783,7 @@ class Provisioner {
    * 导入包与 Release 中的 ApkStart-runtime-<tag>.zip 使用同一目录布局。
    */
   async importRuntimePack(zipPath, onProgress = () => {}) {
+    assertRuntimeWritable('导入运行时整包');
     const p = this.ensureDirs();
     const file = path.resolve(String(zipPath || ''));
     if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
@@ -735,6 +829,7 @@ class Provisioner {
   }
 
   async extractZip(zipPath, destDir, opts = {}) {
+    assertRuntimeWritable('解压运行时组件');
     // 大包（emulator / 系统镜像）走文件版：不把 1.5GB zip 整包读进内存，
     // 低内存机器也能稳定解压；小包沿用内存版，速度更快。
     const big = fileSize(zipPath) > 64 * 1024 * 1024;
@@ -1039,6 +1134,11 @@ class Provisioner {
    * 放进去等于每次开机都重解压一遍。
    */
   async materializeImages(onLog = () => {}) {
+    if (childRuntimeContext()) {
+      const image = this.systemImageInfo();
+      if (image.ok && !image.pendingExtract) return 0;
+      throw runtimeReadOnly('展开或补齐共享系统镜像');
+    }
     const srcRoot = path.join(this.root, 'system-images');
     // 展开目标必须和 paths().sysImgRoot 用同一套规则，否则会出现
     // 「整包解到 D 盘、镜像又展开回 C 盘 APPDATA」的重复占用（实测 1.2GB + 3.3GB）。
@@ -1378,6 +1478,7 @@ class Provisioner {
 
   /** 下载并安装 emulator（zip 顶层就是 emulator/，直接解到 SDK root） */
   async installEmulator(onProgress = () => {}) {
+    assertRuntimeWritable('安装 emulator');
     const p = this.ensureDirs();
     await this.guardDisk('emulator', p.root);
     const url = await this.resolveEmulatorUrl();
@@ -1433,6 +1534,11 @@ class Provisioner {
   /** emulator 要求 SDK root 下有 platform-tools 目录，否则直接 FATAL */
   ensurePlatformTools() {
     const p = this.paths();
+    if (childRuntimeContext()) {
+      const files = IS_WIN ? [path.basename(p.adbExe), 'AdbWinApi.dll', 'AdbWinUsbApi.dll'] : [path.basename(p.adbExe)];
+      if (files.every((name) => fs.statSync(path.join(p.adbDir, name), { throwIfNoEntry: false })?.isFile())) return true;
+      throw runtimeReadOnly('补齐共享 platform-tools');
+    }
     fs.mkdirSync(p.adbDir, { recursive: true });
     if (fs.existsSync(p.adbExe)) return true;
     const adbName = path.basename(p.adbExe);
@@ -1461,6 +1567,7 @@ class Provisioner {
 
   /** 下载当前选中的内置系统镜像档位。 */
   async installSystemImage(onProgress = () => {}) {
+    assertRuntimeWritable('安装系统镜像');
     const profile = this.imageProfile();
     const ready = this.imageInfo(profile.id);
     if (ready.ok) return ready;
@@ -1529,6 +1636,7 @@ class Provisioner {
 
   /** 下载并安装指定内置镜像。 */
   async installImage(flavor = null, onProgress = () => {}) {
+    assertRuntimeWritable('安装系统镜像');
     const profile = this.imageProfile(flavor);
     const p = this.ensureDirs();
     await this.guardDisk(profile.id === 'google_apis_playstore' ? 'playimg' : 'sysimg', p.sysImgRoot);
@@ -1571,11 +1679,13 @@ class Provisioner {
 
   /** 旧 IPC/安装流程仍调用这个名字，语义固定为 Google Play 档。 */
   async installPlayImage(onProgress = () => {}) {
+    assertRuntimeWritable('安装 Google Play 镜像');
     return this.installImage('google_apis_playstore', onProgress);
   }
 
   /** 下载 AEHD 驱动（小文件）；安装需要管理员权限，交给引导流程。Windows 专有。 */
   async installAehd(onProgress = () => {}) {
+    assertRuntimeWritable('安装 AEHD 驱动');
     if (!IS_WIN) throw new Error('AEHD 驱动仅限 Windows；Linux 的硬件加速由 /dev/kvm 提供，无需驱动');
     if (!/^[0-9a-f]{64}$/i.test(AEHD_ARCHIVE_SHA256)) {
       const err = new Error('已拒绝安装 AEHD：没有固定的可信 SHA-256，不会下载或准备提权安装器。'
@@ -1615,93 +1725,77 @@ class Provisioner {
 
   // ---------------- QEMU ----------------
 
-  /** 抓取官方目录里最新的安装包文件名（不写死版本号） */
+  /** 只解析固定可信版本；目录页、用户 URL 或缓存不能决定待执行文件的摘要。 */
   async resolveQemuUrl() {
-    const configured = store.getSettings().runtime.qemuUrl;
-    if (configured && configured.trim()) return configured.trim();
-    try {
-      const { openStream } = require('./download');
-      const res = await openStream(SOURCES.qemuIndex);
-      // 与 _fetchText 相同的规矩：destroy() 只发 close 不发 end/error，
-      // 没有兜底的话这个 promise 永远不 settle，部署向导就卡死在这里。
-      const html = await new Promise((resolve, reject) => {
-        let d = '';
-        let done = false;
-        const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); fn(v); };
-        const timer = setTimeout(() => {
-          try { res.destroy(); } catch (_) { /* ignore */ }
-          finish(reject, new Error('QEMU 索引下载超时（30s）'));
-        }, 30000);
-        res.on('data', (c) => {
-          d += c;
-          if (d.length > 512 * 1024) {
-            try { res.destroy(); } catch (_) { /* ignore */ }
-            finish(reject, new Error('QEMU 索引响应体超过 512KB 上限'));
-          }
-        });
-        res.on('end', () => finish(resolve, d));
-        res.on('error', (e) => finish(reject, e));
-        res.on('close', () => finish(resolve, d));
-      });
-      const files = [...html.matchAll(/href="([^"]*qemu-w64-setup-(\d+)\.exe)"/g)]
-        .map((m) => ({ file: m[1], ver: Number(m[2]) }))
-        .sort((a, b) => b.ver - a.ver);
-      if (files.length) {
-        const f = files[0].file.replace(/^.*\//, '');
-        return new URL(f, SOURCES.qemuIndex).href;
-      }
-    } catch (_) { /* 落到备用源 */ }
-    return SOURCES.qemuFallback[0];
+    const { resolveQemuComponent } = require('./runtime-integrity');
+    return resolveQemuComponent((store.getSettings().runtime || {}).qemuUrl, process.platform, process.arch).url;
   }
 
   async installQemu(onProgress = () => {}) {
-    // QEMU 路线（Android-x86 ISO）在 Linux 上交给系统包管理器（qemu-system-x86 /
-    // qemu-utils），qemuVersion() 会从 PATH 探测到；应用内不代装。
-    if (!IS_WIN) throw new Error('Linux 请用系统包管理器安装 qemu（sudo apt install qemu-system-x86 qemu-utils）');
+    assertRuntimeWritable('安装 QEMU');
+    const { resolveQemuComponent, verifyComponent, qemuManualHelp } = require('./runtime-integrity');
+    const component = resolveQemuComponent((store.getSettings().runtime || {}).qemuUrl, process.platform, process.arch);
     const p = this.ensureDirs();
     await this.guardDisk('qemu', p.root);
-    const setup = path.join(p.tmp, 'qemu-setup.exe');
-
-    onProgress({ stage: 'resolve', message: '查找最新 QEMU 版本…', percent: 1 });
-    const url = await this.resolveQemuUrl();
-    onProgress({ stage: 'download', message: `下载 QEMU（约 200MB）…`, percent: 2, url });
-
-    await download(url, setup, {
-      resume: true,
-      onProgress: (pr) => onProgress({
-        stage: 'download',
-        message: `下载 QEMU… ${(pr.got / 1048576).toFixed(0)}MB / ${(pr.total / 1048576).toFixed(0)}MB`
-          + (pr.speed ? `（${(pr.speed / 1024).toFixed(0)} KB/s）` : ''),
-        percent: pr.percent,
-        canResume: true,
-      }),
-    });
-    if (fileSize(setup) < MIN_SIZE.qemu) throw new Error('QEMU 安装包下载不完整');
-
-    onProgress({ stage: 'install', message: '正在安装 QEMU（静默）…', percent: 96 });
-    // qemu-w64-setup 是 NSIS 安装器：/S 静默，/D 指定目录（必须最后且不加引号）
-    const target = p.qemuDir;
-    fs.mkdirSync(target, { recursive: true });
-    await new Promise((resolve) => {
-      const proc = spawn(setup, ['/S', `/D=${target}`], { windowsHide: true, stdio: 'ignore' });
-      proc.on('exit', () => resolve());
-      proc.on('error', () => resolve());
-      setTimeout(() => { try { proc.kill(); } catch (_) {} resolve(); }, 600000);
-    });
-
-    const v = await this.qemuVersion();
-    if (!v.ok) {
-      throw new Error('QEMU 安装后未找到 qemu-system-x86_64.exe：可手动下载 QEMU 并解压到 engine/qemu/');
+    const stage = fs.mkdtempSync(path.join(p.tmp, 'qemu-'));
+    const setup = path.join(stage, 'qemu-setup.exe');
+    try {
+      onProgress({ stage: 'download', message: `下载已固定校验的 QEMU（${component.version}）…`, percent: 2, url: component.url });
+      await download(component.url, setup, {
+        onProgress: (pr) => onProgress({
+          stage: 'download',
+          message: `下载 QEMU… ${(pr.got / 1048576).toFixed(0)}MB / ${(pr.total / 1048576).toFixed(0)}MB`
+            + (pr.speed ? `（${(pr.speed / 1024).toFixed(0)} KB/s）` : ''),
+          percent: pr.percent,
+          canResume: false,
+        }),
+      });
+      if (fileSize(setup) < MIN_SIZE.qemu) throw new Error('QEMU 安装包下载不完整');
+      onProgress({ stage: 'install', message: '校验 QEMU 安装器（不申请管理员权限）…', percent: 96 });
+      await verifyComponent(setup, component);
+      // NSIS /D 必须最后且不加引号。只以当前权限直接创建进程，绝不使用 shell/runas。
+      // 安装器若要求提升权限，CreateProcess 失败后交给用户核验并手动安装，不绕过 UAC。
+      await new Promise((resolve, reject) => {
+        let timer;
+        let settled = false;
+        const finish = (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (err) reject(err); else resolve();
+        };
+        try {
+          const proc = spawn(setup, ['/S', `/D=${p.qemuDir}`], {
+            windowsHide: true, stdio: 'ignore', shell: false, cwd: stage,
+          });
+          proc.once('error', finish);
+          proc.once('close', (code, signal) => finish(code === 0 && !signal
+            ? null : new Error(`QEMU 安装器未成功退出（${signal || code}）`)));
+          timer = setTimeout(() => {
+            finish(new Error('QEMU 安装器超时，已拒绝报告安装成功'));
+            try { proc.kill(); } catch (_) { /* 保持失败状态 */ }
+          }, 600000);
+        } catch (e) { finish(e); }
+      });
+      this._qemuCache = null;
+      const v = await this.qemuVersion();
+      if (!v.ok || v.path !== p.qemuExe) throw new Error('QEMU 安装后未在目标目录找到可用的 qemu-system-x86_64.exe');
+      this._cache.qemuVersion = v.version;
+      onProgress({ stage: 'done', message: `QEMU ${v.version} 就绪`, percent: 100 });
+      return v;
+    } catch (err) {
+      const error = new Error(`${err.message}\n${qemuManualHelp(process.platform)}`, { cause: err });
+      error.code = err.code || 'QEMU_INSTALL_FAILED';
+      throw error;
+    } finally {
+      fs.rmSync(stage, { recursive: true, force: true, maxRetries: 3 });
     }
-    fs.rmSync(setup, { force: true });
-    this._cache.qemuVersion = v.version;
-    onProgress({ stage: 'done', message: `QEMU ${v.version} 就绪`, percent: 100 });
-    return v;
   }
 
   // ---------------- 系统镜像 ----------------
 
   async downloadIso(onProgress = () => {}) {
+    assertRuntimeWritable('下载系统 ISO');
     const p = this.ensureDirs();
     const s = store.getSettings();
     // isoPath 是读取引用，不表示写入所有权；旧版默认文件名也可能是用户导入的原件。
@@ -1770,6 +1864,7 @@ class Provisioner {
   }
 
   importIso(file) {
+    assertRuntimeWritable('导入系统 ISO');
     if (this._isoDownloadParts?.size) {
       const source = fs.statSync(file, { bigint: true, throwIfNoEntry: false });
       for (const partial of this._isoDownloadParts) {
@@ -1791,6 +1886,7 @@ class Provisioner {
   }
 
   importDisk(file) {
+    assertRuntimeWritable('导入虚拟磁盘');
     const info = this.inspectImage(file);
     store.saveSettings({ runtime: { diskPath: file } });
     return { ok: true, ...info };
@@ -1799,6 +1895,7 @@ class Provisioner {
   // ---------------- 虚拟磁盘 ----------------
 
   async createDisk(sizeGB = 24, onProgress = () => {}) {
+    assertRuntimeWritable('创建虚拟磁盘');
     const p = this.ensureDirs();
     const s = store.getSettings();
     const dest = s.runtime.diskPath || p.disk;
@@ -1824,9 +1921,11 @@ class Provisioner {
   // ---------------- 系统镜像可达性预检 ----------------
 
   async probeSources() {
+    const { resolveAdbComponent } = require('./runtime-integrity');
+    const unavailable = (err) => ({ status: 0, size: 0, error: err.message });
     const [adb, qemu, iso] = await Promise.all([
-      head(SOURCES.adb[0]),
-      head(SOURCES.qemuFallback[0]),
+      resolveAdbComponent(process.platform, process.arch).then((component) => head(component.url)).catch(unavailable),
+      this.resolveQemuUrl().then((url) => head(url)).catch(unavailable),
       head(SOURCES.iso[0]),
     ]);
     return { adb, qemu, iso };

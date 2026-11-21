@@ -231,7 +231,9 @@ class Runtime {
       needsSetup: null,
       error: '',
       serial: this.emuSerial,
-      autoProfile: this.emulator.profile ? doctor.describeProfile(this.emulator.profile) : '',
+      autoProfile: this.emulator.profile
+        ? (this.emulator.describeProfile ? this.emulator.describeProfile() : doctor.describeProfile(this.emulator.profile)) : '',
+      acceleration: this.emulator.profile?.acceleration || null,
       // 为什么是这组参数（低配降级的原因 / 哪些项是用户手动钉住的）：
       // 首页横幅与设置页都显示同一句话，避免「显示的」和「实跑的」对不上。
       autoProfileWhy: this.emulator.profile ? doctor.describeTuning(this.emulator.profile) : '',
@@ -331,6 +333,7 @@ class Runtime {
       args.push('-boot', 'order=c');
     }
     args.push('-drive', `file=${disk},if=virtio,format=qcow2,cache=writeback`);
+    args.push(...require('./peripherals').buildQemuArgs(s.peripherals));
     return args;
   }
 
@@ -350,6 +353,7 @@ class Runtime {
       if (env.emulator.ok && env.sysimg.ok) {
         return await this._bootEmulator({ env, onLog, lcdOrientation, lowspec, timeoutMs, signal });
       }
+      if (store.isChild) return { ok: false, code: 'INSTANCE_BACKEND_UNSUPPORTED', error: '分身仅支持已就绪的 Android Emulator，请回主实例准备组件；不会启动共享 QEMU 磁盘' };
       return await this._bootQemuEntry({ install, env, onLog, signal });
     } finally {
       this._booting = false;
@@ -389,6 +393,9 @@ class Runtime {
       let authHealed = false; // unauthorized 只自愈一次，避免反复删快照冷启动死循环
       const probe = async ({ serial }) => {
         if (signal && signal.aborted || !this.emulator.running()) return 'fatal';
+        const identity = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
+        if (signal?.aborted || !this.emulator.running()) return 'fatal';
+        if (!identity) return 'pending';
         if (!this._probeClient || this._probeClient.serial !== serial) {
           this._probeClient = new AdbClient({ adbPath: this.adbPath(), serial });
         }
@@ -396,6 +403,8 @@ class Runtime {
         try {
           const out = String(await waitStartupProbe(signal,
             () => c.shell('getprop sys.boot_completed; pm path android', { timeout: 8000 })));
+          const current = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
+          if (!processOwner.sameIdentity(identity, current)) return 'pending';
           const lines = out.split(/\r?\n/).map((l) => l.trim());
           const booted = lines[0] === '1' || /^1$/.test(lines[0] || '');
           const pmReady = lines.some((l) => /^package:/.test(l));
@@ -404,6 +413,8 @@ class Runtime {
           return booted ? 'pending' : 'booting';
         } catch (e) {
           if (signal?.aborted) return 'fatal';
+          const current = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
+          if (!processOwner.sameIdentity(identity, current)) return 'pending';
           errStreak += 1;
           // adb shell 报错可能是「还没开机」也可能是「授权对话框卡住」（上游 b7c4f06）。
           // 后者每轮 shell 都抛异常，只按普通 offline 处理会按 240s×4 组参数干等，
@@ -468,9 +479,11 @@ class Runtime {
         return {
           ok: false,
           error: (st && st.error) || '安卓运行时未能启动',
+          code: st && st.code,
+          data: st && st.data,
           needsSpace: !!(st && st.needsSpace),
           attempts: (st && st.attempts) || [],
-          diagnosis: this.emulator.lastDiagnosis,
+          diagnosis: (st && st.diagnosis) || this.emulator.lastDiagnosis,
           exitCode: st && st.exitCode,
         };
       }
@@ -498,6 +511,10 @@ class Runtime {
 
   /** 空闲时保存 quickboot 快照：只在没有应用窗口时写盘，避免和应用启动抢 I/O */
   _armSnapshotSave(delay = 20000) {
+    if (this.emulator.snapshotSaveAllowed?.() === false) {
+      this.emulator.cancelSnapshotSave();
+      return;
+    }
     if (!this.emulator.running()) return;
     this.emulator.scheduleSnapshotSave(this.adbPath(), {
       delay,
@@ -1259,6 +1276,7 @@ class Runtime {
     // 每轮启动的「自动做过什么」独立记账：上一轮修过的东西不该出现在这一轮的修复窗口里
     this.autoRepairLog = [];
     const s = this.settings;
+    if (store.isChild) autoRepair = false;
     // attach is opt-in for the configured serial only. UI discovery remains an explicit action.
     if (s.engine.mode === 'attach') {
       const serial = String(s.device || '').trim();

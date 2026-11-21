@@ -137,6 +137,72 @@ function provision(dir, download) {
 }
 
 async function main() {
+  await test('startup probe never constructs an ADB client for unowned console or guest ports', async (dir) => {
+    let clients = 0;
+    class ProbeClient { constructor() { clients++; } shell() { return forbidden(); } }
+    const { rt, processes } = runtime(dir, { './adb': { AdbClient: ProbeClient } });
+    rt.adbPath = () => path.join(dir, 'fixture-adb');
+    processes.set(5554, { pid: 42, started: 'foreign', owned: false });
+    processes.set(5555, { pid: 42, started: 'foreign', owned: false });
+    rt.emulator.running = () => true;
+    rt.emulator.start = async ({ probe }) => {
+      assert.equal(await probe({ serial: 'emulator-5554' }), 'pending');
+      return { ok: false, error: 'fixture ends after probe' };
+    };
+    assert.equal((await rt.bootEmulator({ env: { accel: { ok: true } } })).ok, false);
+    assert.equal(clients, 0);
+  });
+  await test('startup probe accepts readiness only while both ports retain the same owned identity', async (dir) => {
+    let shells = 0;
+    class ProbeClient {
+      constructor({ serial }) { this.serial = serial; }
+      async shell() { shells++; return '1\npackage:/system/framework/framework-res.apk'; }
+    }
+    const { rt, processes } = runtime(dir, { './adb': { AdbClient: ProbeClient } });
+    rt.adbPath = () => path.join(dir, 'fixture-adb');
+    const owner = { pid: 42, started: 'owned-birth', owned: true };
+    processes.set(5554, owner); processes.set(5555, owner);
+    rt.emulator.running = () => true;
+    rt.emulator.start = async ({ probe }) => {
+      assert.equal(await probe({ serial: 'emulator-5554' }), 'ok');
+      return { ok: false, error: 'fixture ends after probe' };
+    };
+    await rt.bootEmulator({ env: { accel: { ok: true } } });
+    assert.equal(shells, 1);
+  });
+  for (const rejectShell of [false, true]) {
+    await test(`startup probe discards ${rejectShell ? 'failed' : 'successful'} shell after guest identity changes`, async (dir) => {
+      let shells = 0, repairs = 0, states = 0;
+      let processes;
+      class ProbeClient {
+        constructor({ serial }) { this.serial = serial; }
+        async shell() {
+          shells++;
+          const replacement = { pid: 42, started: 'reused-pid-birth', owned: true };
+          processes.set(5554, replacement); processes.set(5555, replacement);
+          if (rejectShell) throw new Error('unauthorized');
+          return '1\npackage:/system/framework/framework-res.apk';
+        }
+        async deviceState() { states++; return 'unauthorized'; }
+      }
+      const f = runtime(dir, { './adb': { AdbClient: ProbeClient, isUnauthorizedError: () => true } });
+      const rt = f.rt; processes = f.processes;
+      rt.adbPath = () => path.join(dir, 'fixture-adb');
+      const owner = { pid: 42, started: 'initial-birth', owned: true };
+      processes.set(5554, owner); processes.set(5555, owner);
+      rt.emulator.running = () => true;
+      rt.emulator.resetAdbServer = async () => { repairs++; };
+      rt.emulator.invalidateSnapshot = rt.emulator.forceColdBootOnNextStart = forbidden;
+      rt.emulator.start = async ({ probe }) => {
+        assert.equal(await probe({ serial: 'emulator-5554' }), 'pending');
+        return { ok: false, error: 'fixture ends after probe' };
+      };
+      await rt.bootEmulator({ env: { accel: { ok: true } } });
+      assert.equal(shells, 1);
+      assert.equal(states, 0);
+      assert.equal(repairs, 0);
+    });
+  }
   await test('cancelled native discovery settles without late prepare or spawn', async (dir) => {
     const { rt, prepared } = runtime(dir);
     const entered = deferred();

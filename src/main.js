@@ -8,8 +8,17 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const ipcguard = require('./core/ipcguard');
+const instanceContext = require('./core/instance-context').current();
+const instanceAdb = require('./core/instance-adb');
+const { InstanceManager } = require('./core/instances');
+const peripherals = require('./core/peripherals');
+const { AutomationRunner, validateScript } = require('./core/automation');
 
 const store = require('./core/store');
+if (instanceContext.isChild) {
+  fs.mkdirSync(instanceContext.userDataDir, { recursive: true });
+  app.setPath('userData', instanceContext.userDataDir);
+}
 const theme = require('./core/theme');
 const { Runtime } = require('./core/engine');
 const { Installer } = require('./core/installer');
@@ -98,6 +107,7 @@ if (process.platform === 'linux') {
  * 必须在 app ready 之前设置，之后改无效。
  */
 function relocateUserDataIfCrowded() {
+  if (instanceContext.isChild) return;
   try {
     const doctor = require('./core/doctor');
     const freeMB = doctor.freeDiskMB(store.DATA_DIR);
@@ -155,7 +165,7 @@ process.on('unhandledRejection', (e) => appLog(`REJECT ${e && (e.stack || e.mess
  * 其他平台上当成「无事可做」直接返回空数组 —— 不要让它抛错，也不要在日志里刷红。
  */
 function ensureShortcuts() {
-  if (!platform.canIntegrateShell) return Promise.resolve([]);
+  if (instanceContext.isChild || !platform.canIntegrateShell) return Promise.resolve([]);
   return installer.ensureShortcuts().catch(() => []);
 }
 
@@ -179,6 +189,7 @@ function legacyEngineDefaults(s) {
  * 用户无需任何下载与设置，开箱即用。之后用户仍可在设置里改回在线版。
  */
 function bootstrapBundledRuntime() {
+  if (instanceContext.isChild) return;
   try {
     const exeDir = path.dirname(process.execPath);
     // 便携版把运行时放在 exe 旁边；electron-builder 的 portable 会把资源解到
@@ -303,9 +314,12 @@ let quitting = false;
 let winAgent = null;
 let appWin = null;
 const windowClients = new WeakMap();
+const windowSessions = new WeakMap();
 let notifier = null;
 let androidSet = null;
 let updater = null;
+let instanceManager = null;
+let automation = null;
 let updateBusy = false;
 let updateInfo = null;
 let currentSystemStatus;
@@ -361,7 +375,7 @@ async function decodeIcon(raw) {
 
 /** 开机自启：默认关闭（用户可在「设置 → 通用」里打开） */
 function applyAutoStart() {
-  if (!app.isPackaged) return; // 开发时不写注册表
+  if (instanceContext.isChild || !app.isPackaged) return; // 开发时不写注册表
   const on = store.getSettings().autoStart === true;
   try {
     // 必须显式给 name，否则注册表里的启动项会叫 "electron.app.Electron"
@@ -428,6 +442,7 @@ function refreshPointerMapping() {
  */
 function openAppWindow(pkg, tip, box = null, opts = {}) {
   if (quitting) throw new Error('ApkStart 正在退出');
+  automation?.cancel('runtime-changed');
   const rec = store.getApp(pkg);
   appWin.open({
     pkg,
@@ -438,6 +453,7 @@ function openAppWindow(pkg, tip, box = null, opts = {}) {
     // 独立窗口模式下不显示宿主窗口：用户要看的画面在模拟器自己的窗口里
     hidden: !!opts.hidden,
   });
+  windowSessions.set(appWin.win, require('crypto').randomUUID());
   appWin.setIcon(rec && rec.icoPath);
   appWin.setState({ tip: tip || '正在启动安卓运行时…', ready: false, landscape: appWin.lcdLandscape });
   currentAppPkg = pkg;
@@ -1215,12 +1231,27 @@ async function emuWindowGone() {
   throw new Error('旧模拟器仍在线，已取消自动重启以避免重复接管');
 }
 
+function automationTarget() {
+  const win = appWin?.win;
+  const client = win && windowClients.get(win);
+  const instanceId = win && windowSessions.get(win);
+  if (quitting || !appWin?.isOpen || !appWin.state.ready || !client?.serial || !instanceId) return null;
+  return { packageName: appWin.pkg, serial: client.serial, instanceId };
+}
+
+function matchesAutomationTarget(target, client) {
+  const current = automationTarget();
+  return !!current && !!target && target.packageName === current.packageName
+    && target.serial === current.serial && target.instanceId === current.instanceId
+    && windowClients.get(appWin.win) === client;
+}
+
 async function runLaunch(pkg) {
   if (launchBusy) {
     appLog(`launch ${pkg} rejected: another launch in progress`);
     send('toast', { type: 'info', message: '正在启动另一个应用，请等它完成后再试。' });
     if (appWin && appWin.isOpen) {
-      try { appWin.win.show(); appWin.win.focus(); } catch (_) { /* 已关 */ }
+      await appWin.reveal().catch(() => false);
     }
     return { ok: false, error: 'busy' };
   }
@@ -1260,6 +1291,15 @@ async function runLaunchInner(pkg) {
   const mark = (s) => appLog(`launch ${pkg} ${s} +${Date.now() - t0}ms`);
   appLog(`launch start ${pkg}`);
   try {
+    // 已就绪的同包窗口只需前置；不要重跑安装、网络准备或隐藏/嵌入链路。
+    if (!quitting && appWin?.isOpen && appWin.pkg === pkg && appWin.state.ready
+      && runtime?.activeApps.includes(pkg)
+      && (runtime.vmRunning || runtime.settings.engine.mode === 'attach')) {
+      if (await appWin.reveal()) {
+        mark('existing window revealed');
+        return { ok: true, reused: true };
+      }
+    }
     // 0) 先决定这个应用该用横屏还是竖屏 LCD。
     //    模拟器窗口比例开机锁死（issue #41），所以必须赶在拉起运行时之前定下来；
     //    窗口本身也先按这个比例打开，别等模拟器起来再改（改一次要重排画面）。
@@ -1676,10 +1716,23 @@ function installIpcGuards() {
         console.warn(`[ipc] 拒绝不可信调用 ${channel}：${verdict.reason}`);
         throw new Error('IPC 调用被拒绝：此窗口无权调用该功能');
       }
+      if (instanceContext.isChild) {
+        const readShared = new Set(['provision:check', 'provision:accelStatus', 'system:list', 'system:detail',
+          'system:status', 'system:tasks', 'system:diskUsage', 'assoc:status']);
+        const sharedMutation = /^(provision:|system:|image:|assoc:|instances:)/.test(channel) && !readShared.has(channel);
+        const globalAction = ['app:shortcut', 'shortcut:rebuild', 'app:clearLocks', 'app:removeSelf', 'app:updateCheck',
+          'app:updateOpen', 'app:updateApply', 'app:updateRunPayload', 'runtime:autoDeploy',
+          'runtime:repairRun', 'runtime:cleanup', 'runtime:installVcRedist', 'runtime:setImageFlavor',
+          'runtime:startInstaller', 'runtime:markInstalled', 'runtime:resetInstall'].includes(channel);
+        if (sharedMutation || globalAction) {
+          throw new Error('分身只使用共享运行时，请回主实例执行组件维护、系统切换或软件更新');
+        }
+      }
       const has = (obj, key) => obj != null && typeof obj === 'object' && Object.hasOwn(obj, key);
       const patch = channel === 'settings:set' ? args[0] : null;
       const changesTarget = has(patch, 'device') || has(patch, 'adbPath') || has(patch?.engine, 'mode')
         || ['dir', 'avdDir', 'systemImageFlavor', 'compatImage'].some(key => has(patch?.runtime, key));
+      if (changesTarget || changesSession.has(channel)) automation?.cancel('runtime-changed');
       if ((changesTarget || changesSession.has(channel)) && appWin?.isOpen) {
         throw new Error('请先关闭安卓应用窗口，再更改运行时目标或执行系统维护');
       }
@@ -1700,7 +1753,9 @@ function registerIpc() {
   let _systemManager = null;
   const getSystemManager = () => {
     if (_systemManager) return _systemManager;
-    const catalog = new SystemCatalog({ appRoot: APP_ROOT });
+    const catalog = new SystemCatalog({ appRoot: APP_ROOT,
+      ...(instanceContext.isChild ? { dataDir: path.join(store.DATA_DIR, 'system-catalog') } : {}),
+    });
     const doctor = require('./core/doctor');
     const switchFlavor = async (flavor) => {
       const profile = runtime.provisioner.imageProfile(String(flavor || ''));
@@ -1717,6 +1772,7 @@ function registerIpc() {
     };
     _systemManager = new SystemManager({
       store, catalog, doctor,
+      ...(instanceContext.isChild ? { dataDir: path.join(store.DATA_DIR, 'systems') } : {}),
       provisioner: runtime.provisioner,
       backendEngine: runtime,
       switchFlavor,
@@ -1739,6 +1795,7 @@ function registerIpc() {
     })(),
     exe: process.execPath,
     packaged: app.isPackaged,
+    instance: { isChild: instanceContext.isChild, id: instanceContext.id },
     platform: platform.describe(),
   }));
 
@@ -1828,6 +1885,34 @@ function registerIpc() {
   });
 
   ipcMain.handle('app:launch', async (_e, pkg) => runLaunch(pkg));
+  ipcMain.handle('instances:list', () => instanceManager ? instanceManager.list() : []);
+  ipcMain.handle('instances:create', (_e, payload) => instanceManager.create({ name: payload?.name }));
+  ipcMain.handle('instances:launch', async (_e, payload) => instanceManager.launch(payload?.id, payload?.package));
+  ipcMain.handle('automation:target', () => ({ ok: !!automationTarget(), target: automationTarget() }));
+  ipcMain.handle('automation:status', () => automation.status());
+  ipcMain.handle('automation:validate', (_e, payload) => ({ ok: true, script: validateScript(payload?.script) }));
+  ipcMain.handle('automation:run', (_e, payload) => runtimeActions.run('automation:run', () => automation.run(payload), { builtin: false }));
+  ipcMain.handle('automation:action', (_e, payload) => runtimeActions.run('automation:action', () => automation.perform(payload), { builtin: false }));
+  ipcMain.handle('automation:cancel', () => automation.cancel('cancelled'));
+
+  ipcMain.handle('peripherals:webcams', async () => {
+    if (store.getSettings().engine.mode !== 'builtin') throw new Error('主机摄像头枚举仅适用于内置 Android Emulator');
+    const executable = runtime.provisioner.paths().emulatorExe;
+    if (!executable || !fs.existsSync(executable)) throw new Error('请先在主实例准备 Android Emulator 组件');
+    const output = await new Promise((resolve, reject) => require('child_process').execFile(executable, ['-webcam-list'],
+      { windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+        if (error) reject(new Error(`摄像头枚举失败：${error.message}`));
+        else resolve(`${stdout}\n${stderr}`);
+      }));
+    return { ok: true, devices: peripherals.parseWebcamList(output) };
+  });
+  ipcMain.handle('peripherals:refresh', async () => {
+    const client = appWin?.isOpen ? windowClients.get(appWin.win) : null;
+    if (!client || !await client.isOnline()) return { ok: false, status: 'unconfirmed', error: '请先打开当前实例中的安卓应用' };
+    const output = await client.exec(['shell', 'dumpsys', 'display'], { timeout: 10000, withSerial: true });
+    const result = peripherals.parseDisplayRefresh(output.stdout, { requestedRate: store.getSettings().peripherals.refreshRate, displayId: 0 });
+    return { ok: true, ...result };
+  });
 
   ipcMain.handle('app:uninstall', async (_e, pkg) => {
     await installer.uninstall(pkg);
@@ -1940,6 +2025,7 @@ function registerIpc() {
       safePatch = { ...patch, runtime: rest };
     }
     const next = store.saveSettings(safePatch);
+    if (safePatch?.engine?.keepSnapshot === false) runtime?.emulator?.cancelSnapshotSave();
     if (safePatch && safePatch.theme !== undefined) syncTheme(next.theme);
     if (safePatch && safePatch.autoStart !== undefined) applyAutoStart();
     // 语言变了（upstream #38）：主进程的菜单/对话框是下次打开才读到新语言，
@@ -3234,10 +3320,10 @@ function registerIpc() {
 
   // 启动失败时的全自动修复入口：Runtime 判定 ACCEL / ACCEL_UNUSABLE 后会回调它，
   // 修好（AEHD 服务拉起来 / WHPX 已生效）就自动重试一次开机，用户不必去点「一键修复」。
-  if (runtime) runtime.onAccelRepair = () => enableVirtualizationImpl();
+  if (runtime && !instanceContext.isChild) runtime.onAccelRepair = () => enableVirtualizationImpl();
   // 非加速类（锁文件、组件缺失、渲染崩溃、磁盘满）自动修复的动作执行器。
   // auto:true 保证这条路径里不会蹦出确认框，也不会动用户数据。
-  if (runtime) runtime.onAutoRepair = (action) => runRepairAction(action, { auto: true });
+  if (runtime && !instanceContext.isChild) runtime.onAutoRepair = (action) => runRepairAction(action, { auto: true });
 
   /** 设置页「硬件加速」状态：只读、带缓存，不触发任何提权或安装 */
   ipcMain.handle('provision:accelStatus', async () => {
@@ -3975,9 +4061,32 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     store.ensureDirs();
+    if (instanceContext.isChild) {
+      try {
+        const { Provisioner } = require('./core/provision');
+        const adbPath = new Provisioner(APP_ROOT).paths().adbExe;
+        await instanceAdb.initialize({ adbPath });
+      } catch (error) {
+        appLog(`instance adb initialization failed: ${error.message}`);
+        dialog.showErrorBox('分身启动失败', `无法初始化分身独立的 ADB 服务：${error.message}\n请回主实例检查运行时组件；不会使用其他实例的连接。`);
+        app.quit();
+        return;
+      }
+    }
     syncTheme(store.getSettings().theme);
     nativeTheme.on('updated', refreshWindowTheme);
     runtime = new Runtime(APP_ROOT);
+    if (!instanceContext.isChild) {
+      instanceManager = new InstanceManager({ store, appRoot: APP_ROOT, executable: process.execPath, isPackaged: app.isPackaged });
+    }
+    automation = new AutomationRunner({
+      getClient: target => {
+        const client = appWin?.isOpen ? windowClients.get(appWin.win) : null;
+        return matchesAutomationTarget(target, client) ? client : null;
+      },
+      canRun: (target, client) => matchesAutomationTarget(target, client),
+      onState: state => send('automation:state', state),
+    });
     // 启动即留一行痕迹：出问题时用户把 app.log 发过来就能看到版本与数据目录
     appLog(`start v${app.getVersion()} data=${store.DATA_DIR} pid=${process.pid}`);
     // 平台能力一行进日志：跨平台反馈里第一眼就能确认「在什么系统上、支持级别是什么」
@@ -4035,6 +4144,8 @@ if (!gotLock) {
       pointerConfig: () => pointer.pointerOptions(store.getSettings()),
     });
     appWin.onCloseApp((pkg, win) => {
+      const targetSession = automation?.status().target?.instanceId;
+      if (targetSession && targetSession === windowSessions.get(win)) automation.cancel('window-closed');
       onContainerActive(false);
       const client = windowClients.get(win);
       if (!client || !client.serial || quitting) return;
@@ -4072,10 +4183,18 @@ if (!gotLock) {
       if (!agent || quitting) return { ok: false };
       const dirs = await agentScope();
       if (quitting) return { ok: false };
-      // 第二个参数是本进程 pid：代理据此拒绝把窗口嵌进「不是我们的」窗口
-      await agent.scope(dirs, process.pid).catch(() => null);
-      if (quitting) return { ok: false };
-      if (!dirs.length) appLog('agent scope 为空：不压制任何窗口（避免误伤其他软件）');
+      // EXE 目录可被多个实例共享，必须再限定本进程的绝对 AVD datadir。
+      let avdDir = '';
+      let avdName = '';
+      try {
+        avdName = runtime.emulator.avdName;
+        avdDir = path.join(runtime.provisioner.paths().avdHome, `${avdName}.avd`);
+      } catch (_) { /* 不猜测归属 */ }
+      const scoped = await agent.scope(dirs, process.pid, { avdDir, avdName }).catch(() => null);
+      if (quitting || !scoped?.ok || !dirs.length) {
+        appLog('agent scope 未确认：不压制任何窗口（避免误伤其他实例）');
+        return { ok: false };
+      }
       return agent.bootHide().catch(() => ({ ok: false }));
     };
 
@@ -4163,7 +4282,7 @@ if (!gotLock) {
 
     // F11 全屏 / 窗口切换；全局快捷键只在 ApkStart 活着时有效
     try {
-      globalShortcut.register('F11', () => { toggleDisplayMode(); });
+      if (!instanceContext.isChild) globalShortcut.register('F11', () => { toggleDisplayMode(); });
     } catch (_) { /* ignore */ }
 
     const args = parseArgs(process.argv);
@@ -4211,7 +4330,7 @@ if (!gotLock) {
     // 启动 8 秒后静默查一次新版本（打包后才有意义）：自动更新开启时
     // 「通知 → 自动下载 → 空闲时自动重启安装」一条龙；关闭则退回只通知。
     // 之后每 6 小时再查一次，长期挂着的容器也能收到新版本。
-    if (app.isPackaged) {
+    if (!instanceContext.isChild && app.isPackaged) {
       // 先看上次更新有没有装成功：失败标记要尽快告诉用户，别等 8 秒后的检查
       notifyUpdateFailure();
       setTimeout(() => {
@@ -4320,6 +4439,7 @@ if (!gotLock) {
 
   app.on('before-quit', (e) => {
     quitting = true;
+    automation?.cancel('window-closed');
     if (quitReady) return;
     e.preventDefault();
     if (quitTask) return;
@@ -4346,6 +4466,8 @@ if (!gotLock) {
       safely(() => wheelRouter?.dispose());
       if (await syncDrained && runtimeDrained) safely(() => runtime?.dispose());
       else console.warn('[quit] 仍有设备操作未排空，不主动关闭其 ADB 传输');
+      try { await instanceAdb.dispose(); }
+      catch (err) { console.warn('[quit] 自有 ADB 收尾失败', err); }
       safely(() => { if (decodeWindow && !decodeWindow.isDestroyed()) decodeWindow.destroy(); });
       quitReady = true;
       app.quit();

@@ -1319,6 +1319,17 @@ function fillSettings(s) {
   if ($('setDataGB')) $('setDataGB').value = String(Number(eng.dataPartitionGB || 0));
   if ($('setFastDns')) $('setFastDns').checked = eng.fastDns !== false;
   if ($('setKeepSnapshot')) $('setKeepSnapshot').checked = eng.keepSnapshot !== false;
+  const peripheral = s.peripherals || {};
+  for (const [id, key] of [['setCameraBack', 'cameraBack'], ['setCameraFront', 'cameraFront']]) {
+    const select = $(id);
+    const value = peripheral[key] || 'none';
+    if (select) {
+      if (![...select.options].some(option => option.value === value)) select.add(new Option(value, value));
+      select.value = value;
+    }
+  }
+  if ($('setRefreshRate')) $('setRefreshRate').value = String(peripheral.refreshRate || 60);
+  if ($('setSerialPort')) $('setSerialPort').value = peripheral.serialPort || '';
   $('setDisplayMode').value = d.mode === 'fullscreen' ? 'fullscreen' : 'window';
   $('setPortrait').value = d.portrait || '900x1600';
   $('portraitField').hidden = $('setDisplayMode').value === 'fullscreen';
@@ -1559,6 +1570,7 @@ function openSettingsSection(secId) {
   if ($('setHits')) { $('setHits').hidden = true; $('setHits').innerHTML = ''; }
   if ($('setBody')) $('setBody').scrollTop = 0;
   if (['runtime', 'android'].includes(settingsSec) && systemPanelVisible()) loadSystems();
+  if (settingsSec === 'automation') refreshInstances();
 }
 
 /** 每次使用当前语言的标签，避免语言切换后还搜旧文案。 */
@@ -1714,6 +1726,13 @@ function applyPlatformCapabilities(info) {
     if (visible) setText(el, text);
   };
   const disable = (id, disabled) => { const el = $(id); if (el) el.disabled = disabled; };
+  const isChild = info?.instance?.isChild === true;
+  if ($('instancesGroup')) $('instancesGroup').hidden = isChild;
+  if (isChild) {
+    for (const id of ['setAutoStart', 'setPrewarm', 'setAutoShortcut', 'setStartMenuShortcut',
+      'setEngineMode', 'setAdbPath', 'setDevice', 'setRuntimeDir', 'setAvdDir', 'setImageFlavor',
+      'btnAssoc', 'btnRebuildShortcuts', 'btnCreateInstance', 'btnRefreshInstances']) disable(id, true);
+  }
 
   for (const value of ['auto', 'embedded']) {
     const option = [...$('setWindowMode').options].find((o) => o.value === value);
@@ -1724,7 +1743,7 @@ function applyPlatformCapabilities(info) {
   for (const id of ['setMouseRightBack', 'setMouseWheelMode', 'setMouseSideButtons']) disable(id, !canHook);
   note('mouseHookSupportNote', !canHook, '右键、滚轮和侧键映射依赖 Windows 鼠标钩子，当前平台不支持。');
 
-  for (const id of ['setAutoShortcut', 'setStartMenuShortcut', 'setShortcutDir', 'btnRebuildShortcuts', 'btnAssoc']) disable(id, !canShell);
+  for (const id of ['setAutoShortcut', 'setStartMenuShortcut', 'setShortcutDir', 'btnRebuildShortcuts', 'btnAssoc']) disable(id, isChild || !canShell);
   note('shortcutSupportNote', !canShell, '桌面快捷方式、开始菜单和 APK 文件关联当前仅支持 Windows。');
   note('integrationSupportNote', !canShell, 'APK 文件关联由 Windows 文件类型注册表提供，当前平台不支持。');
   $('emptyWindowsHelp').hidden = !canShell;
@@ -2126,7 +2145,92 @@ async function changeLanguage(value) {
   }
 }
 
+let instancesBusy = false;
+async function refreshInstances() {
+  if (!$('instancesList') || !api.instances || instancesBusy) return;
+  instancesBusy = true;
+  try {
+    const select = $('instanceApp');
+    const selected = select.value;
+    select.replaceChildren(...state.apps.map(app => new Option(app.label || app.package, app.package)));
+    if (state.apps.some(app => app.package === selected)) select.value = selected;
+    const list = await api.instances.list();
+    $('instancesList').replaceChildren();
+    for (const item of list) {
+      const row = document.createElement('div'); row.className = 'field row';
+      const label = document.createElement('span');
+      const needsVerification = item.needsVerification === true;
+      label.textContent = `${item.name} · ${needsVerification ? '需手动核验' : item.running ? '已启动' : item.state === 'starting' ? '启动中' : '未启动'}`;
+      const button = document.createElement('button'); button.className = 'btn ghost sm';
+      button.textContent = '在此分身打开';
+      button.disabled = needsVerification;
+      if (needsVerification) button.title = '进程归属或启动状态未确认；请先手动核验，不会重复启动或终止该进程';
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try {
+          if (!select.value) throw new Error('请先在主实例安装一个有本地安装包的应用');
+          const result = await api.instances.launch(item.id, select.value);
+          if (result?.ok !== true) throw new Error(result?.error || '启动失败');
+          toast({ title: '已发送到分身', body: '首次打开需创建独立安卓数据，进度在分身窗口显示', type: 'ok' });
+          await refreshInstances();
+        } catch (error) { toast({ title: '分身启动失败', body: error.message, type: 'error' }); }
+        finally { button.disabled = false; }
+      });
+      row.append(label, button); $('instancesList').append(row);
+    }
+    if (!list.length) $('instancesList').textContent = '尚未创建分身';
+  } catch (error) { $('instancesList').textContent = error.message; }
+  finally { instancesBusy = false; }
+}
+
+function bindExtendedSettings() {
+  const failed = error => toast({ title: '操作失败', body: error.message, type: 'error' });
+  for (const [id, key] of [['setCameraBack', 'cameraBack'], ['setCameraFront', 'cameraFront'], ['setRefreshRate', 'refreshRate'], ['setSerialPort', 'serialPort']]) {
+    $(id)?.addEventListener('change', async event => {
+      try {
+        const value = key === 'refreshRate' ? Number(event.target.value) : event.target.value.trim();
+        state.settings = await api.setSettings({ peripherals: { [key]: value } });
+        toast({ title: '配置已保存', body: '下次完整启动安卓生效，不会中断当前应用', type: 'ok' });
+      } catch (error) { failed(error); }
+      finally { if (state.settings) fillSettings(state.settings); }
+    });
+  }
+  $('btnListWebcams')?.addEventListener('click', async event => {
+    event.target.disabled = true;
+    try {
+      const result = await api.peripherals.webcams();
+      for (const id of ['setCameraBack', 'setCameraFront']) {
+        const select = $(id);
+        for (const device of result.devices || []) {
+          if (![...select.options].some(option => option.value === device.id)) select.add(new Option(`${device.id} · ${device.name || device.id}`, device.id));
+        }
+      }
+      toast({ title: '摄像头枚举完成', body: `发现 ${(result.devices || []).length} 个设备；选择后才启用映射`, type: 'ok' });
+    } catch (error) { failed(error); }
+    finally { event.target.disabled = false; }
+  });
+  $('btnVerifyRefresh')?.addEventListener('click', async event => {
+    event.target.disabled = true;
+    try {
+      const result = await api.peripherals.refresh();
+      $('refreshRateStatus').textContent = result.activeRate
+        ? `客机 ${result.activeRate} Hz · ${result.status === 'confirmed' ? '与请求一致' : '与请求不一致'}`
+        : `未确认：${result.error || '运行时未返回可识别的活动显示模式'}`;
+    } catch (error) { $('refreshRateStatus').textContent = `未确认：${error.message}`; }
+    finally { event.target.disabled = false; }
+  });
+  $('btnRefreshInstances')?.addEventListener('click', refreshInstances);
+  $('btnCreateInstance')?.addEventListener('click', async event => {
+    event.target.disabled = true;
+    try { await api.instances.create({ name: $('instanceName').value.trim() }); $('instanceName').value = ''; await refreshInstances(); }
+    catch (error) { failed(error); }
+    finally { event.target.disabled = false; }
+  });
+  window.apkAutomation?.mount({ root: $('automationPanel'), api });
+}
+
 function bindSettings() {
+  bindExtendedSettings();
   const save = async (patch) => {
     state.settings = await api.setSettings(patch);
   };

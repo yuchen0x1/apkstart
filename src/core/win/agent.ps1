@@ -53,11 +53,12 @@ public class ApkAgent
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] static extern IntPtr SetParent(IntPtr c, IntPtr p);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetParent(IntPtr c, IntPtr p);
     [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr c);
-    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
-    [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
-    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint f);
+    [DllImport("user32.dll", SetLastError = true)] static extern int GetWindowLong(IntPtr h, int i);
+    [DllImport("user32.dll", SetLastError = true)] static extern int SetWindowLong(IntPtr h, int i, int v);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint f);
+    [DllImport("kernel32.dll")] static extern void SetLastError(uint error);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
     // 裁剪嵌入窗口的可见区域：把压到标题栏上的那条外框去掉
     [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr h, IntPtr rgn, bool redraw);
@@ -73,7 +74,8 @@ public class ApkAgent
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
     [DllImport("gdi32.dll")] static extern int GetDIBits(IntPtr dc, IntPtr bmp, uint start, uint lines, byte[] bits, ref BITMAPINFO bi, uint usage);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool GetClientRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
@@ -165,7 +167,17 @@ public class ApkAgent
     // relied on window class names alone could hide or even re-parent WeChat's own
     // windows. Class names are never unique; the owning process's path is.
     static readonly System.Collections.Generic.List<string> _scopeDirs = new System.Collections.Generic.List<string>();
-    static readonly System.Collections.Generic.Dictionary<uint, bool> _oursCache = new System.Collections.Generic.Dictionary<uint, bool>();
+    sealed class OwnershipCache
+    {
+        public long Started, CheckedAt;
+        public string Exe;
+        public bool Ours;
+    }
+    static readonly System.Collections.Generic.Dictionary<uint, OwnershipCache> _oursCache = new System.Collections.Generic.Dictionary<uint, OwnershipCache>();
+    // Supplying avdDir enables fail-closed instance isolation, even if the directory is
+    // not provisioned yet. Omitted avdDir retains the old single-instance protocol.
+    static bool _scopeAvdRequired = false;
+    static string _scopeAvdInput = "", _scopeAvd = "", _scopeAvdName = "";
     // PID of the ApkStart main process. The only window we are ever allowed to embed
     // into / swallow clicks for. Guard against a recycled HWND: if _host later belongs
     // to somebody else, the mouse hook must pass events through instead of eating them.
@@ -192,6 +204,8 @@ public class ApkAgent
     // around is a cosmetic bug, hiding a user's WeChat window is not.
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetFinalPathNameByHandleW(IntPtr h, StringBuilder name, uint size, uint flags);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CommandLineToArgvW(string command, out int count);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
 
     static string RealPath(string name)
     {
@@ -252,23 +266,163 @@ public class ApkAgent
         lock (_oursCache) { _oursCache.Clear(); }
     }
 
-    static bool IsOurs(uint pid)
+    static void SetAvdScope(string avd, string name, bool supplied)
     {
-        if (pid == 0 || _scopeDirs.Count == 0) return false;
-        // Do not cache by PID: Windows can recycle it for an unrelated Qt process.
+        _scopeAvdRequired = supplied;
+        _scopeAvdInput = supplied ? (avd ?? "") : "";
+        _scopeAvd = supplied ? NarrowDirectory(_scopeAvdInput) : "";
+        _scopeAvdName = name ?? "";
+        lock (_oursCache) { _oursCache.Clear(); }
+    }
+
+    static string[] Arguments(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return new string[0];
+        int count;
+        IntPtr argv = CommandLineToArgvW(command, out count);
+        if (argv == IntPtr.Zero) return new string[0];
         try
         {
-            using (Process p = Process.GetProcessById((int)pid))
+            string[] args = new string[count];
+            for (int i = 0; i < count; i++) args[i] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, i * IntPtr.Size));
+            return args;
+        }
+        finally { LocalFree(argv); }
+    }
+
+    static bool MatchesAvd(string exe, string[] args, string avd, string avdName)
+    {
+        if (avd.Length == 0 || args.Length == 0 || RealPath(args[0]) != exe) return false;
+        int data = 0, hw = 0, names = 0;
+        string hardware = RealPath(System.IO.Path.Combine(avd, "hardware-qemu.ini"));
+        for (int i = 1; i < args.Length; i++)
+        {
+            string arg = args[i];
+            if (arg == "-datadir" || arg == "-android-hw" || arg == "-avd")
             {
-                string file = RealPath(p.MainModule.FileName);
-                string name = System.IO.Path.GetFileName(file);
-                if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^(emulator|emulator-check|qemu-system-(x86_64|i386|aarch64|armel)|netsimd)\.exe$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) return false;
-                for (int i = 0; i < _scopeDirs.Count; i++)
-                    if (file.StartsWith(_scopeDirs[i], StringComparison.Ordinal)) return true;
+                if (++i >= args.Length) return false;
+                string value = args[i];
+                if (arg == "-avd")
+                {
+                    if (avdName.Length > 0 && value != avdName) return false;
+                    names++;
+                }
+                else if (arg == "-datadir")
+                {
+                    if (RealPath(value) != avd) return false;
+                    data++;
+                }
+                else
+                {
+                    if (hardware.Length == 0 || RealPath(value) != hardware) return false;
+                    hw++;
+                }
+            }
+            else if (arg.StartsWith("@", StringComparison.Ordinal))
+            {
+                if (avdName.Length > 0 && arg.Substring(1) != avdName) return false;
+                names++;
+            }
+        }
+        // Names alone are never identity. In isolated mode require an exact canonical
+        // datadir or hardware-qemu.ini path; no environment/home or same-EXE fallback.
+        return hw > 0 || (data > 0 && (names > 0 || avdName.Length == 0));
+    }
+
+    static bool ReadAvdIdentity(uint pid, long started, string exe)
+    {
+        try
+        {
+            // Load the inbox Framework WMI assembly only for a validated emulator candidate.
+            // Reflection keeps this embedded source compilable with Add-Type's default refs.
+            var assembly = System.Reflection.Assembly.Load("System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a");
+            Type queryType = assembly.GetType("System.Management.ManagementObjectSearcher", true);
+            object query = Activator.CreateInstance(queryType, new object[] {
+                "SELECT CommandLine, CreationDate FROM Win32_Process WHERE ProcessId=" + pid.ToString(CultureInfo.InvariantCulture) });
+            using ((IDisposable)query)
+            {
+                object options = queryType.GetProperty("Options").GetValue(query, null);
+                options.GetType().GetProperty("Timeout").SetValue(options, TimeSpan.FromSeconds(2), null);
+                object rows = queryType.GetMethod("Get", Type.EmptyTypes).Invoke(query, null);
+                using ((IDisposable)rows)
+                {
+                    foreach (object row in (System.Collections.IEnumerable)rows)
+                    {
+                        using ((IDisposable)row)
+                        {
+                            var item = row.GetType().GetProperty("Item", new Type[] { typeof(string) });
+                            string command = item.GetValue(row, new object[] { "CommandLine" }) as string;
+                            string created = item.GetValue(row, new object[] { "CreationDate" }) as string;
+                            if (string.IsNullOrEmpty(command) || string.IsNullOrEmpty(created)) return false;
+                            Type dates = assembly.GetType("System.Management.ManagementDateTimeConverter", true);
+                            DateTime birthDate = (DateTime)dates.GetMethod("ToDateTime").Invoke(null, new object[] { created });
+                            long birth = birthDate.ToUniversalTime().ToFileTimeUtc();
+                            // WMI timestamps have microsecond precision, process creation is 100ns.
+                            if (Math.Abs((decimal)birth - started) >= 10) return false;
+                            return MatchesAvd(exe, Arguments(command), _scopeAvd, _scopeAvdName);
+                        }
+                    }
+                }
             }
         }
         catch { }
         return false;
+    }
+
+    static bool CandidateOwned(uint pid, string file, long started)
+    {
+        if (pid == 0 || started <= 0 || _scopeDirs.Count == 0) return false;
+        string name = System.IO.Path.GetFileName(file);
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^(emulator|emulator-check|qemu-system-(x86_64|i386|aarch64|armel)|netsimd)\.exe$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) return false;
+        bool inScope = false;
+        for (int i = 0; i < _scopeDirs.Count; i++)
+            if (file.StartsWith(_scopeDirs[i], StringComparison.Ordinal)) { inScope = true; break; }
+        if (!inScope) return false;
+        if (!_scopeAvdRequired) return true;
+        // AVD provisioning can happen after the initial scope command. Until it exists,
+        // deny all; once it exists resolve its final path rather than trusting a prefix.
+        if (_scopeAvd.Length == 0) _scopeAvd = NarrowDirectory(_scopeAvdInput);
+        if (_scopeAvd.Length == 0) return false;
+        long now = NowMs();
+        lock (_oursCache)
+        {
+            OwnershipCache cached;
+            if (_oursCache.TryGetValue(pid, out cached) && cached.Started == started && cached.Exe == file
+                && (cached.Ours || now - cached.CheckedAt < 2000)) return cached.Ours;
+        }
+        // WMI is queried only AFTER executable/path validation, never for arbitrary Qt apps.
+        bool ours = ReadAvdIdentity(pid, started, file);
+        lock (_oursCache)
+        {
+            _oursCache[pid] = new OwnershipCache { Started = started, CheckedAt = now, Exe = file, Ours = ours };
+        }
+        return ours;
+    }
+
+    static bool IsOurs(uint pid)
+    {
+        if (pid == 0 || _scopeDirs.Count == 0) return false;
+        try
+        {
+            using (Process p = Process.GetProcessById((int)pid))
+            {
+                long started = p.StartTime.ToUniversalTime().ToFileTimeUtc();
+                string file = RealPath(p.MainModule.FileName);
+                bool ours = CandidateOwned(pid, file, started);
+                // The original process must still be alive after WMI; a recycled PID may
+                // not reuse an old positive result (cache keys include fresh birth + exe).
+                return ours && !p.HasExited;
+            }
+        }
+        catch { return false; }
+    }
+
+    static bool IsOurWindow(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return false;
+        uint pid;
+        GetWindowThreadProcessId(hwnd, out pid);
+        return IsOurs(pid);
     }
 
     static uint ParentOf(uint pid)
@@ -540,7 +694,7 @@ public class ApkAgent
     static bool EmuAlive()
     {
         if (_scopeDirs.Count == 0) return true;   // 作用域未建立时不能下结论
-        if (_emu != IntPtr.Zero && IsWindow(_emu)) return true;
+        if (IsOurWindow(_emu)) return true;
         return FindEmulator() != IntPtr.Zero;
     }
 
@@ -548,7 +702,7 @@ public class ApkAgent
     // 不抢焦点、不发输入，避免 DWM/Qt 交换链留下一块黑帧。
     static void Refresh()
     {
-        if (_emu == IntPtr.Zero) return;
+        if (!IsOurWindow(_emu) || !ValidHost()) return;
         IntPtr rp = RealParent(_emu);
         bool embedded = _host != IntPtr.Zero && (rp == _host || rp == _chromeRender);
         if (!embedded) return;
@@ -566,7 +720,7 @@ public class ApkAgent
      */
     static int MeanBrightness(IntPtr hwnd)
     {
-        if (hwnd == IntPtr.Zero) return -1;
+        if (!IsOurWindow(hwnd)) return -1;
         RECT r;
         if (!GetWindowRect(hwnd, out r)) return -1;
         int w = r.R - r.L, h = r.B - r.T;
@@ -652,37 +806,14 @@ public class ApkAgent
         return "\"host\":" + h.ToInt64() + ",\"list\":[" + sb + "]";
     }
 
-    // embed 那一刻 Electron 的网页渲染子窗口可能还没建好，FindChromeRender 会返回 0，
-    // 于是 simulator 被挂成了宿主的直接子窗口（和网页层是兄弟）—— 网页层会持续
-    // 盖住画面并吃掉鼠标。这里在常驻扫描里补挂：一旦发现网页层出现了，就重挂一次。
-    static void EnsureReparent()
-    {
-        if (_emu == IntPtr.Zero || _host == IntPtr.Zero) return;
-        if (_chromeRender == IntPtr.Zero || !IsWindow(_chromeRender))
-            _chromeRender = FindChromeRender(_host);
-        if (_chromeRender == IntPtr.Zero) return;
-        IntPtr ep = GetParent(_emu);
-        if (ep == _chromeRender) return;
-        if (ep != _host && ep != IntPtr.Zero) return;   // 别的宿主，别乱动
-        RECT r;
-        if (!GetWindowRect(_emu, out r)) return;
-        RECT hr;
-        if (!GetWindowRect(_host, out hr)) return;
-        SetParent(_emu, _chromeRender);
-        // 坐标相对网页层客户区（与宿主客户区一致），保持原屏幕位置
-        SetWindowPos(_emu, IntPtr.Zero, r.L - hr.L, r.T - hr.T,
-                     r.R - r.L, r.B - r.T, 0x0004 | 0x0010 | 0x0040);
-    }
-
     static void QuietSweep()
     {
-        EnsureReparent();
-        // 尺寸自愈：宿主被最大化/缩放后，Electron 的 chrome 层常常没跟着变大，
-        // 画面就只剩左上角一条。这里每轮重贴一次（Fit 内部按宿主客户区重算，
-        // 尺寸没变时 SetWindowPos 基本无开销）。
-        if (_emu != IntPtr.Zero && _host != IntPtr.Zero) Fit(-8, 30, 640, 480, false, 0);
+        // 只重放最近一次 JS 确认的物理像素矩形。不能用固定 38px 标题栏覆盖
+        // Electron 按所在显示器 DPI 算出的矩形；网页层晚创建时 Fit 会验证并补挂。
+        if (_emu != IntPtr.Zero && _host != IntPtr.Zero && _hasFitRect)
+            Fit(_fitX, _fitY, _fitW, _fitH, false, 0);
         IntPtr ep = _emu != IntPtr.Zero ? GetParent(_emu) : IntPtr.Zero;
-        bool embedded = _emu != IntPtr.Zero && ep != IntPtr.Zero
+        bool embedded = IsOurWindow(_emu) && ValidHost() && ep != IntPtr.Zero
                      && (ep == _host || ep == _chromeRender);
         IntPtr e = embedded ? _emu : FindEmulator();
         // 黑屏兜底摘出来的独立窗口是用户正在看的画面，绝不能再压掉
@@ -735,165 +866,227 @@ public class ApkAgent
         return found;
     }
 
+    static string _windowError = "";
+    static int _windowWin32Error = 0;
+    static bool _hasFitRect = false;
+    static int _fitX, _fitY, _fitW, _fitH;
+    static IntPtr _placementEmu = IntPtr.Zero;
+    static RECT _standaloneRect;
+    static bool _hasStandaloneRect = false;
+
+    static bool WindowFailure(string error, int code)
+    {
+        _windowError = error;
+        _windowWin32Error = code;
+        return false;
+    }
+
+    static string WindowReply(bool ok)
+    {
+        return "{\"ok\":" + (ok ? "true" : "false") + ",\"emu\":" + _emu.ToInt64()
+            + (ok ? "" : ",\"error\":" + JsonStr(_windowError) + ",\"win32\":" + _windowWin32Error) + "}";
+    }
+
+    static bool Reparent(IntPtr child, IntPtr parent)
+    {
+        // SetParent returns the PREVIOUS parent: zero is normal for a top-level window.
+        // Clear/capture last-error at the call boundary, then verify the actual result.
+        SetLastError(0);
+        SetParent(child, parent);
+        int error = Marshal.GetLastWin32Error();
+        if (!IsWindow(child) || GetParent(child) != parent)
+            return WindowFailure("set-parent-failed", error);
+        return true;
+    }
+
+    static bool SetStyle(IntPtr hwnd, int index, int value)
+    {
+        SetLastError(0);
+        int previous = SetWindowLong(hwnd, index, value);
+        int error = Marshal.GetLastWin32Error();
+        return previous != 0 || error == 0 || WindowFailure("set-style-failed", error);
+    }
+
+    static bool ValidHost()
+    {
+        if (_host == IntPtr.Zero || !IsWindow(_host)) return false;
+        uint pid;
+        GetWindowThreadProcessId(_host, out pid);
+        return _appPid == 0 || pid == _appPid;
+    }
+
+    static void RememberStandalone(IntPtr emu)
+    {
+        RECT r;
+        if (GetParent(emu) == IntPtr.Zero && ((uint)GetWindowLong(emu, GWL_STYLE) & WS_CHILD) == 0
+            && GetWindowRect(emu, out r) && r.R > r.L && r.B > r.T)
+        {
+            _placementEmu = emu;
+            _standaloneRect = r;
+            _hasStandaloneRect = true;
+        }
+    }
+
     static bool Embed(IntPtr host, IntPtr emu)
     {
-        if (host == IntPtr.Zero || emu == IntPtr.Zero) return false;
-        _standalone = false;   // 重新嵌入：上次兜底摘出来的独立窗口不再豁免压制
+        _hasFitRect = false;
+        if (!IsOurWindow(emu)) return WindowFailure("emu=0", 0);
+        if (host != _host || !ValidHost()) return WindowFailure("host-not-ours", 0);
         HideToolWindows();
-        // 网页层子窗口铺满宿主客户区，坐标系与宿主一致，所以后面 Fit 传的矩形不用改。
+        RememberStandalone(emu);
         IntPtr parent = FindChromeRender(host);
-        if (parent == IntPtr.Zero) parent = host;   // 找不到就退回老行为，别让应用开不起来
-        SetParent(emu, parent);
-        uint style = (uint)GetWindowLong(emu, GWL_STYLE);
+        if (parent == IntPtr.Zero) parent = host;
+        int originalStyle = GetWindowLong(emu, GWL_STYLE);
+        uint style = (uint)originalStyle;
         style &= ~WS_POPUP;
         style &= ~(uint)(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_BORDER);
         style |= WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
-        SetWindowLong(emu, GWL_STYLE, (int)style);
+        // WS_CHILD makes GetParent unambiguous (WS_POPUP would report its owner).
+        if (!SetStyle(emu, GWL_STYLE, (int)style)) return false;
+        if (!Reparent(emu, parent))
+        {
+            SetWindowLong(emu, GWL_STYLE, originalStyle);
+            return false;
+        }
         int ex = GetWindowLong(emu, GWL_EXSTYLE);
         ex &= ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
-        SetWindowLong(emu, GWL_EXSTYLE, ex);
-        // 旧版本给这个窗口设过 window region；复用时先清掉，否则命中测试继续错位
+        if (!SetStyle(emu, GWL_EXSTYLE, ex)) return false;
+        _standalone = false;
+        _chromeRender = parent == host ? IntPtr.Zero : parent;
         SetWindowRgn(emu, IntPtr.Zero, false);
         return true;
     }
 
-    // HWND_TOP: Chromium 的渲染子窗口和模拟器是同级的子窗口，
-    // 不主动抬到最前就会被 Chromium 那块黑底盖住（用户看到的就是黑屏）。
-    static readonly IntPtr HWND_TOP = new IntPtr(1);
-    static void Fit(int x, int y, int w, int h, bool frame, int clipTop)
+    // Win32 HWND_TOP is zero. 1 is HWND_BOTTOM, which hides Qt behind Chromium.
+    static readonly IntPtr HWND_TOP = IntPtr.Zero;
+    static bool Fit(int x, int y, int w, int h, bool frame, int clipTop)
     {
-        if (_emu == IntPtr.Zero) return;
-        // Fit 是 JS 侧每次 resize 都会调的，此时网页层一定已经建好了。
-        // 确保模拟器挂在网页层之下（兄弟关系会被网页层盖住并吃掉鼠标）。
-        if (_host != IntPtr.Zero)
-        {
-            IntPtr cr = FindChromeRender(_host);
-            if (cr != IntPtr.Zero)
-            {
-                _chromeRender = cr;
-                IntPtr cur = GetParent(_emu);
-                if (cur != cr && (cur == _host || cur == IntPtr.Zero))
-                {
-                    SetParent(_emu, cr);
-                    // 坐标相对网页层客户区，与宿主一致，沿用传入的 x/y 即可
-                }
-            }
-        }
-        // 以 **宿主窗口客户区** 为准自校正尺寸，而不是信 JS 传来的 w/h、
-        // 也不是信 Chrome 渲染层自己的尺寸。
-        //
-        // 为什么：Electron 最大化后宿主窗口变成 1936x1048，但内部的
-        // Chrome_RenderWidgetHostHWND 仍停在旧尺寸（实测 532x984）—— 而模拟器
-        // 窗口挂在 chrome 层之下，会被父窗口裁剪，于是画面只占左上角一条、
-        // 右边一大片空白（用户截图里「最大化/全屏后没填满」）。
-        // 所以这里先把 chrome 层拉满宿主客户区，再把 emu 设为该客户区大小。
-        if (_host != IntPtr.Zero)
-        {
-            RECT hc;
-            if (GetClientRect(_host, out hc))
-            {
-                int cw = hc.R - hc.L;
-                int chh = hc.B - hc.T;
-                if (cw > 200 && chh > 200)
-                {
-                    if (_chromeRender != IntPtr.Zero)
-                    {
-                        RECT crc;
-                        if (GetWindowRect(_chromeRender, out crc))
-                        {
-                            if ((crc.R - crc.L) != cw || (crc.B - crc.T) != chh)
-                            {
-                                SetWindowPos(_chromeRender, IntPtr.Zero, 0, 0, cw, chh,
-                                    SWP_NOZORDER | SWP_NOACTIVATE);
-                            }
-                        }
-                    }
-                    // x/y 保持 -8 的溢出（把 Qt 的 8px 灰边推出可视区），
-                    // 宽高按客户区 + 2*8；标题栏 38px 由宿主自绘盖住。
-                    x = -8;
-                    y = 38 - 8;
-                    w = cw + 16;
-                    h = (chh - 38) + 16;
-                }
-            }
-        }
-        if (w < 16) w = 16;
-        if (h < 16) h = 16;
-        // 只有「确实已经嵌进我们窗口」的才允许显示。
-        // 万一 embed 失败（模拟器窗口还没建好 / 句柄换了），Fit 绝不能把它当独立窗口
-        // 顶到桌面上 —— 那正是用户看到的那个 "Android Emulator - apkstart5554" 黑窗。
-        IntPtr ep = GetParent(_emu);
-        bool embedded = ep != IntPtr.Zero
-                     && (ep == _host || ep == _chromeRender);
-        if (!embedded)
+        if (!IsOurWindow(_emu)) return WindowFailure("emu=0", 0);
+        if (_standalone) return WindowFailure("not-embedded", 0);
+        if (!ValidHost())
         {
             ShowWindow(_emu, 0);
-            return;
+            return WindowFailure("host-not-ours", 0);
         }
-        // SWP_FRAMECHANGED forces Windows to recompute the whole non-client area and
-        // repaint it. It is needed exactly once (right after SetParent); repeating it
-        // on every periodic sweep caused visible stutter and wasted GPU/CPU.
+        IntPtr ep = GetParent(_emu);
+        if (ep == IntPtr.Zero || (ep != _host && ep != _chromeRender))
+        {
+            ShowWindow(_emu, 0);
+            return WindowFailure("embed-parent-mismatch", 0);
+        }
+        if (w <= 0 || h <= 0) return WindowFailure("invalid-rect", 0);
+        // The render child may appear after embed. Never acknowledge a failed reparent.
+        IntPtr cr = FindChromeRender(_host);
+        if (cr != IntPtr.Zero && ep != cr && !Reparent(_emu, cr))
+        {
+            ShowWindow(_emu, 0);
+            return false;
+        }
+        _chromeRender = cr;
+        RECT hc;
+        if (!GetClientRect(_host, out hc))
+        {
+            int error = Marshal.GetLastWin32Error();
+            ShowWindow(_emu, 0);
+            return WindowFailure("host-client-rect-failed", error);
+        }
+        // Keep Chromium's clipping surface in sync, but do NOT replace JS's DPI-scaled
+        // LCD rectangle with an unscaled 38px title bar. Direct-host fallback uses exactly
+        // the same x/y/w/h as the render-child path and periodic sweeps.
+        if (cr != IntPtr.Zero)
+        {
+            RECT crc;
+            int cw = hc.R - hc.L, ch = hc.B - hc.T;
+            if (cw <= 0 || ch <= 0) return WindowFailure("invalid-host-rect", 0);
+            if (!GetWindowRect(cr, out crc) || crc.R - crc.L != cw || crc.B - crc.T != ch)
+            {
+                if (!SetWindowPos(cr, IntPtr.Zero, 0, 0, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    ShowWindow(_emu, 0);
+                    return WindowFailure("render-fit-failed", error);
+                }
+            }
+        }
+        // Only show after re-checking the real parent; stale/foreign parents are failures.
+        ep = GetParent(_emu);
+        if (ep == IntPtr.Zero || (ep != _host && ep != cr))
+        {
+            ShowWindow(_emu, 0);
+            return WindowFailure("embed-parent-mismatch", 0);
+        }
         uint flags = SWP_NOACTIVATE | SWP_SHOWWINDOW | (frame ? SWP_FRAMECHANGED : 0u);
-        SetWindowPos(_emu, HWND_TOP, x, y, w, h, flags);
-        // 绝不给嵌入窗口设 window region：Qt/GL 子窗口一旦带 region，命中测试和
-        // 输入坐标映射会错位（点击失效 / 点不到按钮），旋转改尺寸后 region 还是旧
-        // 矩形又会在四周露黑边。标题栏那条 8px 溢出改由宿主自绘标题栏盖住。
+        if (!SetWindowPos(_emu, HWND_TOP, x, y, Math.Max(16, w), Math.Max(16, h), flags))
+        {
+            int error = Marshal.GetLastWin32Error();
+            ShowWindow(_emu, 0);
+            return WindowFailure("emu-fit-failed", error);
+        }
+        _fitX = x; _fitY = y; _fitW = w; _fitH = h;
+        _hasFitRect = true;
+        // No window region: it breaks Qt/GL hit testing. Keep the existing physical 8px pad.
+        return true;
     }
 
     static void Raise()
     {
-        if (_emu == IntPtr.Zero) return;
+        if (!IsOurWindow(_emu) || !ValidHost()) return;
         SetWindowPos(_emu, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    static bool Detach()
+    static bool ReleaseEmulator(bool show)
     {
-        // 独立窗口模式可能一步到位（从没嵌入过）：此时 _emu 还是空，得现找。
-        if (_emu == IntPtr.Zero) _emu = FindEmulator();
-        if (_emu == IntPtr.Zero) return false;
-        _standalone = true;   // 用户要靠这个窗口看画面，常驻压制循环必须放过它
-        SetParent(_emu, IntPtr.Zero);
-        uint style = (uint)GetWindowLong(_emu, GWL_STYLE);
-        style &= ~WS_CHILD;
-        style |= (uint)(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-        SetWindowLong(_emu, GWL_STYLE, (int)style);
-        int ex = GetWindowLong(_emu, GWL_EXSTYLE);
-        ex |= WS_EX_APPWINDOW;
-        SetWindowLong(_emu, GWL_EXSTYLE, ex);
-        SetWindowPos(_emu, IntPtr.Zero, 60, 40, 480, 853, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-        ShowWindow(_emu, 5);
-        // 独立窗口模式下只保留 Android 画面，隐藏右侧的 Qt 浮动工具栏。
-        // 工具栏是单独的 QWindowTool 顶层窗口，Detach 后不会随画面窗口自动收拢；
-        // 立即清一次，避免用户在画面亮起时先看到相距很远的控制栏。
-        HideToolWindows();
-        // 摘出来的窗口必须自己抢到前台：以前它出现在 ApkStart 应用窗口后面，
-        // 用户只看到前面那块黑壳，以为程序没反应（实测就是这么误判的）。
-        SetForegroundWindow(_emu);
-        _emu = IntPtr.Zero;
-        return true;
-    }
-
-    // 与 Detach 相同，但**不显示**窗口：宿主窗口即将销毁时调用。
-    // 不先摘下来，Windows 会在宿主销毁时把子窗口重新挂到桌面并设成可见，
-    // 于是就凭空多出一个 "Android Emulator - apkstart5554" 的黑窗。
-    static void ParkEmulator()
-    {
-        _standalone = false;
-        if (_emu == IntPtr.Zero) _emu = FindEmulator();
+        _hasFitRect = false;
+        if (!IsOurWindow(_emu)) _emu = FindEmulator();
         IntPtr e = _emu;
-        if (e == IntPtr.Zero) { _host = IntPtr.Zero; return; }
-        ShowWindow(e, 0);
-        SetParent(e, IntPtr.Zero);
+        if (e == IntPtr.Zero)
+        {
+            _host = IntPtr.Zero;
+            return show ? WindowFailure("emu=0", 0) : true;
+        }
+        RememberStandalone(e);
+        bool wasChild = ((uint)GetWindowLong(e, GWL_STYLE) & WS_CHILD) != 0;
+        RECT placement = new RECT();
+        bool place = wasChild && (_hasStandaloneRect && _placementEmu == e);
+        if (place) placement = _standaloneRect;
+        else if (wasChild) place = GetWindowRect(e, out placement);
+        // Park must hide BEFORE removing the parent; failed release stays hidden and the
+        // caller receives false. No pending fit may re-show it during close/park handoff.
+        if (!show) ShowWindow(e, 0);
+        if (GetParent(e) != IntPtr.Zero && !Reparent(e, IntPtr.Zero)) return false;
         uint style = (uint)GetWindowLong(e, GWL_STYLE);
         style &= ~WS_CHILD;
         style |= (uint)(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-        SetWindowLong(e, GWL_STYLE, (int)style);
-        int ex = GetWindowLong(e, GWL_EXSTYLE);
-        ex |= WS_EX_APPWINDOW;
-        SetWindowLong(e, GWL_EXSTYLE, ex);
-        SetWindowPos(e, IntPtr.Zero, 40, 40, 480, 853, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        if (!SetStyle(e, GWL_STYLE, (int)style)) return false;
+        int ex = GetWindowLong(e, GWL_EXSTYLE) | WS_EX_APPWINDOW;
+        if (!SetStyle(e, GWL_EXSTYLE, ex)) return false;
+        uint flags = SWP_NOZORDER | SWP_FRAMECHANGED | (show ? SWP_SHOWWINDOW : SWP_NOACTIVATE);
+        if (!place) flags |= SWP_NOMOVE | SWP_NOSIZE;
+        if (!SetWindowPos(e, IntPtr.Zero, placement.L, placement.T,
+            placement.R - placement.L, placement.B - placement.T, flags))
+            return WindowFailure("release-fit-failed", Marshal.GetLastWin32Error());
+        _standalone = show;
+        if (show)
+        {
+            // SW_SHOW preserves maximized geometry; restore only if actually minimized.
+            // Repeated foreground requests never reset the user's screen/position/size.
+            ShowWindow(e, IsIconic(e) ? 9 : 5);
+            HideToolWindows();
+            SetForegroundWindow(e);
+        }
         _emu = IntPtr.Zero;
         _host = IntPtr.Zero;
+        _chromeRender = IntPtr.Zero;
+        return true;
+    }
+
+    static bool Detach() { return ReleaseEmulator(true); }
+
+    // Hide -> detach -> acknowledge -> JS destroys host. Preserve the existing ordering.
+    static bool ParkEmulator()
+    {
+        _standalone = false;
+        return ReleaseEmulator(false);
     }
 
     // ------------------------------------------------------------------ rotation
@@ -904,7 +1097,7 @@ public class ApkAgent
     // 按完键再还回去。
     static void Rotate(string dir)
     {
-        if (_emu == IntPtr.Zero) _emu = FindEmulator();
+        if (!IsOurWindow(_emu)) _emu = FindEmulator();
         if (_emu == IntPtr.Zero) return;
         // keybd_event feeds the SYSTEM input queue, so if we are not the foreground
         // window the Ctrl+Left lands in whatever the user is typing in (WeChat's input
@@ -1274,6 +1467,7 @@ public class ApkAgent
                         // Whitelist of "our" directories. Must arrive before boothide /
                         // embed; the sweeps refuse to touch anything outside it.
                         SetScope(S(line, "dirs"));
+                        SetAvdScope(S(line, "avdDir"), S(line, "avdName"), System.Text.RegularExpressions.Regex.IsMatch(line, "\"avdDir\"\\s*:"));
                         long appPid = L(line, "pid");
                         _appPid = appPid > 0 ? (uint)appPid : 0;
                         _hostPid = 0;
@@ -1300,19 +1494,20 @@ public class ApkAgent
                             _host = want;
                             _hostPid = wantPid;
                             _chromeRender = FindChromeRender(want);
-                            _emu = FindEmulator();
-                            bool ok = Embed(_host, _emu);
-                            _embedAt = Environment.TickCount;
+                            // A previous attempt may have reparented successfully before Fit failed;
+                            // EnumWindows cannot rediscover that child. Reuse only a revalidated handle.
+                            if (!IsOurWindow(_emu)) _emu = FindEmulator();
+                            bool ok = Embed(_host, _emu)
+                                && Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), true, (int)L(line, "clipTop"));
+                            _embedAt = ok ? Environment.TickCount : 0;
                             _lastToolSweep = 0;
-                            Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), true, (int)L(line, "clipTop"));
-                            Reply(sock, "{\"ok\":" + (ok ? "true" : "false") + ",\"emu\":" + _emu.ToInt64() + "}");
+                            Reply(sock, WindowReply(ok));
                         }
                     }
                     else if (cmd == "fit")
                     {
-                        if (_emu == IntPtr.Zero) _emu = FindEmulator();
-                        Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), false, (int)L(line, "clipTop"));
-                        Reply(sock, "{\"ok\":true}");
+                        bool ok = Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), false, (int)L(line, "clipTop"));
+                        Reply(sock, WindowReply(ok));
                     }
                     else if (cmd == "refresh")
                     {
@@ -1340,7 +1535,7 @@ public class ApkAgent
                     }
                     else if (cmd == "hide")
                     {
-                        if (_emu != IntPtr.Zero) ShowWindow(_emu, 0);
+                        if (IsOurWindow(_emu)) ShowWindow(_emu, 0);
                         Reply(sock, "{\"ok\":true}");
                     }
                     else if (cmd == "perf")
@@ -1351,7 +1546,7 @@ public class ApkAgent
                     }
                     else if (cmd == "show")
                     {
-                        if (_emu != IntPtr.Zero) ShowWindow(_emu, 5);
+                        if (IsOurWindow(_emu)) ShowWindow(_emu, 5);
                         Reply(sock, "{\"ok\":true}");
                     }
                     else if (cmd == "detach")
@@ -1359,7 +1554,7 @@ public class ApkAgent
                         // 找不到模拟器窗口时如实回 false：上层要靠这个值区分
                         // 「已经切到独立窗口」和「窗口根本没了，得重启运行时」。
                         bool detached = Detach();
-                        Reply(sock, "{\"ok\":" + (detached ? "true" : "false") + "}");
+                        Reply(sock, WindowReply(detached));
                     }
                     else if (cmd == "hook")
                     {
@@ -1412,8 +1607,8 @@ public class ApkAgent
                         _quiet = true;
                         _bootHideStart = Environment.TickCount;
                         _bootHideSweep = 0;
-                        ParkEmulator();
-                        Reply(sock, "{\"ok\":true}");
+                        bool parked = ParkEmulator();
+                        Reply(sock, WindowReply(parked));
                     }
                     else if (cmd == "quit")
                     {

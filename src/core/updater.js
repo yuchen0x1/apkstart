@@ -261,16 +261,18 @@ class Updater {
       const out = path.join(dir, 'payload');
       fs.rmSync(out, { recursive: true, force: true });
       fs.mkdirSync(out, { recursive: true });
+      let files;
       try {
         await this._extract(file, out);
         this._flattenPayload(out);
-        this._assertPayload(out, it);
+        files = this._assertPayload(out, it);
       } catch (e) {
         fs.rmSync(out, { recursive: true, force: true });
         throw e;
       }
       this.onProgress({ stage: 'ready', percent: 100, message: '更新包已解压并通过校验' });
-      return { mode: 'zip', payload: out, version: it.version, sha256: this.sha256, zip: file };
+      // 从已验签、校验 CRC 的载荷固定程序文件摘要，apply 不得接受之后被改写的载荷。
+      return { mode: 'zip', payload: out, version: it.version, sha256: this.sha256, zip: file, files };
     }
     // 安装版：交给外部 NSIS 之前必须先确认「这确实是一份完整的 Windows 程序」。
     // 一个半截下载 / 错误页被当成 Setup.exe 执行时，安装器会先卸旧再解压失败，
@@ -347,28 +349,66 @@ class Updater {
   }
 
   /**
-   * 解压后的载荷必须真的是一份 ApkStart：有主程序、有 resources。
-   * 没有这一步，一个空的/错发的 zip 会把整个安装目录覆盖成一堆无关文件，
-   * 程序下次就起不来了（更新器最怕的「更新完打不开」）。
+   * 当前便携包为 asar:false：除了主程序，还必须有目标版本的 app/package.json。
+   * 逐文件固定大小和 SHA-256，不能把「EXE 大小相同」当成应用代码已经更新。
+   * resources/runtime 与安装目录内的数据目录不是程序载荷，不覆盖、不备份、不清理。
    */
   _assertPayload(dir, it) {
     const exeName = path.basename(this.exePath || 'ApkStart.exe');
     const rootExe = path.join(dir, exeName);
-    let found = fs.existsSync(rootExe);
-    if (!found) {
-      // 某些打包方式会把内容套一层目录
-      for (const name of fs.readdirSync(dir)) {
-        const p = path.join(dir, name);
-        if (fs.existsSync(path.join(p, exeName))) { found = true; break; }
-      }
+    if (!fs.existsSync(rootExe) || !fs.lstatSync(rootExe).isFile() || !fs.statSync(rootExe).size) {
+      throw new Error(`更新包内容异常：没有找到有效的 ${exeName}，已中止（原程序未被修改）`);
     }
-    if (!found) {
-      throw new Error(`更新包内容异常：没有找到 ${exeName}，已中止（原程序未被修改）`);
-    }
-    if (!fs.existsSync(path.join(dir, 'resources'))) {
+    if (!fs.existsSync(path.join(dir, 'resources')) || !fs.lstatSync(path.join(dir, 'resources')).isDirectory()) {
       throw new Error('更新包内容异常：缺少 resources 目录，已中止（原程序未被修改）');
     }
-    this.latestPayload = { dir, version: it.version };
+    let pkg;
+    try {
+      pkg = JSON.parse(fs.readFileSync(path.join(dir, 'resources', 'app', 'package.json'), 'utf8').replace(/^\ufeff/, ''));
+    } catch (_) {
+      throw new Error('更新包内容异常：缺少或损坏 resources/app/package.json，已中止（原程序未被修改）');
+    }
+    const want = String(it.version || '').replace(/^v/i, '');
+    if (!/^\d+\.\d+\.\d+$/.test(want) || !pkg || pkg.version !== want) {
+      throw new Error('更新包 package.json 版本不匹配，已中止（原程序未被修改）');
+    }
+    const protectedPaths = ['resources/runtime'];
+    const dataRel = path.relative(this.installDir, this.dataDir || '').replace(/\\/g, '/').toLowerCase();
+    if (dataRel && !dataRel.startsWith('../') && dataRel !== '..' && !path.isAbsolute(dataRel)) protectedPaths.push(dataRel);
+    const files = [];
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    const visit = (rel) => {
+      const file = safeEntryPath(dir, rel);
+      const st = fs.lstatSync(file);
+      if (st.isSymbolicLink()) throw new Error('更新载荷包含符号链接，已中止：' + rel);
+      if (st.isDirectory()) {
+        for (const name of fs.readdirSync(file).sort()) {
+          const child = rel ? rel + '/' + name : name;
+          const lower = child.toLowerCase();
+          if (!protectedPaths.some(p => lower === p || lower.startsWith(p + '/'))) visit(child);
+        }
+      } else {
+        if (!st.isFile()) throw new Error('更新载荷包含非普通文件，已中止：' + rel);
+        const hash = crypto.createHash('sha256');
+        const fd = fs.openSync(file, 'r');
+        try {
+          let n;
+          while ((n = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, n));
+        } finally { fs.closeSync(fd); }
+        files.push({ path: rel, size: st.size, sha256: hash.digest('hex') });
+      }
+    };
+    // 根目录单独检查，safeEntryPath 按设计不会把根目录本身当成文件条目。
+    if (fs.lstatSync(dir).isSymbolicLink()) throw new Error('更新载荷根目录不能是符号链接');
+    for (const name of fs.readdirSync(dir).sort()) {
+      if (!protectedPaths.includes(name.toLowerCase())) visit(name);
+    }
+    if (!files.some(f => f.path.toLowerCase() === exeName.toLowerCase())
+      || !files.some(f => f.path.toLowerCase() === 'resources/app/package.json')) {
+      throw new Error('更新程序文件不能位于受保护的数据目录内');
+    }
+    this.latestPayload = { dir, version: want };
+    return files;
   }
 
   /**
@@ -525,9 +565,13 @@ class Updater {
     } catch (_) { /* 凭条写不进去不影响更新本身 */ }
 
     // 替换前最后一道闸：载荷必须真的是 ApkStart，否则宁可放弃更新
+    let payloadFiles;
     if (job.mode === 'zip') {
       if (!job.payload || !fs.existsSync(job.payload)) throw new Error('更新载荷不存在，已取消更新');
-      this._assertPayload(job.payload, { version: job.version });
+      payloadFiles = this._assertPayload(job.payload, { version: job.version });
+      if (job.files && JSON.stringify(job.files) !== JSON.stringify(payloadFiles)) {
+        throw new Error('更新载荷文件与已验证的 SHA-256 清单不符，已取消更新');
+      }
     } else if (job.mode === 'setup') {
       // 用 job.size（这次真正下到的字节数），而不是 this.latest.asset.size ——
       // 后台若又查到了更新的版本，latest 已经换成别人的大小了。
@@ -539,7 +583,7 @@ class Updater {
     const lines = [
       `$ErrorActionPreference = 'SilentlyContinue'`,
       `$log = ${psq(logFile)}`,
-      `function Note($m) { Add-Content -Path $log -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }`,
+      `function Note($m) { Add-Content -LiteralPath $log -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }`,
       `Note 'updater start'`,
       // 等本进程真正退出（最多 60 秒），否则 exe/dll 仍被占用
       `try { Wait-Process -Id ${waitPid} -Timeout 60 } catch { }`,
@@ -554,60 +598,134 @@ class Updater {
     ];
 
     if (job.mode === 'zip') {
-      const bak = path.join(this.updateDir, `backup-${job.version}`);
+      // 重试不得覆盖上次失败留下的恢复目录。
+      const bak = path.join(this.updateDir, `backup-${job.version}-${crypto.randomBytes(8).toString('hex')}`);
       lines.push(
         `$src = ${psq(job.payload)}`,
         `$dst = ${psq(dir)}`,
         `$bak = ${psq(bak)}`,
+        `$probe = ${psq(exe)}`,
+        `$pkgRel = 'resources/app/package.json'`,
+        `$want = ${psq(String(job.version || '').replace(/^v/i, ''))}`,
+        `$files = ConvertFrom-Json -InputObject ${psq(JSON.stringify(payloadFiles))} -ErrorAction Stop`,
+        `$original = New-Object 'System.Collections.Generic.List[object]'`,
+        `$missing = New-Object 'System.Collections.Generic.List[string]'`,
         `$ok = $false`,
-        // 1) 先把「将被覆盖的现有文件」备份出来，替换失败时能原样还原
-        `$files = @(Get-ChildItem -LiteralPath $src -Recurse -File)`,
-        `foreach ($f in $files) {`,
-        `  $rel = $f.FullName.Substring($src.Length).TrimStart('\\')`,
-        `  $target = Join-Path $dst $rel`,
-        `  if (Test-Path -LiteralPath $target) {`,
-        `    $b = Join-Path $bak $rel`,
-        `    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $b) | Out-Null`,
-        `    Copy-Item -LiteralPath $target -Destination $b -Force`,
-        `  }`,
-        `}`,
-        `Note ("backup " + $files.Count + " files")`,
-        // 2) 覆盖（程序文件可能被杀软短暂占用，重试）
-        `$probe = Join-Path $dst ${psq(path.basename(exe))}`,
-        `$srcExe = Join-Path $src ${psq(path.basename(exe))}`,
-        `$asarSrc = Join-Path $src 'resources\\app.asar'`,
-        `$asarDst = Join-Path $dst 'resources\\app.asar'`,
-        `for ($i = 1; $i -le 12; $i++) {`,
-        `  Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force`,
-        `  $ok = $false`,
-        `  if ((Test-Path -LiteralPath $probe) -and ((Get-Item -LiteralPath $probe).Length -gt 0)) {`,
-        `    $ok = $true`,
-        // 关键：旧版 exe 一直都在，只看「存在且非空」会把「根本没复制成功」当成成功，
-        // 于是重启的还是旧版本、又检测到更新 —— 用户看到的就是「更新完又提示更新」的死循环
-        // （上游 #98 的现场）。所以必须拿解压目录里的新文件逐项比对大小。
-        `    if ((Test-Path -LiteralPath $srcExe) -and ((Get-Item -LiteralPath $srcExe).Length -ne (Get-Item -LiteralPath $probe).Length)) { $ok = $false }`,
-        `    if ($ok -and (Test-Path -LiteralPath $asarSrc)) {`,
-        `      if (-not (Test-Path -LiteralPath $asarDst)) { $ok = $false }`,
-        `      elseif ((Get-Item -LiteralPath $asarSrc).Length -ne (Get-Item -LiteralPath $asarDst).Length) { $ok = $false }`,
+        `$copyStarted = $false`,
+        `$rollback = 'not-attempted'`,
+        `$reason = ''`,
+        // 固定的相对路径不依赖 Get-ChildItem 的短/长路径形式；拒绝通过目标联接点越界。
+        `function Program-Path($root, $rel) {`,
+        `  $target = Join-Path $root $rel`,
+        `  $check = $target`,
+        `  while ($check) {`,
+        `    if (Test-Path -LiteralPath $check -ErrorAction Stop) {`,
+        `      $item = Get-Item -LiteralPath $check -Force -ErrorAction Stop`,
+        `      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw ('reparse point: ' + $check) }`,
         `    }`,
+        `    $parent = Split-Path -Parent $check`,
+        `    if ($parent -eq $check) { break }`,
+        `    $check = $parent`,
         `  }`,
-        `  if ($ok) { Note "copy pass $i ok"; break }`,
-        `  Note "copy pass $i failed, retry"; Start-Sleep -Milliseconds 700`,
+        `  return $target`,
         `}`,
-        // 3) 失败 → 回滚到备份，并把载荷留在原处供排查
-        `if (-not $ok) {`,
+        `function File-State($file, $rel) {`,
+        `  $item = Get-Item -LiteralPath $file -Force -ErrorAction Stop`,
+        `  if ($item.PSIsContainer) { throw ('not a program file: ' + $file) }`,
+        `  return @{ path = $rel; size = $item.Length; sha256 = (Get-FileHash -LiteralPath $file -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() }`,
+        `}`,
+        `function Test-Files($root, $expected) {`,
+        `  try {`,
+        `    foreach ($entry in $expected) {`,
+        `      $file = Program-Path $root $entry.path`,
+        `      $actual = File-State $file $entry.path`,
+        `      if ($actual.size -ne $entry.size -or $actual.sha256 -cne $entry.sha256) { throw ('size/SHA-256 mismatch: ' + $entry.path) }`,
+        `    }`,
+        `    return $true`,
+        `  } catch { Note ('file verification failed: ' + $_.Exception.Message); return $false }`,
+        `}`,
+        `function Read-Version($file) {`,
+        `  try {`,
+        `    $body = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)) -ErrorAction Stop`,
+        `    if ($body.version -is [string]) { return $body.version }`,
+        `  } catch { Note ('read version failed: ' + $file) }`,
+        `  return ''`,
+        `}`,
+        `$before = Read-Version (Join-Path $dst $pkgRel)`,
+        `$beforeReady = ((Test-Path -LiteralPath $probe -PathType Leaf) -and $before -ne '')`,
+        `$canRestart = $beforeReady`,
+        `try {`,
+        // 脚本等 App 退出期间，载荷也可能损坏；不能重新采样后把损坏的内容当成基准。
+        `  if (-not (Test-Files $src $files) -or (Read-Version (Join-Path $src $pkgRel)) -cne $want) { throw 'prepared payload changed' }`,
+        // 1) 在任何覆盖前收集原文件状态，复制并验证完整备份；备份失败不碰原程序。
+        `  foreach ($entry in $files) {`,
+        `    $target = Program-Path $dst $entry.path`,
+        `    if (Test-Path -LiteralPath $target -ErrorAction Stop) { [void]$original.Add((File-State $target $entry.path)) }`,
+        `    else { [void]$missing.Add($entry.path) }`,
+        `  }`,
+        `  New-Item -ItemType Directory -Path $bak -ErrorAction Stop | Out-Null`,
+        `  foreach ($entry in $original) {`,
+        `    $b = Program-Path $bak $entry.path`,
+        `    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $b))`,
+        `    Copy-Item -LiteralPath (Program-Path $dst $entry.path) -Destination $b -Force -ErrorAction Stop`,
+        `  }`,
+        `  if (-not (Test-Files $bak $original)) { throw 'backup verification failed' }`,
+        `  Note ('backup verified: ' + $original.Count + ' files')`,
+        // 2) 只复制程序清单；-ErrorAction Stop 将非终止复制错误也纳入本轮失败。
+        `  $copyStarted = $true`,
+        `  for ($i = 1; $i -le 12; $i++) {`,
+        `    try {`,
+        `      foreach ($entry in $files) {`,
+        `        $target = Program-Path $dst $entry.path`,
+        `        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $target))`,
+        `        Copy-Item -LiteralPath (Program-Path $src $entry.path) -Destination $target -Force -ErrorAction Stop`,
+        `      }`,
+        `      if (-not (Test-Files $dst $files)) { throw 'installed program files differ from payload' }`,
+        `      if ((Read-Version (Join-Path $dst $pkgRel)) -cne $want) { throw 'installed package version mismatch' }`,
+        `      $ok = $true; Note "copy pass $i ok"; break`,
+        `    } catch { $reason = $_.Exception.Message; Note ("copy pass $i failed: " + $reason) }`,
+        `    if ($i -lt 12) { Start-Sleep -Milliseconds 700 }`,
+        `  }`,
+        `  if (-not $ok) { throw ('copy failed after 12 passes: ' + $reason) }`,
+        `} catch { $reason = $_.Exception.Message; Note ('portable update failed: ' + $reason) }`,
+        // 3) 失败时逐项恢复旧内容，且只删除本次新建的文件；不镜像删除用户文件/运行时。
+        `if (-not $ok -and $copyStarted) {`,
         `  Note 'copy failed, rolling back'`,
-        `  if (Test-Path -LiteralPath $bak) { Copy-Item -Path (Join-Path $bak '*') -Destination $dst -Recurse -Force; Note 'rollback done' }`,
-        `  Remove-Item -LiteralPath $src -Recurse -Force`,
-        // 回滚后必须把旧版本拉起来：否则用户看到的是「更新完程序自己关了，再也没打开」，
-        // 手动打开还是旧版、又提示更新（#98 的完整现场）。
-        `  if (Test-Path -LiteralPath $probe) { Start-Process -FilePath $probe; Note 'relaunched (rolled back)' }`,
-        `  Set-Content -Path ${psq(failFile)} -Value ('{"version":' + (ConvertTo-Json ${psq(String(job.version || ''))}) + ',"log":' + (ConvertTo-Json $log) + '}') -Encoding UTF8`,
-        `  exit 1`,
+        `  $canRestart = $false`,
+        `  $rollback = 'unverified'`,
+        `  foreach ($entry in $original) {`,
+        `    try {`,
+        `      $target = Program-Path $dst $entry.path`,
+        `      [void][IO.Directory]::CreateDirectory((Split-Path -Parent $target))`,
+        `      Copy-Item -LiteralPath (Program-Path $bak $entry.path) -Destination $target -Force -ErrorAction Stop`,
+        `    } catch { Note ('rollback copy failed: ' + $_.Exception.Message) }`,
+        `  }`,
+        `  foreach ($rel in $missing) {`,
+        `    try {`,
+        `      $target = Program-Path $dst $rel`,
+        `      if (Test-Path -LiteralPath $target -ErrorAction Stop) { Remove-Item -LiteralPath $target -Force -ErrorAction Stop }`,
+        `    } catch { Note ('rollback cleanup failed: ' + $_.Exception.Message) }`,
+        `  }`,
+        // 单个恢复复制报错仍继续还原其余文件；最终状态只以实际字节和新增文件缺席为准。
+        `  try {`,
+        `    foreach ($rel in $missing) {`,
+        `      if (Test-Path -LiteralPath (Program-Path $dst $rel) -ErrorAction Stop) { throw ('new file remains: ' + $rel) }`,
+        `    }`,
+        `    if (-not (Test-Files $dst $original) -or (Read-Version (Join-Path $dst $pkgRel)) -cne $before) { throw 'rollback verification failed' }`,
+        `    $rollback = 'restored'; $canRestart = $beforeReady; Note 'rollback done'`,
+        `  } catch { Note ('rollback not verified: ' + $_.Exception.Message) }`,
         `}`,
-        // 4) 成功：清掉备份与解压目录（新版本里已删除的文件不会被清理，保留无害）
-        `Remove-Item -LiteralPath $bak -Recurse -Force`,
-        `Remove-Item -LiteralPath $src -Recurse -Force`,
+        `if ($ok) {`,
+        // 只有全部校验通过才清理本次备份和载荷，旧尝试的备份一律不动。
+        `  Remove-Item -LiteralPath $bak -Recurse -Force`,
+        `  Remove-Item -LiteralPath $src -Recurse -Force`,
+        `} else {`,
+        `  try {`,
+        `    $failure = @{ version = $want; log = $log; rollback = $rollback; backup = $bak; payload = $src; error = $reason } | ConvertTo-Json -Compress`,
+        `    [IO.File]::WriteAllText(${psq(failFile)}, $failure)`,
+        `  } catch { Note 'could not write update failure marker' }`,
+        `  Note 'update failed, payload kept for manual install'`,
+        `}`,
       );
     } else {
       // 安装版：安装器是外部进程，它「先卸旧、再解新」。中途任何一步失败
@@ -732,7 +850,7 @@ class Updater {
 
     lines.push(
       `if ($ok) { Remove-Item -LiteralPath ${psq(path.join(this.updateDir, 'pending.json'))} -Force }`,
-      `if (($ok -or $canRestart) -and (Test-Path -LiteralPath ${psq(exe)} -PathType Leaf)) { Start-Process -FilePath ${psq(exe)}; Note 'relaunched' }`,
+      `if (($ok -or $canRestart) -and (Test-Path -LiteralPath ${psq(exe)} -PathType Leaf)) { Start-Process -FilePath ${psq(exe)}; ${job.mode === 'zip' ? "if ($rollback -eq 'restored') { Note 'relaunched (rolled back)' } else { Note 'relaunched' }" : "Note 'relaunched'"} }`,
       `Note 'updater done'`,
       // 只有验证通过才清理载荷；即使失败标记写不出来也必须保留。
       `if (-not $ok) { exit 1 }`,

@@ -137,23 +137,27 @@ class AppWindow {
   }
 
   /**
-   * 换一个 LCD 比例（不重开窗口，只改大小并居中）。
+   * 换一个 LCD 比例（不重开窗口，也不把用户移好的窗口再次居中）。
    * 用在「用户拒绝为横屏应用重启运行时」：窗口得跟着回到当前 LCD 的比例，
    * 否则就是横窗口套竖画面，比修之前更难看。
    */
   applyBox(box) {
     if (!this.isOpen || !box || !box.w || !box.h) return;
+    // 热启动重复确认同一 LCD 时保留用户自己调整的大小、位置和最大化状态。
+    if (this.lcd && this.lcd.w === box.w && this.lcd.h === box.h) return;
     this.lcd = { w: box.w, h: box.h };
     this.portrait = { w: box.w, h: box.h };
     const wasMax = this.win.isMaximized();
     if (wasMax) this.win.unmaximize();
+    const before = this.win.getBounds();
     const area = this._area();
     const size = AppWindow.sizeFor(area, this.portrait, false);
     this.win.setContentSize(Math.max(320, size.w), Math.max(420, size.h + TITLEBAR_H));
     const b = this.win.getBounds();
+    // 只在新尺寸越过所在屏幕的工作区时钳回边缘；不跟随鼠标跨屏、不重居中。
     this.win.setPosition(
-      Math.round(area.x + (area.w - b.width) / 2),
-      Math.round(area.y + (area.h - b.height) / 2),
+      Math.round(Math.max(area.x, Math.min(Number.isFinite(before.x) ? before.x : area.x, area.x + area.w - b.width))),
+      Math.round(Math.max(area.y, Math.min(Number.isFinite(before.y) ? before.y : area.y, area.y + area.h - b.height))),
     );
     if (wasMax) this.win.maximize();
     this.state.landscape = this.lcdLandscape;
@@ -162,7 +166,12 @@ class AppWindow {
   }
 
   _area() {
-    const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    let d;
+    // 新窗口才以鼠标所在屏为起点；已有窗口的比例调整留在它自己所在的屏幕。
+    if (this.isOpen) {
+      try { d = screen.getDisplayMatching(this.win.getBounds()); } catch (_) { /* 首次创建 / 旧接口兜底 */ }
+    }
+    if (!d) d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
     const a = d.workArea || d.bounds;
     return { x: a.x, y: a.y, w: a.width, h: a.height };
   }
@@ -187,15 +196,8 @@ class AppWindow {
     const { pkg, label, iconPath, lcd, fullscreen, hidden } = o;
     if (this.isOpen && this.pkg === pkg) {
       this._closedCb = o.onClosed || this._closedCb;
-      // 独立窗口模式：用户再点一次这个应用，该把模拟器窗口抬到前面，
-      // 而不是把藏着黑壳的宿主窗口弹出来。
-      if (this.standaloneActive) {
-        this.revealStandalone().catch(() => {});
-        return this.win;
-      }
-      this.win.show();
-      this.win.focus();
-      this._revealEmbedded();
+      // 复用只恢复/前置现有画面，不改尺寸，也不把独立窗口的黑壳弹出来。
+      this.reveal().catch(() => {});
       return this.win;
     }
     this.close({ keepApp: true });
@@ -532,6 +534,21 @@ class AppWindow {
     return true;
   }
 
+  /** 热启动前置接口：不重开、不重新居中；独立模式只前置真实模拟器窗口。 */
+  async reveal() {
+    if (!this.isOpen) return false;
+    if (this.standaloneActive) return this.revealStandalone();
+    if (this._hidden) return false;
+    try {
+      if (this.win.isMinimized?.()) this.win.restore();
+      this.win.show();
+      this.win.moveTop?.();
+      this.win.focus();
+      this._revealEmbedded();
+      return true;
+    } catch (_) { return false; }
+  }
+
   /** 独立窗口模式下把模拟器窗口重新亮出来并置前（从主界面再点一次应用时用）。 */
   async revealStandalone() {
     const win = this.win;
@@ -546,8 +563,12 @@ class AppWindow {
   async fitNow() {
     if (!this.isOpen) return;
     // 外部窗口模式：画面不在我们窗口里，贴合没有任何意义（也不该调代理）
-    if (this.external) return;
-    await this._queueWindowCommand(agent => agent.fit(this._rect())).catch(() => {});
+    if (this.external || this.standaloneActive) return;
+    await this._queueWindowCommand(agent => {
+      // 排队期间可能已切到独立窗口；旧 fit 不能再把它拉回/藏掉。
+      if (this.external || this.standaloneActive) return null;
+      return agent.fit(this._rect());
+    }).catch(() => {});
   }
 
   /** 模拟器子窗口应该占据的矩形（物理像素，已把 8px 内边距推出可视区） */

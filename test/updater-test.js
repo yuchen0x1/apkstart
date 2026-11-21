@@ -8,6 +8,12 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
+// download/proxy 会间接载入 store；即使模块初始化查询数据目录也只能看到临时 fixture。
+const fixtureHome = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-upd-home-'));
+process.env.APPDATA = fixtureHome;
+process.env.XDG_DATA_HOME = fixtureHome;
+process.once('exit', () => fs.rmSync(fixtureHome, { recursive: true, force: true }));
+
 const { Updater } = require('../src/core/updater');
 const { safeEntryPath, ZipFile } = require('../src/core/zip');
 const { writeZip } = require('./lib/zip-writer');
@@ -37,7 +43,19 @@ async function expectThrow(fn, re, msg) {
   throw new Error(`${msg || '应当抛错'}：但没有抛错`);
 }
 
-function mkTmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-upd-')); }
+const tmpRoots = [];
+function mkTmp() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-upd-'));
+  tmpRoots.push(root);
+  return root;
+}
+
+function portablePayload(dir, version = '1.2.3') {
+  fs.mkdirSync(path.join(dir, 'resources', 'app', 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'ApkStart.exe'), 'MZ-new');
+  fs.writeFileSync(path.join(dir, 'resources', 'app', 'package.json'), JSON.stringify({ version, main: 'src/main.js' }));
+  fs.writeFileSync(path.join(dir, 'resources', 'app', 'src', 'main.js'), 'code-new');
+}
 
 /** 造一个「结构上像 Windows 程序」的文件：MZ + e_lfanew → PE\0\0，其余填 0 */
 function fakeExe(file, size = 400 * 1024, opts = {}) {
@@ -60,6 +78,63 @@ function mkUpdater(root, overrides = {}) {
     dataDir: path.join(root, 'data'),
     settings: () => ({}),
   });
+}
+
+/** 原样执行替换逻辑，只 stub 宿主进程操作；所有文件都在临时 fixture 下。 */
+function runPortableFixture(root, script, fault = '') {
+  const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const fixture = path.join(root, 'portable-fixture.ps1');
+  const prelude = [
+    'function Wait-Process {}',
+    'function Get-Process {}',
+    'function Stop-Process { throw "unexpected stop" }',
+    'function Start-Sleep {}',
+    'function Start-Process { param($FilePath); Note ("fixture restart: " + $FilePath) }',
+    `$script:fault = '${fault}'`,
+    '$script:transient = $false',
+    'function Copy-Item {',
+    '  [CmdletBinding()] param([string]$LiteralPath, [string]$Destination, [switch]$Force)',
+    '  $source = [IO.Path]::GetFullPath($LiteralPath)',
+    '  $fromPayload = $source.StartsWith($src + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)',
+    '  $fromBackup = $source.StartsWith($bak + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)',
+    '  $main = $source.EndsWith("src\\main.js")',
+    '  if ($script:fault -eq "unchanged-copy-error" -and ($fromPayload -or $fromBackup)) { Write-Error "fixture unchanged file denied"; return }',
+    '  if ($script:fault -eq "backup-error" -and -not $fromPayload -and -not $fromBackup -and $main) { Write-Error "fixture backup error"; return }',
+    '  if ($script:fault -eq "rollback-error" -and $fromBackup) { Write-Error "fixture rollback error"; return }',
+    '  if ($fromPayload -and $main) {',
+    '    if ($script:fault -eq "same-size-old") { return }',
+    '    if ($script:fault -in @("copy-error", "rollback-error", "marker-error")) { Write-Error "fixture non-terminating copy error"; return }',
+    '    if ($script:fault -eq "transient" -and -not $script:transient) { $script:transient = $true; Write-Error "fixture transient error"; return }',
+    '  }',
+    '  Microsoft.PowerShell.Management\\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force -ErrorAction Stop',
+    '  if ($fromPayload -and $source.EndsWith("app\\package.json")) {',
+    '    if ($script:fault -eq "missing-package") { Microsoft.PowerShell.Management\\Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop }',
+    `    if ($script:fault -eq "wrong-version") { [IO.File]::WriteAllText($Destination, '{"version":"0.0.1","main":"src/main.js"}') }`,
+    '  }',
+    '}',
+  ];
+  fs.writeFileSync(fixture, '\ufeff' + prelude.join('\r\n') + '\r\n' + script);
+  return spawnSync(ps, ['-NoProfile', '-NonInteractive', '-File', fixture], {
+    encoding: 'utf8', timeout: 60000, windowsHide: true,
+  });
+}
+
+function windowsFixturesAllowed() {
+  if (process.platform !== 'win32') {
+    console.log('  跳过隔离脚本执行：需要 Windows PowerShell 与 robocopy');
+    return false;
+  }
+  const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const probe = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-Command',
+    '@{ policy = [string](Get-ExecutionPolicy); language = [string]$ExecutionContext.SessionState.LanguageMode } | ConvertTo-Json -Compress',
+  ], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+  assert(probe.status === 0, `无法探测 PowerShell 策略：${probe.error || probe.stderr}`);
+  const info = JSON.parse(probe.stdout.trim());
+  if (info.language !== 'FullLanguage' || !['RemoteSigned', 'Unrestricted', 'Bypass'].includes(info.policy)) {
+    console.log(`  跳过隔离脚本执行：PowerShell ${info.policy}/${info.language}；不覆盖执行策略或语言限制`);
+    return false;
+  }
+  return true;
 }
 
 async function main() {
@@ -179,13 +254,87 @@ async function main() {
     const root = mkTmp();
     const dir = path.join(root, 'payload');
     const inner = path.join(dir, 'ApkStart');
-    fs.mkdirSync(path.join(inner, 'resources'), { recursive: true });
-    fs.writeFileSync(path.join(inner, 'ApkStart.exe'), 'MZ');
+    portablePayload(inner, '1.0.0');
     const u = mkUpdater(root);
     u._flattenPayload(dir);
     u._assertPayload(dir, { version: '1.0.0' });
     assert(fs.existsSync(path.join(dir, 'ApkStart.exe')), '应摊平到载荷根');
     assert(!fs.existsSync(inner), '内层目录应被移除');
+  });
+
+  for (const row of [
+    { name: '缺少 package.json', pkg: null, error: /package\.json/ },
+    { name: 'package.json 损坏', pkg: '{', error: /package\.json/ },
+    { name: '缺少 version', pkg: '{}', error: /版本不匹配/ },
+    { name: 'version 非字符串', pkg: '{"version":123}', error: /版本不匹配/ },
+    { name: '目标版本不匹配', pkg: '{"version":"1.2.2"}', error: /版本不匹配/ },
+  ]) {
+    await test(`便携载荷校验：${row.name}，不生成替换脚本`, async () => {
+      const root = mkTmp();
+      const payload = path.join(root, 'payload');
+      portablePayload(payload);
+      const pkg = path.join(payload, 'resources', 'app', 'package.json');
+      if (row.pkg === null) fs.rmSync(pkg); else fs.writeFileSync(pkg, row.pkg);
+      const u = mkUpdater(root);
+      await expectThrow(() => u.apply({ mode: 'zip', payload, version: '1.2.3' }, { spawn: false }), row.error);
+      assert(!fs.existsSync(path.join(u.updateDir, 'apply.log.ps1')), '异常载荷不能交给外部替换脚本');
+      assert(fs.existsSync(payload), '前置拒绝不删除可排查的载荷');
+    });
+  }
+
+  await test('asar:false 载荷清单逐一固定 EXE、应用代码/资源的大小和 SHA-256，排除 runtime/数据', () => {
+    const root = mkTmp();
+    const payload = path.join(root, 'payload');
+    portablePayload(payload);
+    const u = mkUpdater(root);
+    u.dataDir = path.join(u.installDir, 'user-data');
+    for (const rel of ['resources/runtime/avd/user.img', 'user-data/apps.json', 'resources/app/src/.hidden.js', 'resources/app/src/界面[1].js']) {
+      fs.mkdirSync(path.dirname(path.join(payload, rel)), { recursive: true });
+      fs.writeFileSync(path.join(payload, rel), rel);
+    }
+    const files = u._assertPayload(payload, { version: 'v1.2.3' });
+    eq(files.length, 5, 'EXE、package.json、主代码和两个额外代码文件');
+    for (const entry of files) {
+      const bytes = fs.readFileSync(path.join(payload, entry.path));
+      eq(entry.size, bytes.length);
+      eq(entry.sha256, require('crypto').createHash('sha256').update(bytes).digest('hex'));
+      assert(!/^(resources\/runtime|user-data)\//i.test(entry.path), '用户内容不属于程序清单');
+    }
+    assert(!fs.existsSync(path.join(payload, 'resources', 'app.asar')), '实际使用 asar:false fixture');
+  });
+
+  await test('已验签便携包固定文件摘要，同大小改写代码不能通过 apply，也不重新下载', async () => {
+    const root = mkTmp();
+    const crypto = require('crypto');
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+    const u = mkUpdater(root, { publicKey });
+    const version = '9.9.9';
+    const dir = path.join(u.updateDir, version);
+    fs.mkdirSync(dir, { recursive: true });
+    const { repo, assetNames } = require('../src/core/release-manifest');
+    const name = assetNames('v' + version).portable;
+    const zip = writeZip(path.join(dir, name), [
+      { name: 'ApkStart.exe', data: 'MZ-new' },
+      { name: 'resources/app/package.json', data: JSON.stringify({ version }) },
+      { name: 'resources/app/src/main.js', data: 'code-new' },
+    ]);
+    const size = fs.statSync(zip).size;
+    const hash = crypto.createHash('sha256').update(fs.readFileSync(zip)).digest('hex');
+    const data = Buffer.from(JSON.stringify({ schema: 1, repository: repo, tag: 'v' + version,
+      assets: [{ name, size, sha256: hash }] }));
+    const sig = crypto.sign(null, data, privateKey).toString('base64');
+    const info = { version, tag: 'v' + version,
+      proof: '<!-- apkstart-manifest ' + data.toString('base64') + ' ' + sig + ' -->',
+      asset: { name, size, digest: 'sha256:' + hash, url: repo + '/releases/download/v' + version + '/' + name } };
+    u.sources.rank = () => { throw new Error('fixture must not access network'); };
+    const job = await u.prepare(info);
+    eq(job.files.length, 3, '摘要来自已验签并解压校验的载荷');
+    u.apply(job, { spawn: false });
+    fs.rmSync(path.join(u.updateDir, 'apply.log.ps1'));
+    fs.writeFileSync(path.join(job.payload, 'resources', 'app', 'src', 'main.js'), 'code-old');
+    await expectThrow(() => u.apply(job, { spawn: false }), /SHA-256/);
+    assert(!fs.existsSync(path.join(u.updateDir, 'apply.log.ps1')), '同大小代码被改写后不能生成脚本');
+    assert(fs.existsSync(zip) && fs.existsSync(job.payload), '拒绝时保留载荷和原始 ZIP');
   });
 
   await test('apply 前置校验：载荷不存在时直接拒绝，不生成脚本', async () => {
@@ -197,29 +346,31 @@ async function main() {
   await test('apply 生成的替换脚本包含备份与回滚步骤', async () => {
     const root = mkTmp();
     const payload = path.join(root, 'payload');
-    fs.mkdirSync(path.join(payload, 'resources'), { recursive: true });
-    fs.writeFileSync(path.join(payload, 'ApkStart.exe'), 'MZ');
+    portablePayload(payload);
     const u = mkUpdater(root);
     const script = u.apply({ mode: 'zip', payload, version: '1.2.3' }, { spawn: false });
     assert(/\$bak/.test(script), '应有备份路径变量');
     assert(/rolling back/.test(script), '应有回滚分支');
-    assert(/Copy-Item -Path \(Join-Path \$bak/.test(script), '失败时应从备份还原');
+    assert(/Copy-Item -LiteralPath \(Program-Path \$bak/.test(script), '失败时应逐文件从备份还原');
     assert(/exit 1/.test(script), '失败应返回非 0 退出码');
     // 脚本能被写出来给人工排查，但不能包含未转义的单引号拼接
     assert(!/\$dst = ''/.test(script), '路径应为非空字面量');
   });
 
-  await test('便携版替换脚本语法可解析（新加的大小比对不能把脚本写坏）', async () => {
-    const root = mkTmp();
+  await test('便携版替换脚本语法可解析（SHA-256、版本和带引号/中文路径）', async () => {
+    const root = path.join(mkTmp(), "夹具 ' [portable]");
     const payload = path.join(root, 'payload');
-    fs.mkdirSync(path.join(payload, 'resources'), { recursive: true });
-    fs.writeFileSync(path.join(payload, 'ApkStart.exe'), 'MZ');
+    portablePayload(payload);
     fs.writeFileSync(path.join(payload, 'resources', 'app.asar'), 'asar');
+    fs.writeFileSync(path.join(payload, 'resources', 'app', 'src', "带'引号[1].js"), 'quoted');
     const u = mkUpdater(root);
     const script = u.apply({ mode: 'zip', payload, version: '1.2.3' }, { spawn: false });
-    // 上游 #98：复制后必须比对真正落地的新文件，不能只看「exe 存在」
-    assert(/\$srcExe/.test(script) && /\.Length -ne/.test(script), '要按大小核对新文件是否真的复制成功');
-    assert(/app\.asar/.test(script), '只要 exe 换了、界面代码没换，版本仍然对不上');
+    // 上游 #98：asar:false 时，EXE/可选 ASAR 与散装应用文件都必须逐项核对摘要。
+    assert(/Get-FileHash -LiteralPath .* -Algorithm SHA256 -ErrorAction Stop/.test(script), '应使用 SHA-256');
+    assert(/\$actual\.size -ne \$entry\.size/.test(script), '要按大小核对每个新文件');
+    assert(script.includes('resources/app/src/main.js') && script.includes('resources/app/package.json'), '应覆盖散装代码和版本文件');
+    assert(script.includes('resources/app.asar'), '包里存在 ASAR 时也不得跳过校验');
+    assert(/Read-Version \(Join-Path \$dst \$pkgRel\)\) -cne \$want/.test(script), '必须核对目标版本');
     assert(/relaunched \(rolled back\)/.test(script), '复制失败回滚后要把旧版本拉起来');
     const file = path.join(root, 'apply-check.ps1');
     fs.writeFileSync(file, script, 'utf8');
@@ -249,6 +400,155 @@ async function main() {
       /拼装后大小不对/,
     );
   });
+
+  await test('便携脚本：非终止复制错误必须失败，完整备份后才覆盖，回滚也须逐项校验', () => {
+    const root = mkTmp();
+    const payload = path.join(root, 'payload');
+    portablePayload(payload);
+    const script = mkUpdater(root).apply({ mode: 'zip', payload, version: '1.2.3' }, { spawn: false });
+    const copies = script.split('\r\n').filter(line => /Copy-Item/.test(line));
+    eq(copies.length, 3, '备份、安装、回滚均逐文件复制');
+    assert(copies.every(line => /-LiteralPath/.test(line) && /-ErrorAction Stop/.test(line)), '不能静默吞掉非终止复制错误或展开通配符');
+    assert(script.indexOf("throw 'backup verification failed'") < script.indexOf('$copyStarted = $true'), '备份完整性通过前不得覆盖');
+    assert(script.includes('Test-Files $dst $files'), '成功依赖每个目标程序文件，而非 EXE 存在');
+    assert(script.includes('Test-Files $dst $original'), '回滚成功依赖每个原文件的哈希和大小');
+    assert(script.includes("$rollback = 'unverified'") && script.includes("$rollback = 'restored'"), '必须分别标记真实回滚结果');
+    assert(/foreach \(\$rel in \$missing\)[\s\S]*Remove-Item -LiteralPath \$target -Force -ErrorAction Stop/.test(script), '回滚清理本轮新增文件');
+    assert(!/Remove-Item -LiteralPath \$target[^\r\n]*-Recurse/.test(script), '不得递归清除用户目录');
+    assert(script.includes('ReparsePoint'), '已有联接点不能让逐文件复制越过目标边界');
+  });
+
+  await test('便携脚本：失败保留载荷/备份/凭条，成功清理严格位于完整验证之后', () => {
+    const root = mkTmp();
+    const payload = path.join(root, 'payload');
+    portablePayload(payload);
+    const script = mkUpdater(root).apply({ mode: 'zip', payload, version: '1.2.3' }, { spawn: false });
+    const rollback = script.slice(script.indexOf('if (-not $ok -and $copyStarted)'), script.indexOf('if ($ok) {'));
+    assert(!/Remove-Item -LiteralPath \$(src|bak)/.test(rollback), '失败回滚不能删除恢复材料');
+    assert(/if \(\$ok\) \{\r\n  Remove-Item -LiteralPath \$bak -Recurse -Force\r\n  Remove-Item -LiteralPath \$src -Recurse -Force/.test(script));
+    assert(/if \(-not \$ok\) \{ exit 1 \}[\s\S]*Remove-Item -LiteralPath/.test(script), '失败退出必须位于下载目录清理之前');
+    assert(/version = \$want; log = \$log; rollback = \$rollback; backup = \$bak; payload = \$src; error = \$reason/.test(script), '失败记录须包含真实恢复状态和保留路径');
+    assert(script.includes('[IO.File]::WriteAllText('), '失败标记无 BOM，主进程可直接 JSON.parse');
+    assert(script.includes("$canRestart = $false\r\n  $rollback = 'unverified'"), '回滚未验证时不能启动半新半旧程序');
+  });
+
+  await test('便携手动重试使用独立备份；同版本自动重试跨实例阻止，复制次数有限', () => {
+    const root = mkTmp();
+    const payload = path.join(root, 'payload');
+    portablePayload(payload);
+    const u = mkUpdater(root);
+    const job = { mode: 'zip', payload, version: '1.2.3' };
+    const first = u.apply(job, { spawn: false });
+    const firstBak = first.match(/^\$bak = '([^']+)'/m)[1];
+    fs.mkdirSync(firstBak, { recursive: true });
+    fs.writeFileSync(path.join(firstBak, 'recover.txt'), 'earlier recovery material');
+    const second = u.apply(job, { spawn: false });
+    const secondBak = second.match(/^\$bak = '([^']+)'/m)[1];
+    assert(firstBak !== secondBak, '重试不能覆盖之前的恢复备份');
+    eq(fs.readFileSync(path.join(firstBak, 'recover.txt'), 'utf8'), 'earlier recovery material');
+    assert(new Updater({ dataDir: u.dataDir }).autoApplyBlocked('v1.2.3'), '失败标记尚未写入也能持久阻止自动循环');
+    eq(u.autoApplyBlocked('1.2.4'), false, '新版本仍可自动更新');
+    eq(JSON.parse(fs.readFileSync(path.join(u.updateDir, 'auto-attempts.json'))).versions.length, 1);
+    assert(second.includes('for ($i = 1; $i -le 12; $i++)') && second.includes('if ($i -lt 12)'), '只允许有限重试，最后一次失败不继续等待');
+    assert(!/while\s*\(\$true\)/i.test(second), '不得无限复制重试');
+  });
+
+  console.log('\n[便携更新：仅临时 fixture，策略允许时执行 PowerShell]');
+  const canRunPowerShellFixtures = windowsFixturesAllowed();
+  const portableScenarios = [
+    { name: 'asar:false 全部文件与目标版本匹配' },
+    { name: '同大小旧代码被静默遗漏', fault: 'same-size-old', rollback: 'restored', passes: 12 },
+    { name: '非终止部分复制错误', fault: 'copy-error', rollback: 'restored', passes: 12 },
+    { name: '临时复制失败第二次成功', fault: 'transient', passes: 1 },
+    { name: '目标 package.json 未写入', fault: 'missing-package', rollback: 'restored', passes: 12 },
+    { name: '目标 version 仍是旧版', fault: 'wrong-version', rollback: 'restored', passes: 12 },
+    { name: '备份复制失败不覆盖原程序', fault: 'backup-error', rollback: 'not-attempted' },
+    { name: '载荷在生成脚本之后被同大小改写', fault: 'payload-changed', rollback: 'not-attempted' },
+    { name: '复制/回滚均报错但原文件确未变化仍可重启旧版', fault: 'unchanged-copy-error', rollback: 'restored', passes: 12 },
+    { name: '回滚复制失败如实标记且不启动混合版本', fault: 'rollback-error', rollback: 'unverified', passes: 12 },
+    { name: '失败标记无法写入仍阻止自动循环', fault: 'marker-error', rollback: 'restored', passes: 12 },
+  ];
+  for (const row of canRunPowerShellFixtures ? portableScenarios : []) {
+    await test(`便携更新：${row.name}`, () => {
+      const root = path.join(mkTmp(), "portable ' [夹具]");
+      const u = mkUpdater(root);
+      u.dataDir = path.join(u.installDir, 'user-data');
+      const version = '1.2.3';
+      const downloadDir = path.join(u.updateDir, version);
+      const payload = path.join(downloadDir, 'payload');
+      portablePayload(u.installDir, '0.0.1');
+      portablePayload(payload, version);
+      fs.writeFileSync(u.exePath, 'MZ-old');
+      const mainRel = path.join('resources', 'app', 'src', 'main.js');
+      fs.writeFileSync(path.join(u.installDir, mainRel), 'code-old');
+      // 新旧代码等大小、等修改时间；只比较存在/大小/时间都会误判。
+      const sameTime = new Date('2026-01-01T00:00:00Z');
+      for (const base of [u.installDir, payload]) fs.utimesSync(path.join(base, mainRel), sameTime, sameTime);
+      const newOnly = path.join('resources', 'app', 'new-only.js');
+      fs.writeFileSync(path.join(payload, newOnly), 'new file');
+      fs.writeFileSync(path.join(payload, 'resources', 'app', 'src', "界面'[1].js"), 'quoted code');
+      const protectedFiles = ['resources/runtime/avd/user.img', 'user-data/apps.json', 'legacy.txt'];
+      for (const rel of protectedFiles) {
+        fs.mkdirSync(path.dirname(path.join(u.installDir, rel)), { recursive: true });
+        fs.writeFileSync(path.join(u.installDir, rel), 'keep ' + rel);
+        if (rel !== 'legacy.txt') {
+          fs.mkdirSync(path.dirname(path.join(payload, rel)), { recursive: true });
+          fs.writeFileSync(path.join(payload, rel), 'must not overwrite user contents');
+        }
+      }
+      const zip = path.join(downloadDir, 'fixture.zip');
+      fs.writeFileSync(zip, 'retained source archive');
+      const earlier = path.join(u.updateDir, 'backup-earlier');
+      fs.mkdirSync(earlier, { recursive: true });
+      fs.writeFileSync(path.join(earlier, 'recovery.txt'), 'earlier attempt');
+      const files = u._assertPayload(payload, { version });
+      const script = u.apply({ mode: 'zip', payload, version, files }, { spawn: false });
+      if (row.fault === 'payload-changed') fs.writeFileSync(path.join(payload, mainRel), 'code-bad');
+      const failure = path.join(u.updateDir, 'failed.json');
+      if (row.fault === 'marker-error') fs.mkdirSync(failure);
+      const r = runPortableFixture(root, script, row.fault);
+      const log = fs.readFileSync(path.join(u.updateDir, 'update.log'), 'utf8');
+      eq(r.status, row.rollback ? 1 : 0, `${log}\n${r.error || r.stderr}`);
+      eq((log.match(/copy pass \d+ failed/g) || []).length, row.passes || 0, '重试次数有限且成功立即停止');
+      eq(log.includes('fixture restart:'), row.rollback !== 'unverified', '只启动已验证的新程序或恢复后的旧程序');
+      eq(fs.existsSync(payload), !!row.rollback, '失败不得删除载荷');
+      eq(fs.existsSync(zip), !!row.rollback, '失败不得清理源 ZIP');
+      eq(fs.existsSync(path.join(u.updateDir, 'pending.json')), !!row.rollback, '只在成功后清理待安装凭条');
+      assert(new Updater({ dataDir: u.dataDir }).autoApplyBlocked(version), '跨实例阻止同版本自动重试');
+      assert(!u.autoApplyBlocked('1.2.4'), '新版本不受阻止');
+      eq(fs.readFileSync(path.join(earlier, 'recovery.txt'), 'utf8'), 'earlier attempt', '不得清理或覆盖上一次备份');
+      for (const rel of protectedFiles) eq(fs.readFileSync(path.join(u.installDir, rel), 'utf8'), 'keep ' + rel, '用户内容应保持原样');
+      if (row.rollback) {
+        if (row.fault === 'marker-error') assert(log.includes('could not write update failure marker'));
+        else {
+          const marker = JSON.parse(fs.readFileSync(failure, 'utf8'));
+          eq(marker.version, version);
+          eq(marker.rollback, row.rollback);
+          eq(marker.payload, payload);
+          assert(marker.error, '失败记录应说明实际错误');
+          if (row.rollback !== 'not-attempted') {
+            assert(fs.existsSync(marker.backup), '失败备份必须保留');
+            eq(fs.readFileSync(path.join(marker.backup, mainRel), 'utf8'), 'code-old');
+            assert(!fs.existsSync(path.join(marker.backup, 'resources', 'runtime')), '不复制用户运行时');
+          }
+        }
+        if (row.rollback !== 'unverified') {
+          eq(fs.readFileSync(path.join(u.installDir, mainRel), 'utf8'), 'code-old');
+          eq(fs.readFileSync(u.exePath, 'utf8'), 'MZ-old');
+          eq(JSON.parse(fs.readFileSync(path.join(u.installDir, 'resources', 'app', 'package.json'))).version, '0.0.1');
+          assert(!fs.existsSync(path.join(u.installDir, newOnly)), '回滚不得残留本次新增代码');
+        }
+      } else {
+        assert(!fs.existsSync(failure), '成功不得留下失败记录');
+        for (const entry of files) {
+          const bytes = fs.readFileSync(path.join(u.installDir, entry.path));
+          eq(bytes.length, entry.size);
+          eq(require('crypto').createHash('sha256').update(bytes).digest('hex'), entry.sha256);
+        }
+        eq(fs.readdirSync(u.updateDir).filter(name => name.startsWith('backup-')).join(','), 'backup-earlier');
+      }
+    });
+  }
 
   console.log('\n[安装版 Setup.exe 校验（0.6.3 新增）]');
 
@@ -463,7 +763,7 @@ async function main() {
     }
     fs.writeFileSync(fixture, '\ufeff' + prelude.join('\r\n') + '\r\n' + script);
     return spawnSync(ps, [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixture,
+      '-NoProfile', '-NonInteractive', '-File', fixture,
     ], { encoding: 'utf8', timeout: 60000 });
   }
 
@@ -484,8 +784,7 @@ async function main() {
     { name: '退出为零且版本匹配', installer: [writeNew, cmdExit(0)] },
   ];
 
-  if (process.platform !== 'win32') console.log('  跳过：需要 Windows PowerShell 与 robocopy');
-  for (const row of process.platform === 'win32' ? scenarios : []) {
+  for (const row of canRunPowerShellFixtures ? scenarios : []) {
     await test(`★ 安装版更新：${row.name}`, () => {
       const root = mkTmp();
       try {
@@ -558,8 +857,7 @@ async function main() {
     return result;
   }
 
-  if (process.platform !== 'win32') console.log('  跳过：8.3 短名需要 Windows');
-  for (const rollback of process.platform === 'win32' ? [false, true] : []) {
+  for (const rollback of canRunPowerShellFixtures ? [false, true] : []) {
     const root = mkTmp();
     try {
       const short = shortPath(root);
@@ -801,20 +1099,36 @@ async function main() {
     assert(!launched, '非 Windows 平台不应调用 Windows 的 launch 回调');
   });
 
-  await test('launch 回调失败时会退到 explorer / spawn，三级都失败才抛错', async () => {
+  await test('launch 回调失败时会退到 explorer / spawn，三级都失败才抛错（不启动任何真实进程）', async () => {
     if (process.platform !== 'win32') return;
     const root = mkTmp();
-    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+    const file = path.join(__dirname, '..', 'src', 'core', 'updater.js');
+    const localRequire = require('module').createRequire(file);
+    const calls = [];
+    let failAll = false;
+    const context = { module: { exports: {} }, __dirname: path.dirname(file), process, Buffer,
+      require: name => name === 'child_process' ? { spawn: (cmd) => {
+        calls.push(cmd);
+        if (failAll || cmd === 'explorer.exe') throw new Error('fixture unavailable');
+        return { unref() {} };
+      } } : localRequire(name) };
+    require('vm').runInNewContext(fs.readFileSync(file, 'utf8'), context, { filename: file });
+    const launch = context.module.exports.Updater.prototype._launch;
     const u = mkUpdater(root);
-    const r = u.apply({ mode: 'setup', payload: setup, version: '9.9.9' }, {
-      launch: () => 'no handler',
-    });
-    // explorer 与 spawn 都是 best-effort，能起来就行；这里只要求「不抛错且给了 via」
-    assert(r.ok === true && typeof r.via === 'string', '应当给出实际使用的启动方式');
+    const args = [path.join(root, 'apply.cmd'), path.join(root, 'apply.ps1'), { launch: () => 'no handler' }];
+    eq(launch.call(u, ...args).via, 'spawn', 'explorer 失败应继续回退');
+    eq(calls.length, 2, '所有启动行为均被隔离 stub 接管');
+    failAll = true;
+    await expectThrow(() => launch.call(u, ...args), /无法启动升级脚本/);
   });
 
+  if (!canRunPowerShellFixtures) {
+    console.log(`\n隔离 PowerShell 执行已跳过：${portableScenarios.length} 个便携用例、${scenarios.length} 个安装版用例、2 个短路径用例（不覆盖系统限制）`);
+  }
   console.log(`\n更新器安全测试：${passed} 通过，${failed} 失败`);
   process.exitCode = failed ? 1 : 0;
 }
 
-main().catch((e) => { console.error(e); process.exitCode = 1; });
+main().catch((e) => { console.error(e); process.exitCode = 1; }).finally(() => {
+  for (const root of tmpRoots) fs.rmSync(root, { recursive: true, force: true });
+});

@@ -18,6 +18,7 @@ const net = require('net');
 const { isDeepStrictEqual } = require('util');
 const { setTimeout: delay } = require('timers/promises');
 const { AdbClient } = require('../adb');
+const peripherals = require('../peripherals');
 
 const MONITOR_PORT_BASE = 5580;
 const cancelled = () => ({ ok: false, code: 'START_CANCELLED', error: 'QEMU 启动已取消' });
@@ -144,7 +145,8 @@ class QemuBackend {
 
   /**
    * 构建 QEMU 参数：q35 + WHPX/TCG + virtio 磁盘/网卡 + USB 平板/键盘 + adb hostfwd。
-   * @param {object} o { disk, iso, install, memoryMB, cores, adbPort, monitorPort, uefi, display }
+   * 外围设备参数由 peripherals 模块严格校验；空配置不添加任何摄像头/串口设备。
+   * @param {object} o { disk, iso, install, memoryMB, cores, adbPort, monitorPort, uefi, display, peripherals }
    */
   buildArgs(o = {}) {
     const accelInfo = o.accel || { whpx: false };
@@ -169,9 +171,20 @@ class QemuBackend {
       '-device', 'usb-tablet',
       '-device', 'usb-kbd',
       '-monitor', `tcp:127.0.0.1:${monitorPort},server,nowait`,
-      '-device', 'AC97,audiodev=snd0',
-      '-audiodev', 'sdl,id=snd0',
+      '-device', ['AC97', 'audiodev=snd0'].join(','),
+      '-audiodev', ['sdl', 'id=snd0'].join(','),
     ];
+
+    // 读取显式传入的启动配置，否则读取同一份 settings.peripherals。
+    // buildQemuArgs 对未支持的摄像头/刷新率抛出明确错误，不能静默丢弃。
+    const configuredPeripherals = o.peripherals !== undefined
+      ? o.peripherals
+      : ((this.settings && this.settings.peripherals) || undefined);
+    args.push(...peripherals.buildQemuArgs(configuredPeripherals, {
+      backend: 'qemu',
+      serialId: o.serialId,
+    }));
+
     if (o.display === 'none') args.push('-display', 'none');
 
     const firmware = this.ovmfFirmware();

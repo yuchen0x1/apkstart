@@ -1,5 +1,7 @@
 'use strict';
 /** 使用真实渲染层与 Chromium 键盘事件，后端调用只记录到内存。 */
+const fs = require('fs');
+const path = require('path');
 async function runInteractions({ win, fixture, check }) {
   const js = code => win.webContents.executeJavaScript(code);
   const settle = () => js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
@@ -127,6 +129,315 @@ async function runInteractions({ win, fixture, check }) {
   await fixture.respond('settings:set', original);
   await js('(async () => { state.settings=await api.getSettings(); state.info=await api.info(); })()');
   await js("wizard.deploying=false; document.getElementById('wizardMask').classList.remove('on'); document.getElementById('toastWrap').innerHTML=''");
+  const auditRoot = process.env.UI_AUDIT_DIR;
+  const capture = async name => {
+    if (!auditRoot) return;
+    const dir = path.join(auditRoot, process.env.UI_AUDIT_PHASE || 'after');
+    fs.mkdirSync(dir, { recursive: true });
+    await settle();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        fs.writeFileSync(path.join(dir, `upstream-${name}.png`), (await win.webContents.capturePage()).toPNG());
+        return;
+      } catch (error) {
+        if (attempt === 2) throw error;
+        await new Promise(resolve => setTimeout(resolve, 150 * (attempt + 1)));
+        await settle();
+      }
+    }
+  };
+  await runUpstreamFeatures({ win, fixture, check, capture });
   await settle();
 }
-module.exports = { runInteractions };
+module.exports = { runInteractions, runUpstreamFeatures };
+
+/**
+ * Upstream #102/#110 acceptance: camera configuration, isolated instances and
+ * the explicit panel-only recorder. Every request goes to the in-memory fixture;
+ * no ADB, QEMU, filesystem picker, camera or network is reached.
+ */
+async function runUpstreamFeatures({ win, fixture, check, capture = async () => {} }) {
+  const js = code => win.webContents.executeJavaScript(code);
+  const settle = () => js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
+  const waitFor = async (expression, timeout = 5000) => {
+    await js(`new Promise((resolve, reject) => {
+      const deadline = performance.now() + ${timeout};
+      const poll = () => {
+        if (${expression}) return resolve(true);
+        if (performance.now() > deadline) return reject(new Error('UI 条件等待超时：' + ${JSON.stringify(expression)}));
+        setTimeout(poll, 20);
+      };
+      poll();
+    })`);
+  };
+  const waitForCall = async (channel, start, predicate = () => true, timeout = 5000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const call = fixture.calls.slice(start).find(candidate => candidate.channel === channel && predicate(candidate));
+      if (call) return call;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    throw new Error(`UI 条件等待超时：未收到 ${channel}`);
+  };
+  const click = async selector => {
+    await js(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) throw new Error('缺少界面元素：' + ${JSON.stringify(selector)});
+      el.click();
+    })()`);
+    await settle();
+  };
+  const open = async section => {
+    await js(`openSettings({section:${JSON.stringify(section)}})`);
+    await waitFor(`document.getElementById('settingsMask').classList.contains('on')
+      && !!document.querySelector(${JSON.stringify(`.set-sec[data-sec="${section}"]`)})
+      && document.querySelector(${JSON.stringify(`.set-sec[data-sec="${section}"]`)}).classList.contains('on')
+      && document.getElementById('settingsLoading').hidden && !document.getElementById('setBody').inert`);
+    await settle();
+  };
+  const section = async name => { await js(`openSettingsSection(${JSON.stringify(name)})`); await settle(); };
+  const setTheme = async theme => {
+    await js(`window.apkTheme.save(${JSON.stringify(theme)})`);
+    await waitFor(theme === 'system'
+      ? "window.apkTheme.preference==='system' && ['light','dark'].includes(document.documentElement.dataset.theme)"
+      : `window.apkTheme.preference===${JSON.stringify(theme)} && document.documentElement.dataset.theme===${JSON.stringify(theme)}`);
+    await settle();
+  };
+  const changeLanguage = async lang => {
+    await js(`changeLanguage(${JSON.stringify(lang)})`);
+    await waitFor(`window.apkI18n && window.apkI18n.lang===${JSON.stringify(lang)} && !languageBusy`);
+    await settle();
+  };
+  const selectValue = async (id, value) => {
+    await js(`(() => {
+      const el = document.getElementById(${JSON.stringify(id)});
+      if (!el) throw new Error('缺少控件：' + ${JSON.stringify(id)});
+      el.value = ${JSON.stringify(value)};
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await settle();
+  };
+
+  const expectedScale = Number(process.env.UI_AUDIT_SCALE || 1);
+  const observedScale = await js('devicePixelRatio');
+  check('新增功能面板在默认/指定显示比例下可渲染', Math.abs(observedScale - expectedScale) < 0.01,
+    { requested: expectedScale, observed: observedScale });
+
+  await open('automation');
+  await waitFor("document.querySelector('#automationPanel [data-automation=target]')?.textContent.includes('检测到')");
+  const notice = await js("document.querySelector('#automationPanel [data-automation=notice]')?.textContent || ''");
+  check('自动化面板明示仅记录本面板，不监听原生窗口/全局键盘', notice.includes('只记录本面板')
+    && notice.includes('不录原生窗口/全局键盘') && notice.includes('不是全局真实输入录制'), notice);
+  check('自动化面板自带 tap/swipe/key/text/wait、录制、回放、取消与 JSON 编辑框', await js(
+    "['tap-form','swipe-form','key-form','text-form','wait-form','record-start','record-stop','replay','cancel','json'].every(name => !!document.querySelector('[data-automation=\"' + name + '\"]'))"));
+  for (const theme of ['light', 'dark']) {
+    await setTheme(theme);
+    await capture(`automation-${theme}`);
+    const layout = await js(`(() => {
+      const panel = document.getElementById('automationPanel');
+      const body = document.getElementById('setBody');
+      return { visible: !!panel && panel.getClientRects().length > 0, overflow: !!panel && panel.scrollWidth > panel.clientWidth + 1,
+        bodyOverflow: !!body && body.scrollWidth > body.clientWidth + 1 };
+    })()`);
+    check(`自动化面板${theme}主题可见、无横向溢出`, layout.visible && !layout.overflow && !layout.bodyOverflow, layout);
+  }
+  await setTheme('light');
+
+  // Camera selection is saved through the real renderer event path and read back
+  // after closing/reopening settings. "List host cameras" is fixture-only.
+  await section('display');
+  const webcamStart = fixture.calls.length;
+  await click('#btnListWebcams');
+  const listed = await waitForCall('peripherals:webcams', webcamStart);
+  await waitFor("[...document.querySelectorAll('#setCameraBack option')].some(option => option.value === 'webcam0')");
+  check('列出主机摄像头使用固定夹具设备并仅在用户点击后执行', listed && await js("document.getElementById('setCameraBack').value==='none'"));
+  const cameraSaveStart = fixture.calls.length;
+  await selectValue('setCameraBack', 'webcam0');
+  const cameraSave = await waitForCall('settings:set', cameraSaveStart,
+    call => call.payload?.peripherals?.cameraBack === 'webcam0');
+  check('摄像头选择保存到 peripherals.cameraBack', !!cameraSave
+    && await js("document.getElementById('setCameraBack').value==='webcam0'"), cameraSave?.payload);
+  await js("closeSettings()"); await settle();
+  await open('display');
+  check('重新打开设置读回已保存的摄像头配置', await js("document.getElementById('setCameraBack').value==='webcam0'"));
+  const refreshStart = fixture.calls.length;
+  await click('#btnVerifyRefresh');
+  await waitFor("document.getElementById('refreshRateStatus').textContent.includes('客机 60 Hz')");
+  check('刷新率读回显示客机活动值并标注与请求一致', await js("document.getElementById('refreshRateStatus').textContent.includes('与请求一致')"));
+  const rateStart = fixture.calls.length;
+  await selectValue('setRefreshRate', '120');
+  await waitForCall('settings:set', rateStart, call => call.payload?.peripherals?.refreshRate === 120);
+  await click('#btnVerifyRefresh');
+  await waitFor("document.getElementById('refreshRateStatus').textContent.includes('与请求不一致')");
+  check('刷新率请求与实际读回不一致时如实提示', await js("document.getElementById('refreshRateStatus').textContent.includes('与请求不一致')"));
+  await js("(async () => { state.settings = await api.setSettings({ peripherals: { cameraBack:'none', cameraFront:'none', refreshRate:60, serialPort:'' } }); fillSettings(state.settings); })()");
+  check('摄像头与刷新率夹具调用未触碰真实设备/网络', fixture.calls.slice(webcamStart).every(call =>
+    !/^(shell:|adb:|runtime:(start|stop)|app:launch)/.test(call.channel)));
+
+  // Isolated instances: create, launch the selected app, then refresh its state.
+  await section('automation');
+  await waitFor("!instancesBusy && !!document.querySelector('#instancesList')");
+  await waitFor("[...document.querySelectorAll('#instanceApp option')].length >= 3");
+  await js(`(() => {
+    document.getElementById('instanceName').value = '工作分身';
+    const select = document.getElementById('instanceApp');
+    select.value = 'com.example.reader';
+  })()`);
+  const instanceStart = fixture.calls.length;
+  await click('#btnCreateInstance');
+  const created = await waitForCall('instances:create', instanceStart);
+  await waitFor("document.getElementById('instancesList').textContent.includes('工作分身')");
+  const instances = await fixture.respond('instances:list');
+  const instanceId = instances.find(item => item.name === '工作分身')?.id;
+  check('创建分身记录名称并在列表中显示', created?.payload?.name === '工作分身'
+    && !!instanceId && await js("document.getElementById('instancesList').textContent.includes('工作分身')"), created?.payload);
+  const launchStart = fixture.calls.length;
+  await js("document.querySelector('#instancesList button').click()");
+  const launched = await waitForCall('instances:launch', launchStart);
+  await waitFor("document.querySelector('#toastWrap').textContent.includes('已发送到分身')");
+  check('在分身中打开只把当前选择的应用发给指定分身', launched?.payload?.id === instanceId
+    && launched?.payload?.package === 'com.example.reader', launched?.payload);
+  const refreshInstancesStart = fixture.calls.length;
+  await click('#btnRefreshInstances');
+  await waitForCall('instances:list', refreshInstancesStart);
+  await waitFor("document.getElementById('instancesList').textContent.includes('已启动')");
+  check('刷新分身列表读回运行状态且未调用主实例启动入口', !fixture.calls.slice(instanceStart).some(call => call.channel === 'app:launch')
+    && await js("document.getElementById('instancesList').textContent.includes('已启动')"));
+
+  fixture.setResponse('instances:list', () => [{ id: instanceId, name: '归属待核验',
+    state: 'unknown', running: false, external: true, needsVerification: true }]);
+  await click('#btnRefreshInstances');
+  await waitFor("!instancesBusy && document.getElementById('instancesList').textContent.includes('需手动核验')");
+  const unknownStart = fixture.calls.length;
+  await js("document.querySelector('#instancesList button').click()");
+  await settle();
+  check('分身归属未知时显示需手动核验并阻止重复启动',
+    await js("document.querySelector('#instancesList button').disabled && !document.getElementById('instancesList').textContent.includes('未启动')")
+    && !fixture.calls.slice(unknownStart).some(call => call.channel === 'instances:launch'));
+  fixture.clearResponse('instances:list');
+  await click('#btnRefreshInstances');
+  await waitFor("!instancesBusy && document.getElementById('instancesList').textContent.includes('工作分身')");
+
+  // Panel-only recording and replay. The local bridge records only actions that
+  // this panel successfully sent; it is not a native window or global recorder.
+  await section('automation');
+  await waitFor("document.querySelector('#automationPanel [data-automation=target]')?.textContent.includes('检测到')");
+  await click('#automationPanel [data-automation=bind]');
+  await waitFor("document.querySelector('#automationPanel [data-automation=target]')?.textContent.includes('已绑定')");
+  const recordStart = fixture.calls.length;
+  await click('#automationPanel [data-automation=record-start]');
+  await waitFor("document.querySelector('#automationPanel [data-automation=record-state]').textContent.includes('正在录制')");
+  await js(`(() => {
+    document.querySelector('#automationPanel [data-automation=tap-x]').value = '0.25';
+    document.querySelector('#automationPanel [data-automation=tap-y]').value = '0.75';
+  })()`);
+  const actionStart = fixture.calls.length;
+  await click('#automationPanel [data-automation=tap-send]');
+  const action = await waitForCall('automation:action', actionStart);
+  await waitFor("!document.querySelector('#automationPanel fieldset').disabled");
+  check('面板显式点击通过自动化 IPC 发送到绑定目标', action?.payload?.target?.instanceId === 'ui-session-1'
+    && action?.payload?.action?.type === 'tap' && action?.payload?.action?.x === 0.25
+    && action?.payload?.action?.y === 0.75, action?.payload);
+  const keyCount = fixture.calls.filter(call => call.channel === 'automation:action').length;
+  await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true })); window.dispatchEvent(new MouseEvent('click', { bubbles: true }));");
+  await settle();
+  check('面板外的全局键盘/点击不会被采集为自动化动作',
+    fixture.calls.filter(call => call.channel === 'automation:action').length === keyCount);
+  await click('#automationPanel [data-automation=record-stop]');
+  await waitFor("document.querySelector('#automationPanel [data-automation=json]').value.length > 0");
+  await waitFor("!document.querySelector('#automationPanel [data-automation=json]').disabled");
+  const recorded = JSON.parse(await js("document.querySelector('#automationPanel [data-automation=json]').value"));
+  check('停止录制得到可导入的 JSON，坐标保持 0..1 规范化值', recorded.version === 1
+    && recorded.target?.instanceId === 'ui-session-1'
+    && recorded.actions.some(item => item.type === 'tap' && item.x === 0.25 && item.y === 0.75), recorded);
+
+  const importStart = fixture.calls.length;
+  await js(`(() => {
+    const editor = document.querySelector('#automationPanel [data-automation=json]');
+    editor.value = ${JSON.stringify(JSON.stringify(recorded))};
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await click('#automationPanel [data-automation=import]');
+  await waitForCall('automation:validate', importStart);
+  await waitFor("!document.querySelector('#automationPanel [data-automation=json]').disabled");
+  check('JSON 只校验/导入文本，不会自动执行', !fixture.calls.slice(importStart).some(call => call.channel === 'automation:run'));
+  const invalidStart = fixture.calls.length;
+  await js(`(() => {
+    const editor = document.querySelector('#automationPanel [data-automation=json]');
+    editor.value = ${JSON.stringify(JSON.stringify({
+      version: 1, target: { packageName: 'com.example.notes', serial: 'ui-fixture', instanceId: 'ui-session-1' },
+      actions: [{ type: 'exec', command: 'id' }],
+    }))};
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await click('#automationPanel [data-automation=import]');
+  await waitFor("document.querySelector('#automationPanel [data-automation=status]').textContent.includes('仅允许 tap/swipe/key/text/wait')");
+  await waitFor("!document.querySelector('#automationPanel [data-automation=json]').disabled");
+  check('导入非法 exec 动作被拒绝且没有执行请求', !fixture.calls.slice(invalidStart).some(call => call.channel === 'automation:run'));
+  await js(`(() => {
+    const editor = document.querySelector('#automationPanel [data-automation=json]');
+    editor.value = ${JSON.stringify(JSON.stringify(recorded))};
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await click('#automationPanel [data-automation=import]');
+  const replayStart = fixture.calls.length;
+  await click('#automationPanel [data-automation=replay]');
+  const replay = await waitForCall('automation:run', replayStart);
+  await waitFor("document.querySelector('#automationPanel [data-automation=status]').textContent.includes('回放已完成')");
+  await waitFor("!document.querySelector('#automationPanel [data-automation=json]').disabled");
+  check('回放只发送经过校验、绑定同一实例的录制脚本', replay?.payload?.script?.actions?.some(item => item.type === 'tap')
+    && replay?.payload?.script?.target?.instanceId === 'ui-session-1');
+
+  let releaseRun, runRequested;
+  const pendingRun = new Promise(resolve => { releaseRun = resolve; runRequested = resolve; });
+  fixture.setResponse('automation:run', () => new Promise(resolve => {
+    releaseRun = resolve; runRequested();
+  }));
+  const cancelStart = fixture.calls.length;
+  await click('#automationPanel [data-automation=replay]');
+  await pendingRun;
+  await click('#automationPanel [data-automation=cancel]');
+  const cancelled = await waitForCall('automation:cancel', cancelStart);
+  releaseRun({ ok: false, status: 'cancelled' });
+  await settle();
+  const cancelFeedback = await js("document.querySelector('#automationPanel [data-automation=status]').textContent");
+  check('回放中取消会调用自动化取消入口并保留停止反馈', !!cancelled
+    && /已请求停止|回放已取消/.test(cancelFeedback), cancelFeedback);
+  fixture.clearResponse('automation:run');
+
+  // Translation coverage of the new settings headings plus the camera labels.
+  const expected = {
+    'en-US': ['Isolated instance', 'Action scripts and panel recording'],
+    'es-ES': ['Instancia aislada', 'Scripts de acciones y grabación del panel'],
+    'vi-VN': ['Phiên bản độc lập', 'Tập lệnh thao tác và ghi bảng điều khiển'],
+    'ru-RU': ['Изолированный экземпляр', 'Скрипты действий и запись панели'],
+  };
+  const bindLabels = {
+    'en-US': 'Bind current app instance',
+    'es-ES': 'Vincular la instancia actual de la aplicación',
+    'vi-VN': 'Liên kết phiên bản ứng dụng hiện tại',
+    'ru-RU': 'Привязать текущий экземпляр приложения',
+  };
+  for (const [lang, titles] of Object.entries(expected)) {
+    await changeLanguage(lang);
+    const actual = await js("[...document.querySelectorAll('.set-sec[data-sec=\"automation\"] .group-title')].map(node => node.textContent)");
+    check(`新增面板标题在 ${lang} 下切换为本地译文`, titles.every(title => actual.includes(title)), actual);
+    const panel = await js("({bind:document.querySelector('#automationPanel [data-automation=bind]').textContent, notice:document.querySelector('#automationPanel [data-automation=notice]').textContent})");
+    check(`自动化内部按钮与安全说明在 ${lang} 下完成翻译`, panel.bind === bindLabels[lang]
+      && !!panel.notice && !/[\u3400-\u9fff]/u.test(panel.notice), panel);
+  }
+  await section('display');
+  await changeLanguage('es-ES');
+  check('摄像头设置标签切换为西班牙语', await js("document.querySelector('label[for=setCameraBack]').textContent==='Cámara trasera'"));
+  await changeLanguage('ru-RU');
+  check('摄像头设置标签切换为俄语', await js("document.querySelector('label[for=setCameraBack]').textContent==='Задняя камера'"));
+  await changeLanguage('vi-VN');
+  check('摄像头设置标签切换为越南语', await js("document.querySelector('label[for=setCameraBack]').textContent==='Camera sau'"));
+  await changeLanguage('zh-CN');
+  check('新增摄像头设置标签切回中文', await js("document.querySelector('label[for=setCameraBack]').textContent==='后置摄像头'"));
+
+  await js("(async () => { state.settings = await api.setSettings({ peripherals: { cameraBack:'none', cameraFront:'none', refreshRate:60, serialPort:'' } }); fillSettings(state.settings); })()");
+  await setTheme('system');
+  await js("closeSettings(); document.getElementById('toastWrap').innerHTML=''");
+  await settle();
+}

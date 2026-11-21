@@ -8,6 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const instanceAdb = require('./instance-adb');
 
 // 常见安装位置。Windows 那几条是模拟器/手机助手自带的 adb；非 Windows 用
 // Android Studio 与发行版包管理器的位置（upstream #24：以前这张表全是 .exe，
@@ -219,7 +220,8 @@ function parseStatList(text) {
 
 class AdbClient {
   constructor({ adbPath, serial }) {
-    this.adbPath = adbPath || 'adb';
+    this._adbRoute = instanceAdb.route(); // Child construction before initialize must fail closed.
+    this.adbPath = instanceAdb.executable(adbPath || 'adb', this._adbRoute);
     this.serial = serial || '';
     this._input = null;        // 常驻 `adb shell` 进程
     this._inputSeq = 0;
@@ -227,6 +229,8 @@ class AdbClient {
   }
 
   static resolveAdb(explicit, appRoot) {
+    const route = instanceAdb.route();
+    if (route.isChild) return route.adbPath;
     const adbName = process.platform === 'win32' ? 'adb.exe' : 'adb';
     const candidates = [
       explicit,
@@ -242,23 +246,23 @@ class AdbClient {
   _args(args, withSerial = true) {
     const a = [];
     if (withSerial && this.serial) a.push('-s', this.serial);
-    return a.concat(args);
+    return instanceAdb.clientArgs(a.concat(args), this._adbRoute);
   }
 
   _adbEnv() {
-    return { ...process.env, ANDROID_ADB_SERVER_PORT: process.env.ANDROID_ADB_SERVER_PORT || '5044' };
+    return instanceAdb.environment(this._adbRoute);
   }
 
   exec(args, { timeout = 30000, withSerial = true, binary = false } = {}) {
     return new Promise((resolve, reject) => {
       const finalArgs = this._args(args, withSerial);
-      execFile(this.adbPath, finalArgs, {
+      execFile(instanceAdb.executable(this.adbPath, this._adbRoute), finalArgs, {
         timeout,
         maxBuffer: 64 * 1024 * 1024,
         encoding: binary ? 'buffer' : 'utf8',
         windowsHide: true,
-        // 与运行时模拟器共用专用 adb server 端口（默认 5044），与 5037 上的
-        // WSA / 第三方模拟器 adb 隔离，避免注册被反复踢掉导致设备 offline
+        // 构造时固定路由；child 始终使用自己已确认存活的 foreground server，
+        // 不读取可漂移的路由变量，也不回退父实例 5044 / 系统 5037。
         env: this._adbEnv(),
       }, (err, stdout, stderr) => {
         if (err) {
@@ -288,11 +292,12 @@ class AdbClient {
    * 不会让滑动命令在 shell 里排成一长队。
    */
   _inputSession() {
+    instanceAdb.assertReady(this._adbRoute); // Also fence an already-open input session after daemon exit.
     const old = this._input;
     if (old && old.exitCode === null && !old.killed && old.stdin && old.stdin.writable) return old;
     if (old) this.disposeInput();
 
-    const p = spawn(this.adbPath, this._args(['shell'], true), {
+    const p = spawn(instanceAdb.executable(this.adbPath, this._adbRoute), this._args(['shell'], true), {
       stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: this._adbEnv(),
     });
     this._input = p;

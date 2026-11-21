@@ -3,6 +3,15 @@
 function createFixture() {
   const calls = [];
   const english = require('../../src/i18n/en-US.json');
+  const dictionaries = { 'en-US': english,
+    'es-ES': { ...english, ...require('../../src/i18n/es-ES.json') },
+    'vi-VN': { ...english, ...require('../../src/i18n/vi-VN.json') },
+    'ru-RU': { ...english, ...require('../../src/i18n/ru-RU.json') } };
+  const languages = [{ id: 'auto', label: '跟随系统' }, { id: 'zh-CN', label: '简体中文' },
+    { id: 'en-US', label: 'English' }, { id: 'es-ES', label: 'Español' },
+    { id: 'vi-VN', label: 'Tiếng Việt' }, { id: 'ru-RU', label: 'Русский' }];
+  const instances = [];
+  const automationTarget = { packageName: 'com.example.notes', serial: 'ui-fixture', instanceId: 'ui-session-1' };
   const platform = process.env.UI_AUDIT_PLATFORM || 'win32';
   const isWin = platform === 'win32';
   const path = require('path')[isWin ? 'win32' : 'posix'];
@@ -17,6 +26,7 @@ function createFixture() {
     engine: { mode: 'builtin', idleShutdownMinutes: 15, resourceMode: 'balanced', gpuMode: 'auto', windowMode: 'auto', memoryMB: 4096, cores: 4, autoMemory: true, audio: true, fastDns: true, liteMode: true, keepSnapshot: true, prewarm: false, mouseRightBack: true, mouseWheelMode: 'smooth' },
     runtime: { dir: 'D:\\ApkStart\\runtime', avdDir: 'D:\\ApkStart\\avd', systemImageFlavor: 'google_apis_playstore', selectedSystemId: 'google-play', downloadConnections: 8, installMode: 'guided', systemInstallMode: 'guided', autoMirror: true },
     display: { mode: 'window', size: 'auto', portrait: true, scale: 1 },
+    peripherals: { cameraBack: 'none', cameraFront: 'none', refreshRate: 60, serialPort: '' },
     update: { autoUpdate: false }, report: { auto: false, autoSend: false }, guest: { locale: 'zh-CN', groups: [] },
     sharedDir: 'D:\\ApkStartShared', deviceSharedDir: '/sdcard/ApkStartShared', device: '127.0.0.1:5555',
     autoConnect: true, createShortcutOnInstall: true, notifyOnInstall: true, autoStart: false,
@@ -58,7 +68,25 @@ function createFixture() {
       calls.push({ channel, payload });
       if (overrides.has(channel)) return overrides.get(channel)(payload);
       switch (channel) {
-        case 'app:i18n': return { lang: settings.language === 'en-US' ? 'en-US' : 'zh-CN', dict: settings.language === 'en-US' ? english : {} };
+        case 'app:i18n': return { lang: dictionaries[settings.language] ? settings.language : 'zh-CN', dict: dictionaries[settings.language] || {}, languages };
+        case 'instances:list': return instances;
+        case 'instances:create': {
+          const item = { id: `00000000-0000-4000-8000-${String(instances.length + 1).padStart(12, '0')}`, name: payload?.name || '测试分身', running: false };
+          instances.push(item); return { ok: true, ...item };
+        }
+        case 'instances:launch': {
+          const item = instances.find(value => value.id === payload?.id);
+          if (!item) return { ok: false, error: '分身不存在' };
+          item.running = true; return { ok: true, id: item.id };
+        }
+        case 'peripherals:webcams': return { ok: true, devices: [{ id: 'webcam0', name: 'Fixture camera' }] };
+        case 'peripherals:refresh': return { ok: true, status: Number(settings.peripherals.refreshRate) === 60 ? 'confirmed' : 'mismatch', activeRate: 60, modes: [{ id: 1, rate: 60 }] };
+        case 'automation:target': return { ok: true, target: automationTarget };
+        case 'automation:status': return { ok: true, running: false, status: 'idle', target: automationTarget };
+        case 'automation:validate': return { ok: true, script: payload?.script };
+        case 'automation:run': return { ok: true, status: 'completed', completed: payload?.script?.actions?.length || 0, target: automationTarget };
+        case 'automation:action': return { ok: true, status: 'completed', completed: 1, target: automationTarget };
+        case 'automation:cancel': return { ok: true, status: 'cancelled' };
         case 'app:theme': return { theme: settings.theme };
         case 'app:info': return { version: '0.8.0', name: 'ApkStart', platform: { platform, canEmbed:isWin, canIntegrateShell:isWin, canProvision:true, support:isWin?'full':'external', acceleration:{kind:isWin?'whpx':'kvm',ok:true} }, dataDir, ...resolvedPaths(), sharedDir: settings.sharedDir };
         case 'settings:get': return settings;

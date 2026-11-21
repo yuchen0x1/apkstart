@@ -8,12 +8,11 @@ const path = require('path');
 const os = require('os');
 const { randomUUID } = require('crypto');
 const { normalizePreference } = require('./theme');
+const instanceContext = require('./instance-context').current();
+const peripherals = require('./peripherals');
 
-// Linux 不能落 ~/AppData/Roaming：XDG 约定的数据目录是 ~/.local/share
-// （实测记录见 docs/PLATFORM-LINUX-VALIDATION.md 缺口 #2）
-const DATA_DIR = process.platform === 'linux'
-  ? path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'apkstart')
-  : path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'apkstart');
+// 每个分身使用独立清单、配置和缓存；基础目录由本机平台约定推导，不接受 IPC 路径。
+const DATA_DIR = instanceContext.dataDir;
 const ICON_DIR = path.join(DATA_DIR, 'icons');
 const APK_DIR = path.join(DATA_DIR, 'apks');
 const APPS_FILE = path.join(DATA_DIR, 'apps.json');
@@ -32,7 +31,7 @@ const DEFAULT_SETTINGS = {
     idleShutdownMinutes: 15,
     startVisible: true,
     // 必须带窗口：无头模式 SurfaceFlinger 不出 VSYNC，应用进程活着但屏幕上什么都没有。
-    // 带窗口的模拟器是原生 60fps + 原生鼠标键盘，ApkStart 只负责把它打扮成应用窗口。
+    // 带窗口保留原生输入；客机刷新率可配置，但不代表应用帧率或宿主呈现帧率。
     headless: false,
     gpuMode: 'auto',         // auto = 按 emulator 版本自动挑后端并逐级降级
     // 上次「拉起就崩」的渲染后端（格式 `<emulator版本>|<gpu>`）；auto 模式下下次把它排到最后，
@@ -136,6 +135,12 @@ const DEFAULT_SETTINGS = {
     selectedSystemId: 'google-play',
     systemCatalogUrl: '',       // 空 = 官方默认 raw.githubusercontent.com/.../system-catalog/catalog.json
     systemInstallMode: 'auto',  // auto = 能自动装就自动装；guided = 引导用户在虚拟机窗口完成安装
+  },
+  peripherals: {
+    cameraBack: 'none',       // none | emulated | webcamN；默认不访问主机摄像头
+    cameraFront: 'none',
+    refreshRate: 60,           // 客机显示模式请求，必须读回确认，不等于应用 FPS
+    serialPort: '',            // 只在明确支持的 QEMU 后端开放
   },
   sharedDir: path.join(os.homedir(), 'ApkStartShared'),
   deviceSharedDir: '/sdcard/ApkStartShared',
@@ -306,6 +311,7 @@ function resourcePreset(mode) {
 
 const store = {
   DATA_DIR, ICON_DIR, APK_DIR,
+  isChild: instanceContext.isChild,
 
   getSettings() {
     const s = deepMerge(DEFAULT_SETTINGS, readJson(SETTINGS_FILE, {}));
@@ -323,6 +329,25 @@ const store = {
     // 旧版本用 Android freeform 小窗，现在整个模拟器窗口就是应用窗口，
     // 应用必须铺满这块屏幕，否则会出现「窗口里再套一个小窗」。
     s.freeform = false;
+    s.peripherals = peripherals.normalizeSettings(s.peripherals);
+    if (instanceContext.isChild) {
+      s.runtime.avdDir = instanceContext.avdDir;
+      s.runtime.selectedSystemId = 'google-play';
+      s.runtime.systemImageFlavor = 'google_apis_playstore';
+      s.runtime.compatImage = true;
+      s.runtime.activeImageId = '';
+      s.runtime.diskPath = '';
+      s.runtime.isoPath = '';
+      s.engine.qemuPath = '';
+      s.engine.systemImage = '';
+      s.engine.mode = 'builtin';
+      s.engine.prewarm = false;
+      s.autoDeploy = false;
+      s.autoStart = false;
+      s.createShortcutOnInstall = false;
+      s.createStartMenuShortcut = false;
+      s.update.autoUpdate = false;
+    }
     return s;
   },
 
@@ -330,8 +355,27 @@ const store = {
     // 白名单过滤：settings:set 是渲染层直达的通用写入入口，未知键（或被构造的
     // runtime.*Url 之外的键）一律丢弃，避免配置文件被塞进任意内容。
     const safe = filterKnown(DEFAULT_SETTINGS, patch);
-    const next = deepMerge(this.getSettings(), safe);
+    const previous = this.getSettings();
+    if (instanceContext.isChild) {
+      // 子实例不能重新选择共享运行时、接管设备或修改全局系统集成。
+      delete safe.runtime;
+      delete safe.adbPath;
+      delete safe.device;
+      delete safe.autoStart;
+      delete safe.autoDeploy;
+      delete safe.createShortcutOnInstall;
+      delete safe.createStartMenuShortcut;
+      delete safe.update;
+      if (safe.engine) {
+        delete safe.engine.mode;
+        delete safe.engine.qemuPath;
+        delete safe.engine.systemImage;
+        delete safe.engine.prewarm;
+      }
+    }
+    const next = deepMerge(previous, safe);
     next.theme = normalizePreference(next.theme);
+    next.peripherals = peripherals.normalizeSettings(next.peripherals);
     // 只改了「资源策略」时，把它翻译成具体的三个开关，避免两套配置各说各话
     if (safe && safe.engine && safe.engine.resourceMode) {
       Object.assign(next.engine, resourcePreset(next.engine.resourceMode));

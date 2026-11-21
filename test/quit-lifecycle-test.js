@@ -19,7 +19,7 @@ const deferred = () => {
 };
 const stopEvent = () => ({ prevented: false, preventDefault() { this.prevented = true; } });
 
-function setup({ withMain = true } = {}) {
+function setup({ withMain = true, isChild = false } = {}) {
   const log = [], timers = new Set(), parks = [], windows = [], warnings = [];
   let now = 0, nativeOwner = null;
   const clock = {
@@ -126,7 +126,8 @@ function setup({ withMain = true } = {}) {
   const appWin = new mod.exports.AppWindow({ agent });
   appWin.onCloseApp(pkg => log.push(`stop:${pkg}`));
   appWin.onWindowClosed(pkg => log.push(`closed:${pkg}`));
-  const context = { ...clock, app, appWin, quitting: false, winAgent: agent,
+  const context = { ...clock, app, appWin, quitting: false, winAgent: agent, automation: null,
+    instanceContext: { isChild }, instanceAdb: { async dispose() { log.push('dispose:owned-adb'); } },
     runtimeActions: { drain: async () => true },
     sharer: { async stop() { log.push('stop:sharer'); return true; } }, notifier: { stop() { log.push('stop:notifier'); } },
     wheelRouter: { dispose() { log.push('dispose:wheel'); } }, runtime: { dispose() { log.push('dispose:runtime'); } },
@@ -616,6 +617,34 @@ test('quit drains real operation leases before parking windows or disposing the 
   await flush();
   once(h, 'park', 'dispose:runtime', 'quit-allowed');
 });
+test('child quit awaits only its private ADB disposer after draining runtime', async () => {
+  const h = setup({ isChild: true });
+  const pending = deferred();
+  h.context.instanceAdb.dispose = () => { h.log.push('dispose:owned-adb'); return pending.promise; };
+  assert(h.app.quit().prevented);
+  await flush();
+  once(h, 'dispose:runtime', 'dispose:owned-adb');
+  assert(h.log.indexOf('dispose:runtime') < h.log.indexOf('dispose:owned-adb'));
+  assert(!h.log.includes('quit-allowed'));
+  pending.resolve();
+  await flush();
+  once(h, 'dispose:owned-adb', 'quit-allowed');
+
+  const parent = setup();
+  parent.app.quit();
+  await flush();
+  once(parent, 'dispose:owned-adb', 'quit-allowed');
+});
+
+test('private ADB disposal failure does not skip final child shutdown', async () => {
+  const h = setup({ isChild: true });
+  h.context.instanceAdb.dispose = async () => { throw new Error('fixture disposal failed'); };
+  h.app.quit();
+  await flush();
+  once(h, 'destroy:decode', 'quit-allowed');
+  assert(h.warnings.some(message => message.includes('自有 ADB')));
+});
+
 test('quit waits for production Sharer.stop/join to drain before runtime disposal', async () => {
   const h = setup();
   const sharing = pendingSharing(h);

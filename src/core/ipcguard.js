@@ -59,6 +59,10 @@ const SHELL_CHANNELS = new Set([
 ]);
 const MAIN_CHANNELS = new Set([
   'app:info', 'app:i18n', 'app:theme', 'dialog:openDir', 'apps:list',
+  'instances:list', 'instances:create', 'instances:launch',
+  'peripherals:webcams', 'peripherals:refresh',
+  'automation:target', 'automation:status', 'automation:validate',
+  'automation:run', 'automation:action', 'automation:cancel',
   'apk:pick', 'apk:parse', 'apk:kind', 'apk:compat', 'apk:install', 'apk:reveal',
   'app:launch', 'app:uninstall', 'app:shortcut', 'app:clearData', 'app:pin',
   'app:revealApk', 'app:exportApk', 'app:backup', 'app:restore',

@@ -10,6 +10,7 @@
  * 用法：
  *   node test/run-electron.js smoke      # 界面冒烟（preload / 沙箱 / 首屏）
  *   node test/run-electron.js ui         # 双主题、键盘、窗口尺寸的隔离渲染回归
+ *   node test/run-electron.js upstream   # 多开、外设与面板录放的隔离验收
  *   node test/run-electron.js selftest   # 主进程自检（真实 IPC 通道）
  */
 const { spawn } = require('child_process');
@@ -27,6 +28,8 @@ if (mode === 'smoke') {
   args = [path.join(__dirname, 'electron-smoke.js')];
 } else if (mode === 'ui') {
   args = [path.join(__dirname, 'electron-ui.js')];
+} else if (mode === 'upstream') {
+  args = [path.join(__dirname, 'upstream-features-ui-test.js')];
 } else if (mode === 'selftest') {
   env.APKSTART_SELFTEST = '1';
   args = [path.join(__dirname, '..')];

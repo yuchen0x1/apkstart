@@ -108,10 +108,11 @@ test('动态文案抽样：状态与 toast 都覆盖', () => {
   assert(missing.length === 0, `缺动态文案：${JSON.stringify(missing)}`);
 });
 
-test('渲染层翻译器存在且只在英文环境改写文本', () => {
+test('渲染层翻译器支持全部有效语言并只在中文环境跳过 DOM 改写', () => {
   const src = fs.readFileSync(path.join(ROOT, 'src', 'ui', 'i18n.js'), 'utf8');
   assert(/window\.apkI18n/.test(src), '必须暴露 window.apkI18n 给 app.js / shell.js');
-  assert(/lang !== 'en-US'/.test(src), '非英文环境必须直接返回，不做任何 DOM 改写');
+  assert(/LANG_TAGS/.test(src), '必须识别 es-ES / vi-VN / ru-RU 语言标记');
+  assert(/lang === 'zh-CN'/.test(src), '中文环境必须直接返回，不做任何 DOM 改写');
   assert(/MutationObserver/.test(src), '动态卡片/toast 需要增量翻译');
 });
 
@@ -129,6 +130,97 @@ test('语言设置项已进默认设置与设置页', () => {
   assert(/language: 'auto'/.test(store), '默认设置缺 language');
   assert(/id="setLanguage"/.test(html), '设置页缺语言下拉框');
   assert(/setLanguage'\)\.addEventListener\('change'/.test(app), '语言下拉框没绑定事件');
+});
+
+const NEW_LANGS = ['es-ES', 'vi-VN', 'ru-RU'];
+
+test('LANGUAGES / IDS 暴露 auto、中、英、西、越、俄', () => {
+  for (const id of ['auto', 'zh-CN', 'en-US', ...NEW_LANGS]) {
+    assert(i18n.IDS.includes(id), `IDS 缺 ${id}`);
+    assert(i18n.LANGUAGES.some((l) => l.id === id), `LANGUAGES 缺 ${id}`);
+  }
+  assert.strictEqual(i18n.LANGUAGES.find((l) => l.id === 'es-ES').label, 'Español');
+  assert.strictEqual(i18n.LANGUAGES.find((l) => l.id === 'vi-VN').label, 'Tiếng Việt');
+  assert.strictEqual(i18n.LANGUAGES.find((l) => l.id === 'ru-RU').label, 'Русский');
+});
+
+test('es/vi/ru 词典为真实译文、无中文、未整条复制英文且占位符一致', () => {
+  const enKeys = Object.keys(DICT);
+  for (const lang of NEW_LANGS) {
+    const d = i18n.loadDict(lang);
+    const keys = Object.keys(d);
+    assert(keys.length >= 200, `${lang} 只有 ${keys.length} 条，核心覆盖率不足`);
+    const bad = Object.entries(d).filter(([, v]) => !String(v).trim() || CJK.test(String(v)));
+    assert.strictEqual(bad.length, 0, `${lang} 有 ${bad.length} 条空值或中文：${JSON.stringify(bad.slice(0, 3))}`);
+    const wrongSlots = Object.entries(d).filter(([k, v]) => countN(k) !== countN(v));
+    assert.strictEqual(wrongSlots.length, 0, `${lang} 占位符不匹配：${JSON.stringify(wrongSlots.slice(0, 3))}`);
+    const copied = keys.filter((k) => DICT[k] !== undefined && d[k] === DICT[k]);
+    // 少数词（如 General / OK）在目标语言中本来同形，允许极少量，但不能整包复制英文。
+    assert(copied.length <= 3 && copied.length / keys.length < 0.02,
+      `${lang} 有 ${copied.length} 条与英文完全相同，疑似未翻译：${JSON.stringify(copied.slice(0, 5))}`);
+    const extra = keys.filter((k) => !enKeys.includes(k));
+    assert.strictEqual(extra.length, 0, `${lang} 有 ${extra.length} 条不在英文源词典：${JSON.stringify(extra.slice(0, 5))}`);
+    const covered = keys.filter((k) => enKeys.includes(k)).length;
+    const ratio = covered / enKeys.length;
+    assert(ratio >= 0.2, `${lang} 对英文词典覆盖率只有 ${(ratio * 100).toFixed(1)}%`);
+  }
+});
+
+test('三语 JSON 原始条目全部可解析、非空、占位符一致且无中文', () => {
+  for (const lang of NEW_LANGS) {
+    const raw = JSON.parse(fs.readFileSync(path.join(ROOT, 'src', 'i18n', `${lang}.json`), 'utf8'));
+    const bad = Object.entries(raw).filter(([, v]) => !String(v).trim() || CJK.test(String(v)));
+    assert.strictEqual(bad.length, 0, `${lang} 原始 JSON 有 ${bad.length} 条空值或中文`);
+    const wrongSlots = Object.entries(raw).filter(([k, v]) => countN(k) !== countN(v));
+    assert.strictEqual(wrongSlots.length, 0, `${lang} 原始 JSON 占位符不匹配：${JSON.stringify(wrongSlots.slice(0, 3))}`);
+  }
+});
+
+test('es/vi/ru 切换命中本地译文并回填占位符', () => {
+  const expected = {
+    'es-ES': ['Salir', 'Paso 1 de 3'],
+    'vi-VN': ['Thoát', 'Bước 1 / 3'],
+    'ru-RU': ['Выход', 'Шаг 1 из 3'],
+  };
+  for (const lang of NEW_LANGS) {
+    i18n.setLanguage(lang);
+    assert.strictEqual(i18n.t('退出'), expected[lang][0], `${lang} 未命中本地译文`);
+    assert.strictEqual(i18n.t('第 1 步 / 共 3 步'), expected[lang][1], `${lang} 占位符回填错误`);
+  }
+  i18n.setLanguage('zh-CN');
+});
+
+test('新语言缺本地译文时回落英文，英文也缺时保留中文原文', () => {
+  const missingZh = '这是一句故意没进词典的文案 42';
+  for (const lang of NEW_LANGS) {
+    i18n.setLanguage(lang);
+    assert.strictEqual(i18n.t('诊断报告已导出'), 'The diagnostic report has been exported', `${lang} 没有回落英文`);
+    assert.strictEqual(i18n.t(missingZh), missingZh, `${lang} 应保留中文原文而不是空串`);
+  }
+  i18n.setLanguage('zh-CN');
+});
+
+test('auto 匹配 es / vi / ru 地域变体，未知语言回落英文', () => {
+  assert.strictEqual(i18n.resolve('auto', 'es-MX'), 'es-ES');
+  assert.strictEqual(i18n.resolve('auto', 'es-419'), 'es-ES');
+  assert.strictEqual(i18n.resolve('auto', 'vi-VN'), 'vi-VN');
+  assert.strictEqual(i18n.resolve('auto', 'vi'), 'vi-VN');
+  assert.strictEqual(i18n.resolve('auto', 'ru-RU'), 'ru-RU');
+  assert.strictEqual(i18n.resolve('auto', 'ru'), 'ru-RU');
+  assert.strictEqual(i18n.resolve('auto', ['fr-FR', 'ru-RU']), 'ru-RU');
+  assert.strictEqual(i18n.resolve('auto', 'uk-UA'), 'en-US');
+  assert.strictEqual(i18n.resolve('ru-RU', 'es-ES'), 'ru-RU');
+});
+
+test('运行载荷含本地译文和英文回落，renderer 可一次取全', () => {
+  const cases = [['es-MX', 'es-ES', 'Salir'], ['vi-VN', 'vi-VN', 'Thoát'], ['ru-RU', 'ru-RU', 'Выход']];
+  for (const [systemLocale, expectedLang, expectedQuit] of cases) {
+    const p = i18n.payload(systemLocale);
+    assert.strictEqual(p.lang, expectedLang);
+    assert.strictEqual(p.dict['退出'], expectedQuit);
+    assert.strictEqual(p.dict['诊断报告已导出'], 'The diagnostic report has been exported');
+    assert(p.languages.some((l) => l.id === 'ru-RU'));
+  }
 });
 
 i18n.setLanguage('zh-CN');

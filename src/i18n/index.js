@@ -5,9 +5,9 @@
  * 设计取舍：**中文是源语言，词典的 key 就是中文原文**。
  *   - 好处一：代码里不用先给几百条文案编 key（`settings.engine.title` 这种），
  *     也就不会出现「key 还在、文案已改，翻译悄悄失效」；
- *   - 好处二：新增文案忘了翻译时，界面显示中文原文而不是 `__MISSING__`，
- *     用户仍然能用 —— 这是「优雅降级」而不是「坏掉」。
- *   - 代价：改中文原文等于改 key，英文那条会失配（测试会报覆盖率下降，见 test/i18n-test.js）。
+ *   - 新增文案先补英文；其它语言未翻译的条目回落英文，英文也缺失才保留中文原文，
+ *     不显示空白或 `__MISSING__`。各语言 JSON 只收录真实译文，不复制英文凑覆盖率。
+ *   - 代价：改中文原文等于改 key，对应译文会失配（见 test/i18n-test.js）。
  *
  * 占位符统一用 U+0001：
  *   - 模板里的 `{name}` 与**字面数字**都会先归一成占位符再去查词典，
@@ -20,26 +20,39 @@ const fs = require('fs');
 const path = require('path');
 
 const N = '\u0001';
-const DICT_FILE = path.join(__dirname, 'en-US.json');
-
-/** 可选项：auto 跟随系统；其余是明确指定 */
+/** 可选项：auto 跟随系统；其余是明确指定（供设置校验和 renderer 共用） */
 const LANGUAGES = [
   { id: 'auto', label: '跟随系统' },
   { id: 'zh-CN', label: '简体中文' },
   { id: 'en-US', label: 'English' },
+  { id: 'es-ES', label: 'Español' },
+  { id: 'vi-VN', label: 'Tiếng Việt' },
+  { id: 'ru-RU', label: 'Русский' },
 ];
 const IDS = LANGUAGES.map((l) => l.id);
+const SYSTEM_LANGUAGES = { zh: 'zh-CN', en: 'en-US', es: 'es-ES', vi: 'vi-VN', ru: 'ru-RU' };
+const dictionaries = new Map();
+const EMPTY = Object.freeze({});
 
-let dict = null;
 let current = 'zh-CN';
 
-function loadDict() {
-  if (dict) return dict;
+const countSlots = (s) => String(s).split(N).length - 1;
+
+/** 返回该语言的原始译文（不混入英文，便于准确统计覆盖率）。 */
+function loadDict(lang = 'en-US') {
+  if (!IDS.includes(lang) || lang === 'auto' || lang === 'zh-CN') return EMPTY;
+  if (dictionaries.has(lang)) return dictionaries.get(lang);
+  let dict = EMPTY;
   try {
-    dict = JSON.parse(fs.readFileSync(DICT_FILE, 'utf8'));
-  } catch (_) {
-    dict = {};
-  }
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, `${lang}.json`), 'utf8'));
+    // 坏条目不能吞掉变量；忽略后按英文 → 中文的正常回落链处理。
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      dict = Object.freeze(Object.fromEntries(Object.entries(raw).filter(([key, value]) => (
+        typeof value === 'string' && value.trim() && countSlots(key) === countSlots(value)
+      ))));
+    }
+  } catch (_) { /* 缺失或损坏的语言包回落英文，不影响界面启动。 */ }
+  dictionaries.set(lang, dict);
   return dict;
 }
 
@@ -88,40 +101,40 @@ function resolve(pref, systemLocale) {
   const locales = Array.isArray(systemLocale) ? systemLocale : [systemLocale];
   let sawLocale = false;
   for (const value of locales) {
-    const loc = String(value || '').toLowerCase();
-    if (loc) sawLocale = true;
-    // The catalog has one Chinese entry; zh-TW/zh-HK therefore map to it too.
-    if (loc.startsWith('zh')) return 'zh-CN';
-    if (loc.startsWith('en')) return 'en-US';
+    const loc = String(value || '').trim().toLowerCase().replace(/_/g, '-');
+    if (!loc) continue;
+    sawLocale = true;
+    const primary = loc.split('-')[0];
+    if (SYSTEM_LANGUAGES[primary]) return SYSTEM_LANGUAGES[primary];
   }
   return sawLocale ? 'en-US' : 'zh-CN';
 }
 
 function setLanguage(lang) {
-  current = lang === 'en-US' ? 'en-US' : 'zh-CN';
+  current = IDS.includes(lang) && lang !== 'auto' ? lang : 'zh-CN';
   return current;
 }
 
 function getLanguage() { return current; }
 
-/**
- * 翻译一条文案。中文环境原样返回（只填参数）。
- * 词典里没有对应条目时同样返回中文原文 —— 宁可显示中文，也不要显示空串或 key。
- */
+/** 中文是 key；没有真实本地化译文时以英文兜底，最终保留可读的中文原文。 */
 function t(template, params) {
   const zh = fillZh(template, params);
   if (current === 'zh-CN') return zh;
-  const d = loadDict();
   const key = normalizeKey(template);
-  const en = d[key] || d[template] || d[String(template).trim()];
-  if (!en) return zh;
-  return fillEn(en, collectValues(template, params));
+  const source = String(template).trim();
+  const values = collectValues(template, params);
+  const local = loadDict(current)[key] || loadDict(current)[source];
+  if (local) return fillEn(local, values);
+  const english = loadDict('en-US')[key] || loadDict('en-US')[source];
+  return english ? fillEn(english, values) : zh;
 }
 
-/** 给渲染进程用：语言 + 词典（渲染层自己遍历 DOM，不需要每条文案过一次 IPC） */
+/** 每种翻译界面都携带真实译文和英文回落，供 renderer 一次遍历 DOM。 */
 function payload(systemLocale) {
-  const lang = resolve((require('./../core/store').getSettings().language || 'auto'), systemLocale);
-  return { lang, dict: lang === 'en-US' ? loadDict() : {}, languages: LANGUAGES };
+  const lang = resolve((require('../core/store').getSettings().language || 'auto'), systemLocale);
+  const dict = lang === 'zh-CN' ? EMPTY : { ...loadDict('en-US'), ...loadDict(lang) };
+  return { lang, dict, languages: LANGUAGES };
 }
 
 module.exports = {

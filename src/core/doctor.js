@@ -16,6 +16,7 @@ const path = require('path');
 const net = require('net');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
+const instanceAdb = require('./instance-adb');
 
 const ASCII = /^[\x20-\x7e]*$/;
 const isAsciiPath = (p) => ASCII.test(String(p || ''));
@@ -391,11 +392,10 @@ function chooseProfile({
     gpu,
     gpuCandidates: orderedGpus,
     gpuPinned,
-    // Windows emulator 37.x 不应依赖隐式默认值：检测到 WHPX/AEHD 时明确
-    // 传 `-accel on`，否则某些环境会悄悄走 TCG，开机时间从几十秒变成数分钟。
-    // 没有硬件加速时保留 `off` 作为诊断/重试状态，但由 emulator.js 不再强制
-    // 传 `-accel off`；让官方 emulator 自己选择可用的 TCG 路径，避免部分机器
-    // 因显式 `-accel off` 在 guest 刚启动时触发 0xC0000005。
+    // on 表示检测到可用加速器，不等于本次客机已确认使用硬件加速。
+    // emulator.js 对 on 保留官方默认选择（省略 -accel），兼容部分 Windows
+    // emulator 37.x 对显式 on 的崩溃；仅 off 显式传 -accel off。
+    // 实际加速状态必须以本次运行日志为准，不能从参数省略推断为 TCG。
     accel: accelOk ? 'on' : 'off',
     accelOk,
     port,
@@ -536,14 +536,12 @@ async function freePortPair(start = 5554) {
 }
 
 /**
- * adb server 端口：固定不复用探测。
- * 之前是"从 5044 往上找一个空闲端口"，但 adb server 本身是常驻进程，占着这个端口，
- * 于是每启动一次 ApkStart 就会多一个 adb server（实测一次会话跑出 6 个），
- * 而且端口老是变，下次启动想接管上次的模拟器时对不上号。
- * 5044 是 ApkStart 专用端口（用户自己的 adb 在 5037），直接固定用。
+ * 取得本进程已经固定的 ADB 路由，不在启动重试中漂移端口。
+ * 父实例仍默认 5044；分身必须先由 instance-adb.initialize() 向 OS 申请
+ * 私有端口并确认自有 foreground server，未初始化时明确失败，不回退父端口。
  */
-async function freeAdbPort(start = 5044) {
-  return Number(process.env.APKSTART_ADB_PORT) || start;
+async function freeAdbPort() {
+  return instanceAdb.route().port;
 }
 
 /**
@@ -879,8 +877,13 @@ function describeProfile(p) {
   if (!p || !p.memoryMB) return '正在检测本机参数…';
   const lcd = p.lcd && p.lcd.w ? `${p.lcd.w}×${p.lcd.h}` : '';
   const snap = p.snapshot === false ? '冷启动（不存快照）' : 'quickboot 快照';
+  const acceleration = p.acceleration || {};
+  const accel = acceleration.confirmed === true ? '硬件加速（运行日志已确认）'
+    : p.accel === 'off' ? '请求软件模拟'
+      : acceleration.confirmed === false ? '运行日志未确认硬件加速'
+        : p.accelOk ? '检测到加速器（本次运行待确认）' : '未检测到可用加速器';
   return `${p.tuned ? '低配自动降级' : '自动'}：${(p.memoryMB / 1024).toFixed(1)}GB 内存 · ${p.cores} 核`
-    + `${lcd ? ` · ${lcd}` : ''} · ${p.gpu} 渲染 · ${p.accelOk ? '硬件加速' : '软件模拟'} · ${snap}`
+    + `${lcd ? ` · ${lcd}` : ''} · ${p.gpu} 渲染 · ${accel} · ${snap}`
     + `${p.lite ? ' · 轻量容器' : ''} · 端口 ${p.port}`;
 }
 

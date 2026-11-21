@@ -147,11 +147,14 @@ class WinAgent extends EventEmitter {
    * @param {number} [appPid] 主进程 pid：代理只允许把窗口嵌进这个进程的窗口，
    *        并以此为据决定「鼠标事件的当前窗口是不是我们的」（防止句柄被回收复用）
    */
-  async scope(dirs, appPid) {
+  async scope(dirs, appPid, { avdDir = '', avdName = '' } = {}) {
     const list = emulatorScopes(dirs);
-    // Native paths are JSON-encoded exactly once by call(); never pre-escape slashes.
-    const req = { cmd: 'scope', dirs: list.join(';') };
-    if (Number(appPid) > 0) req.pid = Number(appPid);
+    // 每个进程即使共享运行时 EXE，也只能管理自己的精确 AVD。
+    // 空/无效路径仍显式发送，让原生端清掉旧范围并 fail closed。
+    const validDir = typeof avdDir === 'string' && path.isAbsolute(avdDir) && !avdDir.includes('\0');
+    const req = { cmd: 'scope', dirs: list.join(';'), avdDir: validDir ? path.resolve(avdDir) : '' };
+    if (typeof avdName === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(avdName)) req.avdName = avdName;
+    if (Number.isSafeInteger(Number(appPid)) && Number(appPid) > 0) req.pid = Number(appPid);
     return this.call(req, 4000).catch(() => ({ ok: false, n: 0 }));
   }
 

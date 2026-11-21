@@ -18,6 +18,8 @@ const { Provisioner } = require('./provision');
 const doctor = require('./doctor');
 const userdata = require('./userdata');
 const processOwner = require('./process-owner');
+const peripherals = require('./peripherals');
+const instanceAdb = require('./instance-adb');
 
 const AVD_NAME = 'apkstart';
 const SNAPSHOT_NAME = 'apkstart';
@@ -66,8 +68,10 @@ class EmulatorEngine {
     this.provisioner = new Provisioner(appRoot);
     this.proc = null;
     this._log = [];
+    this._logSeq = 0;
     this.port = 5554;
-    this.adbPort = Number(process.env.ANDROID_ADB_SERVER_PORT) || 5044;
+    this._adbRoute = instanceAdb.route();
+    this.adbPort = this._adbRoute.port;
     this.profile = null;
     this.attempts = [];
     this.lastDiagnosis = null;
@@ -95,7 +99,8 @@ class EmulatorEngine {
   forceWipeOnNextStart() { this._forceWipe = true; }
 
   log(line) {
-    this._log.push({ t: Date.now(), line });
+    this._logSeq = (this._logSeq || 0) + 1;
+    this._log.push({ t: Date.now(), seq: this._logSeq, line });
     if (this._log.length > 600) this._log.shift();
   }
 
@@ -135,6 +140,30 @@ class EmulatorEngine {
   }
 
   get serial() { return `emulator-${this.port}`; }
+
+  /** accel 是选档依据，不等于命令行已传 on，更不等于本轮真的挂上了加速器。 */
+  _accelerationState(plan = {}, logLines = []) {
+    const argument = plan.accel === 'off' ? 'off' : null;
+    const evidence = logLines.find((line) => /hypervisor platform accelerator is operational|(?:WHPX|AEHD|KVM|HAXM)[^\n]*operational/i.test(line)
+      && !/\bnot\b|\bnon-operational\b/i.test(line)) || '';
+    return {
+      detected: this._detectedAccel ? { ...this._detectedAccel } : null,
+      requested: plan.accel || 'auto',
+      argument, // null = 有意不传 -accel，使用官方默认；只有 off 显式传参
+      policy: argument === 'off' ? 'explicit-off' : 'emulator-default',
+      confirmed: argument === 'off' ? false : (evidence ? true : null),
+      evidence: argument === 'off' ? '' : evidence,
+    };
+  }
+
+  describeProfile(profile = this.profile) {
+    const text = doctor.describeProfile(profile);
+    const accel = profile?.acceleration;
+    if (!accel) return text;
+    const actual = accel.argument === 'off' ? '软件模拟（显式 -accel off）'
+      : `官方默认加速（不传 -accel；${accel.confirmed ? '启动日志已确认' : '实际加速未确认'}）`;
+    return `${text} · ${actual}`;
+  }
 
   /**
    * 取「当前生效的自定义镜像」。
@@ -315,6 +344,56 @@ class EmulatorEngine {
     return this.ownsProcess(info, { discoverRoot: true }) ? info : null;
   }
 
+  /** Console and ADB endpoints must belong to this exact, birth-pinned AVD. */
+  async _ownedAdbTarget(expected = null, port = this.port) {
+    const target = await this.ownedProcessOnPort(port);
+    if (!target || (expected && !processOwner.sameIdentity(expected, target))) return null;
+    const pid = await processOwner.pidOnPort(Number(port) + 1);
+    if (pid !== target.pid || port !== this.port) return null;
+    const current = await processOwner.getProcessInfo(pid);
+    return processOwner.sameIdentity(target, current) ? current : null;
+  }
+
+  async _requireAdbTarget(expected = null, port = this.port) {
+    const target = await this._ownedAdbTarget(expected, port);
+    if (target) return target;
+    const error = new Error('运行时 console/ADB 端口归属无法确认或已变化，已停止向客机发送命令');
+    error.code = 'RUNTIME_OWNERSHIP_LOST';
+    throw error;
+  }
+
+  _adbInvocation(adbPath, args) {
+    const route = this._adbRoute;
+    instanceAdb.assertReady(route);
+    let candidate = adbPath || '';
+    if (!route.isChild && !candidate) {
+      try { candidate = this.provisioner.adbVersionPath() || ''; } catch (_) { /* try bundled below */ }
+      if (!candidate) {
+        try { candidate = this.provisioner.paths().adbExe || ''; } catch (_) { /* legacy PATH */ }
+      }
+      if (!candidate || !fs.existsSync(candidate)) candidate = 'adb';
+    }
+    return {
+      adb: instanceAdb.executable(candidate || 'adb', route),
+      args: instanceAdb.clientArgs(args, route),
+      env: instanceAdb.environment(route),
+    };
+  }
+
+  async _guestShell(adbPath, cmd, target, port, { timeout = 8000, includeErrors = false } = {}) {
+    await this._requireAdbTarget(target, port);
+    const call = this._adbInvocation(adbPath, ['-s', `emulator-${port}`, 'shell', cmd]);
+    const result = await new Promise((resolve) => {
+      try {
+        execFile(call.adb, call.args, { timeout, windowsHide: true, env: call.env }, (error, out, err) => {
+          resolve(includeErrors ? String(out || '') + String(err || '') : (error ? '' : String(out || '')));
+        });
+      } catch (_) { resolve(''); }
+    });
+    await this._requireAdbTarget(target, port);
+    return result;
+  }
+
   /** Lock PIDs are candidates, never proof. Do not collect other listening QEMUs. */
   async killOrphanProcesses({ onLog = () => {} } = {}) {
     const avdDir = path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`);
@@ -365,6 +444,10 @@ class EmulatorEngine {
     memoryMB = 2048, cores = 2, gpu = 'software', dataMB = 4096,
     heapMB = 256, accel = 'auto', snapshot = true, wipe = false, lcd = null,
   } = {}) {
+    const peripheralSettings = peripherals.normalizeSettings(this.settings?.peripherals);
+    // 不支持的串口映射必须在改写 AVD 之前明确拒绝，不能保存后静默忽略。
+    peripherals.buildEmulatorArgs(peripheralSettings);
+    const peripheralConfig = peripherals.buildEmulatorConfig(peripheralSettings);
     const p = this.provisioner.ensureDirs();
     const home = p.avdHome;
     const avdDir = path.join(home, `${this.avdName}.avd`);
@@ -412,7 +495,7 @@ class EmulatorEngine {
     // 注意：这里只作废**快照**，绝不能顺手 -wipe-data —— 用户数据里是已装的应用和存档。
     const key = `${doctor.snapshotKey({
       dataMB, emulatorVersion: this._emuVersion || '', api, tag,
-    }, choice.dir)}|${screen.w}x${screen.h}@${screen.dpi}`;
+    }, choice.dir)}|${screen.w}x${screen.h}@${screen.dpi}|${JSON.stringify(peripheralSettings)}`;
     const keyFile = path.join(avdDir, 'snapshot.key');
     let prevKey = '';
     try { prevKey = fs.readFileSync(keyFile, 'utf8').trim(); } catch (_) { /* 首次 */ }
@@ -468,8 +551,7 @@ class EmulatorEngine {
       // 旧版遗留的 default_boot（那是 API30 镜像的内存状态，加载必进引导循环）。
       'hw.sdCard=no',
       'hw.audioInput=none',
-      'hw.camera.back=none',
-      'hw.camera.front=none',
+      ...Object.entries(peripheralConfig).map(([name, value]) => `${name}=${value}`),
       'hw.gps=no',
       // 方向/加速度传感器必须开：关掉之后安卓拒绝旋转，横竖屏只能靠"转画面"糊弄，
       // 表现就是画面躺倒、排版不变。开了才能用 wm size 做真正的手机/平板排版切换。
@@ -482,6 +564,11 @@ class EmulatorEngine {
     const data = this.ensureDataPartition(avdDir, dataMB);
 
     return {
+      ok: data?.ok === true,
+      ...(data?.ok === true ? {} : {
+        code: data?.code || 'DATA_PARTITION_PREPARE_FAILED',
+        error: `安卓 /data 分区准备失败：${data?.error || data?.reason || '无法确认分区可用'}；已停止启动，未清空用户数据`,
+      }),
       home, avdDir, ini: path.join(home, `${this.avdName}.ini`), image: choice,
       wipePending: this.wipePending, screen, data,
     };
@@ -502,68 +589,101 @@ class EmulatorEngine {
    *     一起 exit 1 → 开机卡在启动动画，adb 永远 offline。
    */
   ensureDataPartition(avdDir, dataMB = 4096) {
-    const emulatorExe = this.locate().emulatorExe;
-    if (!emulatorExe || !fs.existsSync(emulatorExe)) return { ok: false, reason: 'no-emulator' };
-    try { fs.mkdirSync(avdDir, { recursive: true }); } catch (_) { /* ignore */ }
-    const emuDir = path.dirname(emulatorExe);
     const img = path.join(avdDir, 'userdata-qemu.img');
     const wantBytes = Math.max(1024, Math.round(dataMB || 4096)) * 1024 * 1024;
+    const fail = (operation, reason, error, extra = {}) => {
+      const message = String(error?.message || error || reason);
+      this.log(`userdata ${operation} 失败（已停止启动，未清空用户数据）：${message}`);
+      return {
+        ok: false, usable: false, operation, reason, error: message,
+        code: operation === 'grow' ? 'DATA_PARTITION_RESIZE_FAILED' : 'DATA_PARTITION_PREPARE_FAILED',
+        image: img, requestedBytes: wantBytes, ...extra,
+      };
+    };
+    // 工具退出码为 0 也不能代替容量检查：文件扩了但 ext4 仍只有 64MB 同样不能开机。
+    const verified = (file) => {
+      const size = fs.statSync(file).size;
+      const fsBytes = userdata.fsBytes(file);
+      if (!userdata.hasExt4Superblock(file) || size < wantBytes
+          || fsBytes < wantBytes * 0.95 || fsBytes > size) {
+        throw new Error(`分区容量校验失败：需要 ${wantBytes} 字节，镜像 ${size} 字节，ext4 ${fsBytes} 字节`);
+      }
+      return { size, fsBytes };
+    };
+    const emulatorExe = this.locate().emulatorExe;
+    if (!emulatorExe || !fs.existsSync(emulatorExe)) {
+      return fail('prepare', 'no-emulator', '缺少模拟器运行时，无法准备 /data 分区');
+    }
     let size = 0;
-    try { size = fs.statSync(img).size; } catch (_) { /* 不存在 */ }
+    let exists = false;
+    try {
+      fs.mkdirSync(avdDir, { recursive: true });
+      try { size = fs.statSync(img).size; exists = true; }
+      catch (e) { if (e.code !== 'ENOENT') throw e; }
+    } catch (e) { return fail('prepare', 'data-access', e); }
 
     if (size > 0 && userdata.hasExt4Superblock(img)) {
-      // 文件够大 + 文件系统也真的长到了这个大小，才算「不用动」。
-      // 只看文件大小会漏掉一种真实故障：qemu-img 撑开了文件、resize2fs 却失败了，
-      // 于是文件 6GB、安卓只有 64MB —— 用户看到的就是「装游戏说空间不足」。
       const fsBytes = userdata.fsBytes(img);
-      const fsOk = fsBytes >= Math.min(size, wantBytes) * 0.95;
-      if (size >= wantBytes && fsOk) return { ok: true, created: false, size, fsBytes };
-      // 容量配置变大了（或文件系统没长到位）：就地扩容，不重建、保留已装应用
+      if (size >= wantBytes && fsBytes >= wantBytes * 0.95 && fsBytes <= size) {
+        return { ok: true, usable: true, created: false, size, fsBytes, requestedBytes: wantBytes };
+      }
+      // 就地扩容只操作已有 ext4；无论工具在哪一步失败，都把 FBE 特性位补回去。
+      // 失败后的文件系统未必仍一致，因此不再把「可能可用的旧容量」冒充成功继续启动。
+      let failure = null;
+      let repaired = false;
       try {
         userdata.clearEncryptFlag(img);
         if (size < wantBytes) this._qemuImg('resize', img, wantBytes);
-        this._resize2fs(img);
-        userdata.setEncryptFlag(img);
-        const grown = userdata.fsBytes(img);
-        this.log(`userdata 扩容：文件 ${size} → ${wantBytes}，文件系统 ${fsBytes} → ${grown}`);
-        return { ok: true, created: false, grown: true, size: wantBytes, fsBytes: grown };
-      } catch (e) {
-        // 旧版/异常关机留下的 userdata 可能没有干净卸载，resize2fs 会明确要求
-        // 先跑 e2fsck。自动修复后重试一次，避免用户只能手动删掉整个 AVD（#46/#60）。
-        if (/e2fsck|run .*e2fsck|exit 8/i.test(String(e.message || e))) {
-          try {
-            this._e2fsck(img);
-            this._resize2fs(img);
-            userdata.setEncryptFlag(img);
-            const grown = userdata.fsBytes(img);
-            this.log(`userdata 先经 e2fsck 修复后扩容完成：${size} → ${wantBytes}`);
-            return { ok: true, created: false, grown: true, repaired: true, size: wantBytes, fsBytes: grown };
-          } catch (retry) {
-            e = retry;
-          }
+        try { this._resize2fs(img); }
+        catch (e) {
+          if (!/e2fsck|run .*e2fsck|exit 8/i.test(String(e.message || e))) throw e;
+          this._e2fsck(img);
+          this._resize2fs(img);
+          repaired = true;
         }
-        this.log(`扩容 userdata 失败（继续用现有分区）：${e.message}`);
-        // 老分区仍然可用，但必须如实告诉调用方「这次没扩成」，不能让设置页显示成功
-        return { ok: false, created: false, size, fsBytes, error: e.message };
+      } catch (e) { failure = e; }
+      finally {
+        try { userdata.setEncryptFlag(img); }
+        catch (e) { failure = new Error(`${failure ? `${failure.message}；` : ''}恢复 FBE 特性位失败：${e.message}`); }
+      }
+      try {
+        if (failure) throw failure;
+        const actual = verified(img);
+        this.log(`userdata 扩容完成：文件 ${size} → ${actual.size}，文件系统 ${fsBytes} → ${actual.fsBytes}`);
+        return { ok: true, usable: true, created: false, grown: true, repaired, ...actual, requestedBytes: wantBytes };
+      } catch (e) {
+        return fail('grow', 'resize-failed', e, { created: false, size, fsBytes });
       }
     }
 
-    // 首次 / 旧版留下的全零占位 / 镜像损坏：全新造一个
+    // 不认识的旧镜像可能是加密/受损数据，不能因魔数检查失败就删掉它或其 qcow2。
+    // 仅首次安装和已确认的小型全零占位允许自动建种子；未知数据交给显式修复流程。
     try {
-      fs.rmSync(img, { force: true });
-      fs.rmSync(`${img}.qcow2`, { force: true });
-      // 先不带 encrypt 位（老 e2fsck/resize2fs 才肯干活）
-      fs.writeFileSync(img, userdata.buildEmptyExt4({ sizeMB: 64, encrypt: false }));
-      this._qemuImg('resize', img, wantBytes);
-      this._resize2fs(img);
-      userdata.setEncryptFlag(img);
-      this.log(`已重建 userdata：${(wantBytes / 1024 / 1024 / 1024).toFixed(1)}GB ext4（4K block，支持 FBE）`);
-      return { ok: true, created: true, size: wantBytes };
+      if (fs.existsSync(`${img}.qcow2`)) {
+        return fail('prepare', 'unverified-overlay', '存在 userdata qcow2 数据但无法确认基础分区，已保留原文件', { created: false, size });
+      }
+      if (exists && size > 0 && (size > 1024 * 1024 || fs.readFileSync(img).some((byte) => byte !== 0))) {
+        return fail('prepare', 'unverified-userdata', '现有 userdata 无法确认为 ext4 或空占位，已保留原文件；请先备份并检查运行时数据', { created: false, size });
+      }
+    } catch (e) { return fail('prepare', 'data-access', e, { created: false, size }); }
+
+    // 在独立临时目录中完成首建/占位重建，全部校验成功才替换；失败不会留下可被误用的半成品。
+    let staging = '';
+    try {
+      staging = fs.mkdtempSync(path.join(avdDir, '.userdata-'));
+      const seed = path.join(staging, 'userdata-qemu.img');
+      fs.writeFileSync(seed, userdata.buildEmptyExt4({ sizeMB: 64, encrypt: false }));
+      this._qemuImg('resize', seed, wantBytes);
+      this._resize2fs(seed);
+      userdata.setEncryptFlag(seed);
+      const actual = verified(seed);
+      fs.renameSync(seed, img);
+      this.log(`已准备 userdata：${(actual.fsBytes / 1073741824).toFixed(1)}GB ext4（支持 FBE）`);
+      return { ok: true, usable: true, created: true, rebuilt: exists, ...actual, requestedBytes: wantBytes };
     } catch (e) {
-      // 尽力而为：哪怕扩容失败，也要把 encrypt 位补回去，让 FBE 能初始化（分区会偏小）
-      try { userdata.setEncryptFlag(img); } catch (_) { /* ignore */ }
-      this.log(`重建 userdata 失败：${e.message}`);
-      return { ok: false, created: true, error: e.message };
+      return fail(exists ? 'rebuild' : 'create', 'create-failed', e, { created: true, size });
+    } finally {
+      if (staging) { try { fs.rmSync(staging, { recursive: true, force: true }); } catch (_) { /* only our staging directory */ } }
     }
   }
 
@@ -577,7 +697,7 @@ class EmulatorEngine {
     const r = spawnSync(exe, [op, '-f', 'raw', ...rest], {
       cwd: IS_WIN ? dir : undefined, windowsHide: true, encoding: 'utf8',
     });
-    if (r.status !== 0) throw new Error(`qemu-img ${op} 失败: ${(r.stderr || '').trim() || r.status}`);
+    if (r.error || r.status !== 0) throw new Error(`qemu-img ${op} 失败: ${r.error?.message || (r.stderr || '').trim() || r.signal || r.status}`);
   }
 
   /** e2fsck：修复异常中断留下的 dirty userdata 后再扩容。
@@ -609,7 +729,7 @@ class EmulatorEngine {
     if (r.error && r.error.code === 'ENOENT') {
       throw new Error('缺少 resize2fs：请安装 e2fsprogs（sudo apt install e2fsprogs）');
     }
-    if (r.status !== 0) throw new Error(`resize2fs 失败: ${(r.stderr || '').trim() || r.status}`);
+    if (r.error || r.status !== 0) throw new Error(`resize2fs 失败: ${r.error?.message || (r.stderr || r.stdout || '').trim() || r.signal || r.status}`);
   }
 
   /** emulator 依赖这些环境变量定位 SDK / AVD；中文路径一律转 8.3 短路径 */
@@ -618,7 +738,7 @@ class EmulatorEngine {
     // AVD 目录必须与 provisioner.paths().avdHome 一致：bundled 只读运行时（EXE 旁
     // resources/runtime）时 root/avd 不存在也不可写，AVD 要落到用户数据目录。
     const avdHome = doctor.shortPath(this.provisioner.paths().avdHome);
-    const adbPort = String(plan.adbPort || process.env.ANDROID_ADB_SERVER_PORT || '5044');
+    const adbEnv = instanceAdb.environment(this._adbRoute);
     // opengl32sw.dll（Qt 软件 OpenGL 渲染器）在新版 Google emulator 包里已不再附带。
     // 缺失时 Qt 动态 GL 回退到系统 opengl32.dll —— 在部分显卡驱动上绘制全黑
     // （实测：窗口全黑但输入正常，安卓侧 screencap 有内容），或画面错乱。
@@ -628,13 +748,13 @@ class EmulatorEngine {
     const emuDir = path.dirname(this.locate().emulatorExe || '');
     const hasSwGL = emuDir && fs.existsSync(path.join(emuDir, 'opengl32sw.dll'));
     return {
-      ...process.env,
+      ...adbEnv,
       ...(plan.accel === 'off' ? { ANDROID_I_WANT_MY_TCG: 'yes' } : {}),
       ANDROID_SDK_ROOT: safeRoot,
       ANDROID_HOME: safeRoot,
       ANDROID_AVD_HOME: avdHome,
       ANDROID_EMULATOR_HOME: avdHome,
-      ANDROID_ADB_SERVER_PORT: adbPort,
+      ANDROID_ADB_SERVER_PORT: String(this._adbRoute.port),
       ANDROID_EMULATOR_USE_SYSTEM_LIBS: '',
       ...(hasSwGL ? { QT_OPENGL: 'software' } : {}),
     };
@@ -689,34 +809,15 @@ class EmulatorEngine {
       // 用了它之后 probe 永远找不到窗口，用户看到的是一个全黑的应用窗口。
       // 窗口的隐藏改由窗口代理常驻压制完成（见 win/agent.ps1 的 QuietSweep）。
     }
-    // 只有快照真的存在才传 -snapshot：全新 AVD（或快照刚被作废）时传了它，
-    // qemu 会一直等一份不存在的内存状态，进程活着但永远不开机——
-    // 上层只看到「开机超时」，接着换参数重试，反而被 AVD 锁挡成
-    // "Running multiple emulators with the same AVD"。
-    // 快照参数决定「下次开机是 8 秒还是 90 秒」，这里是第二个致命点：
-    // 老实现「没有快照就传 -no-snapshot」，而 -no-snapshot 同时禁掉了**退出时保存**，
-    // 于是第一次冷启动结束后永远产生不了快照，用户每次点开都是全量引导。
-    // 正确做法是 -no-snapshot-load：这次不加载（避免等一个不存在的快照），
-    // 但退出时照常把内存状态写成 apkstart，下次就直接恢复。
-    // 快照要占一份约 2~3GB 的 ram.bin（磁盘紧张的用户可以关掉，只影响启动速度）
-    const wantSnapshot = this.settings?.engine?.keepSnapshot !== false;
-    if (wipe) {
-      // 重置数据时不能加载旧快照（数据都对不上了），但**必须允许保存新快照**：
-      // 修复网络就是靠「重置后第一次开机有网 → 立刻存快照 → 下次恢复」这条链路。
-      // 老写法这里推的是 -no-snapshot，会把保存一起关掉，快照永远存不下来。
-      // 只给 -no-snapshot-load 的话，保存会落到 emulator 的默认快照名 default_boot，
-      // 下次按 -snapshot apkstart 找又找不到 —— 等于白存一次，还得再冷启一遍。
-      // 所以这里连快照名一起给：不强求加载，但存就存到 apkstart 里。
-      if (!wantSnapshot) args.push('-no-snapshot');
-      else args.push('-snapshot', this.snapshotName, '-no-snapshot-load');
-    } else if (!wantSnapshot) {
+    // 快照统一由健康检查后的显式保存负责，禁止 emulator 退出时绕过运行中的开关
+    // 自动保存。-no-snapshot-save 只禁退出保存，不影响控制台 snapshot save。
+    // 冷启/重置仍使用同一个快照名，但 snapshot:false 必须优先于 wipe。
+    const wantSnapshot = this.snapshotSaveAllowed({ snapshot });
+    if (!wantSnapshot) {
       args.push('-no-snapshot');
-    } else if (snapshot !== false) {
-      args.push('-snapshot', this.snapshotName);
-      // 快照可能存于「虚拟机没网」的状态；网络修复要求这次冷启动。
-      if (!this.hasSnapshot() || this._coldBoot) args.push('-no-snapshot-load');
     } else {
-      args.push('-no-snapshot');
+      args.push('-snapshot', this.snapshotName, '-no-snapshot-save');
+      if (wipe || !this.hasSnapshot() || this._coldBoot) args.push('-no-snapshot-load');
     }
     if (wipe) args.push('-wipe-data');
     // 系统语言**不在这里**改：实测 emulator 37.x 的 -prop 只接受 qemu.* 属性
@@ -731,6 +832,7 @@ class EmulatorEngine {
     // 0xC0000005；-gpu 换的只是呈现方式，Vulkan 通道还是同一份代码，所以换后端绕不过。
     // 只在「上一轮崩在 Vulkan」时临时加，不影响正常机器（正常机器仍用 Vulkan）。
     if (noVulkan) args.push('-feature', '-Vulkan');
+    args.push(...peripherals.buildEmulatorArgs(this.settings?.peripherals));
     return args;
   }
 
@@ -861,53 +963,36 @@ class EmulatorEngine {
     await this.killOrphanProcesses().catch(() => {});
   }
 
-  /**
-   * 重建本专用端口上的 adb server。
-   *
-   * 这里是「打开应用要等两分钟」最主要的元凶，历史实现只 kill-server 就返回了：
-   * emulator 在启动瞬间会去连 ANDROID_ADB_SERVER_PORT 上的 adb daemon，
-   * 连不上就**再也不注册这台设备** —— adb devices 里要么没有 emulator-5554，
-   * 要么永远停在 offline（日志里就是那句 "Unable to connect to adb daemon on port: 5044"）。
-   * 于是上层 probe 一直拿不到 sys.boot_completed，白等 3 分钟超时后重试，
-   * 每次重试都是全量冷启动，快照也因为「设备不在线」保存不了，形成死循环。
-   *
-   * 所以必须先 kill（清掉旧设备记录）再 start，并等到端口真的在监听才返回。
-   */
-  /** 供上层在 adb 传输卡住（offline / unauthorized）时主动重启一次 server */
+  /** Repair may terminate only this process's own foreground daemon handle. */
   async resetAdbServer() {
-    const port = Number(process.env.ANDROID_ADB_SERVER_PORT) || this.adbPort || 5044;
-    return this._resetAdbServer(port);
+    const port = this.port;
+    const target = await this._requireAdbTarget(null, port);
+    const adbPath = this._adbRoute.isChild ? this._adbRoute.adbPath : this._adbInvocation('', []).adb;
+    await instanceAdb.restartServer({ adbPath });
+    await this._requireAdbTarget(target, port);
+    // Child scanners are disabled: explicitly re-register only this birth-pinned
+    // guest, retaining emulator-N rather than adding a generic TCP serial.
+    await instanceAdb.registerEmulator(port + 1, {
+      shouldConnect: async () => !!(await this._ownedAdbTarget(target, port)),
+    });
+    await this._requireAdbTarget(target, port);
+    return true;
   }
 
-  async _resetAdbServer(adbPort) {
-    let adb = 'adb';
-    try { adb = this.provisioner.adbVersionPath() || 'adb'; } catch (_) { /* 用 PATH 里的 */ }
-    const env = { ...process.env, ANDROID_ADB_SERVER_PORT: String(adbPort) };
-    const run = (args, timeout) => new Promise((resolve) => {
-      try {
-        execFile(adb, args, { timeout, windowsHide: true, env }, () => resolve());
-      } catch (_) { resolve(); }
-    });
-    await run(['kill-server'], 6000);
-    await run(['start-server'], 12000);
-    // adb start-server 在部分机器上同步返回得很快，但端口还没真正 listen，
-    // 这里等到能连上为止（最多 ~3 秒，正常几十毫秒）。
-    const net = require('net');
-    for (let i = 0; i < 25; i += 1) {
-      // eslint-disable-next-line no-await-in-loop
-      const alive = await new Promise((resolve) => {
-        const sock = net.connect({ host: '127.0.0.1', port: Number(adbPort) });
-        let done = false;
-        const fin = (v) => { if (done) return; done = true; try { sock.destroy(); } catch (_) { /* ignore */ } resolve(v); };
-        sock.setTimeout(150, () => fin(false));
-        sock.once('connect', () => fin(true));
-        sock.once('error', () => fin(false));
-      });
-      if (alive) return true;
-      // eslint-disable-next-line no-await-in-loop
-      await sleep(120);
+  /** Startup/retry is ensure-only, never a reset of parent/sibling/unknown ADB. */
+  async _resetAdbServer(adbPort = this.adbPort) {
+    if (Number(adbPort) !== this._adbRoute.port) {
+      const error = new Error('ADB 路由已固定，拒绝启动时改端口');
+      error.code = 'INSTANCE_ADB_ROUTE_CHANGED';
+      throw error;
     }
-    return false;
+    const ready = await instanceAdb.ensureServer({ adbPath: this._adbInvocation('', []).adb });
+    if (!ready) {
+      const error = new Error('ADB 服务未确认就绪');
+      error.code = 'INSTANCE_ADB_START_FAILED';
+      throw error;
+    }
+    return true;
   }
 
   /**
@@ -951,7 +1036,7 @@ class EmulatorEngine {
     this.attempts.push({
       plan: plan.label || '未知参数', diagnosis: d.code, exitCode: this.lastExitCode,
       params: doctor.describeAttempt(plan), gpu: plan.gpu, accel: plan.accel,
-      error: msg,
+      acceleration: this._accelerationState(plan, this._attemptLines(logStart, 600)), error: msg,
     });
     this.lastDiagnosis = d;
     return d;
@@ -969,25 +1054,9 @@ class EmulatorEngine {
    * @returns {Promise<{ok:boolean, reason:string, gateway?:string, ip?:string}>}
    */
   async checkNetwork(adbPath = '', { waitMs = 0, interval = 3000 } = {}) {
-    let adb = adbPath || '';
-    if (!adb) {
-      try { adb = this.provisioner.adbVersionPath() || ''; } catch (_) { adb = ''; }
-    }
-    if (!adb) {
-      // adbVersionPath() 只查「版本文件」，很多安装形态下是空的；
-      // 直接按运行时根目录找 bundled 的 platform-tools 才稳。
-      try { adb = path.join(this.locate().root, 'platform-tools', process.platform === 'win32' ? 'adb.exe' : 'adb'); } catch (_) { adb = ''; }
-    }
-    if (!adb || !fs.existsSync(adb)) adb = 'adb';
-    const port = Number(process.env.ANDROID_ADB_SERVER_PORT) || this.adbPort || 5044;
-    const env = { ...process.env, ANDROID_ADB_SERVER_PORT: String(port) };
-    const sh = (cmd, timeout = 8000) => new Promise((resolve) => {
-      try {
-        execFile(adb, ['-s', this.serial, 'shell', cmd], { timeout, windowsHide: true, env }, (e, out) => {
-          resolve(e ? '' : String(out || ''));
-        });
-      } catch (_) { resolve(''); }
-    });
+    const port = this.port;
+    const target = await this._requireAdbTarget(null, port);
+    const sh = (cmd, timeout = 8000) => this._guestShell(adbPath, cmd, target, port, { timeout });
     // 安卓的多路由表会让 `ip route` 的主表看起来是空的（默认路由在 per-interface 表里），
     // 而且 shell 的 uid 不在应用的 network 组里，`ping` 经常误报 "Network is unreachable"，
     // 哪怕 Wi-Fi 其实已经连上、应用也能正常上网。所以这里只认「有没有拿到 IPv4 地址」，
@@ -1039,23 +1108,11 @@ class EmulatorEngine {
    * @returns {Promise<{ok:boolean, fixed:boolean, reason?:string}>}
    */
   async repairWifi(adbPath = '', onLog = () => {}) {
-    let adb = adbPath || '';
-    if (!adb) {
-      try { adb = path.join(this.locate().root, 'platform-tools', process.platform === 'win32' ? 'adb.exe' : 'adb'); } catch (_) { adb = ''; }
-    }
-    if (!adb || !fs.existsSync(adb)) adb = 'adb';
-    const port = Number(process.env.ANDROID_ADB_SERVER_PORT) || this.adbPort || 5044;
-    const env = { ...process.env, ANDROID_ADB_SERVER_PORT: String(port) };
-    const sh = (cmd, timeout = 10000) => new Promise((resolve) => {
-      try {
-        execFile(adb, ['-s', this.serial, 'shell', cmd], { timeout, windowsHide: true, env }, (e, out, err) => {
-          // 注意：命令失败（非 0 退出）时也要把 stdout/stderr 带出来。
-          // 之前这里失败就返回空串，导致 `connect-network` 的 SecurityException
-          // 被吞掉、UI 兜底分支永远进不去（实测踩过这个坑）。
-          resolve(String(out || '') + String(err || ''));
-        });
-      } catch (_) { resolve(''); }
-    });
+    const port = this.port;
+    const target = await this._requireAdbTarget(null, port);
+    // Preserve stderr on command failure (SecurityException triggers the UI
+    // fallback), but ownership loss rejects immediately instead of continuing.
+    const sh = (cmd, timeout = 10000) => this._guestShell(adbPath, cmd, target, port, { timeout, includeErrors: true });
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
     // 0) 已经连着就不用修
@@ -1190,25 +1247,39 @@ class EmulatorEngine {
       onLog(msg);
       return { ok: false, error: msg, needsSpace: true, attempts: [] };
     }
-    const adbPort = await doctor.freeAdbPort(Number(process.env.ANDROID_ADB_SERVER_PORT) || 5044);
-    // 让本进程里所有 adb 调用和 emulator 用同一个 server 端口
-    process.env.ANDROID_ADB_SERVER_PORT = String(adbPort);
-    this.adbPort = adbPort;
-
-    // 这四件事互不依赖，并行做：以前是「加速检查 → 版本 → 探端口 → 清 adb server」串行，
-    // 冷启动前白等 3~5 秒，正好是用户点开应用后盯着加载框的那段时间。
-    // 上一次运行留下的 adb server 可能还挂着旧设备记录（会把新模拟器挤成 offline），
-    // 所以清 server 仍然要做，只是不必单独等它。
-    const [accelInfo, verInfo, startPort] = await Promise.all([
-      this.provisioner.emulatorAccel(),
-      this.provisioner.emulatorVersion(),
-      doctor.freePortPair(5554),
-      this._resetAdbServer(adbPort),
-    ]);
+    let adbPort;
+    let accelInfo;
+    let verInfo;
+    let startPort;
+    try {
+      adbPort = await doctor.freeAdbPort();
+      this.adbPort = adbPort;
+      // Independent read-only checks + ensure-only ADB readiness. Retry never
+      // resets a live service or issues kill-server against an unknown listener.
+      const results = await Promise.all([
+        this.provisioner.emulatorAccel(),
+        this.provisioner.emulatorVersion(),
+        doctor.freePortPair(5554),
+        this._resetAdbServer(adbPort),
+      ]);
+      [accelInfo, verInfo, startPort] = results;
+      if (results[3] === false) throw new Error('ADB 服务未就绪');
+    } catch (error) {
+      const code = error.code || 'INSTANCE_ADB_START_FAILED';
+      const message = `ADB 服务准备失败，已停止启动：${error.message || error}`;
+      const diagnosis = { code, title: 'ADB 服务未就绪', hint: message };
+      this.lastDiagnosis = diagnosis;
+      this.attempts = [{ stage: 'adb', diagnosis: code, error: message }];
+      this.log(message);
+      onLog(message);
+      this._persistFailure({ why: 'adb' });
+      return { ok: false, code, error: message, diagnosis, attempts: this.attempts, exitCode: null };
+    }
     const emuVersion = verInfo.version || '';
     this._emuVersion = emuVersion;
+    this._detectedAccel = accelInfo;
 
-    // 与设置页 / 诊断报告共用同一个入口，保证「显示的」就是「实跑的」
+    // 与设置页共用选档入口；检测结果只影响选档，实际传参与日志确认另行记录。
     const profile = doctor.autoProfile({
       settings: s, accel: accelInfo, emulatorVersion: emuVersion, diskMB,
       port: startPort, adbPort,
@@ -1231,6 +1302,7 @@ class EmulatorEngine {
     if (Number(timeoutMs) > 0) {
       profile.bootTimeoutMs = Math.max(profile.bootTimeoutMs || 0, Number(timeoutMs));
     }
+    profile.acceleration = this._accelerationState(profile);
     this.profile = profile;
     // 嵌入 Electron 的可见窗口会经历跨进程 SetParent、失焦和 DWM 重绘；
     // 这类场景下 host 的交换链可能在失焦后丢失，表现为「安卓仍在跑，窗口全黑」。
@@ -1260,7 +1332,7 @@ class EmulatorEngine {
 
     const logFile = path.join(store.DATA_DIR, 'logs', 'emulator.log');
     fs.mkdirSync(path.dirname(logFile), { recursive: true });
-    this._logWrite(logFile, `\n\n=== ${new Date().toISOString()} START ${doctor.describeProfile(profile)} ===\n`);
+    this._logWrite(logFile, `\n\n=== ${new Date().toISOString()} START ${this.describeProfile(this.profile || profile)} ===\n`);
 
     // 屏幕规格在整个启动过程中保持一致，否则每次重试都换分辨率会狂清快照。
     // 分辨率来自 doctor 的 profile（设置里可改「画质」），auto 时按加速状态选。
@@ -1293,12 +1365,15 @@ class EmulatorEngine {
       // eslint-disable-next-line no-await-in-loop
       const port = i === 0 ? startPort : await doctor.freePortPair(startPort + (i * 2));
       const plan = { ...base, port, adbPort, lcd: screen };
+      plan.acceleration = this._accelerationState(plan);
+      // 关加速的兜底不能沿用自动档里「检测通过」的 accelOk 当作本轮实际状态。
+      if (plan.accel === 'off') plan.accelOk = false;
       this.port = port;
       // 每轮重置退出码：上一轮 0xC0000005 不能带进下一轮的诊断里
       this.lastExitCode = null;
       // 日志也按轮切分：内存日志是跨轮累积的，第 1 轮的崩溃行若留在尾部，
       // 第 2 轮（比如换后端后端口冲突）会被误诊成同一个崩溃。
-      const logStart = this._log.length;
+      const logStart = this._logSeq; // Array length is not a boundary once the 600-entry ring shifts.
       onLog(`启动运行时（第 ${i + 1}/${variants.length} 次：${plan.label}）…`);
 
       try {
@@ -1308,6 +1383,22 @@ class EmulatorEngine {
           // （实测报 Failed to load snapshot 后退回冷启动），必须先清掉再重建。
           wipe: plan.wipe || !!this.wipePending || forceWipe,
         });
+        // /data 准备失败不是 GPU/加速降级能修好的问题，必须在任何 spawn 前收工。
+        // 同时检查顶层和分区结果，避免旧适配器只返回 data.ok:false 时被忽略。
+        if (!avd || avd.ok === false || avd.data?.ok === false) {
+          const error = avd?.error || `安卓 /data 分区准备失败：${avd?.data?.error || avd?.data?.reason || '无法确认分区可用'}`;
+          const code = avd?.code || avd?.data?.code || 'DATA_PARTITION_PREPARE_FAILED';
+          const diagnosis = { code, title: '安卓数据分区准备失败', hint: error };
+          this.lastDiagnosis = diagnosis;
+          this.attempts.push({
+            plan: plan.label, stage: 'data-partition', diagnosis: code, error,
+            params: doctor.describeAttempt(plan), gpu: plan.gpu, accel: plan.accel,
+            data: avd?.data || null,
+          });
+          onLog(`${error}；已停止启动，不会通过切换参数或清空数据重试。`);
+          this._persistFailure({ profile: plan, why: 'data-partition', data: avd?.data || null });
+          return { ok: false, code, error, diagnosis, data: avd?.data || null, attempts: this.attempts, exitCode: null };
+        }
         // 埋点：上层（main）用它在拉起模拟器**之前**打开黑窗压制。
         // 控制台窗口在 spawn 之后几十毫秒就冒出来，事后再补一次扫描必然闪一下，
         // 所以这里必须先把它打开、再拉起进程。
@@ -1317,18 +1408,20 @@ class EmulatorEngine {
         }
         // eslint-disable-next-line no-await-in-loop
         this.spawnOnce({ ...plan, wipe: plan.wipe || avd.wipePending || forceWipe }, { headless, onLog, logFile });
+        this.profile = plan;
         // _coldBoot 只对这次 spawn 生效，避免之后每次开机都退化成长时间冷启动
         this._coldBoot = false;
         // 参数错误 / DLL 缺失会立刻退出
         // eslint-disable-next-line no-await-in-loop
         const dead = await this._waitSpawnSettled(2200);
+        plan.acceleration = this._accelerationState(plan, this._attemptLines(logStart, 600));
         if (dead || !this.proc) {
           const earlyLines = this._attemptLines(logStart, 60);
           let d = doctor.diagnose(earlyLines);
           // 检测说有加速、日志里却连「accelerator ... operational」都没有就退了：
           // 这不是渲染/镜像问题，是驱动没接管。旧逻辑在这里只能给 UNKNOWN
           // （日志里一条错误都没有，所有正则都落空），用户拿着报告也无从下手。
-          const early = doctor.earlyAccelExit({
+          const early = plan.accel === 'off' ? null : doctor.earlyAccelExit({
             accel: accelInfo, logLines: earlyLines, exitCode: this.lastExitCode,
           });
           if (early && ['UNKNOWN', 'ACCEL'].includes(d.code)) d = early;
@@ -1337,7 +1430,7 @@ class EmulatorEngine {
             // 实际参数：失败后用户/作者都要能看出「这一轮到底用了多保守的配置」，
             // 只看 label（gpu / 加速方式）是不够的。
             params: doctor.describeAttempt(plan),
-            gpu: plan.gpu, accel: plan.accel,
+            gpu: plan.gpu, accel: plan.accel, acceleration: plan.acceleration,
           });
           this.lastDiagnosis = d;
           lastError = `${d.title}：${d.hint}`;
@@ -1350,7 +1443,7 @@ class EmulatorEngine {
           if (d.code === 'DISK_FULL') {
             onLog('磁盘空间不足，已停止重试（不会动你的应用与存档）。');
             this._persistFailure({
-              profile, profileText: doctor.describeProfile(profile),
+              profile, profileText: this.describeProfile(this.profile || profile),
               tuning: doctor.describeTuning(profile), why: 'disk-full',
             });
             return { ok: false, error: lastError, needsSpace: true, attempts: this.attempts, exitCode: this.lastExitCode };
@@ -1377,7 +1470,7 @@ class EmulatorEngine {
           // spawned so status/doctor:profile can distinguish the running VM from
           // the next-start profile shown in Settings.
           this.profile = plan;
-          return { ok: true, serial: this.serial, port, accel: accelInfo, logFile, profile, attempts: this.attempts };
+          return { ok: true, serial: this.serial, port, accel: accelInfo, logFile, profile: plan, attempts: this.attempts };
         }
 
         const started = Date.now();
@@ -1422,6 +1515,7 @@ class EmulatorEngine {
           interval = Math.min(1200, Math.round(interval * 1.6));
         }
 
+        plan.acceleration = this._accelerationState(plan, this._attemptLines(logStart, 600));
         if (ok) {
           const bootMs = Date.now() - started;
           // `profile` is the desired auto profile, while `plan` is the concrete
@@ -1431,10 +1525,9 @@ class EmulatorEngine {
           this.profile = plan;
           // 这一次真的起来了：清掉上次的失败记录，避免以后「诊断」翻出旧账
           this._clearFailure();
-          // 一定要存 quickboot 快照：模拟器进程会随 ApkStart 退出而结束（Electron 的
-          // job 对象会连带杀掉子进程），下次打开有没有快照直接决定是 25 秒还是 7 秒。
-          // 装完新应用时 installer 会作废快照，避免"重启后应用消失"。
-          this.snapshotWorthSaving = true;
+          // 快照只在设置、实际运行档与保存策略均允许时保存；显式 false 不因开机成功被覆盖。
+          // 装完新应用时 installer 会作废旧快照，避免恢复后应用消失。
+          if (this.snapshotWorthSaving !== false) this.snapshotWorthSaving = true;
           onLog(`运行时就绪（${Math.round(bootMs / 1000)}s，${plan.label}）`);
           // 开机成功不等于能用：顺手体检网络。虚拟机没网时，需要联网的页面会一直黑屏，
           // 用户只会说「这个应用黑屏」，很难联想到是网络。这里主动查一次并说清楚。
@@ -1459,7 +1552,7 @@ class EmulatorEngine {
           }
           return {
             ok: true, serial: this.serial, port, accel: accelInfo, logFile,
-            profile, attempts: this.attempts, bootMs, quickBoot: true, network,
+            profile: plan, attempts: this.attempts, bootMs, quickBoot: true, network,
           };
         }
 
@@ -1482,7 +1575,7 @@ class EmulatorEngine {
         // 进程死了却没有任何可识别的错误行，而本机号称有加速：落到「加速器没接管」。
         // 用户报的那份报告正好走这条路径（日志停在 Userspace boot properties，退出码 1）。
         if (fatal && d.code === 'UNKNOWN') {
-          const early = doctor.earlyAccelExit({
+          const early = plan.accel === 'off' ? null : doctor.earlyAccelExit({
             accel: accelInfo, logLines: attemptLines, exitCode: this.lastExitCode,
           });
           if (early) d = early;
@@ -1490,7 +1583,7 @@ class EmulatorEngine {
         this.attempts.push({
           plan: plan.label, diagnosis: d.code, timeout: !fatal, exitCode: this.lastExitCode,
           params: doctor.describeAttempt(plan),
-          gpu: plan.gpu, accel: plan.accel,
+          gpu: plan.gpu, accel: plan.accel, acceleration: plan.acceleration,
         });
         const tcgCrash = this._softwareTcgCrashed(plan, d);
         if (tcgCrash) {
@@ -1531,7 +1624,7 @@ class EmulatorEngine {
     if ((!d || d.code === 'UNKNOWN') && accelInfo && !accelInfo.ok) d = doctor.noAccelDiagnosis();
     // 兜底：有加速、却没有任何一条能解释退出的日志 —— 结论就是「驱动没接管」。
     // 不能让用户对着一句 UNKNOWN 去换镜像、换渲染后端（这两条路都是白折腾）。
-    if (!d || d.code === 'UNKNOWN') {
+    if ((!d || d.code === 'UNKNOWN') && this.profile?.accel !== 'off') {
       d = doctor.earlyAccelExit({
         accel: accelInfo, logLines: this.recentLog(300), exitCode: this.lastExitCode,
       }) || d;
@@ -1545,6 +1638,8 @@ class EmulatorEngine {
         // 加速探测的原始结论：AEHD「装了但服务没跑」时这里带 suspect 标记，
         // 报告里能直接看出「程序当时以为有加速」，而不是反复怀疑显卡。
         accel: accelInfo || null,
+        acceleration: this.profile?.acceleration || null,
+        actualProfile: this.profile,
         // 日志里那些「看着像错误、其实无害」的行，报告里主动解释一句，
         // 省得用户拿 "host doesn't support requested feature" 去查错方向。
         notes: doctor.notes(this.recentLog(300)),
@@ -1573,7 +1668,7 @@ class EmulatorEngine {
       `运行时多次尝试仍未能启动（${d.title}）。\n${d.hint}\n\n`
       // 低配机器上最常被问的一句是「你到底给我分配了什么」。这行就是实跑参数，
       // 与设置页展示、诊断报告里的是同一份（doctor.describeProfile）。
-      + `实际参数：${doctor.describeProfile(profile)}\n`
+      + `实际参数：${this.describeProfile(this.profile || profile)}\n`
       + `已尝试：${this.attempts.map((a) => `${a.plan}${a.params ? `（${a.params}）` : ''} → ${a.diagnosis}`).join('；')}\n`
       + `${customHint ? `${customHint.trim()}\n` : ''}`
       + `诊断报告：${report.file}${visibleHint}`,
@@ -1582,7 +1677,7 @@ class EmulatorEngine {
     err.report = report.file;
     err.attempts = this.attempts;
     this._persistFailure({
-      profile, profileText: doctor.describeProfile(profile),
+      profile, profileText: this.describeProfile(this.profile || profile),
       tuning: doctor.describeTuning(profile), why: 'boot-failed', report: report.file,
       // 本次用的是哪套镜像：进程重启后仍要能回答「是不是我换的镜像导致的」
       image: choice && {
@@ -1616,8 +1711,14 @@ class EmulatorEngine {
    * （快照要写 1~3GB），体感反而更慢。改成「空闲时再存」，并由 Runtime 在
    * 最后一个应用窗口关闭时触发；关机前若还没来得及存，也会补一次。
    */
-  async saveSnapshotNow(adbPath, { timeout = 45000 } = {}) {
-    if (!adbPath) return false;
+  snapshotSaveAllowed(profile = this.profile) {
+    return this.settings?.engine?.keepSnapshot !== false
+      && profile?.snapshot !== false && this.snapshotWorthSaving !== false;
+  }
+
+  async saveSnapshotNow(adbPath, { timeout = 45000, shouldSave = () => true } = {}) {
+    if (!this.snapshotSaveAllowed()) { this.cancelSnapshotSave(); return false; }
+    if (!adbPath || !shouldSave()) return false;
     // 「存快照把模拟器写崩」的记忆位（上游 #46）：在一台已稳定跑了几分钟的模拟器上，
     // 只执行 `adb emu avd snapshot save`，60 秒后进程就 0xC0000005 消失。
     // 学过一次就不再试 —— 用户宁可下次冷启动多等 20 秒，也不要应用窗口用的过程中突然没了。
@@ -1627,7 +1728,7 @@ class EmulatorEngine {
       return false;
     }
     const alive = this.running();
-    const ok = await this._saveViaAdb(adbPath, { timeout });
+    const ok = await this._saveViaAdb(adbPath, { timeout, shouldSave });
     if (alive && !this.running()) {
       this._noteSnapshotUnsafe();
       this.log('快照保存导致模拟器退出，已记录：本机后续不再保存快照');
@@ -1659,23 +1760,30 @@ class EmulatorEngine {
    * 只排一次；如果到点时容器还有应用在前台，就推迟到真正空闲。
    */
   scheduleSnapshotSave(adbPath, { delay = 20000, isIdle = () => true } = {}) {
-    if (!adbPath) return;
-    if (this._snapTimer) clearTimeout(this._snapTimer);
+    this.cancelSnapshotSave();
+    if (!adbPath || !this.snapshotSaveAllowed()) return;
+    this._snapSaved = false;
+    const request = {};
+    this._snapSaveRequest = request;
+    const current = () => this._snapSaveRequest === request && this.snapshotSaveAllowed();
     const arm = (ms) => {
       this._snapTimer = setTimeout(async () => {
+        if (this._snapSaveRequest !== request) return;
         this._snapTimer = null;
+        if (!this.snapshotSaveAllowed()) { this._snapSaveRequest = null; return; }
         if (!this.running()) return;
-        if (!isIdle()) { arm(15000); return; }
+        if (!isIdle()) { if (current()) arm(15000); return; }
         // 磁盘余量不够写快照（内存大小 + 1GB 余量）就跳过：硬写只会把磁盘写满，
         // 进而让下一次开机直接失败。快照只影响启动速度，不写也不影响数据。
-        const freeMB = require('./doctor').freeDiskMB(store.DATA_DIR);
+        const freeMB = doctor.freeDiskMB(this.provisioner.paths().avdHome);
         const needMB = Math.round(Number(this.profile?.memoryMB || 3072) * 1.15) + 1024;
         if (freeMB && freeMB < needMB) {
           this.log(`跳过快照保存：磁盘剩余 ${(freeMB / 1024).toFixed(1)}GB < 需要 ${(needMB / 1024).toFixed(1)}GB`);
           return;
         }
-        await this.saveSnapshotNow(adbPath).catch(() => false);
-        this._snapSaved = true;
+        if (!current()) return;
+        const saved = await this.saveSnapshotNow(adbPath, { shouldSave: current }).catch(() => false);
+        if (current()) this._snapSaved = saved === true;
       }, ms);
       if (this._snapTimer.unref) this._snapTimer.unref();
     };
@@ -1685,6 +1793,7 @@ class EmulatorEngine {
   cancelSnapshotSave() {
     if (this._snapTimer) clearTimeout(this._snapTimer);
     this._snapTimer = null;
+    this._snapSaveRequest = null;
   }
 
   /**
@@ -1696,10 +1805,14 @@ class EmulatorEngine {
   async _adbGuestHealthy(adbPath) {
     if (!adbPath) return false;
     try {
+      const port = this.port;
+      const target = await this._requireAdbTarget(null, port);
       const { AdbClient } = require('./adb');
       const probe = new AdbClient({ adbPath, serial: this.serial });
       const state = await probe.deviceState();
+      await this._requireAdbTarget(target, port);
       const out = await probe.shell('getprop sys.boot_completed', { timeout: 6000 }).catch(() => '');
+      await this._requireAdbTarget(target, port);
       return state === 'device' && String(out).trim() === '1';
     } catch (_) {
       return false;
@@ -1716,7 +1829,7 @@ class EmulatorEngine {
     }
     if (!target) return !this.running() && !(await this._consoleAlive());
     const healthy = adbPath ? await this._adbGuestHealthy(adbPath).catch(() => false) : true;
-    if (adbPath && this.snapshotWorthSaving !== false && healthy) {
+    if (adbPath && this.snapshotSaveAllowed() && healthy) {
       await this.saveSnapshotNow(adbPath, { timeout: 60000 }).catch(() => false);
     }
     // An adb serial/console port can be reassigned between validation and `emu kill`.
@@ -1823,11 +1936,20 @@ class EmulatorEngine {
     });
   }
 
-  /** 用 adb 触发一次快照保存（失败返回 false，调用方决定要不要再试） */
-  _saveViaAdb(adbPath, { timeout = 45000 } = {}) {
+  /** 用 adb 保存前仍需验证健康与端口归属；直接调用和定时保存也不能绕过。 */
+  async _saveViaAdb(adbPath, { timeout = 45000, shouldSave = () => true } = {}) {
+    const allowed = () => this.snapshotSaveAllowed() && shouldSave();
+    if (!adbPath || !allowed()) return false;
+    const serial = this.serial;
+    const port = this.port;
+    const target = await this._ownedAdbTarget(null, port);
+    if (!target || !allowed()) return false;
+    if (!(await this._adbGuestHealthy(adbPath)) || !allowed()) return false;
+    const current = await this._ownedAdbTarget(target, port);
+    if (!processOwner.sameIdentity(target, current) || serial !== this.serial || !allowed()) return false;
+    const call = this._adbInvocation(adbPath, ['-s', serial, 'emu', 'avd', 'snapshot', 'save', this.snapshotName]);
     return new Promise((resolve) => {
-      execFile(adbPath, ['-s', this.serial, 'emu', 'avd', 'snapshot', 'save', this.snapshotName],
-        { timeout, windowsHide: true }, (err) => resolve(!err));
+      execFile(call.adb, call.args, { timeout, windowsHide: true, env: call.env }, (err) => resolve(!err));
     });
   }
 
@@ -1837,11 +1959,12 @@ class EmulatorEngine {
    * 只取「本轮启动尝试」产生的日志行。
    * 内存日志是跨轮累积的（诊断报告要看到全部尝试），但诊断结论必须只看本轮：
    * 否则第 1 轮的 `emulator exit 3221225477` 会让第 2 轮的任何失败都被判成同一个崩溃。
-   * 本轮一条日志都没有时（进程压根没起来）退回整体尾部，至少给个结论。
+   * 用单调序号而不是会因 shift() 变化的数组下标；本轮没有日志就返回空，
+   * 绝不借上轮的 operational/崩溃证据来填空。
    */
   _attemptLines(from, max = 80) {
-    const lines = this._log.slice(Math.max(0, from || 0)).map((x) => x.line);
-    return lines.length ? lines.slice(-max) : this.recentLog(max);
+    const boundary = Math.max(0, from || 0);
+    return this._log.filter((entry) => entry.seq > boundary).slice(-max).map((entry) => entry.line);
   }
 
   /**

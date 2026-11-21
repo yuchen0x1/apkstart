@@ -30,6 +30,7 @@ function harness() {
   const context = vm.createContext({
     path, __dirname: ROOT, ipcguard, ipcMain, console: { warn() {} },
     currentSystemStatus: null,
+    instanceContext: { isChild: false, id: null }, automation: null,
     channelMode: require('../src/core/runtime-actions').channelMode,
     createReportDelivery: require('../src/core/report-delivery').createReportDelivery,
     runtimeActions: { run: (_channel, action) => action() },
@@ -56,7 +57,8 @@ function harness() {
 }
 
 for (const channel of ['runtime:resetData', 'settings:set', 'shell:openPath', 'app:removeSelf',
-  'app:updateApply', 'provision:installEmulator', 'image:import', 'system:remove', 'android:grantAll', 'window:close']) {
+  'app:updateApply', 'provision:installEmulator', 'image:import', 'system:remove', 'android:grantAll', 'window:close',
+  'instances:create', 'instances:launch', 'peripherals:webcams', 'peripherals:refresh', 'automation:run', 'automation:action', 'automation:cancel']) {
   test(`shell cannot invoke privileged channel ${channel}`, async () => {
     const h = harness();
     await assert.rejects(h.invoke(h.shellWindow, channel, {}), /IPC/);
@@ -65,6 +67,17 @@ for (const channel of ['runtime:resetData', 'settings:set', 'shell:openPath', 'a
     assert.equal(h.calls.patches.length, 0);
   });
 }
+test('child instances cannot mutate shared components or global integration', async () => {
+  const h = harness();
+  h.context.instanceContext.isChild = true;
+  for (const channel of ['provision:installQemu', 'system:switch', 'image:import', 'app:removeSelf',
+    'app:updateApply', 'assoc:register', 'instances:create', 'shortcut:rebuild']) {
+    await assert.rejects(h.invoke(h.mainWindow, channel, {}), /主实例/);
+  }
+  assert.equal(h.calls.dialogs.length, 0);
+  assert.equal(h.calls.patches.length, 0);
+  assert.equal((await h.invoke(h.mainWindow, 'settings:get')).theme, 'dark');
+});
 test('existing main channels remain available and shell-only or future channels fail closed', async () => {
   const h = harness();
   const shellOnly = new Set(['shell:state', 'shell:minimize', 'shell:maximize', 'shell:close',
@@ -256,7 +269,8 @@ test('production close callback retains the original client and queues cleanup u
   const a = { serial: 'device-A' }, b = { serial: 'device-B' };
   let selected = a, callback, release;
   const runtimeActions = new RuntimeActions({ status: () => assert.fail() });
-  const context = { windowClients, runtimeActions, quitting: false, appLog() {}, onContainerActive() {},
+  const context = { windowClients, windowSessions: new WeakMap(), automation: null,
+    runtimeActions, quitting: false, appLog() {}, onContainerActive() {},
     appWin: { isOpen: false, onCloseApp: fn => { callback = fn; } },
     runtime: { client: () => selected, endApp: async (pkg, opts) => {
       assert.equal(opts.shouldCancel(), false);

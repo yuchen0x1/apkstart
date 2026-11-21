@@ -135,4 +135,69 @@ test('硬件加速检查与按需授权提示英中往返，不再声称自动�
   assert.strictEqual(text.nodeValue, '正在检查并启用硬件加速…');
   assert.strictEqual(button.getAttribute('title'), detail);
 });
+test('西/越/俄载荷切换都从中文源文重新翻译，并回到中文原文', () => {
+  text.nodeValue = '设置'; button.setAttribute('title', '设置'); document.title = '设置';
+  const payloads = {
+    'es-ES': { lang: 'es-ES', dict: { '设置': 'Ajustes', '搜索应用': 'Buscar aplicaciones' } },
+    'vi-VN': { lang: 'vi-VN', dict: { '设置': 'Cài đặt', '搜索应用': 'Tìm ứng dụng' } },
+    'ru-RU': { lang: 'ru-RU', dict: { '设置': 'Настройки', '搜索应用': 'Поиск приложений' } },
+  };
+  const expected = { 'es-ES': 'Ajustes', 'vi-VN': 'Cài đặt', 'ru-RU': 'Настройки' };
+  for (const lang of ['es-ES', 'vi-VN', 'ru-RU']) {
+    api.retranslate(payloads[lang]);
+    assert.strictEqual(text.nodeValue, expected[lang], `${lang} 文本`);
+    assert.strictEqual(button.getAttribute('title'), expected[lang], `${lang} 属性`);
+    assert.strictEqual(document.title, expected[lang], `${lang} 标题`);
+    assert.strictEqual(document.documentElement.getAttribute('lang'), lang, `${lang} HTML lang`);
+  }
+  api.retranslate(chinese);
+  assert.strictEqual(text.nodeValue, '设置');
+  assert.strictEqual(button.getAttribute('title'), '设置');
+  assert.strictEqual(document.title, '设置');
+  assert.strictEqual(document.documentElement.getAttribute('lang'), 'zh-CN');
+});
+test('三语词典条目在 renderer 中回填数字，缺本地词时用英文载荷条目', () => {
+  const payload = { lang: 'es-ES', dict: {
+    '第 \u0001 步 / 共 \u0001 步': 'Paso \u0001 de \u0001',
+    '\u0001 已安装': '\u0001 instalado',
+    '诊断报告已导出': 'The diagnostic report has been exported',
+  } };
+  api.retranslate(payload);
+  assert.strictEqual(api.translateOne('第 2 步 / 共 5 步'), 'Paso 2 de 5');
+  assert.strictEqual(api.translateOne('诊断报告已导出'), 'The diagnostic report has been exported');
+  assert.strictEqual(api.translateOne('设置'), '设置');
+  api.retranslate(chinese);
+});
+test('apply 直接切到西语也会先恢复中文源文，而不是把旧译文当源文跳过', () => {
+  text.nodeValue = '设置'; button.setAttribute('title', '设置'); document.title = '设置';
+  api.apply(english);
+  assert.strictEqual(text.nodeValue, 'Settings');
+  api.apply({ lang: 'es-ES', dict: { '设置': 'Ajustes' } });
+  assert.strictEqual(text.nodeValue, 'Ajustes');
+  assert.strictEqual(button.getAttribute('title'), 'Ajustes');
+  assert.strictEqual(document.title, 'Ajustes');
+  api.apply(chinese);
+  assert.strictEqual(text.nodeValue, '设置');
+  assert.strictEqual(button.getAttribute('title'), '设置');
+  assert.strictEqual(document.title, '设置');
+});
+test('observer 新增节点立即翻译，skip 子树内新增节点保持原文', () => {
+  const freshText = { nodeType: 3, nodeValue: '设置' };
+  const fresh = element({ title: '设置' }, [freshText]);
+  fresh.parentElement = body; body.children.push(fresh);
+  const skippedText = { nodeType: 3, nodeValue: '设置' };
+  const skippedChild = element({ title: '设置' }, [skippedText]);
+  const skippedRoot = element({ 'data-i18n-skip': '' }, [skippedChild]);
+  skippedRoot.tagName = 'DIV'; skippedRoot.parentElement = body; body.children.push(skippedRoot);
+  api.retranslate(english);
+  observer.callback([{ type: 'childList', addedNodes: [fresh, skippedRoot] }]);
+  assert.strictEqual(freshText.nodeValue, 'Settings');
+  assert.strictEqual(fresh.getAttribute('title'), 'Settings');
+  assert.strictEqual(skippedText.nodeValue, '设置');
+  assert.strictEqual(skippedChild.getAttribute('title'), '设置');
+  api.retranslate(chinese);
+  assert.strictEqual(freshText.nodeValue, '设置');
+  assert.strictEqual(fresh.getAttribute('title'), '设置');
+  body.children.pop(); body.children.pop();
+});
 console.log(`界面语言往返回归：${passed} 通过，0 失败`);
