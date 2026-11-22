@@ -244,11 +244,6 @@ function parseWebcamList(output) {
   return entries;
 }
 
-function numberAfter(pattern, text) {
-  const match = pattern.exec(text);
-  return match ? Number(match[1]) : null;
-}
-
 function parseModeContent(content) {
   // DisplayDeviceInfo prints `modeId 1`, while Display.Mode prints `id=1`.
   const idMatch = /\bid\s*[=:]\s*(-?\d+)/i.exec(content)
@@ -288,6 +283,90 @@ function parseActiveSfMode(text) {
   return marker ? parseModeContent(marker[1]) : null;
 }
 
+/** Strip physical Display Devices blocks; they describe scanout hardware, not a logical display. */
+function withoutDisplayDeviceSections(text) {
+  let inDevices = false;
+  const kept = [];
+  for (const line of text.split(/(?<=\n)/)) {
+    if (/^[ \t]*(?:Logical[ \t]+)?Display[ \t]+(?:#[ \t]*)?\d+[ \t]*:[ \t]*$/i.test(line.replace(/[\r\n]+$/, ''))
+        || /^[ \t]*Logical Displays[ \t]*:/i.test(line)) inDevices = false;
+    if (/^[ \t]*Display Devices[ \t]*:/i.test(line)) { inDevices = true; continue; }
+    if (!inDevices) kept.push(line);
+  }
+  return kept.join('');
+}
+
+/** Split Android dumpsys display output into independently attributable displays. */
+function splitDisplaySections(text) {
+  const lines = text.match(/[^\n]*(?:\n|$)/g).filter((line) => line.length > 0);
+  const anchors = [
+    { kind: 'header', re: /^[ \t]*(?:Logical[ \t]+)?Display[ \t]+(?:#[ \t]*)?(\d+)[ \t]*:[ \t]*$/i },
+    { kind: 'displayId', re: /^[ \t]*mDisplayId[ \t]*=[ \t]*(\d+)\b/i },
+  ];
+  for (const anchor of anchors) {
+    const starts = [];
+    let offset = 0;
+    for (const rawLine of lines) {
+      const match = anchor.re.exec(rawLine.replace(/[\r\n]+$/, ''));
+      if (match) starts.push({ offset, id: anchor.kind === 'header' || anchor.kind === 'displayId' ? Number(match[1]) : null });
+      offset += rawLine.length;
+    }
+    if (!starts.length) continue;
+    const sections = starts.map((start, i) => ({
+      id: start.id,
+      text: text.slice(start.offset, i + 1 < starts.length ? starts[i + 1].offset : text.length),
+    }));
+    return { sections, prefix: text.slice(0, starts[0].offset) };
+  }
+  return { sections: [], prefix: text };
+}
+
+function displayIds(section, headingId = null) {
+  const ids = new Set();
+  if (headingId !== null) ids.add(headingId);
+  for (const match of section.matchAll(/\bmDisplayId\s*=\s*(\d+)\b/gi)) ids.add(Number(match[1]));
+  // DisplayInfo uses `displayId 0`, while some dumps print `displayId=0`.
+  for (const match of section.matchAll(/\bdisplayId(?:\s*=\s*|\s*:\s*|\s+)(\d+)\b/gi)) ids.add(Number(match[1]));
+  return [...ids];
+}
+
+function hasDisplayModeEvidence(text) {
+  return /\bmSupportedModes\s*=|\bmActiveModeId\s*=|\bactiveModeId\s*[=:]|\bmActiveSfDisplayMode\s*=|\bmodeId\s*(?:[=:]\s*|\s+)\d+/i.test(text)
+    || parseDisplayModes(text).length > 0;
+}
+
+/**
+ * When the caller names a display, never use modes from another display. Older
+ * single-display dumps without identity fields remain usable for the default id 0;
+ * if multiple devices or an unidentifiable mode block are present, fail closed.
+ */
+function scopedDisplayText(text, displayId) {
+  if (!Number.isInteger(displayId) || displayId < 0) return { text: '', ambiguous: true };
+  // Explicit physical-device records are not logical displays; ignore only this
+  // clearly delimited block. Unknown prefix evidence remains a hard ambiguity.
+  const logicalText = withoutDisplayDeviceSections(text);
+  const { sections, prefix } = splitDisplaySections(logicalText);
+  if (!sections.length) {
+    // Legacy/single-display dumps often contain only mActiveModeId and mSupportedModes.
+    // They can safely describe the default logical display only when no display
+    // identity (and therefore no evidence of multiple displays) is present.
+    if (displayId === 0 && !/\bmDisplayId\s*=|\bdisplayId(?:\s*=\s*|\s*:\s*|\s+)\d+|^[ \t]*(?:Logical[ \t]+)?Display[ \t]+(?:#[ \t]*)?\d+[ \t]*:/im.test(logicalText)) {
+      return { text: logicalText, ambiguous: false };
+    }
+    return { text: '', ambiguous: hasDisplayModeEvidence(logicalText) };
+  }
+  if (hasDisplayModeEvidence(prefix)) return { text: '', ambiguous: true };
+  const candidates = [];
+  for (const section of sections) {
+    if (!hasDisplayModeEvidence(section.text)) continue;
+    const ids = displayIds(section.text, section.id);
+    if (ids.length !== 1) return { text: '', ambiguous: true };
+    if (ids[0] === displayId) candidates.push(section.text);
+  }
+  if (candidates.length !== 1) return { text: '', ambiguous: true };
+  return { text: candidates[0], ambiguous: false };
+}
+
 function parseDisplayRefresh(output, options = {}) {
   const text = String(output || '');
   const requestedRaw = options.requestedRate;
@@ -298,38 +377,60 @@ function parseDisplayRefresh(output, options = {}) {
     catch (error) { requestedError = error.message; }
   }
 
-  const modes = parseDisplayModes(text);
-  const activeModeId = numberAfter(/\bmActiveModeId\s*[=:]\s*(-?\d+)/i, text)
-    ?? numberAfter(/\bactiveModeId\s*[=:]\s*(-?\d+)/i, text)
-    ?? numberAfter(/\bmodeId\s*(?:[:=]|\s)\s*(-?\d+)/i, text);
-  let activeMode = activeModeId === null ? null : modes.find((mode) => mode.id === activeModeId) || null;
+  const hasRequestedDisplay = options.displayId !== undefined;
+  const displayId = hasRequestedDisplay ? Number(options.displayId) : null;
+  const scoped = hasRequestedDisplay
+    ? scopedDisplayText(text, displayId)
+    : { text, ambiguous: false };
+  const evidence = scoped.text;
+  const modes = scoped.ambiguous ? [] : parseDisplayModes(evidence);
+  const selectorIds = [...new Set([
+    ...evidence.matchAll(/\bmActiveModeId\s*[=:]\s*(-?\d+)/gi),
+    ...evidence.matchAll(/\bactiveModeId\s*[=:]\s*(-?\d+)/gi),
+  ].map((match) => Number(match[1])))];
+  // DisplayInfo can repeat the same active mode in base and override records. Keep
+  // identical readings, but do not let them hide a conflicting active mode ID.
+  const genericIds = [...new Set(
+    [...evidence.matchAll(/\bmodeId\s*(?:[:=]|\s)\s*(-?\d+)/gi)].map((match) => Number(match[1])),
+  )];
+  const activeModeId = selectorIds.length ? selectorIds[0] : genericIds.length === 1 ? genericIds[0] : null;
+  let ambiguous = scoped.ambiguous || selectorIds.length > 1 || genericIds.length > 1
+    || (selectorIds.length > 0 && genericIds.some((id) => !selectorIds.includes(id)));
+  let activeMode = null;
+  if (!ambiguous && activeModeId !== null) {
+    const matches = modes.filter((mode) => mode.id === activeModeId);
+    if (matches.length === 1) activeMode = matches[0];
+    else if (matches.length > 1) ambiguous = true;
+  }
 
   // DisplayDeviceInfo's active mode can be exposed without mActiveModeId. This
   // marker is explicit and therefore safe; do not fall back to the first supported mode.
-  if (!activeMode) activeMode = parseActiveSfMode(text);
+  if (!ambiguous && !activeMode) activeMode = parseActiveSfMode(evidence);
 
   // A DisplayInfo block can carry the selected mode id and refreshRate in the same
   // record. Only use a block explicitly marked modeId, never a supported-mode list.
-  if (!activeMode) {
-    for (const match of text.matchAll(/\{([^{}]*\bmodeId\s*(?:[=:]|\s)\s*-?\d+[^{}]*)\}/gi)) {
+  if (!ambiguous && !activeMode) {
+    const candidates = [];
+    for (const match of evidence.matchAll(/\{([^{}]*\bmodeId\s*(?:[=:]|\s)\s*-?\d+[^{}]*)\}/gi)) {
       const candidate = parseModeContent(match[1]);
-      if (candidate) { activeMode = candidate; break; }
+      if (candidate) candidates.push(candidate);
     }
+    if (candidates.length === 1) activeMode = candidates[0];
+    else if (candidates.length > 1) ambiguous = true;
   }
 
-  const activeRate = activeMode && Number.isFinite(activeMode.refreshRate)
+  const activeRate = !ambiguous && activeMode && Number.isFinite(activeMode.refreshRate)
     ? activeMode.refreshRate : null;
   let status = 'unconfirmed';
   if (activeRate !== null) {
     status = requestedRate === null || Math.abs(activeRate - requestedRate) < 0.01
       ? 'confirmed' : 'mismatch';
   }
-  const displayId = options.displayId !== undefined ? Number(options.displayId) : null;
   const result = {
     ok: status === 'confirmed',
     status,
     requestedRate,
-    activeModeId: activeModeId ?? (activeMode && activeMode.id !== null ? activeMode.id : null),
+    activeModeId: ambiguous ? null : (activeModeId ?? (activeMode && activeMode.id !== null ? activeMode.id : null)),
     activeRate,
     refreshRate: activeRate,
     modes,

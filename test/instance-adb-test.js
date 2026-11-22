@@ -204,6 +204,7 @@ function fixture(t, { isChild = true, id = 'child-a', allocator = { next: 49163 
     child_process: childProcess, fs: fakeFs, path: win, net,
     './instance-adb': helper, './doctor': doctor, './userdata': {}, './process-owner': processOwner,
     './peripherals': require('../src/core/peripherals'), './adb': adbModule,
+    './platform': { canEmbed: true },
     './logfile': { append: (file) => calls.fs.push(['append', file]) },
     './store': { DATA_DIR: 'C:\\fixture\\data', getSettings: () => settings, saveSettings: () => {} },
     './provision': { Provisioner },

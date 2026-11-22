@@ -91,7 +91,6 @@ function emulatorConsolePort(serial) {
 const AUTO_ACTION_TEXT = {
   'clear-locks': '清理上次残留的锁文件',
   redeploy: '校验并补齐运行时文件',
-  'vc-redist': '安装 VC++ 运行库（会弹出授权窗口）',
   'cleanup-safe': '清理运行时临时文件',
   'gpu-software': '改用软件渲染',
 };

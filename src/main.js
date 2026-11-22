@@ -491,7 +491,7 @@ async function toggleDisplayMode() {
   const next = store.saveSettings({
     display: { mode: displaySettings().mode === 'fullscreen' ? 'window' : 'fullscreen' },
   });
-  if (appWin && appWin.isOpen) {
+  if (appWin?.isOpen && !appWin.hostSuppressed) {
     if (next.display.mode === 'fullscreen') {
       appWin.win.maximize();
       // 全屏 = 平板横屏排版：让安卓按宽屏重新排版，而不是只把窗口拉大
@@ -1391,6 +1391,26 @@ async function runLaunchInner(pkg) {
     // 确认在线后再重发一次作用域，才能让代理找到实际的 emulator 窗口。
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* 诊断性兜底 */ } }
 
+    // 首次接入和延迟重试共用独立窗口的就绪路径。此时代理已前置画面，宿主已隐藏。
+    const announceStandalone = () => {
+      if (appWin.blackDetached) {
+        appLog(`embed black frame (mean=${appWin.lastBlackMean}) -> detached standalone window`);
+        const current = store.getSettings().engine || {};
+        if (current.windowMode !== 'embedded' && current.embeddedBlack !== true) {
+          try {
+            store.saveSettings({ engine: { embeddedBlack: true } });
+            appLog('remembered standalone mode for this machine (embeddedBlack=true)');
+          } catch (e) { appLog(`save embeddedBlack failed: ${e.message}`); }
+        }
+      }
+      appWin.setState({ ready: true, tip: '画面在「Android Emulator」窗口里显示。' });
+      send('toast', {
+        type: 'success',
+        message: `《${(store.getApp(pkg) || {}).label || pkg}》已在「Android Emulator」窗口打开。`,
+      });
+      appLog('standalone window shown; host window hidden');
+    };
+
     // 2) 应用真的活下来了，才把画面接上来（否则用户会先看到闪一下的桌面/崩溃页）
     let embedded = false;
     let detached = false;
@@ -1444,60 +1464,32 @@ async function runLaunchInner(pkg) {
       // 嵌入成功但宿主画黑帧时，appwin 会自己摘成独立窗口：这不是「嵌入失败」，
       // 而是「换了一条能看见画面的路」，顶层不能再去重试 SetParent（必然再黑一次）。
       detached = !embedded && !!appWin.blackDetached;
-      if (detached) {
-        appLog(`embed black frame (mean=${appWin.lastBlackMean}) -> detached standalone window`);
-        // 这台机器嵌入必黑：记下来。下次点应用直接走独立窗口，不再让用户先对着
-        // 一块黑屏等几秒（实测用户的判断就是「程序没反应 / 一直加载」）。
-        if (engCfg.windowMode !== 'embedded' && engCfg.embeddedBlack !== true) {
-          try {
-            store.saveSettings({ engine: { embeddedBlack: true } });
-            appLog('remembered standalone mode for this machine (embeddedBlack=true)');
-          } catch (e) { appLog(`save embeddedBlack failed: ${e.message}`); }
-        }
-      } else if (!embedded) {
-        appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
-      }
+      if (!embedded && !detached) appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
     }
+    if (launchCancelled()) throw new Error('应用窗口已关闭或 ApkStart 正在退出，已取消窗口接管');
     mark(`embedded=${embedded} detached=${detached}`);
-    // 嵌入完成后把窗口从别的窗口底下抬出来。否则上层窗口（浏览器等）会盖住安卓画面，
-    // 用户看到的是「黑屏 / 画面没填满」，鼠标也点不到应用（全被上层窗口吃掉）。
-    // 短暂 topmost 再立刻撤销，只借用一次置顶把 Z 序抬到最前，不会长期霸占顶层。
-    if (appWin.isOpen) {
-      if (detached) {
-        // 独立窗口：把这块永远连不上画面的黑壳直接藏起来。代理 detach 时已经把
-        // 模拟器窗口亮出来并抢到前台 —— 用户点应用就该看到画面，而不是黑壳。
-        try { appWin.win.hide(); } catch (_) { /* 窗口可能刚关 */ }
-        send('toast', {
-          type: 'success',
-          message: `《${(store.getApp(pkg) || {}).label || pkg}》已在「Android Emulator」窗口打开。`,
-        });
-        appLog('standalone window shown; host window hidden');
-      } else {
-        try {
-          appWin.win.show();
-          appWin.win.setAlwaysOnTop(true);
-          appWin.win.moveTop();
-          appWin.win.focus();
-          setTimeout(() => {
-            if (!launchCancelled()) {
-              try { launchWindow.setAlwaysOnTop(false); } catch (_) { /* 窗口已关 */ }
-            }
-          }, 700);
-        } catch (_) { /* 窗口可能刚关闭 */ }
-      }
-    }
-    appWin.setState(detached
-      // 独立窗口：宿主已隐藏，这条状态只在用户从任务栏把它调出来时才看得到
-      ? { ready: true, tip: '画面在「Android Emulator」窗口里显示。' }
-      : appWin.external
-        // 非 Windows：画面只能留在模拟器自己的窗口里。不要显示黑屏，
-        // 直接在应用窗口里写明「去哪看画面」（upstream #24）。
+    if (detached) {
+      announceStandalone();
+    } else {
+      // 短暂 topmost 再撤销，把画面或启动提示从别的窗口下面抬出来。
+      try {
+        launchWindow.show();
+        launchWindow.setAlwaysOnTop(true);
+        launchWindow.moveTop();
+        launchWindow.focus();
+        setTimeout(() => {
+          if (!launchCancelled()) {
+            try { launchWindow.setAlwaysOnTop(false); } catch (_) { /* 窗口已关 */ }
+          }
+        }, 700);
+      } catch (_) { /* 窗口可能刚关闭 */ }
+      appWin.setState(appWin.external
+        // 无法嵌入时说明去哪里看画面；未接上句柄则保留启动遮罩。
         ? { ready: false, tip: platform.supportNote() }
-        // Windows 上 embed=false 仍然代表画面句柄尚未接上：启动遮罩必须继续留着，
-        // 否则 shell 会把黑底当成「已经就绪」，用户只能看到一块黑屏。
         : embedded
           ? { ready: true, tip: '' }
           : { ready: false, tip: '正在连接安卓画面…' });
+    }
     if (appWin.external) appLog(`embed unsupported on ${platform.platform}: external window mode`);
     // 嵌入失败（模拟器窗口还没建好）时按递增间隔有限重试；
     // 每次成功都显式更新 ready，失败则一直保留启动遮罩而不是露出黑屏。
@@ -1520,6 +1512,10 @@ async function runLaunchInner(pkg) {
           if (ok) {
             appWin.setState({ ready: true, tip: '' });
             appLog(`embed recovered on retry ${i + 1}/${delays.length}`);
+            return;
+          }
+          if (appWin.blackDetached) {
+            announceStandalone();
             return;
           }
         }
@@ -1588,8 +1584,7 @@ function startNotifier() {
       getAppIcon: (pkg) => (store.getApp(pkg) || {}).icoPath || '',
       onOpen: (pkg) => {
         if (appWin && appWin.isOpen && appWin.pkg === pkg) {
-          appWin.win.show();
-          appWin.win.focus();
+          appWin.reveal().catch(() => {});
         } else {
           runLaunch(pkg).catch(() => {});
         }
@@ -2298,7 +2293,7 @@ function registerIpc() {
 
   ipcMain.handle('display:set', async (_e, patch) => {
     const next = store.saveSettings({ display: patch || {} });
-    if (appWin && appWin.isOpen) {
+    if (appWin?.isOpen && !appWin.hostSuppressed) {
       appWin.portrait = windowBox();
       const full = next.display.mode === 'fullscreen';
       if (full && !appWin.win.isMaximized()) appWin.win.maximize();
@@ -2599,6 +2594,7 @@ function registerIpc() {
         };
       }
       case 'vc-redist': {
+        if (auto) return { ok: false, detail: '系统运行库需要在设置中手动确认安装' };
         const r = await installVcRedistImpl();
         return { ok: !!r.ok, detail: r.ok ? 'VC++ 运行库已安装' : '安装未完成（可能取消了管理员授权）' };
       }
@@ -3966,7 +3962,7 @@ function registerIpc() {
   });
 
   ipcMain.handle('app:foreground', () => {
-    if (appWin && appWin.isOpen) { appWin.win.show(); appWin.win.focus(); return true; }
+    if (appWin?.isOpen) return appWin.reveal();
     return false;
   });
 

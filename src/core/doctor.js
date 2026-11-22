@@ -454,7 +454,7 @@ function planVariants(profile, { preferSoftware = false } = {}) {
   const fallbackGpus = gpus.filter((g) => g !== firstGpu && /software|swiftshader|swangle|lavapipe/.test(g));
   const ordered = [firstGpu, ...fallbackGpus].slice(0, 2);
   if (preferSoftware && !profile.gpuPinned) {
-    // 可见窗口优先「ANGLE + SwiftShader」(swangle)：它同样是软件渲染，不会出现 host
+    // 计划嵌入的 Windows 窗口优先「ANGLE + SwiftShader」(swangle)：它同样是软件渲染，不会出现 host
     // 后端失焦后交换链丢失导致的全黑，但合成路径对 WebView 友好得多。
     // 上游实测：裸 software 会让「点同意后进主界面」黑屏，swangle 不会。
     const pref = gpus.find((g) => /swangle/.test(g))
@@ -643,9 +643,9 @@ const RULES = [
   },
   {
     code: 'DLL',
-    re: /0xc0000135|STATUS_DLL_NOT_FOUND|missing DLL|Qt6.*not found|MSVCP140|VCRUNTIME|无法启动此程序|The code execution cannot proceed/i,
-    title: '运行时组件被杀毒软件删除或缺少 VC++ 运行库',
-    hint: '请把 ApkStart 目录加入杀毒软件白名单后重新解压安装包，并安装微软 VC++ 2015-2022 运行库。',
+    re: /0xc0000135|emulator exit 3221225781\b|STATUS_DLL_NOT_FOUND|missing DLL|Qt6.*not found|MSVCP140|VCRUNTIME|无法启动此程序|The code execution cannot proceed/i,
+    title: '模拟器依赖 DLL 加载失败',
+    hint: '仅凭退出码无法确认具体缺少哪个组件。请先校验运行时文件；只有提示缺少 MSVCP140 或 VCRUNTIME，或体检确认 VC++ 运行库缺失时，再修复微软 VC++ 2015-2022 x64 运行库。',
   },
   {
     code: 'DISK_FULL',

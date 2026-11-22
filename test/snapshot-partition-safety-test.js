@@ -53,7 +53,7 @@ function clock() {
   };
 }
 
-function fixture(t) {
+function fixture(t, { canEmbed = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-snapshot-partition-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const time = clock();
@@ -222,7 +222,7 @@ function fixture(t) {
       restartServer: async () => ({ isChild: false, port: 5044 }),
       registerEmulator: async () => true,
     },
-    './platform': { canProvision: true, describe: () => ({}) },
+    './platform': { canProvision: true, canEmbed, describe: () => ({}) },
     './android': {}, './repair': {}, './container': {}, './guest': {},
     './logfile': { append: (file, text) => tempFs.appendFileSync(file, text) },
   };
@@ -580,6 +580,47 @@ for (const avd of [{ ok: false, error: 'adapter refused data' }, { data: { ok: f
   });
 }
 
+for (const [name, engine, canEmbed, headless, gpu] of [
+  ['auto Windows embedding', { windowMode: 'auto' }, true, false, 'swangle'],
+  ['forced embedding ignores the remembered black frame', { windowMode: 'embedded', embeddedBlack: true }, true, false, 'swangle'],
+  ['standalone Windows window', { windowMode: 'standalone' }, true, false, 'host'],
+  ['auto after an embedded black frame', { windowMode: 'auto', embeddedBlack: true }, true, false, 'host'],
+  ['external-only platform', { windowMode: 'auto' }, false, false, 'host'],
+  ['headless start', { windowMode: 'auto' }, true, true, 'host'],
+  ['manual host selection despite a stale auto failure', { windowMode: 'auto', gpuMode: 'host', badGpu: '37.4.1|host' }, true, false, 'host'],
+  ['automatic mode still backs off a known bad host GPU', { windowMode: 'standalone', badGpu: '37.4.1|host' }, true, false, 'swangle'],
+]) {
+  test(`first emulator GPU argument reflects ${name}`, async (t) => {
+    const f = fixture(t, { canEmbed });
+    Object.assign(f.settings.engine, engine);
+    f.prepareStart();
+    const result = await f.emu.start({ headless });
+    assert.equal(result.ok, true);
+    const { args } = f.calls.spawn[0];
+    assert.equal(args[args.indexOf('-gpu') + 1], gpu);
+    assert.equal(result.profile.gpu, gpu);
+    assert.equal(args.includes('-no-window'), headless);
+  });
+}
+
+test('standalone launch retries software rendering after a failed host GPU', async (t) => {
+  const f = fixture(t);
+  f.settings.engine.windowMode = 'standalone';
+  f.prepareStart();
+  f.emu._waitSpawnSettled = async () => {
+    if (f.calls.spawn.length !== 1) return false;
+    f.emu.log('Failed to initialize GL emulation');
+    f.emu.lastExitCode = 1;
+    f.emu.proc = null;
+    return true;
+  };
+  const result = await f.emu.start();
+  assert.equal(result.ok, true);
+  assert.deepEqual(f.calls.spawn.map(({ args }) => args[args.indexOf('-gpu') + 1]), ['host', 'swangle']);
+  assert.equal(result.profile.gpu, 'swangle');
+  assert.equal(f.settings.engine.badGpu, '37.4.1|host');
+});
+
 for (const requested of ['on', 'auto', 'off']) {
   test(`accel=${requested} retains official default/off arguments and corresponding environment`, (t) => {
     const f = fixture(t);
@@ -647,6 +688,33 @@ test('acceleration confirmation rejects negative evidence and never borrows a pr
   assert.equal(f.emu.attempts.length, 2);
   assert.equal(f.emu.attempts[0].acceleration.confirmed, true);
   assert.equal(f.emu.attempts[1].acceleration.confirmed, null);
+});
+
+test('unclassified fatal retry does not inherit the preceding GPU diagnosis', async (t) => {
+  const f = fixture(t);
+  f.prepareStart();
+  f.emu._waitSpawnSettled = async () => {
+    if (f.calls.spawn.length !== 1) return false;
+    f.emu.log('Failed to initialize GL emulation');
+    f.emu.lastExitCode = 1;
+    f.emu.proc = null;
+    return true;
+  };
+  await assert.rejects(f.emu.start({
+    headless: true,
+    maxAttempts: 2,
+    probe: async () => {
+      assert.equal(f.calls.spawn.length, 2);
+      f.emu.log('Userspace boot properties');
+      f.emu.lastExitCode = 1;
+      f.emu.proc = null;
+      return 'fatal';
+    },
+  }), (error) => {
+    assert.equal(error.diagnosis.code, 'ACCEL_UNUSABLE');
+    return true;
+  });
+  assert.deepEqual([...f.emu.attempts].map(a => a.diagnosis), ['GPU_INIT', 'ACCEL_UNUSABLE']);
 });
 
 test('explicit-off failed attempt cannot be diagnosed as detected accelerator failing to attach', async (t) => {

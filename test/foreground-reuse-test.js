@@ -81,6 +81,11 @@ const RUN_LAUNCH = extractBlock('async function runLaunch(pkg)');
 const RUN_LAUNCH_INNER = extractBlock('async function runLaunchInner(pkg)');
 const AGENT_SCOPE = extractBlock('const agentScope = async () =>');
 const ARM_AGENT = extractBlock('armAgent = async (agent) =>');
+const START_NOTIFIER = extractBlock('function startNotifier()');
+const FOREGROUND_IPC = extractBlock("ipcMain.handle('app:foreground', () =>") + ');';
+const TOGGLE_DISPLAY = extractBlock('async function toggleDisplayMode()');
+const SET_DISPLAY = extractBlock("ipcMain.handle('display:set', async (_e, patch) =>") + ');';
+const REPAIR_ACTION = extractBlock('async function runRepairAction(id, { auto = false } = {})');
 
 function deferred() {
   let resolve, reject;
@@ -94,6 +99,7 @@ function makeLaunchVm({
   activeApps = ['com.ready'],
   vmRunning = true,
   engineMode = 'builtin',
+  windowMode = 'auto',
 } = {}) {
   const calls = {
     reveal: 0,
@@ -102,6 +108,8 @@ function makeLaunchVm({
     armAgent: 0,
     installer: 0,
     close: 0,
+    state: [],
+    settings: [],
     send: [],
     logs: [],
   };
@@ -119,7 +127,8 @@ function makeLaunchVm({
     },
     reveal: async () => { calls.reveal += 1; return true; },
     close: () => { calls.close += 1; },
-    setState: () => {},
+    setState(patch) { Object.assign(this.state, patch); calls.state.push({ ...patch }); },
+    refreshPointer: () => {},
     external: false,
     blackDetached: false,
     lastEmbedError: '',
@@ -148,7 +157,8 @@ function makeLaunchVm({
     runtimeActions: { run: async fn => fn() },
     store: {
       getApp: () => ({}),
-      getSettings: () => ({ display: { mode: 'window' }, engine: { mode: engineMode } }),
+      getSettings: () => ({ display: { mode: 'window' }, engine: { mode: engineMode, windowMode } }),
+      saveSettings: patch => calls.settings.push(patch),
     },
     lcd: {
       desiredOrientation: () => '',
@@ -159,8 +169,14 @@ function makeLaunchVm({
     windowBox: () => ({ w: 540, h: 960 }),
     openAppWindow: () => {
       calls.openAppWindow += 1;
-      return { isDestroyed: () => false };
+      appWin.win = { isDestroyed: () => false };
+      appWin.standaloneActive = false;
+      appWin._hidden = false;
+      return appWin.win;
     },
+    windowClients: new Map(),
+    deviceSize: { value: null },
+    onContainerActive: () => {},
     armAgent: async () => { calls.armAgent += 1; return { ok: true }; },
     hasHeadlessRuntimeWindow: async () => false,
     showWindow: () => {},
@@ -233,6 +249,101 @@ test('launchBusy standalone path calls reveal and never directly shows the hidde
   gate.resolve({ ok: true });
   const firstResult = await first;
   assert.equal(firstResult.ok, true);
+});
+
+for (const [retry, windowMode] of [[false, 'auto'], [true, 'auto'], [true, 'embedded']]) {
+  test(`${retry ? 'retried' : 'initial'} black-frame detach completes display setup (${windowMode})`, async () => {
+    const h = makeLaunchVm({ ready: false, windowMode });
+    h.winAgent = null;
+    h.installer.launch = async () => ({ ok: true, engine: 'builtin' });
+    const timers = [];
+    h.setTimeout = (resolve, delay) => { timers.push({ resolve, delay }); };
+    let embeds = 0;
+    h.appWin.embed = async () => {
+      embeds += 1;
+      if (!retry || embeds > 1) {
+        h.appWin.blackDetached = h.appWin.standaloneActive = h.appWin._hidden = true;
+      }
+      return false;
+    };
+
+    const result = await h.runLaunchInner('com.ready');
+    assert.equal(result.ok, true);
+    assert.equal(result.detached, !retry);
+    assert.equal(h.appWin.state.ready, !retry);
+    if (retry) {
+      assert.deepEqual(timers.map(t => t.delay), [1200]);
+      timers.shift().resolve();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(h.appWin.state.ready, true);
+    assert.match(h.appWin.state.tip, /Android Emulator/);
+    assert.equal(embeds, retry ? 2 : 1);
+    assert.equal(timers.length, 0, 'a confirmed detach must stop re-embedding');
+    assert.deepEqual(h.calls.settings.map(p => p.engine.embeddedBlack), windowMode === 'auto' ? [true] : []);
+    assert.equal(h.calls.send.filter(([event, data]) => event === 'toast' && data.type === 'success').length, 1);
+  });
+}
+
+test('notification for the current package reveals the existing window, other packages still launch', async () => {
+  const h = makeLaunchVm();
+  const launches = [];
+  h.notifier = null;
+  h.NotifyBridge = class {
+    constructor(options) { this.onOpen = options.onOpen; }
+    start() {}
+  };
+  h.runLaunch = async pkg => { launches.push(pkg); };
+  vm.runInNewContext(`${START_NOTIFIER}\nstartNotifier();`, h, { filename: MAIN_FILE });
+  h.notifier.onOpen('com.ready');
+  h.notifier.onOpen('com.other');
+  assert.equal(h.calls.reveal, 1);
+  assert.equal(h.calls.directShow, 0);
+  assert.deepEqual(launches, ['com.other']);
+});
+
+test('foreground IPC uses reveal and reports its result without showing a hidden host', async () => {
+  const h = makeLaunchVm();
+  let foreground;
+  h.ipcMain = { handle(channel, fn) { assert.equal(channel, 'app:foreground'); foreground = fn; } };
+  vm.runInNewContext(FOREGROUND_IPC, h, { filename: MAIN_FILE });
+  assert.equal(await foreground(), true);
+  h.appWin.reveal = async () => false;
+  assert.equal(await foreground(), false);
+  h.appWin.isOpen = false;
+  h.appWin.reveal = async () => { assert.fail('closed window must not be revealed'); };
+  assert.equal(await foreground(), false);
+  assert.equal(h.calls.reveal, 1);
+  assert.equal(h.calls.directShow, 0);
+});
+
+test('display mode changes save preferences without maximizing or resizing a suppressed host', async () => {
+  const h = makeLaunchVm();
+  h.appWin.hostSuppressed = true;
+  const handlers = new Map();
+  h.ipcMain = { handle: (channel, fn) => handlers.set(channel, fn) };
+  h.store.saveSettings = patch => {
+    h.calls.settings.push(patch);
+    return { display: { mode: 'window', ...patch.display } };
+  };
+  vm.runInNewContext(`${TOGGLE_DISPLAY}\n${SET_DISPLAY}`, h, { filename: MAIN_FILE });
+  assert.equal(await h.toggleDisplayMode(), 'fullscreen');
+  assert.equal((await handlers.get('display:set')(null, { mode: 'window' })).mode, 'window');
+  assert.equal(h.calls.settings.length, 2);
+  assert.equal(h.calls.directShow, 0);
+  assert.equal(h.appWin._hidden, true);
+});
+
+test('VC++ repair cannot elevate on the automatic path; the explicit action remains available', async () => {
+  let installs = 0;
+  const h = { installVcRedistImpl: async () => { installs += 1; return { ok: true }; } };
+  vm.runInNewContext(REPAIR_ACTION, h, { filename: MAIN_FILE });
+  const automatic = await h.runRepairAction('vc-redist', { auto: true });
+  assert.equal(automatic.ok, false);
+  assert.equal(installs, 0);
+  const manual = await h.runRepairAction('vc-redist');
+  assert.equal(manual.ok, true);
+  assert.equal(installs, 1);
 });
 
 function makeArmAgentVm(scopeReply) {

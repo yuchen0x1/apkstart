@@ -55,7 +55,7 @@ function describeExitCode(code) {
     // 0xC000001D：CPU 执行到它不认识的指令。这才是「真·缺指令集」的唯一硬证据，
     // 以前没映射，报告里是一片空白，只能靠日志里那句无害的 CPUID 警告去猜。
     case 3221225501: return '0xC000001D 非法指令（CPU 缺少模拟器要求的指令集）';
-    case 3221225781: return '0xC0000135 缺少 DLL（VC++ 运行库 / 运行时组件被杀毒删除）';
+    case 3221225781: return '0xC0000135 依赖 DLL 加载失败（具体组件未确认）';
     case 3221225506: return '0xC0000022 拒绝访问（驱动或权限问题）';
     case 3221225595: return '0xC000007B 镜像位数不匹配或 DLL 损坏';
     default: return '';
@@ -1304,13 +1304,13 @@ class EmulatorEngine {
     }
     profile.acceleration = this._accelerationState(profile);
     this.profile = profile;
-    // 嵌入 Electron 的可见窗口会经历跨进程 SetParent、失焦和 DWM 重绘；
-    // 这类场景下 host 的交换链可能在失焦后丢失，表现为「安卓仍在跑，窗口全黑」。
-    // 可见模式因此把软件渲染提到前面，但优先 swangle（ANGLE + SwiftShader）而不是
-    // 裸 software：swangle 同样不依赖显卡交换链，合成路径对 WebView 友好得多，
-    // 而裸 software 会让「点同意进主界面」这种 WebView 重合成场景黑屏。
-    // 两者都仍可保留 WHPX 加速，只是把 guest GLES 的呈现改走 SwiftShader 路径。
-    const variants = doctor.planVariants(profile, { preferSoftware: !headless }).slice(0, maxAttempts);
+    // 只有 Win32 嵌入会跨进程 SetParent；host 的交换链可能在失焦后丢失，所以
+    // 保留 swangle 的防黑屏优先级。独立窗口（包括自动记住嵌入黑屏后的启动）
+    // 不走 SetParent，应遵循自动档选出的 GPU，而不是一律先用 CPU 做软件渲染。
+    const { windowMode, embeddedBlack } = s.engine;
+    const preferSoftware = !headless && require('./platform').canEmbed && windowMode !== 'standalone'
+      && (windowMode === 'embedded' || embeddedBlack !== true);
+    const variants = doctor.planVariants(profile, { preferSoftware }).slice(0, maxAttempts);
     // 报告里要写清这次是「带窗口」还是「无窗口」跑的：同一台机器上两者结果常常不同，
     // 少了这一个 bit，报告就没法区分「模拟器起不来」和「带窗口渲染起不来」（issue #29）。
     this.headlessMode = !!headless;
@@ -1320,13 +1320,14 @@ class EmulatorEngine {
     // 但 VM 起来十几秒后进程直接 exit 1（日志里只有 "AEHD is operational"），
     // 每次都要白等 20 多秒再退到 swangle。key 里带上 emulator 版本，
     // 升级运行时后自动重新给它一次机会。
-    const badGpuKey = this.settings.engine.badGpu || '';
+    const badGpuKey = s.engine.badGpu || '';
     const [badVer, badGpu] = badGpuKey.includes('|') ? badGpuKey.split('|') : ['', ''];
-    if (badGpu && badVer === emuVersion) {
+    if (!profile.gpuPinned && badGpu && badVer === emuVersion) {
+      const firstGpu = variants[0]?.gpu;
       const rank = (v) => (v.gpu === badGpu ? 1 : 0);
       variants.sort((a, b) => rank(a) - rank(b));
-      if (variants[0] && variants[0].gpu === badGpu && variants.length > 1) {
-        onLog(`上次 ${badGpu} 渲染后端启动即崩溃，本次改用 ${variants[1].gpu} 先试`);
+      if (firstGpu === badGpu && variants[0].gpu !== badGpu) {
+        onLog(`上次 ${badGpu} 渲染后端启动即崩溃，本次改用 ${variants[0].gpu} 先试`);
       }
     }
 
@@ -1358,6 +1359,7 @@ class EmulatorEngine {
     // 又保证用户下次正常点开应用时绝不会莫名其妙被清数据。
     const forceWipe = !!this._forceWipe;
     this._forceWipe = false;
+    let lastLogStart = this._logSeq;
 
     for (let i = 0; i < variants.length; i += 1) {
       const base = variants[i];
@@ -1369,11 +1371,12 @@ class EmulatorEngine {
       // 关加速的兜底不能沿用自动档里「检测通过」的 accelOk 当作本轮实际状态。
       if (plan.accel === 'off') plan.accelOk = false;
       this.port = port;
-      // 每轮重置退出码：上一轮 0xC0000005 不能带进下一轮的诊断里
+      // 本轮可能因完全不同的原因失败；只通过 attempts 保留上一轮的结论。
+      this.lastDiagnosis = null;
       this.lastExitCode = null;
-      // 日志也按轮切分：内存日志是跨轮累积的，第 1 轮的崩溃行若留在尾部，
-      // 第 2 轮（比如换后端后端口冲突）会被误诊成同一个崩溃。
-      const logStart = this._logSeq; // Array length is not a boundary once the 600-entry ring shifts.
+      // 日志也按轮切分：环形缓冲区满后不能用数组长度作为分界。
+      const logStart = this._logSeq;
+      lastLogStart = logStart;
       onLog(`启动运行时（第 ${i + 1}/${variants.length} 次：${plan.label}）…`);
 
       try {
@@ -1557,11 +1560,7 @@ class EmulatorEngine {
         }
 
         const attemptLines = this._attemptLines(logStart, 80);
-        // issue #5：fatal 轮也不能直接复用上一轮的 lastDiagnosis。原写法
-        // `lastDiagnosis || diagnose(attemptLines)` 会让第 2 轮无论日志写了什么都沿用
-        // 第 1 轮的 ACCESS_VIOLATION —— 若第 2 轮其实是 DISK_FULL / MEMORY / IMAGE，
-        // 就会被错判并错过停机保护，白等十几分钟。改为先看本轮日志；只有本轮确实
-        // 一条可识别错误都没有（UNKNOWN）时，才退回上一轮结论 / 加速兜底。
+        // 先看本轮尾部日志。若未识别，可回用本轮提前检测到的故障，不能借上一轮的结论。
         let d = doctor.diagnose(attemptLines);
         if (fatal && (!d || d.code === 'UNKNOWN') && this.lastDiagnosis) d = this.lastDiagnosis;
         // 进程没崩、只是等到超时：结论就该是「太慢」，不能被日志里的 CPUID 警告
@@ -1620,13 +1619,13 @@ class EmulatorEngine {
 
     // 全部组合都失败、而且本机根本没有加速：给一句能照做的结论，
     // 别再让用户对着「UNKNOWN + 已自动重试」猜（issue #20/#6/#15/#31）。
-    let d = this.lastDiagnosis || doctor.diagnose(this.recentLog(120));
+    const lastAttemptLines = this._attemptLines(lastLogStart, 300);
+    let d = this.lastDiagnosis || doctor.diagnose(lastAttemptLines);
     if ((!d || d.code === 'UNKNOWN') && accelInfo && !accelInfo.ok) d = doctor.noAccelDiagnosis();
-    // 兜底：有加速、却没有任何一条能解释退出的日志 —— 结论就是「驱动没接管」。
-    // 不能让用户对着一句 UNKNOWN 去换镜像、换渲染后端（这两条路都是白折腾）。
+    // 兜底也只看最后一轮，不能借之前的加速日志判断这次是否接管。
     if ((!d || d.code === 'UNKNOWN') && this.profile?.accel !== 'off') {
       d = doctor.earlyAccelExit({
-        accel: accelInfo, logLines: this.recentLog(300), exitCode: this.lastExitCode,
+        accel: accelInfo, logLines: lastAttemptLines, exitCode: this.lastExitCode,
       }) || d;
     }
     this.lastDiagnosis = d;

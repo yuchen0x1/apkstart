@@ -174,6 +174,128 @@ console.log('\n[合成 APK：axml + apk 全链路]');
   }
 }
 
+/* ---------------- 必跑的 ARSC 资源引用（无外部 APK / Android SDK） ---------------- */
+console.log('\n[合成 APK：resources.arsc 包身份与别名]');
+{
+  const strict = require('assert/strict');
+  const { attr, children } = require('../src/core/axml');
+  const LABEL = 0x7f010000;
+  const ICON = 0x7f020000;
+  const LABEL_ALIAS = 0x7f010001;
+  const ICON_ALIAS = 0x7f020001;
+  const OTHER_LABEL = 0x80010000;
+  const OTHER_ICON = 0x80020000;
+  const LABEL_TEXT = 'ARSC Fixture App';
+  const ICON_PATH = 'res/mipmap-hdpi/ic_launcher.png';
+  const OTHER_PATH = 'res/mipmap-mdpi/ic_other.png';
+  const DECOY_PATH = 'res/drawable-xxxhdpi/app_icon_decoy.png';
+  const resources = [{ id: LABEL, value: LABEL_TEXT }, { id: ICON, value: ICON_PATH }];
+  const otherResources = [{ id: OTHER_LABEL, value: 'Other package' }, { id: OTHER_ICON, value: OTHER_PATH }];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-arsc-'));
+  let seq = 0;
+  // 较大的 decoy 必须在引用失效时胜出，避免错误的 ZIP 启发式“碰巧”通过正例。
+  function inspect(options = {}) {
+    const bytes = buildApkBytes({
+      abis: [], labelRef: LABEL, iconRef: ICON, resources, ...options,
+      extraEntries: [
+        { name: OTHER_PATH, data: drawAppIcon(48) },
+        { name: DECOY_PATH, data: drawAppIcon(256) },
+      ],
+    });
+    const file = path.join(dir, `resource-${++seq}.apk`);
+    fs.writeFileSync(file, bytes);
+    const zip = new ZipArchive(bytes);
+    const app = children(parseAxml(zip.read('AndroidManifest.xml')), 'application')[0];
+    // 同时直接构造生产 ResTable，不能把解析失败后被 parseApk 吞掉的异常当成成功。
+    const table = zip.has('resources.arsc') ? new ResTable(zip.read('resources.arsc')) : null;
+    return { zip, app, table, meta: parseApk(file) };
+  }
+  function expectMetadata(f, label = LABEL_TEXT, icon = ICON_PATH) {
+    strict.equal(f.meta.package, 'com.example.test');
+    strict.equal(f.meta.label, label);
+    strict.equal(f.meta.iconFile, icon);
+    strict.deepEqual(f.meta.iconPng, f.zip.read(icon));
+  }
+  try {
+    test('ARSC：TYPE_REFERENCE 清单经 ZIP/AXML/ResTable 得到名称和指定图标，不取 decoy', () => {
+      const f = inspect();
+      strict.deepEqual(f.table.packages.map(p => p.id), [0x7f]);
+      strict.ok(f.zip.read('resources.arsc').length > 100);
+      strict.ok(f.zip.read(DECOY_PATH).length > f.zip.read(ICON_PATH).length);
+      for (const [name, ref] of [['label', LABEL], ['icon', ICON]]) {
+        const a = attr(f.app, name);
+        strict.equal(a.dataType, 0x01);
+        strict.equal(a.refId >>> 0, ref);
+        strict.equal(a.typed, null);
+      }
+      strict.equal(f.table.resolve(LABEL, 'string'), LABEL_TEXT);
+      strict.equal(f.table.resolve(ICON, 'file'), ICON_PATH);
+      strict.equal(f.table.resolve(0x7f030000, 'string'), null, '缺失 type');
+      strict.equal(f.table.resolve(0x7f010099, 'string'), null, '缺失 entry');
+      expectMetadata(f);
+      strict.notDeepEqual(f.meta.iconPng, f.zip.read(DECOY_PATH));
+    });
+    test('ARSC：同包 TYPE_REFERENCE 别名保留 label/icon 解析', () => {
+      expectMetadata(inspect({ labelRef: LABEL_ALIAS, iconRef: ICON_ALIAS, resources: [
+        ...resources, { id: LABEL_ALIAS, value: LABEL }, { id: ICON_ALIAS, value: ICON },
+      ] }));
+    });
+    for (const pkgId of [0x01, 0x80]) {
+      for (const [name, ref, prefer] of [['label', LABEL, 'string'], ['icon', ICON, 'file']]) {
+        test(`ARSC：${name} 引用缺失包 0x${pkgId.toString(16)} 时不借用首包同号资源`, () => {
+          const missing = ((pkgId << 24) | (ref & 0xffffff)) >>> 0;
+          const f = inspect({ [`${name}Ref`]: missing });
+          expectMetadata(f, name === 'label' ? 'Test' : LABEL_TEXT, name === 'icon' ? DECOY_PATH : ICON_PATH);
+          strict.equal(f.table.resolve(missing, prefer), null);
+        });
+      }
+    }
+    for (const [name, alias, missing, prefer] of [
+      ['label', LABEL_ALIAS, 0x01010000, 'string'], ['icon', ICON_ALIAS, 0x01020000, 'file'],
+    ]) {
+      test(`ARSC：${name} 别名指向缺失包时返回 null，不回借首包`, () => {
+        const f = inspect({ labelRef: LABEL_ALIAS, iconRef: ICON_ALIAS, resources: [
+          ...resources,
+          { id: LABEL_ALIAS, value: name === 'label' ? missing : LABEL },
+          { id: ICON_ALIAS, value: name === 'icon' ? missing : ICON },
+        ] });
+        expectMetadata(f, name === 'label' ? 'Test' : LABEL_TEXT, name === 'icon' ? DECOY_PATH : ICON_PATH);
+        strict.equal(f.table.resolve(alias, prefer), null);
+      });
+    }
+    test('ARSC：多包按实际 ID 选择非首包，高位 package ID 也可解析', () => {
+      const both = [...otherResources, ...resources];
+      const app = inspect({ resources: both });
+      strict.deepEqual(app.table.packages.map(p => p.id), [0x80, 0x7f]);
+      expectMetadata(app);
+      expectMetadata(inspect({ resources: both, labelRef: OTHER_LABEL, iconRef: OTHER_ICON }), 'Other package', OTHER_PATH);
+    });
+    test('ARSC：静态跨包别名可解析确实存在的非首包', () => {
+      expectMetadata(inspect({ labelRef: LABEL_ALIAS, iconRef: ICON_ALIAS, resources: [
+        ...resources, ...otherResources,
+        { id: LABEL_ALIAS, value: OTHER_LABEL }, { id: ICON_ALIAS, value: OTHER_ICON },
+      ] }), 'Other package', OTHER_PATH);
+    });
+    test('ARSC：已有多个包也不能用首包代替缺失包，别名同样失败关闭', () => {
+      const f = inspect({ labelRef: LABEL_ALIAS, iconRef: ICON_ALIAS, resources: [
+        ...otherResources, ...resources,
+        { id: LABEL_ALIAS, value: 0x01010000 }, { id: ICON_ALIAS, value: 0x01020000 },
+      ] });
+      expectMetadata(f, 'Test', DECOY_PATH);
+      for (const [ref, prefer] of [[0x01010000, 'string'], [0x01020000, 'file'], [LABEL_ALIAS, 'string'], [ICON_ALIAS, 'file']]) {
+        strict.equal(f.table.resolve(ref, prefer), null);
+      }
+    });
+    test('ARSC 负控制：没有资源表时必须走名称/图标兜底', () => {
+      const f = inspect({ resources: undefined });
+      strict.equal(f.table, null);
+      expectMetadata(f, 'Test', DECOY_PATH);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 /* ---------------- 矢量图标（vector drawable → SVG） ---------------- */
 console.log('\n[apk.js 矢量图标转 SVG]');
 {
