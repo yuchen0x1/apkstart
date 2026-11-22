@@ -460,6 +460,21 @@ test('confirmed rotation resizes its original host and restores requested maximi
   assert.equal(h.timers.size, 0);
 });
 
+test('rotation that finishes after a standalone handoff leaves the host hidden and unchanged', async () => {
+  const h = setup({ withMain: false });
+  h.appWin.setOrientation = async () => true;
+  const win = h.open('guest');
+  const rotating = h.appWin.rotate({ fullscreen: true });
+  assert.equal(await h.appWin.standalone(), true);
+  await h.advance(4200);
+  assert.equal(await rotating, true, 'the guest accepted its layout change');
+  assert.equal(h.appWin.state.landscape, true);
+  assert.equal(win.isVisible(), false);
+  assert.equal(win.resizedTo, undefined);
+  assert.equal(win.movedTo, undefined);
+  assert.equal(win.isMaximized(), false);
+});
+
 test('setOrientation false, rejection or synchronous failure must not report a successful rotation', async () => {
   for (const mode of ['false', 'reject', 'throw']) {
     const h = setup({ withMain: false });

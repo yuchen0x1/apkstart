@@ -221,7 +221,8 @@ class ResTable {
     const typeId = (ref >>> 16) & 0xff;
     const entryIdx = ref & 0xffff;
 
-    const pkg = this.packages.find((p) => p.id === pkgId) || this.packages[0];
+    // package ID 是资源身份的一部分；缺失的 framework/共享库包不能借用首包。
+    const pkg = this.packages.find((p) => p.id === pkgId);
     if (!pkg) return null;
     const chunks = pkg.types.get(typeId);
     if (!chunks) return null;

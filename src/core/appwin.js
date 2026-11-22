@@ -69,6 +69,7 @@ class AppWindow {
   }
 
   get isOpen() { return !!(this.win && !this.win.isDestroyed()); }
+  get hostSuppressed() { return this._hidden; }
 
   _isCurrent(win, generation) {
     return !!win && this.win === win && this._windowGeneration === generation && !win.isDestroyed();
@@ -99,11 +100,10 @@ class AppWindow {
 
   _queueWindowCommand(action, win = this.win, generation = this._windowGeneration) {
     const agent = this.agent;
-    if (!agent || !this._isCurrent(win, generation)) return Promise.resolve(null);
-    return this._queueOwnership(agent, () => {
-      if (!this._isCurrent(win, generation) || this.agent !== agent) return null;
-      return action(agent);
-    });
+    const canControlHost = () => !this._hidden && this._isCurrent(win, generation) && this.agent === agent;
+    if (!agent || !canControlHost()) return Promise.resolve(null);
+    // 宿主代数没变也可能已经脱离；等待中的显示/隐藏命令不能再碰独立窗口。
+    return this._queueOwnership(agent, () => canControlHost() ? action(agent) : null);
   }
 
   /**
@@ -323,7 +323,7 @@ class AppWindow {
       }, 80).unref?.();
     });
 
-    if (fullscreen) win.maximize();
+    if (fullscreen && !this._hidden) win.maximize();
     return win;
   }
 
@@ -474,13 +474,9 @@ class AppWindow {
         const black = await this._looksBlackAfterEmbed(isCurrent);
         if (!isCurrent()) return false;
         if (black) {
-          // 刷新也救不回来：摘成独立窗口。画面还在，只是不能嵌进应用里。
+          // 与主动选择独立窗口共用交接；只有原生代理确认后才能隐藏宿主。
           // eslint-disable-next-line no-await-in-loop
-          await this._queueOwnership(agent, () => isCurrent() && agent.detach()).catch(() => {});
-          if (!isCurrent()) return false;
-          this._embedded = false;
-          this.blackDetached = true;
-          this.lastEmbedError = 'black-frame-detached';
+          await this.standalone({ blackFrame: true });
           return false;
         }
         return true;
@@ -505,7 +501,7 @@ class AppWindow {
    * 等三秒，还以为是程序卡死了。这里一步到位：打开应用就把模拟器窗口
    * 亮出来并抢到前台。
    */
-  async standalone() {
+  async standalone({ blackFrame = false } = {}) {
     const win = this.win;
     const generation = this._windowGeneration;
     const agent = this.agent;
@@ -516,22 +512,28 @@ class AppWindow {
       this.lastEmbedError = 'no-native-agent';
       return false;
     }
-    const r = await this._queueOwnership(agent, () => isCurrent() && agent.detach())
-      .catch((e) => ({ ok: false, error: e.message }));
-    if (!isCurrent()) return false;
-    if (!r || !r.ok) {
-      // 代理说找不到模拟器窗口：这已经不是「显示方式」的问题，
-      // 而是 qemu 活着但 Qt 画面窗口没了（上层会走重启运行时的恢复流程）。
-      this.lastEmbedError = (r && r.error) || 'emu-window-missing';
+    const detached = await this._queueOwnership(agent, async () => {
+      if (!isCurrent()) return false;
+      const r = await agent.detach();
+      if (!isCurrent()) return false;
+      if (!r?.ok) {
+        this.lastEmbedError = r?.error || 'emu-window-missing';
+        return false;
+      }
+      // 归属和状态在同一队列项内更新，等候中的 fit 才不会对独立窗口生效。
+      this._embedded = false;
+      this.standaloneActive = true;
+      this.blackDetached = blackFrame;
+      this.lastEmbedError = blackFrame ? 'black-frame-detached' : '';
+      // 宿主只留作状态载体，不能挡在画面前面。
+      this._hidden = true;
+      try { win.hide(); } catch (_) { /* 窗口可能刚关 */ }
+      return true;
+    }).catch((e) => {
+      if (isCurrent()) this.lastEmbedError = e.message || 'detach-failed';
       return false;
-    }
-    this._embedded = false;
-    this.blackDetached = true;
-    this.standaloneActive = true;
-    // 宿主窗口只留作状态载体，不能挡在画面前面
-    this._hidden = true;
-    try { win.hide(); } catch (_) { /* 窗口可能刚关 */ }
-    return true;
+    });
+    return isCurrent() && detached === true;
   }
 
   /** 热启动前置接口：不重开、不重新居中；独立模式只前置真实模拟器窗口。 */
@@ -625,7 +627,7 @@ class AppWindow {
    * 安卓会按新宽度重新排版：360dp 宽是手机，640dp 宽自动进平板/分栏布局。
    */
   async rotate({ fullscreen = null } = {}) {
-    if (!this.isOpen) return this.state.landscape;
+    if (!this.isOpen || this._hidden) return this.state.landscape;
     const win = this.win;
     const generation = this._windowGeneration;
     const isCurrent = () => this._isCurrent(win, generation);
@@ -642,6 +644,11 @@ class AppWindow {
     // wm size 会触发全局配置变更，应用要重建一次界面，给足时间再贴窗口
     await sleep(1200);
     if (!isCurrent()) return false;
+    if (this._hidden) {
+      // 安卓已接受排版变更，但等待期间已脱离，不再修改或显示宿主。
+      this.setState({ landscape: next });
+      return next;
+    }
     const area = this._area();
     const size = AppWindow.sizeFor(area, this.portrait, next);
     // 最大化状态下 setContentSize 无效，必须先退出最大化再改尺寸，

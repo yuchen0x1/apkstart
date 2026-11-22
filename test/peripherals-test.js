@@ -87,6 +87,145 @@ test('dumpsys display 用 active mode 读回真实刷新率', () => {
   assert.strictEqual(result.activeModeId, 2);
   assert.ok(Math.abs(result.activeRate - 90.00001) < 0.001);
   assert.strictEqual(result.modes.length, 2);
+  const targeted = peripherals.parseDisplayRefresh(dump, { requestedRate: 90, displayId: 0 });
+  assert.strictEqual(targeted.status, 'confirmed', 'unlabelled legacy single-display output remains the default display');
+  assert.strictEqual(targeted.activeRate, 90.00001);
+  assert.strictEqual(targeted.modes.length, 2);
+});
+
+test('realistic device and logical sections scope modes and deduplicate repeated DisplayInfo records', () => {
+  const dump = [
+    'DISPLAY MANAGER (dumpsys display)',
+    '  mDisplayDevices:',
+    '    Display Devices: size=1',
+    '      DisplayDeviceInfo{Built-in Panel, uniqueId="local:0", 720 x 1280, modeId 1, mActiveModeId=1, supportedModes [{id=1, width=720, height=1280, refreshRate=60.0}, {id=2, width=720, height=1280, refreshRate=120.0}]}',
+    '  mLogicalDisplays:',
+    '    Logical Displays: size=1',
+    '      Display 0:',
+    '        mDisplayId=0',
+    '        mBaseDisplayInfo=DisplayInfo{"Built-in Panel", displayId 0, real 720 x 1280, modeId 2, supportedModes [{id=1, width=720, height=1280, refreshRate=60.0}, {id=2, width=720, height=1280, refreshRate=120.0}]}',
+    '        mOverrideDisplayInfo=DisplayInfo{"Built-in Panel", displayId 0, real 720 x 1280, modeId 2, supportedModes [{id=1, width=720, height=1280, refreshRate=60.0}, {id=2, width=720, height=1280, refreshRate=120.0}]}',
+    '        mActiveModeId=2',
+  ].join('\n');
+  const result = peripherals.parseDisplayRefresh(dump, { requestedRate: 120, displayId: 0 });
+  assert.strictEqual(result.status, 'confirmed', 'device modes must not override logical active modes');
+  assert.strictEqual(result.activeModeId, 2);
+  assert.strictEqual(result.activeRate, 120);
+  assert.deepStrictEqual(result.modes.map(mode => mode.refreshRate), [60, 120], 'identical base/override mode records are deduplicated');
+
+  const conflict = peripherals.parseDisplayRefresh(
+    dump.replace('mOverrideDisplayInfo=DisplayInfo{"Built-in Panel", displayId 0, real 720 x 1280, modeId 2',
+      'mOverrideDisplayInfo=DisplayInfo{"Built-in Panel", displayId 0, real 720 x 1280, modeId 1'),
+    { requestedRate: 120, displayId: 0 },
+  );
+  assert.strictEqual(conflict.status, 'unconfirmed', 'conflicting logical active-mode records must fail closed');
+  assert.strictEqual(conflict.activeRate, null);
+  assert.strictEqual(conflict.ok, false);
+});
+
+test('unclassified prefix mode evidence cannot be silently discarded', () => {
+  const dump = [
+    'mActiveModeId=2',
+    'mSupportedModes=[{id=2, width=1920, height=1080, refreshRate=120.0}]',
+    'Display 0:',
+    '  mDisplayId=0',
+    '  mActiveModeId=1',
+    '  mSupportedModes=[{id=1, width=720, height=1280, refreshRate=60.0}]',
+  ].join('\n');
+  const result = peripherals.parseDisplayRefresh(dump, { requestedRate: 60, displayId: 0 });
+  assert.strictEqual(result.status, 'unconfirmed');
+  assert.strictEqual(result.activeRate, null);
+  assert.strictEqual(result.ok, false);
+});
+
+test('dumpsys display only uses the requested logical display when display blocks are reversed', () => {
+  const dump = [
+    'DISPLAY MANAGER (dumpsys display) - 2 displays',
+    'Display 1:',
+    '  mDisplayId=1',
+    '  mBaseDisplayInfo=DisplayInfo{\"External monitor\", displayId 1, real 1920 x 1080, modeId 1}',
+    '  mActiveModeId=1',
+    '  mSupportedModes=[{id=1, width=1920, height=1080, refreshRate=120.0}]',
+    'Display 0:',
+    '  mDisplayId=0',
+    '  mBaseDisplayInfo=DisplayInfo{\"Built-in Screen\", displayId 0, real 720 x 1280, modeId 1}',
+    '  mActiveModeId=1',
+    '  mSupportedModes=[{id=1, width=720, height=1280, refreshRate=60.0}]',
+  ].join('\n');
+  const primary = peripherals.parseDisplayRefresh(dump, { requestedRate: 120, displayId: 0 });
+  assert.strictEqual(primary.status, 'mismatch', 'the other display must not falsely confirm 120 Hz');
+  assert.strictEqual(primary.ok, false);
+  assert.strictEqual(primary.activeModeId, 1);
+  assert.strictEqual(primary.activeRate, 60);
+  assert.deepStrictEqual(primary.modes.map(mode => mode.refreshRate), [60]);
+  assert.strictEqual(primary.displayId, 0);
+
+  const external = peripherals.parseDisplayRefresh(dump, { requestedRate: 120, displayId: 1 });
+  assert.strictEqual(external.status, 'confirmed');
+  assert.strictEqual(external.activeRate, 120);
+  assert.deepStrictEqual(external.modes.map(mode => mode.refreshRate), [120]);
+});
+
+test('reused mode IDs across displays stay scoped; duplicate active IDs within target fail closed', () => {
+  const dump = [
+    'Display 1:',
+    '  mDisplayId=1',
+    '  mActiveModeId=7',
+    '  mSupportedModes=[{id=7, width=1920, height=1080, refreshRate=144.0}]',
+    'Display 0:',
+    '  mDisplayId=0',
+    '  mActiveModeId=7',
+    '  mSupportedModes=[{id=7, width=720, height=1280, refreshRate=60.0}]',
+  ].join('\n');
+  const target = peripherals.parseDisplayRefresh(dump, { requestedRate: 60, displayId: 0 });
+  assert.strictEqual(target.status, 'confirmed');
+  assert.strictEqual(target.activeModeId, 7);
+  assert.strictEqual(target.activeRate, 60);
+  assert.deepStrictEqual(target.modes.map(mode => mode.refreshRate), [60]);
+
+  const duplicate = peripherals.parseDisplayRefresh([
+    'Display 0:',
+    '  mDisplayId=0',
+    '  mActiveModeId=7',
+    '  mSupportedModes=[{id=7, width=720, height=1280, refreshRate=60.0},',
+    '                   {id=7, width=720, height=1280, refreshRate=120.0}]',
+  ].join('\n'), { requestedRate: 120, displayId: 0 });
+  assert.strictEqual(duplicate.status, 'unconfirmed');
+  assert.strictEqual(duplicate.ok, false);
+  assert.strictEqual(duplicate.activeRate, null);
+});
+
+test('target display missing or with conflicting identity stays unconfirmed', () => {
+  const dump = [
+    'Display 1:',
+    '  mDisplayId=1',
+    '  mActiveModeId=1',
+    '  mSupportedModes=[{id=1, width=1920, height=1080, refreshRate=120.0}]',
+  ].join('\n');
+  const missing = peripherals.parseDisplayRefresh(dump, { requestedRate: 120, displayId: 0 });
+  assert.strictEqual(missing.status, 'unconfirmed');
+  assert.strictEqual(missing.activeRate, null);
+  assert.deepStrictEqual(missing.modes, []);
+
+  const conflicting = peripherals.parseDisplayRefresh([
+    'Display 0:',
+    '  mDisplayId=1',
+    '  mActiveModeId=1',
+    '  mSupportedModes=[{id=1, width=720, height=1280, refreshRate=120.0}]',
+  ].join('\n'), { requestedRate: 120, displayId: 0 });
+  assert.strictEqual(conflicting.status, 'unconfirmed');
+  assert.strictEqual(conflicting.ok, false);
+  assert.strictEqual(conflicting.activeRate, null);
+});
+
+test('invalid display IDs remain unconfirmed instead of throwing or selecting the default screen', () => {
+  const dump = 'mActiveModeId=1 mSupportedModes=[{id=1, width=720, height=1280, refreshRate=60.0}]';
+  for (const displayId of [-1, 0.5, 'not-a-display', Infinity]) {
+    const result = peripherals.parseDisplayRefresh(dump, { requestedRate: 60, displayId });
+    assert.strictEqual(result.status, 'unconfirmed');
+    assert.strictEqual(result.activeRate, null);
+    assert.strictEqual(result.ok, false);
+  }
 });
 
 test('真实 active 刷新率不匹配时不误报成功', () => {

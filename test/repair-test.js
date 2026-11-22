@@ -119,6 +119,24 @@ test('检测结果 ok 但可疑（suspect）：各方案仍要给「开启硬件
   }
 });
 
+test('只有 DLL 退出码时指出加载失败，不能断言缺 VC++ 或被杀毒隔离', () => {
+  const { diagnose } = require('../src/core/doctor');
+  const { explainFailure, selfHeal } = require('../src/core/repair');
+  for (const log of ['emulator exit 3221225781', 'emulator exit 3221225781（0xC0000135）']) {
+    const diagnosis = diagnose([log]);
+    assert.strictEqual(diagnosis.code, 'DLL');
+    assert(/DLL.*加载失败/.test(diagnosis.title), diagnosis.title);
+    assert(/(?:无法|不能)确认/.test(diagnosis.hint), diagnosis.hint);
+    assert(!/白名单/.test(diagnosis.hint), diagnosis.hint);
+    const plan = buildPlan({ diagnosis, facts: facts() });
+    assert(/DLL.*加载失败/.test(plan.headline), plan.headline);
+    assert.deepStrictEqual(plan.actions.map(({ id }) => id), ['redeploy', 'report']);
+    const { summary } = explainFailure({ diagnosis, facts: facts() });
+    assert(/尚未确认/.test(summary), summary);
+  }
+  assert.deepStrictEqual(selfHeal('DLL').actions, ['redeploy'], '未知原因不能触发系统运行库安装');
+});
+
 test('镜像损坏：给重建数据与重下镜像，且都标记为「会动数据」', () => {
   const p = planOf('IMAGE');
   const acts = p.actions.filter((a) => a.destructive);

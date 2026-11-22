@@ -1156,7 +1156,7 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(/!detached && !wantStandalone\)/.test(mainSrc), '独立窗口模式下不能再进 embed 重试');
     assert(/embeddedBlack: true/.test(mainSrc), '嵌入必黑要写回设置，下次不再先黑一遍');
     assert(/已在「Android Emulator」窗口打开/.test(mainSrc), '要把「去哪看画面」说清楚');
-    assert(/async standalone\(\)/.test(appwinSrc), 'appwin 要提供一步到位的独立窗口方法');
+    assert(/async standalone\(\{ blackFrame = false \} = \{\}\)/.test(appwinSrc), 'appwin 要提供一步到位的独立窗口方法');
     assert(/this\._hidden = true/.test(appwinSrc), '独立窗口模式下必须藏掉黑壳宿主窗口');
     const release = ps1.slice(ps1.indexOf('static bool ReleaseEmulator('), ps1.indexOf('static bool Detach()'));
     assert(/static bool Detach\(\)\s*\{\s*return ReleaseEmulator\(true\);\s*\}/.test(ps1),

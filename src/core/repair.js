@@ -387,14 +387,14 @@ const PLANS = {
 
   DLL: (f) => ({
     level: LEVEL.AUTO,
-    headline: '缺少 VC++ 运行库，或运行时组件被杀毒软件删掉了。',
+    headline: '模拟器依赖 DLL 加载失败，具体组件尚未确认。',
     why: [
-      '模拟器（Qt6）与 qemu 都依赖微软 VC++ 2015-2022 x64 运行库，缺了会在启动瞬间报 0xc0000135 / 找不到 MSVCP140.dll。',
-      '部分安全软件会把 qemu 的 DLL 当成可疑文件隔离，表现相同。',
+      '退出码 0xc0000135 无法区分运行时文件缺失与系统依赖缺失。先校验运行时，再查看诊断报告中的具体 DLL 名称。',
+      '只有明确提示缺少 MSVCP140 / VCRUNTIME，或体检确认运行库缺失时，才需要在设置里修复微软 VC++ 2015-2022 x64 运行库。',
     ],
     actions: [
-      { id: 'vc-redist', label: '安装 VC++ 运行库', kind: KIND.AUTO, hint: '会弹出管理员授权' },
       { id: 'redeploy', label: '校验并补齐运行时文件', kind: KIND.AUTO, hint: '重新解压缺失组件' },
+      { id: 'report', label: '导出诊断报告', kind: KIND.MANUAL },
     ],
     retry: { lowspec: false, timeoutMs: 600000 },
   }),
@@ -458,8 +458,8 @@ const FALLBACK = PLANS.UNKNOWN;
 const SELF_HEAL = {
   AVD_LOCK: { actions: ['clear-locks'], retry: true, what: '清理上次残留的锁文件' },
   PORT_BUSY: { actions: ['clear-locks'], retry: true, what: '结束残留进程，换一对空闲端口' },
-  // 先校验补齐文件（不动系统、不弹授权），补不齐才轮到装 VC++ 运行库（会弹授权）
-  DLL: { actions: ['redeploy', 'vc-redist'], retry: true, what: '校验运行时文件，缺运行库就补上' },
+  // DLL 加载失败不等于 VC++ 缺失；自动链只补齐本应用的文件，不动系统组件。
+  DLL: { actions: ['redeploy'], retry: true, what: '校验并补齐运行时文件' },
   IMAGE: { actions: ['redeploy'], retry: true, what: '校验并补齐运行时与镜像文件' },
   DISK_FULL: { actions: ['cleanup-safe'], retry: true, what: '清理临时文件与旧日志' },
   GPU_INIT: { actions: ['gpu-software'], retry: true, what: '改用软件渲染' },
@@ -488,7 +488,7 @@ const PLAIN = {
   DISK_FULL: '磁盘空间不足，模拟器写不下数据。',
   IMAGE: '系统镜像或用户数据不完整。',
   AVD_LOCK: '上次没有正常退出，模拟器以为还有一台在运行。',
-  DLL: '缺少运行库文件，模拟器起不来。',
+  DLL: '模拟器依赖的 DLL 没有加载成功，具体组件尚未确认。',
   PORT_BUSY: '模拟器要用的端口被别的程序占了。',
   NON_ASCII: '安装路径里有中文或特殊字符，模拟器找不到自己的文件。',
   SPAWN_ERROR: '模拟器连启动都没拉起来。',

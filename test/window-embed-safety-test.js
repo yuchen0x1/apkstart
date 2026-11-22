@@ -135,6 +135,55 @@ test('standalone reveal never shows the hidden host or fits/repositions it', asy
   assert.equal(await h.app.reveal(), false, 'unready hidden host must stay hidden');
 });
 
+test('a successful black-frame detach hides the host and preserves standalone foregrounding', async () => {
+  const h = harness();
+  h.app.agent.embed = async () => ({ ok: true });
+  h.app._looksBlackAfterEmbed = async () => true;
+  h.win.visible = true;
+  assert.equal(await h.app.embed(), false, 'the window was detached, not embedded');
+  assert.equal(h.app.lastEmbedError, 'black-frame-detached');
+  assert.equal(h.app.blackDetached, true);
+  assert.equal(h.app.standaloneActive, true);
+  assert.equal(h.win.isVisible(), false);
+  assert.equal(await h.app.reveal(), true);
+  await h.app.fitNow();
+  assert.deepEqual(h.commands, ['native:detach', 'host:hide', 'native:detach']);
+});
+
+test('a failed black-frame detach does not claim that the standalone window is ready', async () => {
+  const h = harness();
+  h.app.agent.embed = async () => ({ ok: true });
+  h.app._looksBlackAfterEmbed = async () => true;
+  h.app.agent.detach = async () => ({ ok: false, error: 'detach-failed' });
+  h.win.visible = true;
+  assert.equal(await h.app.embed(), false);
+  assert.equal(h.app.blackDetached, false);
+  assert.equal(h.app.standaloneActive, false);
+  assert.equal(h.app.lastEmbedError, 'detach-failed');
+  assert.equal(h.win.isVisible(), true);
+  assert(!h.commands.includes('host:hide'));
+});
+
+test('queued host commands cannot run after a successful detach', async () => {
+  const h = harness();
+  let acknowledge, started;
+  const pending = new Promise(resolve => { acknowledge = resolve; });
+  const sent = new Promise(resolve => { started = resolve; });
+  h.app.agent.detach = () => { started(); return pending; };
+  h.app.agent.hide = async () => h.commands.push('native:hide');
+  h.app.agent.refresh = async () => h.commands.push('native:refresh');
+  const detached = h.app.standalone();
+  await sent;
+  h.win.emit('restore');
+  h.win.emit('minimize');
+  h.win.emit('focus');
+  const fit = h.app.fitNow();
+  acknowledge({ ok: true });
+  assert.equal(await detached, true);
+  await fit;
+  assert.deepEqual(h.commands, ['host:hide']);
+});
+
 test('queued fit rechecks standalone state after ownership handoff', async () => {
   const h = harness();
   let done;

@@ -19,6 +19,7 @@
  *
  * buildApkBytes(opts) 可以改：minSdk / targetSdk / abis / permissions /
  * requiredFeatures / usesLibraries / split / debuggable，用来覆盖兼容性判定。
+ * labelRef / iconRef 写 TYPE_REFERENCE；resources 构造非空 ARSC，extraEntries 添加图标等条目。
  */
 const { drawAppIcon } = require('../../src/core/png');
 const { crc32 } = require('../../src/core/zip');
@@ -147,7 +148,10 @@ function buildManifestAxml(opts = {}) {
 
   const app = {
     name: 'application',
-    attrs: [A('label', o.label), A('icon', o.icon)],
+    attrs: [
+      o.labelRef === undefined ? A('label', o.label) : A('label', o.labelRef, { type: 0x01 }),
+      o.iconRef === undefined ? A('icon', o.icon) : A('icon', o.iconRef, { type: 0x01 }),
+    ],
     children: [],
   };
   if (o.debuggable) app.attrs.push({ name: 'debuggable', value: true, type: 0x12 });
@@ -275,6 +279,88 @@ function buildStoredZip(entries) {
   return Buffer.concat([...locals, cd, eocd]);
 }
 
+/**
+ * 按二进制格式构造最小 ResTable，不依赖 SDK/aapt 或第三方 APK。
+ * resources: [{ id: 0xPPTTEEEE, value: string | number }]；数字值是 TYPE_REFERENCE 别名。
+ * 每包独立的类型/键池、默认配置、typeSpec 和普通 32 位 entry offsets；包顺序按输入保留。
+ */
+function buildResTable(resources) {
+  const strings = [];
+  const packages = new Map();
+  for (const { id, value } of resources) {
+    const pkgId = id >>> 24;
+    const typeId = (id >>> 16) & 0xff;
+    const entryId = id & 0xffff;
+    if (!pkgId || !typeId) throw new Error('合成资源必须包含 package/type ID');
+    if (!packages.has(pkgId)) packages.set(pkgId, { id: pkgId, keys: [], types: new Map() });
+    const pkg = packages.get(pkgId);
+    if (!pkg.types.has(typeId)) pkg.types.set(typeId, new Map());
+    const entries = pkg.types.get(typeId);
+    if (entries.has(entryId)) throw new Error('合成资源 ID 重复');
+    let data = value;
+    if (typeof value === 'string') {
+      data = strings.indexOf(value);
+      if (data < 0) { data = strings.length; strings.push(value); }
+    } else if (!Number.isInteger(value)) throw new Error('合成资源只支持字符串或引用');
+    entries.set(entryId, { key: pkg.keys.length, type: typeof value === 'string' ? 0x03 : 0x01, data });
+    pkg.keys.push(`fixture_${typeId}_${entryId}`);
+  }
+  // ARSC chunk 按 4 字节对齐；不改变原有 AXML 夹具的字符串池字节。
+  const pool = (values) => {
+    const raw = buildStringPool(values);
+    const aligned = Buffer.concat([raw, Buffer.alloc((4 - raw.length % 4) % 4)]);
+    aligned.writeUInt32LE(aligned.length, 4);
+    return aligned;
+  };
+  const chunks = [pool(strings)];
+  for (const pkg of packages.values()) {
+    const typeNames = Array.from({ length: Math.max(...pkg.types.keys()) }, (_, i) =>
+      ['string', 'mipmap'][i] || `fixture_type_${i + 1}`);
+    const typePool = pool(typeNames);
+    const keyPool = pool(pkg.keys);
+    const types = [];
+    for (const [typeId, entries] of pkg.types) {
+      const count = Math.max(...entries.keys()) + 1;
+      const spec = Buffer.alloc(16 + count * 4);
+      spec.writeUInt16LE(0x0202, 0);
+      spec.writeUInt16LE(16, 2);
+      spec.writeUInt32LE(spec.length, 4);
+      spec.writeUInt8(typeId, 8);
+      spec.writeUInt32LE(count, 12);
+      const header = Buffer.alloc(20 + 64); // ResTable_type + 默认 ResTable_config
+      const offsets = Buffer.alloc(count * 4, 0xff); // NO_ENTRY
+      const values = [];
+      for (const [index, entry] of entries) {
+        offsets.writeUInt32LE(values.length * 16, index * 4);
+        values.push(Buffer.concat([
+          u16(8), u16(0), u32(entry.key), // ResTable_entry（非复杂资源）
+          u16(8), Buffer.from([0, entry.type]), u32(entry.data), // Res_value
+        ]));
+      }
+      header.writeUInt16LE(0x0201, 0);
+      header.writeUInt16LE(header.length, 2);
+      header.writeUInt32LE(header.length + offsets.length + values.length * 16, 4);
+      header.writeUInt8(typeId, 8);
+      header.writeUInt32LE(count, 12);
+      header.writeUInt32LE(header.length + offsets.length, 16);
+      header.writeUInt32LE(64, 20);
+      types.push(spec, header, offsets, ...values);
+    }
+    const body = Buffer.concat([typePool, keyPool, ...types]);
+    const header = Buffer.alloc(288); // ResTable_package，typeIdOffset=0
+    header.writeUInt16LE(0x0200, 0);
+    header.writeUInt16LE(header.length, 2);
+    header.writeUInt32LE(header.length + body.length, 4);
+    header.writeUInt32LE(pkg.id, 8);
+    Buffer.from(`com.example.resources.p${pkg.id}`, 'utf16le').copy(header, 12);
+    header.writeUInt32LE(header.length, 268);
+    header.writeUInt32LE(header.length + typePool.length, 276);
+    chunks.push(header, body);
+  }
+  const body = Buffer.concat(chunks);
+  return Buffer.concat([u16(0x0002), u16(12), u32(12 + body.length), u32(packages.size), body]);
+}
+
 /** 一个可直接被 parseApk 解析的最小 APK 的字节 */
 function buildApkBytes(opts = {}) {
   const o = { ...DEFAULTS, ...opts };
@@ -285,6 +371,8 @@ function buildApkBytes(opts = {}) {
     { name: 'res/mipmap-hdpi/ic_launcher.png', data: png },
     { name: 'classes.dex', data: Buffer.from('dex\n035\0') },
   ];
+  if (o.resources !== undefined) entries.push({ name: 'resources.arsc', data: buildResTable(o.resources) });
+  entries.push(...(o.extraEntries || []));
   for (const abi of abis) {
     entries.push({ name: `lib/${abi}/libtest.so`, data: Buffer.from('ELF-fake') });
   }
