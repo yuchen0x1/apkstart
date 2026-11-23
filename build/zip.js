@@ -97,7 +97,10 @@ function verify(zipPath, expect) {
   const { ZipFile } = require('../src/core/zip');
   const zip = new ZipFile(zipPath);
   try {
-    const names = zip.names().filter((n) => !n.endsWith('/'));
+    // Compress-Archive on Windows may emit directory entries with backslashes;
+    // treat both separators as directory markers so the fallback has the same
+    // verification semantics as the 7-Zip path.
+    const names = zip.names().filter((n) => !n.endsWith('/') && !n.endsWith('\\'));
     let bytes = 0;
     for (const n of names) bytes += zip.entries.get(n).uncompSize;
     if (names.length !== expect.files) {

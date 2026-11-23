@@ -650,10 +650,17 @@
             </div>
             <div class="field switch-field">
               <div>
-                <label for="setAudio">安卓声音</label>
-                <span class="sub">让应用提示音、视频声音正常播放。仅在你完全不需要声音、想再省一点 CPU 时关闭。</span>
+                <label for="setAudio">安卓播放声音</label>
+                <span class="sub">让应用提示音、视频声音正常播放。关闭此项但保留麦克风时不会禁用整个音频子系统；只有两项都关闭才会传入静音参数。</span>
               </div>
               <input type="checkbox" id="setAudio" class="switch" />
+            </div>
+            <div class="field switch-field">
+              <div>
+                <label for="setMicrophone">安卓麦克风输入</label>
+                <span class="sub">把电脑麦克风提供给安卓应用（仅内置 Android Emulator 路径支持，QEMU 后端暂不支持）。修改后需完整重启运行时；还要允许 Windows 的麦克风隐私权限。</span>
+              </div>
+              <input type="checkbox" id="setMicrophone" class="switch" />
             </div>
             <div class="field switch-field">
               <div>
@@ -990,22 +997,22 @@
             </div>
             <span class="sub" id="integrationSupportNote" hidden></span>
             <div class="field">
-              <label for="setRuntimeDir">运行时数据目录（系统镜像 · 已装应用 · 快照）</label>
+              <label for="setRuntimeDir">运行时组件目录（模拟器引擎 · 系统镜像）</label>
               <div class="row">
                 <input id="setRuntimeDir" type="text" readonly placeholder="默认：C 盘用户数据目录" />
                 <button class="btn ghost sm" id="btnBrowseRuntimeDir">浏览</button>
                 <button class="btn ghost sm" id="btnOpenData">打开</button>
               </div>
-              <span class="sub">这里占用空间最大（数 GB）。改到非系统盘可大幅减轻 C 盘压力；修改后需重启软件，已存在的数据不会自动搬移（请手动复制后删除旧目录）。</span>
+              <span class="sub">这里保存模拟器引擎和系统镜像。改到非系统盘可减轻 C 盘压力；修改后需重启软件，现有安卓应用、存档和快照不会自动搬移。要一起迁移它们，还要单独设置下面的「安卓数据目录」。</span>
             </div>
             <div class="field">
               <label for="setAvdDir">安卓数据目录（应用、游戏与快速启动快照）</label>
               <div class="row">
-                <input id="setAvdDir" type="text" readonly placeholder="默认：运行时目录下的 avd 文件夹" />
+                <input id="setAvdDir" type="text" readonly placeholder="默认：按运行时位置决定，可能在用户数据目录" />
                 <button class="btn ghost sm" id="btnBrowseAvdDir">浏览</button>
                 <button class="btn ghost sm" id="btnOpenAvdDir">打开</button>
               </div>
-              <span class="sub">真正吃盘的是这一块：数据分区（默认 6 GB，可在「性能与资源」里调大）+ 快速启动快照（约等于分配的内存）。磁盘紧张时把它指到另一个盘（如 D:），重启软件后生效；旧目录里的 apkstart.avd 可整体搬过去再删。</span>
+              <span class="sub">真正保存已装应用、存档和快照的是这一块。运行时目录单独移到 D: 时，安卓数据可能仍留在 C:；请先停止运行时，把旧目录里的 apkstart.avd 整体复制到新位置，再设置这里并重启，确认新位置可用后再删除旧目录。</span>
             </div>
             <div class="field">
               <label>卸载 ApkStart</label>

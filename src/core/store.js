@@ -50,7 +50,8 @@ const DEFAULT_SETTINGS = {
     windowMode: 'auto',
     // auto 模式的记忆位：这台机器嵌入后必然黑帧（由黑帧采样成功后写回）
     embeddedBlack: false,
-    audio: true,             // 安卓应用的声音（提示音/视频）。关闭可省一点 CPU
+    audio: true,             // 安卓应用的播放声音（提示音/视频）。关闭可省一点 CPU
+    microphone: true,        // 内置 Android Emulator 把电脑麦克风提供给安卓应用
     // ---- 轻量容器（默认全开省资源，用户可逐项关掉）----
     liteMode: true,          // 收敛 vCPU 配额，避免 qemu 占满物理核拖慢 Windows
     // 一句话策略：save（省资源）/ balanced（均衡，自动识别低配机器）/ smooth（流畅，视频·游戏优先）。

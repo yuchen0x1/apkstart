@@ -23,7 +23,7 @@ function createFixture() {
   };
   let settings = {
     theme: 'light', language: 'zh-CN', wizardDone: true, wizardVersion: '0.8.0',
-    engine: { mode: 'builtin', idleShutdownMinutes: 15, resourceMode: 'balanced', gpuMode: 'auto', windowMode: 'auto', memoryMB: 4096, cores: 4, autoMemory: true, audio: true, fastDns: true, liteMode: true, keepSnapshot: true, prewarm: false, mouseRightBack: true, mouseWheelMode: 'smooth' },
+    engine: { mode: 'builtin', idleShutdownMinutes: 15, resourceMode: 'balanced', gpuMode: 'auto', windowMode: 'auto', memoryMB: 4096, cores: 4, autoMemory: true, audio: true, microphone: true, fastDns: true, liteMode: true, keepSnapshot: true, prewarm: false, mouseRightBack: true, mouseWheelMode: 'smooth' },
     runtime: { dir: 'D:\\ApkStart\\runtime', avdDir: 'D:\\ApkStart\\avd', systemImageFlavor: 'google_apis_playstore', selectedSystemId: 'google-play', downloadConnections: 8, installMode: 'guided', systemInstallMode: 'guided', autoMirror: true },
     display: { mode: 'window', size: 'auto', portrait: true, scale: 1 },
     peripherals: { cameraBack: 'none', cameraFront: 'none', refreshRate: 60, serialPort: '' },

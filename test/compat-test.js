@@ -137,6 +137,28 @@ const hasCode = (r, code) => r.reasons.some((x) => x.code === code);
     assert(/摄像头/.test(text) && /GPS/.test(text), text);
   });
 
+  await test('内置 Android Emulator 已知支持麦克风输入，不误报为缺少硬件', () => {
+    const r = compat.analyze(mkApk({
+      abis: ['x86_64'],
+      requiredFeatures: ['android.hardware.microphone'],
+    }));
+    eq(r.level, 'ok', JSON.stringify(r.reasons));
+    assert(hasCode(r, 'microphone-available'), JSON.stringify(r.reasons));
+    assert(!hasCode(r, 'feature-missing'), JSON.stringify(r.reasons));
+    assert(r.env.audioInput === true && r.env.backend === 'android-emulator');
+  });
+
+  await test('QEMU 未验证麦克风采集时保留明确的兼容性警告', () => {
+    const r = compat.analyze(mkApk({
+      abis: ['x86_64'],
+      requiredFeatures: ['android.hardware.microphone'],
+    }), { backend: 'qemu', audioInput: false });
+    eq(r.level, 'partial', JSON.stringify(r.reasons));
+    assert(hasCode(r, 'feature-missing'), JSON.stringify(r.reasons));
+    assert(r.reasons.find(x => x.code === 'feature-missing').text.includes('麦克风'));
+    assert(r.env.audioInput === false && r.env.backend === 'qemu');
+  });
+
   await test('非必需硬件（required=false）不影响结论', () => {
     const r = compat.analyze(mkApk({
       abis: ['x86_64'],

@@ -17,6 +17,8 @@ const DEFAULT_ENV = {
   abis: ['x86_64'],                     // 运行时支持的 ABI
   armTranslation: true,                 // 是否带 ARM 转译层（libndk/libhoudini）
   playServices: false,                  // 是否内置 Google Play 服务
+  backend: 'android-emulator',           // android-emulator | qemu | attached | unknown
+  audioInput: true,                      // 只有内置 Android Emulator 的已知路径才为 true
   source: '内置运行时（Android 14）',
 };
 
@@ -193,7 +195,11 @@ function analyze(info, env = {}) {
     const name = typeof f === 'string' ? f : f.name;
     const required = typeof f === 'string' ? true : f.required !== false;
     if (!required) continue;
-    if (UNSUPPORTED_FEATURES[name]) requiredMissing.push(UNSUPPORTED_FEATURES[name]);
+    if (name === 'android.hardware.microphone' && e.audioInput === true) {
+      add('info', 'microphone-available', '运行时支持麦克风输入（仅内置 Android Emulator 路径；是否真正可用还取决于系统隐私权限和主机设备）。');
+    } else if (UNSUPPORTED_FEATURES[name]) {
+      requiredMissing.push(UNSUPPORTED_FEATURES[name]);
+    }
   }
   if (requiredMissing.length) {
     degrade('partial');
@@ -224,7 +230,15 @@ function analyze(info, env = {}) {
     label: LEVEL_TEXT[level],
     reasons,
     details,
-    env: { sdk: e.sdk, abis: e.abis, armTranslation: !!e.armTranslation, playServices: !!e.playServices, source: e.source },
+    env: {
+      sdk: e.sdk,
+      abis: e.abis,
+      armTranslation: !!e.armTranslation,
+      playServices: !!e.playServices,
+      backend: e.backend || 'unknown',
+      audioInput: e.audioInput === true,
+      source: e.source,
+    },
   };
 }
 

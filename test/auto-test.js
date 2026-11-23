@@ -472,6 +472,32 @@ const { adbKeyHint } = require('../src/core/engine');
       '无加速类结论也要指向同一个一键入口');
   });
 
+  await test('跨 GPU/加速模式重复 0xC0000005 后停止换端口，并阻断外层自愈', async () => {
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    const d = doctor.diagnose(['emulator exit 3221225477']);
+    emu.lastExitCode = 3221225477;
+    emu.attempts = [{ gpu: 'host', accel: 'on', exitCode: 3221225477 },
+      { gpu: 'swangle', accel: 'off', exitCode: 3221225477 }];
+    assert(emu._repeatedAccessViolation(d) === true, '硬件加速与 TCG 各崩一次也应止损');
+    emu.attempts = [{ gpu: 'host', accel: 'on', exitCode: 3221225477 }];
+    assert(emu._repeatedAccessViolation(d) === false, '第一次访问冲突应保留一次有界兜底');
+    emu.attempts.push({ gpu: 'software', accel: 'off', exitCode: 1 });
+    assert(emu._repeatedAccessViolation(d) === false, '不同退出码不能伪装成访问冲突循环');
+    emu.attempts[1].exitCode = 3221225477;
+    emu.attempts[1].diagnosis = 'GPU_INIT';
+    assert(emu._repeatedAccessViolation(d) === true, 'Vulkan 文本误判 GPU_INIT 也不能绕过精确退出码熔断');
+    const terminal = doctor.repeatedCrashDiagnosis();
+    assert(terminal.terminal === true && terminal.code === 'EMULATOR_CRASH_LOOP');
+    assert(/不会继续换端口/.test(terminal.hint), '终止结论必须明确不会继续换端口');
+    const { Runtime } = require('../src/core/engine');
+    const rt = new Runtime(path.join(__dirname, '..'));
+    rt.onAutoRepair = async () => { throw new Error('终止性崩溃不应进入自动修复'); };
+    const blocked = await rt.autoRepair({ diagnosis: { code: 'ACCESS_VIOLATION', terminal: true } });
+    assert(blocked && blocked.retry === false && /连续模拟器崩溃/.test(blocked.reason),
+      '终止性诊断不能再触发外层自动修复');
+  });
+
   await test('存快照把模拟器写崩过一次后：本机不再保存（上游 #46）', async () => {
     const store = require('../src/core/store');
     const { EmulatorEngine } = require('../src/core/emulator');
@@ -918,6 +944,14 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(/^hw\.ramSize=2048$/m.test(cfg));
     assert(/^disk\.dataPartition\.size=4096M$/m.test(cfg), '数据分区不应是 16G');
     assert(/^hw\.gpu\.mode=software$/m.test(cfg));
+    assert(/^hw\.audioInput=yes$/m.test(cfg), '默认应启用内置模拟器的麦克风输入');
+    Object.defineProperty(emu, 'settings', {
+      configurable: true,
+      get: () => ({ engine: { microphone: false } }),
+    });
+    const disabled = emu.ensureAvd({ memoryMB: 2048, cores: 2, gpu: 'software', dataMB: 4096, accel: 'auto' });
+    const disabledCfg = fs.readFileSync(path.join(disabled.avdDir, 'config.ini'), 'utf8');
+    assert(/^hw\.audioInput=no$/m.test(disabledCfg), '关闭麦克风后应写入 hw.audioInput=no');
     assert(!/^fastboot\.forceColdBoot=yes$/m.test(cfg), '不应再强制冷启动');
     assert(!/^fastboot\.forceFastBoot=/m.test(cfg), '快照应由命令行 -snapshot 控制，避免加载旧 default_boot');
     assert(/^hw\.cpu\.arch=x86_64$/m.test(cfg));
@@ -1238,17 +1272,23 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(/-no-window/.test(headless) && !/-no-skin/.test(headless));
   });
 
-  await test('音频：默认开启（不带 -no-audio），关闭后才带 -no-audio', () => {
+  await test('音频：四种播放/输入组合只在两项都关闭时禁用整个子系统', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
-    // 覆盖 settings getter：默认开启不应有 -no-audio
-    Object.defineProperty(emu, 'settings', { configurable: true, get: () => ({ engine: { audio: true } }) });
-    const on = emu.buildArgs({ headless: false, gpu: 'software' }).join(' ');
-    assert(!/-no-audio/.test(on), 'audio=true 时不应传 -no-audio');
-    // 关闭后才应带 -no-audio
-    Object.defineProperty(emu, 'settings', { configurable: true, get: () => ({ engine: { audio: false } }) });
-    const off = emu.buildArgs({ headless: false, gpu: 'software' }).join(' ');
-    assert(/-no-audio/.test(off), 'audio=false 时应传 -no-audio');
+    const cases = [
+      [{ audio: true, microphone: true }, false],
+      [{ audio: false, microphone: true }, false],
+      [{ audio: true, microphone: false }, false],
+      [{ audio: false, microphone: false }, true],
+      // 升级旧配置没有 microphone 键时，按默认开启输入处理，不能误伤麦克风。
+      [{ audio: false }, false],
+    ];
+    for (const [engine, muted] of cases) {
+      Object.defineProperty(emu, 'settings', { configurable: true, get: () => ({ engine }) });
+      const args = emu.buildArgs({ headless: false, gpu: 'software' }).join(' ');
+      assert((/-no-audio/.test(args)) === muted,
+        `${JSON.stringify(engine)} 的 -no-audio 组合不正确：${args}`);
+    }
   });
 
   await test('旧配置强制迁移：无头与「启动后退出」不再生效', () => {

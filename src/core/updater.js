@@ -1,6 +1,6 @@
 'use strict';
 /**
- * 在线更新：从 GitHub Releases（RoutineMiku/apkstart）取最新版本，下载并原地替换。
+ * 在线更新：从本项目 GitHub Releases（yuchen0x1/apkstart）取最新版本，下载并原地替换。
  *
  * 三个形态都要照顾到：
  *   - 安装版（NSIS）：下载 `ApkStart-x.y.z-Setup.exe`，静默安装（/S）；

@@ -2,6 +2,10 @@ appId: com.apkstart.win
 productName: ApkStart
 copyright: Copyright © 2026 ApkStart contributors · 原项目 © RoutineMiku (MIT)
 
+# CI and local builds install the exact Electron package first; reuse its verified
+# distribution instead of downloading the same binary a second time.
+electronDist: node_modules/electron/dist
+
 directories:
   output: dist/release
   buildResources: build

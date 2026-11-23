@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.10.1**（2026-11-21）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.10.2**（2026-11-22）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,16 +46,16 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.10.1
+### v0.10.2
 
-> 修正独立窗口的渲染选路、黑屏回退与诊断。实际发行状态以 GitHub Releases 为准。
+> 针对上游模拟器崩溃循环、运行时路径说明和音频输入边界的维护更新。实际发行状态以 GitHub Releases 为准。
 
-- 独立窗口和不支持嵌入的平台按机器能力自动选渲染后端，不再强制优先走软件渲染。宿主渲染失败仍可回退，Windows 嵌入仍保留防黑屏策略；自动失败记录不覆盖手动选择。
-- Windows 嵌入黑屏后，只有原生代理确认脱离才隐藏宿主。延迟重试在切换成功后停止；再次打开同一应用、点击通知或前置按钮时只唤起独立窗口。
-- 刷新率读回只采用所请求的客机显示器的活动模式，避免把另一块屏的 Hz 当作主屏结果。归属不明确时显示未确认；Hz 不是应用帧率。
-- 启动重试独立记录错误，避免把上一轮 GPU 等故障算到下一轮。DLL 加载失败未确认具体依赖时只校验应用运行时，不自动提权安装 VC++ 运行库，也不建议关闭防护或加白名单。
-- APK 名称、图标按资源包 ID 解析，不再把未知资源包的引用误认成本应用资源。
-- 对于[视频卡顿或音画不同步反馈 #13](https://github.com/yuchen0x1/apkstart/issues/13)，可在「设置 → 显示与操作」切换到独立窗口，保持渲染后端为「自动」，正常停止运行时后重新打开应用。已运行的客机不会因改设置而被强制重启。
+- 针对 Windows 模拟器在不同 GPU 与加速模式下反复以 `0xC0000005`（`3221225477`）退出的场景增加跨模式熔断：同一启动会话第二次出现精确访问冲突退出码后停止换端口、换参数和启动更多实例，不清除安卓数据，并向修复页传递终止性诊断。
+- 保留 TCG 专用熔断，同时把访问冲突判断绑定到当前启动会话的实际退出码，不再依赖截断日志或 GPU 文本；蓝屏仍需结合 Windows 转储确认，不能仅凭 ApkStart 日志归因。
+- 早期启动日志补充宿主系统版本、架构、 Electron / Chromium 版本及 Electron GPU 开关，便于排查 Windows 版本相关的桌面崩溃。
+- 重新说明运行时组件目录与安卓数据目录的职责；只移动运行时不会静默搬移已装应用、存档和快照，也不自动执行未经确认的大型 AVD 迁移。
+- 设置新增「安卓麦克风输入」开关。内置 Android Emulator 会在 AVD 中写入 `hw.audioInput=yes/no`，默认开启；修改后需要完整重启运行时，并仍受 Windows 麦克风隐私权限和主机设备状态影响。
+- 只有播放声音和麦克风都关闭时才传入 `-no-audio`，避免关闭播放声音时误伤麦克风输入；QEMU / Android-x86 / Bliss OS 主机音频采集未在本轮验证，不宣称已支持。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

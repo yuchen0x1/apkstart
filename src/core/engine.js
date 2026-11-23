@@ -481,6 +481,7 @@ class Runtime {
           code: st && st.code,
           data: st && st.data,
           needsSpace: !!(st && st.needsSpace),
+          terminal: !!(st && st.terminal),
           attempts: (st && st.attempts) || [],
           diagnosis: (st && st.diagnosis) || this.emulator.lastDiagnosis,
           exitCode: st && st.exitCode,
@@ -500,7 +501,10 @@ class Runtime {
       return { ok: true, client, engine: 'emulator', serial: this.emuSerial, profile: st.profile, network: st.network || null };
     } catch (e) {
       // 把自动重试/诊断结论原样抛给 UI，避免再包一层含糊的「启动失败」
-      return { ok: false, error: e.message, diagnosis: e.diagnosis, report: e.report, attempts: e.attempts };
+      return {
+        ok: false, error: e.message, terminal: !!e.terminal,
+        diagnosis: e.diagnosis, report: e.report, attempts: e.attempts,
+      };
     } finally {
       this.vmStarting = false;
     }
@@ -1207,6 +1211,11 @@ class Runtime {
   async autoRepair({ diagnosis, onLog = () => {} } = {}) {
     const code = diagnosis && diagnosis.code;
     if (!code) return null;
+    // 终止性崩溃已经明确停止了当前启动会话；即使调用方直接走 autoRepair，
+    // 也不能再把 ACCESS_VIOLATION 映射成换软件渲染并重新拉起一整轮。
+    if (diagnosis && diagnosis.terminal === true) {
+      return { code, ok: false, retry: false, tried: [], reason: '本次启动已因连续模拟器崩溃停止自动重试' };
+    }
     // 加速类有独立的授权链路，交给原来的实现（它自己管「只弹一次」）。
     // TCG_CRASH：软件模拟本身崩了，唯一的真修复是把硬件加速开起来，同样走这条线。
     if (['ACCEL', 'ACCEL_UNUSABLE', 'TCG_CRASH'].includes(code)) {
@@ -1351,8 +1360,12 @@ class Runtime {
         // 全自动修复：先把「不需要用户做决定」的毛病自己处理掉（清锁、补文件、
         // 换软件渲染、降配），再自动重来一遍。加速类会弹一次管理员授权，
         // 预热/后台启动传 autoRepair:false —— 不能因为一次静默预热就弹授权框吓人一跳。
+        // 严重访问冲突已经由 EmulatorEngine 明确熔断；这里也要尊重 terminal 标记，
+        // 否则 start() 虽然停止了端口轮换，外层仍会自动再 boot 一整轮（#127）。
         const diagnosis = r.diagnosis || this.emulator.lastDiagnosis;
-        const healed = autoRepair && !(signal && signal.aborted) ? await this.autoRepair({ diagnosis, onLog }) : null;
+        const terminal = r.terminal === true || diagnosis?.terminal === true;
+        const healed = !terminal && autoRepair && !(signal && signal.aborted)
+          ? await this.autoRepair({ diagnosis, onLog }) : null;
         if (signal && signal.aborted) return cancelledBoot();
         if (healed && healed.retry) {
           // 修复窗口要如实写「重开过一次」：只写「清过锁」会让用户以为程序没再试
@@ -1378,6 +1391,7 @@ class Runtime {
           }
           return {
             ok: false, error: again.error, env,
+            terminal: !!again.terminal,
             diagnosis: again.diagnosis, report: again.report, attempts: again.attempts, exitCode: again.exitCode,
             autoRepair,
           };
@@ -1388,6 +1402,7 @@ class Runtime {
           // 用户拿着这句话就知道该重启还是该进 BIOS，而不是只看一句「起不来」。
           error: healed && healed.reason ? `${r.error}\n\n（已自动尝试修复：${healed.reason}）` : r.error,
           env,
+          terminal,
           diagnosis: r.diagnosis, report: r.report, attempts: r.attempts, exitCode: r.exitCode,
           autoRepair: healed || null,
         };

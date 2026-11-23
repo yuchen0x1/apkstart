@@ -243,6 +243,18 @@ async function runUpstreamFeatures({ win, fixture, check, capture = async () => 
   }
   await setTheme('light');
 
+  await open('performance');
+  check('声音设置明确区分播放与麦克风输入', await js(
+    "!!document.getElementById('setAudio') && !!document.getElementById('setMicrophone') && document.querySelector('label[for=setMicrophone]').textContent.includes('麦克风')"));
+  const microphoneStart = fixture.calls.length;
+  await click('#setMicrophone');
+  const microphoneSave = await waitForCall('settings:set', microphoneStart,
+    call => call.payload?.engine?.microphone === false);
+  check('麦克风开关经真实渲染层保存并读回', !!microphoneSave
+    && await js("document.getElementById('setMicrophone').checked===false"), microphoneSave?.payload);
+  await click('#setMicrophone');
+  await waitForCall('settings:set', microphoneStart, call => call.payload?.engine?.microphone === true);
+
   // Camera selection is saved through the real renderer event path and read back
   // after closing/reopening settings. "List host cameras" is fixture-only.
   await section('display');

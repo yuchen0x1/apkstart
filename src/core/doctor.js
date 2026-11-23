@@ -806,6 +806,26 @@ function tcgCrashDiagnosis() {
 }
 
 /**
+ * 不同 GPU/加速组合连续以同一访问冲突退出时的终止结论。
+ *
+ * 这不是「显卡后端再换一轮」的问题：继续换端口只会在短时间内重复启动
+ * 同一个可能不稳定的 emulator/QEMU，无法修复 Windows 驱动、运行时版本或安全软件
+ * 引起的进程崩溃。尤其不能把用户报告的蓝屏未经验证地归咎于某一个组件。
+ */
+function repeatedCrashDiagnosis() {
+  return {
+    code: 'EMULATOR_CRASH_LOOP',
+    terminal: true,
+    title: '模拟器连续崩溃，已停止自动重试',
+    hint: '模拟器已在不同 GPU/加速参数下重复以 0xC0000005 访问冲突退出。'
+      + '本轮不会继续换端口或启动更多实例，也不会清除安卓数据。'
+      + '请先检查 emulator 版本、GPU 驱动、WHPX/AEHD 状态和安全软件拦截；'
+      + '必要时更新或回退运行时，并导出诊断报告。若同时出现系统蓝屏，需结合 Windows 转储另行确认原因，'
+      + '不能仅凭应用日志断定是 ApkStart、QEMU、显卡驱动或其他组件单独造成。',
+  };
+}
+
+/**
  * 加速器「检查通过、真正起 VM 时却没接管」的专用结论。
  *
  * 现场特征（用户 report 里的原样）：
@@ -1046,7 +1066,7 @@ module.exports = {
   accelUsable,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey, imageIdentity,
-  diagnose, notes, timeoutDiagnosis, noAccelDiagnosis, tcgCrashDiagnosis,
+  diagnose, notes, timeoutDiagnosis, noAccelDiagnosis, tcgCrashDiagnosis, repeatedCrashDiagnosis,
   accelUnusableDiagnosis, earlyAccelExit, spawnErrorDiagnosis,
   describeProfile, describeTuning, describeManual, describeAttempt,
   writeReport, vcRedistOk,

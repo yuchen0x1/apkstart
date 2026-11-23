@@ -36,7 +36,7 @@ const facts = (over = {}) => buildFacts({
 const planOf = (code, over = {}) => buildPlan({ diagnosis: { code, title: `诊断-${code}` }, facts: facts(over), attempts: [] });
 
 test('每个诊断码都能出方案（有结论、有解释、有动作）', () => {
-  const codes = ['TIMEOUT', 'ACCEL', 'ACCEL_UNUSABLE', 'TCG_CRASH', 'CPU_FEATURE', 'GPU_INIT', 'ACCESS_VIOLATION', 'MEMORY',
+  const codes = ['TIMEOUT', 'ACCEL', 'ACCEL_UNUSABLE', 'TCG_CRASH', 'EMULATOR_CRASH_LOOP', 'CPU_FEATURE', 'GPU_INIT', 'ACCESS_VIOLATION', 'MEMORY',
     'DISK_FULL', 'IMAGE', 'AVD_LOCK', 'DLL', 'PORT_BUSY', 'NON_ASCII', 'UNKNOWN', '不存在的码'];
   for (const code of codes) {
     const p = planOf(code);
@@ -63,6 +63,14 @@ test('TCG 崩溃：一键修复指向开启硬件加速，且不安排无意义�
   assert.strictEqual(p.canAutoFix, true, '应当可以一键修复');
   assert(p.retry && p.retry.needsReboot === true, '开启后要重启，不能立刻重试');
   assert(p.why.some((t) => /TCG/.test(t)), '要解释为什么换后端无效');
+});
+
+test('跨 GPU/加速组合连续崩溃：只导出报告，不自动再开机', () => {
+  const p = planOf('EMULATOR_CRASH_LOOP');
+  assert.strictEqual(p.level, 'blocked');
+  assert.strictEqual(p.canAutoFix, false, '终止性崩溃结论不能提供自动重试');
+  assert(p.actions.some((a) => a.id === 'report'), '必须保留导出诊断报告入口');
+  assert(p.why.some((t) => /不会修复|停止自动/.test(t)), `要说明已停止自动循环：${p.why.join('；')}`);
 });
 
 test('超时 + 有加速：优先怀疑渲染，动作里要有换软件渲染', () => {

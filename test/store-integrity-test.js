@@ -32,12 +32,21 @@ test('BOM、旧配置、资源策略与清单格式保持兼容', () => {
   assert.equal(settings.runtime.avdDir, 'custom-avd');
   assert.equal(settings.runtime.systemImageFlavor, 'google_apis_playstore');
   assert.equal(settings.engine.memoryMB, 4096);
+  assert.equal(settings.engine.microphone, true, '旧配置缺少 microphone 时默认应开启');
   assert.equal(settings.autoStart, true);
   assert.equal(store.saveSettings({ engine: { resourceMode: 'save' } }).engine.renderSize, '540x960');
   const app = { package: 'com.example.app', name: '保留名称', extraMetadata: { a: 1 } };
   store.upsertApp(app);
   assert.deepEqual(store.getApp(app.package), app);
   assert.deepEqual(JSON.parse(fs.readFileSync(appsFile)), { apps: [app] });
+});
+
+test('麦克风开关可持久化，且非法类型不会覆盖默认值', () => {
+  reset();
+  assert.equal(store.getSettings().engine.microphone, true);
+  assert.equal(store.saveSettings({ engine: { microphone: false } }).engine.microphone, false);
+  assert.equal(store.saveSettings({ engine: { microphone: 'off' } }).engine.microphone, false);
+  assert.equal(store.saveSettings({ engine: { microphone: true } }).engine.microphone, true);
 });
 
 test('错误的设置分区/叶值回退默认，合法同级值保留', () => {

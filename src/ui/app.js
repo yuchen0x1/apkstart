@@ -1288,6 +1288,7 @@ function fillSettings(s) {
   if ($('setProxyUrl')) $('setProxyUrl').value = (s.runtime && s.runtime.proxyUrl) || '';
   if ($('setConnections')) $('setConnections').value = Number((s.runtime && s.runtime.downloadConnections) || 8);
   $('setAudio').checked = s.engine.audio !== false;
+  if ($('setMicrophone')) $('setMicrophone').checked = s.engine.microphone !== false;
   $('setLiteMode').checked = s.engine.liteMode !== false;
   $('setPrewarm').checked = s.engine.prewarm !== false;
   $('setPriorityMode').value = ['performance', 'game'].includes(s.engine.priorityMode)
@@ -2461,6 +2462,9 @@ function bindSettings() {
     });
   }
   $('setAudio').addEventListener('change', (e) => save({ engine: { audio: e.target.checked } }));
+  if ($('setMicrophone')) {
+    $('setMicrophone').addEventListener('change', (e) => save({ engine: { microphone: e.target.checked } }));
+  }
   $('setLiteMode').addEventListener('change', (e) => save({ engine: { liteMode: e.target.checked } }));
   $('setPrewarm').addEventListener('change', (e) => save({ engine: { prewarm: e.target.checked } }));
   $('setPriorityMode').addEventListener('change', (e) => save({ engine: { priorityMode: e.target.value } }));
@@ -2886,7 +2890,11 @@ function bindSettings() {
     if (!picked) return;
     await api.setSettings({ runtime: { dir: picked } });
     $('setRuntimeDir').value = picked;
-    toast({ title: '数据目录已更新', body: '请重启 ApkStart 使其生效（旧数据不会自动搬移）', type: 'ok', sticky: true });
+    toast({
+      title: '运行时组件目录已更新',
+      body: '请重启 ApkStart 使其生效。现有安卓应用、存档和快照不会自动搬移；如要一起迁移，请先复制旧目录里的 apkstart.avd，再单独设置下面的安卓数据目录。',
+      type: 'ok', sticky: true,
+    });
   });
 
   // 安卓数据目录（AVD + 快照）：真正吃盘的那块，单独指到别的盘

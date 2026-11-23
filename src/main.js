@@ -1672,11 +1672,27 @@ async function compatEnv() {
   try { profile = runtime.provisioner.imageProfile(); } catch (_) { /* ignore */ }
   const armTranslation = profile ? !!profile.armTranslation : true;
   const playServices = profile ? !!profile.gms : true;
+  const settings = store.getSettings();
+  let systemId = settings.runtime?.selectedSystemId || 'google-play';
+  try {
+    const current = currentSystemStatus ? await currentSystemStatus() : null;
+    systemId = current?.current?.systemId || systemId;
+  } catch (_) { /* current system status may not be initialized in an early test */ }
+  const builtinEmulator = new Set(['google-play', 'google-apis', 'aosp', 'custom']);
+  const qemuSystem = new Set(['android-x86', 'bliss-os']);
+  const backend = settings.engine?.mode === 'attach' ? 'attached'
+    : qemuSystem.has(systemId) ? 'qemu'
+      : builtinEmulator.has(systemId) ? 'android-emulator' : 'unknown';
+  // 只有已知的内置 Android Emulator 路径才把 microphone feature 判作可用；
+  // QEMU/外接运行时没有经过主机采集验证，不能给 APK 兼容性检查虚假保证。
+  const audioInput = backend === 'android-emulator' && settings.engine?.microphone !== false;
   return {
     sdk,
     abis: ['x86_64'],
     armTranslation,
     playServices,
+    backend,
+    audioInput,
     imageFlavor: profile ? profile.id : 'google_apis_playstore',
     source: live
       ? `当前运行时（Android ${compat.sdkName(sdk)} · ${profile ? profile.shortLabel : '系统镜像'}）`
@@ -4085,6 +4101,12 @@ if (!gotLock) {
     });
     // 启动即留一行痕迹：出问题时用户把 app.log 发过来就能看到版本与数据目录
     appLog(`start v${app.getVersion()} data=${store.DATA_DIR} pid=${process.pid}`);
+    // 早期崩溃（例如 Windows 11 新版本上的 Chromium STATUS_BREAKPOINT）可能发生在
+    // 界面出现之前；把宿主版本、Electron/Chromium 版本和 Electron GPU 开关先落盘，
+    // 诊断报告才不会只能靠用户回忆环境，且不把问题未经验证地归咎于某个组件。
+    appLog(`host os=${process.platform} ${os.release()} arch=${process.arch}`
+      + ` electron=${process.versions.electron || ''} chrome=${process.versions.chrome || ''}`
+      + ` electronGpu=${process.env.APKSTART_HWACCEL === '1' ? 'on' : 'off'}`);
     // 平台能力一行进日志：跨平台反馈里第一眼就能确认「在什么系统上、支持级别是什么」
     appLog(`platform ${platform.platform} support=${platform.supportLevel()} embed=${platform.canEmbed}`);
     // 生效语言 = 设置里的 language（auto 时看系统语言）。所有 t() 从这里往后都是对的。

@@ -550,7 +550,9 @@ class EmulatorEngine {
       // 快照完全由命令行 -snapshot apkstart 控制：用独立名字，绝不误加载
       // 旧版遗留的 default_boot（那是 API30 镜像的内存状态，加载必进引导循环）。
       'hw.sdCard=no',
-      'hw.audioInput=none',
+      // 内置 Android Emulator 可以把主机麦克风暴露给安卓；默认开启，
+      // 显式关闭才写 no。QEMU 后端不走这里，不能把这项 UI 误写成 QEMU 已支持。
+      `hw.audioInput=${this.settings?.engine?.microphone === false ? 'no' : 'yes'}`,
       ...Object.entries(peripheralConfig).map(([name, value]) => `${name}=${value}`),
       'hw.gps=no',
       // 方向/加速度传感器必须开：关掉之后安卓拒绝旋转，横竖屏只能靠"转画面"糊弄，
@@ -770,9 +772,10 @@ class EmulatorEngine {
       // Carry unambiguous AVD-directory evidence into both launcher and QEMU command lines.
       '-datadir', path.join(this.provisioner.paths().avdHome, `${this.avdName}.avd`),
       '-port', String(port),
-      // 音频：默认开启（让安卓应用的提示音/视频声音能放出来）。
-      // 仅当用户在设置里显式关闭时才传 -no-audio 省一点 CPU。
-      ...(this.settings?.engine?.audio === false ? ['-no-audio'] : []),
+      // 音频：只有播放声音和麦克风都关闭时才禁用整个音频子系统。
+      // emulator 没有一条已验证的「只关输出、保留输入」参数；不能为保留麦克风而误传 -no-audio。
+      ...(this.settings?.engine?.audio === false && this.settings?.engine?.microphone === false
+        ? ['-no-audio'] : []),
       '-no-boot-anim',
       '-no-metrics',
       // 关掉崩溃上报：一旦历史崩溃报告存在，emulator 会弹「同意上传」模态框，
@@ -1437,10 +1440,6 @@ class EmulatorEngine {
           });
           this.lastDiagnosis = d;
           lastError = `${d.title}：${d.hint}`;
-          // 崩在 Vulkan：下一轮改成「同后端 + 关 Vulkan」，比继续换后端更有针对性
-          if (this._preferNoVulkan(variants, i, d, earlyLines)) {
-            onLog('日志里有 Vulkan 初始化痕迹，下一轮关掉 Vulkan 再试…');
-          }
           // 磁盘写满不是「换组参数就能好」的问题：继续重试只会反复失败，
           // 而且历史上最后那组参数带 wipe，会把用户数据一起抹掉。直接收工、如实报错。
           if (d.code === 'DISK_FULL') {
@@ -1455,12 +1454,21 @@ class EmulatorEngine {
           if (['ACCEL', 'GPU_INIT', 'GPU_MODE', 'IMAGE', 'DLL', 'ACCESS_VIOLATION'].includes(d.code)) {
             try { this.provisioner.invalidateEnvCache(); } catch (_) { /* ignore */ }
           }
-          if (this._softwareTcgCrashed(plan, d)) {
-            d = doctor.tcgCrashDiagnosis();
+          // 先判断严重崩溃熔断，再考虑 Vulkan/GPU 方向的普通降级：一旦同一个
+          // 访问冲突已经跨参数重复，继续换端口只会再启动一个可能不稳定的实例。
+          const tcgCrash = this._softwareTcgCrashed(plan, d);
+          const repeatedCrash = !tcgCrash && this._repeatedAccessViolation(d);
+          if (tcgCrash || repeatedCrash) {
+            d = tcgCrash ? doctor.tcgCrashDiagnosis() : doctor.repeatedCrashDiagnosis();
             this.lastDiagnosis = d;
             lastError = `${d.title}：${d.hint}`;
-            onLog(`${d.title}，停止重试等价的软件后端。`);
+            onLog(`${d.title}，本轮不会继续换端口或启动更多实例。`);
+            await this.killAttempt().catch(() => {});
             break;
+          }
+          // 崩在 Vulkan：下一轮改成「同后端 + 关 Vulkan」，比继续换后端更有针对性
+          if (this._preferNoVulkan(variants, i, d, earlyLines)) {
+            onLog('日志里有 Vulkan 初始化痕迹，下一轮关掉 Vulkan 再试…');
           }
           onLog(`${d.title}，自动换一组参数重试…`);
           this._noteGpuFailure(plan);
@@ -1584,12 +1592,15 @@ class EmulatorEngine {
           params: doctor.describeAttempt(plan),
           gpu: plan.gpu, accel: plan.accel, acceleration: plan.acceleration,
         });
+        // 访问冲突熔断必须在 Vulkan/GPU 普通降级之前判断；否则会先标记显卡失败，
+        // 下一轮换端口继续启动 QEMU，正是上游 #127 报告的高风险循环。
         const tcgCrash = this._softwareTcgCrashed(plan, d);
-        if (tcgCrash) {
-          d = doctor.tcgCrashDiagnosis();
+        const repeatedCrash = !tcgCrash && this._repeatedAccessViolation(d);
+        if (tcgCrash || repeatedCrash) {
+          d = tcgCrash ? doctor.tcgCrashDiagnosis() : doctor.repeatedCrashDiagnosis();
           this.lastDiagnosis = d;
           lastError = `${d.title}：${d.hint}`;
-          onLog(`${d.title}，停止重试等价的软件后端。`);
+          onLog(`${d.title}，本轮不会继续换端口或启动更多实例。`);
         } else {
           this.lastDiagnosis = d;
           lastError = `${d.title}：${d.hint}`;
@@ -1602,7 +1613,7 @@ class EmulatorEngine {
         }
         // eslint-disable-next-line no-await-in-loop
         await this.killAttempt();
-        if (tcgCrash) break;
+        if (tcgCrash || repeatedCrash) break;
       } catch (e) {
         // 这一轮连模拟器都没拉起来：AVD 目录不可写、运行时文件被杀软删掉、参数构造失败…
         // 旧实现让异常直接冒到上层 —— start() 整个 reject，重试循环停在第 1 轮，
@@ -1673,6 +1684,7 @@ class EmulatorEngine {
       + `诊断报告：${report.file}${visibleHint}`,
     );
     err.diagnosis = d;
+    err.terminal = d && d.terminal === true;
     err.report = report.file;
     err.attempts = this.attempts;
     this._persistFailure({
@@ -1845,6 +1857,21 @@ class EmulatorEngine {
       try { this.invalidateSnapshot(); } catch (_) { /* ignore */ }
     }
     return true;
+  }
+
+  /**
+   * 当前启动会话里重复出现同一个 0xC0000005：停止自动换端口/换参数。
+   *
+   * 判据只使用本轮 attempts 和精确退出码，不依赖长日志里的 GPU 文本；这样
+   * WHPX/TCG 混合失败、不同 GPU 后端失败，甚至只有 QEMU 崩溃行而没有完整诊断时，
+   * 也不会继续把同一个不稳定运行时拉起到更多端口。attempts 在每次 start() 开始时清空，
+   * 不会把上一次成功前的历史崩溃带进本轮。
+   */
+  _repeatedAccessViolation(d) {
+    if (!d || !['ACCESS_VIOLATION', 'GPU_INIT', 'ACCEL_UNUSABLE'].includes(d.code)) return false;
+    const exit = Number(this.lastExitCode);
+    if (exit !== 3221225477) return false;
+    return this.attempts.filter((a) => a && Number(a.exitCode) === exit).length >= 2;
   }
 
   /**

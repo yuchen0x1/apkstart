@@ -273,6 +273,22 @@ const PLANS = {
     retry: { needsReboot: true },
   }),
 
+  /** 不同加速/GPU 组合连续访问冲突时，停止自动修复与端口轮换，避免扩大事故面。 */
+  EMULATOR_CRASH_LOOP: (f) => ({
+    level: LEVEL.BLOCKED,
+    headline: '模拟器连续崩溃，程序已停止自动重试，没有继续启动更多实例。',
+    why: [
+      machineSentence(f),
+      '不同 GPU / 加速参数都以 0xC0000005 访问冲突退出，继续换端口或画质不会修复模拟器进程本身。',
+      '这条结论不把潜在的 Windows 蓝屏原因归咎于某一个组件；需要分别检查 emulator 版本、GPU 驱动、WHPX/AEHD 和安全软件拦截。',
+      '请先导出诊断报告；必要时更新或回退运行时，再由用户明确决定是否重新尝试。',
+    ].filter(Boolean),
+    actions: [
+      { id: 'report', label: '导出诊断报告', kind: KIND.MANUAL, hint: '把退出码、运行时版本和本轮参数一起保存' },
+      { id: 'open-settings', label: '打开运行时设置', kind: KIND.MANUAL, hint: '检查运行时版本与硬件加速状态' },
+    ],
+  }),
+
   CPU_FEATURE: (f) => ({
     level: LEVEL.BLOCKED,
     headline: '这台 CPU 缺少模拟器需要的指令，程序在它上面跑不起来。',
@@ -481,6 +497,7 @@ const PLAIN = {
   ACCEL: '这台电脑用不上硬件加速，安卓只能慢慢跑。',
   ACCEL_UNUSABLE: '硬件加速驱动装好了，开机时却没能启动起来。',
   TCG_CRASH: '纯软件模拟在开机时崩溃了。',
+  EMULATOR_CRASH_LOOP: '模拟器连续崩溃，程序已停止自动重试。',
   CPU_FEATURE: '这台电脑的 CPU 缺少模拟器必需的指令。',
   GPU_INIT: '显卡渲染没能初始化，模拟器跟着退出了。',
   ACCESS_VIOLATION: '模拟器刚启动就崩溃了（崩在显卡渲染那一层）。',
