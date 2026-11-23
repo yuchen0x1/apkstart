@@ -18,6 +18,14 @@ const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const instanceAdb = require('./instance-adb');
 
+const BOOT_TIMEOUT_MS = Object.freeze({ auto: 240000, off: 600000 });
+
+function bootTimeoutFor(plan = {}) {
+  const base = Number(plan.bootTimeoutMs) || 0;
+  if (plan.accel === 'off') return Math.max(base, BOOT_TIMEOUT_MS.off);
+  return base || BOOT_TIMEOUT_MS.auto;
+}
+
 const ASCII = /^[\x20-\x7e]*$/;
 const isAsciiPath = (p) => ASCII.test(String(p || ''));
 
@@ -1063,6 +1071,7 @@ function vcRedistOk() {
 module.exports = {
   hostInfo, hostBranding, systemVendor, looksVirtual, freeDiskMB, isAsciiPath, shortPath, lcdFor, orientLcd, liteProfile,
   versionNumbers, gpuCandidates, machineTier, lowSpecProfile, chooseProfile, planVariants,
+  bootTimeoutFor, BOOT_TIMEOUT_MS,
   accelUsable,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey, imageIdentity,

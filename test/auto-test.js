@@ -123,6 +123,12 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(v[v.length - 1].memoryMB <= 2048, '最后一档应降到最小内存');
     const keys = v.map((x) => `${x.gpu}|${x.accel}|${x.wipe}|${x.memoryMB}|${x.snapshot !== false}`);
     assert(new Set(keys).size === keys.length, '重试方案不应重复');
+    assert(doctor.bootTimeoutFor({ accel: 'off', bootTimeoutMs: 240000 }) >= 600000,
+      '驱动强制 TCG 时不能沿用硬件档 4 分钟超时');
+    assert(doctor.bootTimeoutFor({ accel: 'off', bootTimeoutMs: 900000 }) === 900000,
+      '已经放宽的软件模拟超时不能被缩短');
+    assert(doctor.bootTimeoutFor({ accel: 'on', bootTimeoutMs: 0 }) === 240000,
+      '硬件档缺省超时应保持 4 分钟');
   });
 
   await test('镜像换盘不算换镜像：sysdir 换了目录不该清用户数据', () => {

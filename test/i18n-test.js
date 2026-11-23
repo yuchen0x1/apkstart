@@ -23,6 +23,21 @@ const fails = [];
 function test(name, fn) {
   try { fn(); passed += 1; } catch (e) { fails.push(`${name}: ${e.message}`); }
 }
+
+function withSettings(language, fn) {
+  const storePath = require.resolve(path.join(ROOT, 'src', 'core', 'store.js'));
+  const previous = require.cache[storePath];
+  require.cache[storePath] = {
+    id: storePath,
+    filename: storePath,
+    loaded: true,
+    exports: { getSettings: () => ({ language }) },
+  };
+  try { return fn(); } finally {
+    if (previous) require.cache[storePath] = previous;
+    else delete require.cache[storePath];
+  }
+}
 const countN = (s) => (String(s).match(new RegExp(N, 'g')) || []).length;
 const normalize = (s) => i18n.normalizeKey(s);
 
@@ -215,7 +230,7 @@ test('auto 匹配 es / vi / ru 地域变体，未知语言回落英文', () => {
 test('运行载荷含本地译文和英文回落，renderer 可一次取全', () => {
   const cases = [['es-MX', 'es-ES', 'Salir'], ['vi-VN', 'vi-VN', 'Thoát'], ['ru-RU', 'ru-RU', 'Выход']];
   for (const [systemLocale, expectedLang, expectedQuit] of cases) {
-    const p = i18n.payload(systemLocale);
+    const p = withSettings('auto', () => i18n.payload(systemLocale));
     assert.strictEqual(p.lang, expectedLang);
     assert.strictEqual(p.dict['退出'], expectedQuit);
     assert.strictEqual(p.dict['诊断报告已导出'], 'The diagnostic report has been exported');

@@ -1485,7 +1485,7 @@ class EmulatorEngine {
         }
 
         const started = Date.now();
-        const timeout = plan.bootTimeoutMs || 240000;
+        const timeout = doctor.bootTimeoutFor(plan);
         let ok = false;
         let fatal = false;
         let sawBooting = false;

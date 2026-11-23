@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.10.5**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.10.6**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,15 +46,14 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.10.5
+### v0.10.6
 
-> 设置热路径性能优化与生态研究记录。正式发行状态以 GitHub Releases 为准。
+> 修复硬件加速回退到 TCG 后，纯软件模拟启动仍受硬件档短超时限制的问题。
 
-- 为设置读取增加基于文件大小、mtime 和 ctime 的进程内缓存；高频运行时状态轮询不再反复同步读取和解析同一份 `settings.json`。
-- 缓存只返回防御性副本；成功保存后重新走统一迁移/规范化流程，外部修改、删除、损坏或权限错误仍按原有 fail-closed 语义处理。
-- 新增 19 项持久化回归中的缓存命中与外部变更失效覆盖，并记录 Android Emulator、scrcpy、Android-x86、Bliss OS、Genymotion、Waydroid、Anbox 与多开产品的公开架构对比。
-- Windows 本机 `npm test` 全部通过：355 个 node:test 用例中 354 通过、1 项 PowerShell 原生窗口夹具因执行策略跳过；其余脚本套件全部 0 失败。
-- `npm audit --omit=dev --audit-level=high` 使用官方 registry 返回 0 个已知漏洞；未执行真实 Android 客机、GPU、安装升级、断电恢复或 Authenticode 验收。
+- 当启动方案因硬件驱动问题切换为 TCG（`accel=off`）时，启动等待至少延长至 10 分钟，避免较慢的软件模拟被 4 分钟硬件档超时误判为启动失败；原方案设置的更长等待时间仍会保留。
+- 增加超时选择回归，覆盖 TCG 下限、较长自定义预算保留和硬件档默认等待时间。
+- Windows 本机全量 `npm test` 通过；1 项 PowerShell 原生窗口行为用例因本机执行策略跳过，缺少外部 APK fixture 的用例按设计跳过。
+- 本轮没有在真实 Android 客机、不同硬件加速驱动或 TCG 慢速主机上完成启动时长与设备验收；正式发行资产、签名清单和跨平台构建以 GitHub Actions / Release 结果为准。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。
