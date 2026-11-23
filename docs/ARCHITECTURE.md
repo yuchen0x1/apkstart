@@ -42,6 +42,31 @@
 > `system-catalog` 负责远程元数据。镜像本体永不内置，按需下载。详见
 > [SYSTEMS.md](SYSTEMS.md)、[DOWNLOAD-MANAGER.md](DOWNLOAD-MANAGER.md)、[COMPATIBILITY.md](COMPATIBILITY.md)。
 
+## 宿主适配层（跨平台基础）
+
+```
+platform-capabilities.js   声明表：每条平台 × 每项能力的等级 / 障碍码 / 实现出处
+        │                  （唯一判断依据，测试逐一钉死）
+        ▼
+platform.js                能力读取 + describe()（诊断报告可见）
+        │
+        ├── host/profile.js    纯函数：宿主 → 官方 emulator 前缀 / platform-tools / 默认镜像 ABI / 加速后端
+        └── host/index.js      HostAdapter：统一接口；runtimeAcquirable() 区分「可获取」与「已验证」
+```
+
+**为什么单列一层**：`provision.js` 曾把宿主相关的东西散写在各处
+（`HOST_TAG = ... : 'mac'` 拼错前缀、`_x64` 写死、镜像 `x86_64` 写死）。现在这些
+都收敛到 `host/profile.js` 的一张表里，任何平台新增/修正只改一处，并且有
+`test/host-profile-test.js` 离线守住。
+
+**关键纪律**：
+- 能力「有没有实现」只看 `platform-capabilities.js`；`host/` 不另立一份判断。
+- 官方产物**可获取**（acquirable）≠ **已验证**（verified）。macOS 前者的确为真
+  （Google 发布了 `emulator-darwin_x64` / `emulator-darwin_aarch64`），但本项目
+  尚无 dmg/签名/公证与真机实测，平台整体仍 `unsupported`。
+- Linux ARM64 没有官方 emulator（`emulator-linux_aarch64` 不存在），
+  不能靠重新打包获得，必须另立技术路线。
+
 ## 三条边界
 
 理解这套代码最关键的是三条「不允许穿过」的边界：

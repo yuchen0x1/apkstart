@@ -119,6 +119,7 @@ function harness(t, options = {}) {
     './store': { DATA_DIR: path.join(root, 'data'), getSettings: () => settings, saveSettings: (value) => calls.saves.push(value) },
     './doctor': { freeDiskMB: () => 100000 },
     './platform': {},
+    './host/profile': require('../src/core/host/profile'),
     './download': downloader,
     './zip': {},
     './sources': { Sources: class { candidates(url) { return options.transports || [url]; } } },
