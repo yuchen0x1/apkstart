@@ -123,10 +123,17 @@ npm audit --registry=https://registry.npmjs.org     → total 0（全等级 0）
 
 ## 11. Release 地址
 
-本批次**尚未发布**。发布需经过：
-1. 分支 → PR → CI（Windows Node 20/22、Linux、UI fixture）全绿；
-2. 版本号与 CHANGELOG/README 同步（`npm run readme:sync`）；
-3. 打 tag 触发 `release.yml`，签署清单并在草稿核对后公开。
+**已合入 main，未打版本 tag**：
+- 分支 `feat/cross-platform-host-adapter` → [PR #24](https://github.com/yuchen0x1/apkstart/pull/24)，
+  squash 合并为 `1cd33fc`（2026-11-23T10:30:07Z）。
+- 合并前 PR CI：[45156208701](https://github.com/yuchen0x1/apkstart/actions/runs/45156208701)
+  （Windows Node 20/22、Linux Node 22、UI win32/linux 能力夹具）全部 success。
+- 合并后 main CI：[45156670083](https://github.com/yuchen0x1/apkstart/actions/runs/45156670083)
+  全部 success。
+
+**未发布 Release**：本批次是架构基础，不改变用户可见功能面，不单独发版号。
+若需发版仍走既有流程：版本号与 CHANGELOG/README 同步（`npm run readme:sync`）→
+打 tag 触发 `release.yml` → 签署清单并在草稿核对后公开。
 
 历史 Release：见 <https://github.com/yuchen0x1/apkstart/releases>。
 
