@@ -9,6 +9,27 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 > 本节记录下一版候选变更；尚未对应正式发布版本。
 
+## [0.10.3] — 2026-11-23
+
+> 修复 Windows 私有 ADB 启动失败，并让自动窗口模式不再默认牺牲视频渲染性能。正式发行状态以本项目 GitHub Releases 为准。
+
+### 修复
+
+- Windows 私有 ADB 改用 `-L tcp:localhost:<port>` 监听形式，避免 ADB 37.x 拒绝 `tcp:127.0.0.1:<port>`；客户端仍只连接本机回环地址（反馈 [#18](https://github.com/yuchen0x1/apkstart/issues/18)）。
+- 自动窗口模式和独立窗口先使用自动选择的硬件渲染后端，不再默认强制 `swangle` 软件渲染；明确选择「始终嵌入」时仍保留软件渲染优先级。自动嵌入出现黑帧时继续摘出到独立窗口并记住结果（反馈 [#13](https://github.com/yuchen0x1/apkstart/issues/13)）。
+- 增加私有 ADB 参数及自动窗口首选 GPU 的回归断言。
+
+### 文件与验证边界
+
+| 平台 | 文件 | 安装或升级方式 |
+|---|---|---|
+| Windows 10/11 x64 安装版 | `ApkStart-0.10.3-Setup.exe` | 退出后以同一用户覆盖原安装，不先卸载。 |
+| Windows x64 便携版 | `ApkStart-v0.10.3-win64-portable.zip` | 只替换程序文件，不覆盖自选运行时、AVD 和安卓数据。 |
+| Linux x86_64 AppImage | `ApkStart-0.10.3-x86_64.AppImage` | 原路径允许替换时可应用内更新，否则退出后手动换包。 |
+| Debian / Ubuntu x86_64 | `ApkStart-0.10.3-amd64.deb` | 交由系统包管理器安装或升级。 |
+
+- Node 回归覆盖 ADB 参数、GPU 选路和现有启动安全边界；未在报告者的真实 Android 客机、Windows GPU 或视频流上测量帧率与音画同步。签名、安装升级及发行资产以 GitHub Actions / Release 实际结果为准。
+
 ## [0.10.2] — 2026-11-22
 
 > 针对上游模拟器崩溃循环、运行时路径说明和音频输入边界的维护更新。正式发行状态以本项目 GitHub Releases 为准。

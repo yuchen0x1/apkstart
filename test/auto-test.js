@@ -671,6 +671,8 @@ const { adbKeyHint } = require('../src/core/engine');
     const recorded = (src.match(/this\.profile = plan;/g) || []).length;
     assert(recorded >= 2,
       '启动从 host 自动回退到 swangle/software 后，运行时状态必须展示实际成功的 plan');
+    assert(/windowMode === 'embedded'/.test(src),
+      'auto 窗口不能默认强制软件渲染；只有明确嵌入模式才优先 swangle');
   });
 
   console.log('\n[layers.js 容器式瘦身]');

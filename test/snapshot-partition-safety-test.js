@@ -581,7 +581,7 @@ for (const avd of [{ ok: false, error: 'adapter refused data' }, { data: { ok: f
 }
 
 for (const [name, engine, canEmbed, headless, gpu] of [
-  ['auto Windows embedding', { windowMode: 'auto' }, true, false, 'swangle'],
+  ['auto Windows embedding', { windowMode: 'auto' }, true, false, 'host'],
   ['forced embedding ignores the remembered black frame', { windowMode: 'embedded', embeddedBlack: true }, true, false, 'swangle'],
   ['standalone Windows window', { windowMode: 'standalone' }, true, false, 'host'],
   ['auto after an embedded black frame', { windowMode: 'auto', embeddedBlack: true }, true, false, 'host'],

@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.10.2**（2026-11-22）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.10.3**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,16 +46,14 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.10.2
+### v0.10.3
 
-> 针对上游模拟器崩溃循环、运行时路径说明和音频输入边界的维护更新。实际发行状态以 GitHub Releases 为准。
+> 修复 Windows 私有 ADB 启动失败，并让自动窗口模式不再默认牺牲视频渲染性能。实际发行状态以 GitHub Releases 为准。
 
-- 针对 Windows 模拟器在不同 GPU 与加速模式下反复以 `0xC0000005`（`3221225477`）退出的场景增加跨模式熔断：同一启动会话第二次出现精确访问冲突退出码后停止换端口、换参数和启动更多实例，不清除安卓数据，并向修复页传递终止性诊断。
-- 保留 TCG 专用熔断，同时把访问冲突判断绑定到当前启动会话的实际退出码，不再依赖截断日志或 GPU 文本；蓝屏仍需结合 Windows 转储确认，不能仅凭 ApkStart 日志归因。
-- 早期启动日志补充宿主系统版本、架构、 Electron / Chromium 版本及 Electron GPU 开关，便于排查 Windows 版本相关的桌面崩溃。
-- 重新说明运行时组件目录与安卓数据目录的职责；只移动运行时不会静默搬移已装应用、存档和快照，也不自动执行未经确认的大型 AVD 迁移。
-- 设置新增「安卓麦克风输入」开关。内置 Android Emulator 会在 AVD 中写入 `hw.audioInput=yes/no`，默认开启；修改后需要完整重启运行时，并仍受 Windows 麦克风隐私权限和主机设备状态影响。
-- 只有播放声音和麦克风都关闭时才传入 `-no-audio`，避免关闭播放声音时误伤麦克风输入；QEMU / Android-x86 / Bliss OS 主机音频采集未在本轮验证，不宣称已支持。
+- 修复 Windows 私有 ADB 使用 `-L tcp:127.0.0.1:<port>` 被 ADB 37.x 拒绝的问题，改用兼容的 `tcp:localhost:<port>` 监听形式；客户端仍只连接本机回环地址，保留私有服务边界（反馈 [#18](https://github.com/yuchen0x1/apkstart/issues/18)）。
+- 修复自动窗口模式默认强制 `swangle` 软件渲染导致视频应用卡顿、音画不同步的问题。自动模式和独立窗口现在先使用自动选择的硬件后端；只有明确选择「始终嵌入」时才优先软件渲染。若自动嵌入出现黑帧，仍会摘出到独立窗口并记住结果（反馈 [#13](https://github.com/yuchen0x1/apkstart/issues/13)）。
+- 更新 ADB 与 GPU 选路回归断言，覆盖私有端口参数和自动窗口的首选渲染后端。
+- Node 回归覆盖 ADB 参数、GPU 选路和现有启动安全边界；本轮未在报告者的真实 Android 客机、Windows GPU 或视频流上测量帧率与音画同步，安装升级、签名和发行资产以 GitHub Actions / Release 实际结果为准。应用内更新继续使用 Ed25519 清单与 SHA-256 资产校验。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

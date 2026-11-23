@@ -1307,12 +1307,12 @@ class EmulatorEngine {
     }
     profile.acceleration = this._accelerationState(profile);
     this.profile = profile;
-    // 只有 Win32 嵌入会跨进程 SetParent；host 的交换链可能在失焦后丢失，所以
-    // 保留 swangle 的防黑屏优先级。独立窗口（包括自动记住嵌入黑屏后的启动）
-    // 不走 SetParent，应遵循自动档选出的 GPU，而不是一律先用 CPU 做软件渲染。
-    const { windowMode, embeddedBlack } = s.engine;
-    const preferSoftware = !headless && require('./platform').canEmbed && windowMode !== 'standalone'
-      && (windowMode === 'embedded' || embeddedBlack !== true);
+    // 只有明确选择「始终嵌入」时才为跨进程 SetParent 保留 swangle 优先级。
+    // auto 模式先用自动档的 host 后端，避免视频应用默认走软件渲染而卡顿；
+    // 如果宿主画黑，appwin 会摘出为独立窗口并记住 embeddedBlack，下一次不再嵌入。
+    // standalone 同样遵循自动档选出的 GPU，不强行走 CPU 软件渲染。
+    const { windowMode } = s.engine;
+    const preferSoftware = !headless && require('./platform').canEmbed && windowMode === 'embedded';
     const variants = doctor.planVariants(profile, { preferSoftware }).slice(0, maxAttempts);
     // 报告里要写清这次是「带窗口」还是「无窗口」跑的：同一台机器上两者结果常常不同，
     // 少了这一个 bit，报告就没法区分「模拟器起不来」和「带窗口渲染起不来」（issue #29）。

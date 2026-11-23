@@ -5,6 +5,27 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.10.3] — 2026-11-23
+
+> 修复 Windows 私有 ADB 启动失败，并让自动窗口模式不再默认牺牲视频渲染性能。实际发行状态以 GitHub Releases 为准。
+
+### 修复
+
+- 修复 Windows 私有 ADB 使用 `-L tcp:127.0.0.1:<port>` 被 ADB 37.x 拒绝的问题，改用兼容的 `tcp:localhost:<port>` 监听形式；客户端仍只连接本机回环地址，保留私有服务边界（反馈 [#18](https://github.com/yuchen0x1/apkstart/issues/18)）。
+- 修复自动窗口模式默认强制 `swangle` 软件渲染导致视频应用卡顿、音画不同步的问题。自动模式和独立窗口现在先使用自动选择的硬件后端；只有明确选择「始终嵌入」时才优先软件渲染。若自动嵌入出现黑帧，仍会摘出到独立窗口并记住结果（反馈 [#13](https://github.com/yuchen0x1/apkstart/issues/13)）。
+- 更新 ADB 与 GPU 选路回归断言，覆盖私有端口参数和自动窗口的首选渲染后端。
+
+### 下载与验证边界
+
+| 文件 | 用途 |
+|---|---|
+| `ApkStart-0.10.3-Setup.exe` | Windows 10/11 x64 在线安装版 |
+| `ApkStart-v0.10.3-win64-portable.zip` | Windows x64 便携版 |
+| `ApkStart-0.10.3-x86_64.AppImage` | Linux x86_64 便携版 |
+| `ApkStart-0.10.3-amd64.deb` | Debian / Ubuntu x86_64 安装版 |
+
+- Node 回归覆盖 ADB 参数、GPU 选路和现有启动安全边界；本轮未在报告者的真实 Android 客机、Windows GPU 或视频流上测量帧率与音画同步，安装升级、签名和发行资产以 GitHub Actions / Release 实际结果为准。应用内更新继续使用 Ed25519 清单与 SHA-256 资产校验。
+
 ## [0.10.2] — 2026-11-22
 
 > 针对上游模拟器崩溃循环、运行时路径说明和音频输入边界的维护更新。实际发行状态以 GitHub Releases 为准。

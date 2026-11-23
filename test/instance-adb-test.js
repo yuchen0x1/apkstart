@@ -290,7 +290,7 @@ test('concurrent/repeated initialization launches once and pins the canonical bi
   assert.equal(route.adbPath, binary);
   assert.equal(await f.init({ adbPath: 'relative-ignored-after-init' }), route);
   assert.equal(daemonCalls(f).length, 1);
-  assert.deepEqual(daemonCalls(f)[0].args, ['-L', `tcp:127.0.0.1:${route.port}`, 'server', 'nodaemon']);
+  assert.deepEqual(daemonCalls(f)[0].args, ['-L', `tcp:localhost:${route.port}`, 'server', 'nodaemon']);
   assert.equal(daemonCalls(f)[0].options.detached, false);
 });
 test('child exec and persistent input share a fixed binary/route despite env drift', async (t) => {
@@ -425,7 +425,7 @@ test('parent starts an owned foreground server only if the legacy port is free',
   const f = fixture(t, { isChild: false });
   await f.helper.ensureServer({ adbPath: binary }); await f.helper.ensureServer({ adbPath: binary });
   assert.equal(daemonCalls(f).length, 1);
-  assert.deepEqual(daemonCalls(f)[0].args, ['-L', 'tcp:127.0.0.1:5044', 'server', 'nodaemon']);
+  assert.deepEqual(daemonCalls(f)[0].args, ['-L', 'tcp:localhost:5044', 'server', 'nodaemon']);
   assert.equal(f.calls.exec.length + f.calls.kill.length, 0);
 });
 test('child clients cannot override route or issue server-control commands', async (t) => {

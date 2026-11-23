@@ -157,12 +157,14 @@ function startOwned(target, timeoutMs) {
     try {
       const env = serverEnvironment(target);
       // AOSP client/commandline.cpp accepts `-L SOCKET server nodaemon`.
+      // `tcp:localhost:<port>` is the portable loopback listen form; adb rejects
+      // an explicit `tcp:127.0.0.1:<port>` listen spec on current Windows builds.
       // --reply-fd is a Windows HANDLE, not a Node stdio index: don't fake fd 3.
       // With ADB_TRACE=adb, client/main.cpp emits this process's "Event loop
       // starting" only AFTER install_listener succeeds. An unrelated open port
       // is never sufficient readiness evidence. Bind races therefore fail closed.
       env.ADB_TRACE = 'adb';
-      const proc = spawn(target.adbPath, ['-L', `tcp:127.0.0.1:${target.port}`, 'server', 'nodaemon'], {
+      const proc = spawn(target.adbPath, ['-L', `tcp:localhost:${target.port}`, 'server', 'nodaemon'], {
         cwd: path.dirname(target.adbPath), env, windowsHide: true,
         detached: false, stdio: ['ignore', 'pipe', 'pipe'],
       });
