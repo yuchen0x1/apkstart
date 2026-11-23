@@ -2,6 +2,30 @@
 
 更新：2026-11-23。仅记录已核验的正式发布与实际证据；候选、失败运行不计作发布成功。
 
+## v0.10.5 · 已正式发布并核验
+
+- [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.5)：GitHub API 显示 `published_at = 2026-11-23T02:04:43Z`，`isDraft = false`、`isPrerelease = false`。
+- 类型：PATCH；Tag 为带注释 Tag `f89d0fe7f431e9d5d3240fdedbda61417e62ad23`，目标提交 `11cbaf2b78fa25702b07fba2ff736eae334a8329`，与远程 `main` 和本地 `HEAD` 一致。
+- [Release 流水线 45097567562](https://github.com/yuchen0x1/apkstart/actions/runs/45097567562)：版本核验、Windows Node 20/22、Linux Node 22、双平台 Electron UI、Windows portable/NSIS、Linux AppImage/deb、清单签名、草稿核对和正式发布全部成功。
+- 本版落地设置读取缓存和生态研究记录；实现边界与测试证据见 [CHANGELOG](CHANGELOG.md) 和 [生态研究](docs/ECOSYSTEM-RESEARCH-0.10.5.md)。
+
+### 正式资产逐项核对
+
+以下 7 项资产已从正式 Release 下载到独立临时目录。本地大小与 GitHub API 元数据一致；四项程序资产与更新清单、`SHA256SUMS` 逐项一致；更新清单使用客户端公钥 `src/core/release-public.pem` 验证 Ed25519 签名。Release 正文中的隐藏清单与下载的 JSON/签名文件逐字节一致。
+
+| 资产 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `ApkStart-v0.10.5-win64-portable.zip` | 149997404 | `9367ac6b8d8c72dde70fcd6a2f88f230dab8168bcd6c1bb1161d8347b2c999c5` |
+| `ApkStart-0.10.5-Setup.exe` | 121381632 | `bf77a20a9374cdec60a7ca8e9cc7254ffa46e6105f4d1ec5a5f7c599794fc34f` |
+| `ApkStart-0.10.5-x86_64.AppImage` | 135180314 | `7671a4b2ccbf975b79195a34c8eaccd7e98342e7574eb0f4e1815699ae1d9353` |
+| `ApkStart-0.10.5-amd64.deb` | 109244360 | `653d601aa16a8de21c36f51b66127735ad65ca166e4bade286ec9fb69d46bd4d` |
+| `ApkStart-update.json` | 628 | `063204cbaaaabcf874d220c0aea0c3bdfecfd0f5267451a79fd4389cb5175339` |
+| `ApkStart-update.json.sig` | 64 | `ea3023a602c9d1d1b8776ca7ca1876644c21995b6a5f02ef09eac1b508e3ba69` |
+| `SHA256SUMS` | 384 | `e95fdd42a1ca0906cf72fbb76b3c914ff24e685194890b8c902a470889bc9f41` |
+
+- 未执行任何下载的安装程序或真实升级；上述结果证明发布资产完整性和清单签名，不证明安装、升级、回滚或设备运行成功。
+- 安装包仍未配置 Authenticode 证书；真实 Android 客机/GPU、长时间视频流、断电恢复、混合 DPI、多实例压力和签名发布者身份仍需对应环境验收。
+
 ## v0.10.4 · 已正式发布并核验
 
 - [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.4)：非草稿、非预发行，GitHub API `published_at = 2026-11-23T01:25:25Z`。
