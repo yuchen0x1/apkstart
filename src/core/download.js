@@ -407,7 +407,7 @@ async function download(url, dest, opt = {}) {
           const finish = () => { if (!done) { done = true; reject(err); } };
           ws.once('close', finish);
           ws.once('error', () => {});
-          try { ws.end(finish); } catch (_) { finish(); }
+          try { ws.end(); } catch (_) { finish(); }
           if (ws.closed) finish();
         };
         const succeed = () => {

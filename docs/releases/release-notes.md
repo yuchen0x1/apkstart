@@ -17,6 +17,7 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 - 当启动方案以 `accel=off` 使用 TCG 时，启动等待至少为 10 分钟；若已有更长的启动预算则继续保留。硬件加速档仍使用原有默认等待时间。
 - 增加超时决策回归，覆盖 TCG 最低等待、长预算不缩短和硬件档默认值。
+- Windows 下载连接中断后，等部分文件写入句柄关闭再返回失败，避免紧接着读取或续传时遇到瞬时文件占用错误。
 
 ### 文件与验证边界
 
@@ -28,7 +29,7 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 | Debian / Ubuntu x86_64 | `ApkStart-0.10.6-amd64.deb` | 交由系统包管理器安装或升级。 |
 | 应用更新清单 | `ApkStart-update.json` / `.sig` | 仅接受签名有效且资产摘要匹配的版本。 |
 
-- Windows 本机全量 `npm test` 通过；1 项 PowerShell 原生窗口行为用例受本机执行策略限制而跳过，缺少外部 APK fixture 的用例按设计跳过。真实 Android 客机、驱动故障回退及 TCG 慢速主机未在本轮实测；签名和正式发行资产以 GitHub Actions / Release 证据为准。
+- Windows 本机全量 `npm test` 通过，Node 20 下下载身份与下载生命周期回归单独通过；1 项 PowerShell 原生窗口行为用例受本机执行策略限制而跳过，缺少外部 APK fixture 的用例按设计跳过。真实 Android 客机、驱动故障回退及 TCG 慢速主机未在本轮实测；签名和正式发行资产以 GitHub Actions / Release 证据为准。
 
 ## [0.10.4] — 2026-11-23
 
