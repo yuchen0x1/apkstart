@@ -2,6 +2,30 @@
 
 更新：2026-11-23。仅记录已核验的正式发布与实际证据；候选、失败运行不计作发布成功。
 
+## v0.10.4 · 已正式发布并核验
+
+- [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.4)：非草稿、非预发行，GitHub API `published_at = 2026-11-23T01:25:25Z`。
+- 类型：PATCH；源码提交 `c03aeec87bba63ee4b06cbac062285d97a968a2b`，`v0.10.4` Tag 与 `main` 同一提交。
+- [Release 流水线 45093871022](https://github.com/yuchen0x1/apkstart/actions/runs/45093871022) 与 [main CI 45093854604](https://github.com/yuchen0x1/apkstart/actions/runs/45093854604)：版本核验、Windows Node 20/22、Linux Node 22、双平台 Electron UI、Windows portable/NSIS、Linux AppImage/deb、清单签名、草稿核对和正式发布全部成功。
+- 上游开放 Issue 审计覆盖当前 92 项；本版落地修复 [#116](https://github.com/RoutineMiku/apkstart/issues/116)（Microsoft Store 只读运行时暂存）、[#5](https://github.com/RoutineMiku/apkstart/issues/5)（SetParent 拒绝后的独立窗口回退）、[#11](https://github.com/RoutineMiku/apkstart/issues/11)（嵌入窗口 Home/Overview/Back 快捷键）和 [#111](https://github.com/RoutineMiku/apkstart/issues/111)（多显示器启动跳动）。其余平台、硬件、真实 APK/设备和蓝屏归因边界未冒充为已修复，详见 [上游问题审计](docs/UPSTREAM-ISSUES-AUDIT.md)。
+
+### 正式资产逐项核对
+
+以下信息来自正式 Release API；7 项资产已下载至独立临时目录。本地验证了更新清单 Ed25519 签名、公钥 `src/core/release-public.pem`、四项程序资产与 `SHA256SUMS` 的逐项一致性，并与 GitHub API 返回的字节数、`sha256:` digest 和 `uploaded` 状态一致。未执行任何安装程序或真实升级。
+
+| 资产 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `ApkStart-v0.10.4-win64-portable.zip` | 149997185 | `a905b03ba217f6a766aebdeb1cd5a2447f02e5d42ddd829d8863045abbae98b0` |
+| `ApkStart-0.10.4-Setup.exe` | 121381077 | `9f0261cccf4fe6d59926edd745f4b23c8e120bfe975c8ff557aca3c7456c11bb` |
+| `ApkStart-0.10.4-x86_64.AppImage` | 135180341 | `11ad55b1384371eb0364276ae572a3775df1c4c975bd316539b6d328606068d2` |
+| `ApkStart-0.10.4-amd64.deb` | 109068196 | `df07b6d74cc39ebe954fb1d5bf2fdec6e93449b27e50d5bf490a00d3856351c2` |
+| `ApkStart-update.json` | 628 | `2f7b1cd22a17715037fc1fe66f782777101d06d131b1760b86e35ac3efc49705` |
+| `ApkStart-update.json.sig` | 64 | `88aeba61e3091ce6b243ba8ed33b6de9f47db765531f5049eb87bbbe5c91619e` |
+| `SHA256SUMS` | 384 | `9e858aea911d1a0b73d1695fcb1c696bc2548c7c387faeb5591ac388f67c1961` |
+
+- 本地 `npm test`、`npm run pack`、`npm run build:exe` 和 `npm run test:packaged` 均通过；PowerShell 原生窗口行为夹具因本机执行策略跳过，CI 的 Windows/Linux 测试与 UI 夹具均成功。
+- 安装包未配置 Authenticode 证书；真实 Microsoft Store 沙箱、完整运行时复制、混合 DPI 多显示器、真实 APK 快捷键焦点、安装升级/回滚和签名发布者身份仍未在本轮宣称验收。
+
 ## v0.10.3 · 已正式发布并核验
 
 - [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.3)：非草稿、非预发行，GitHub API `published_at = 2026-11-23T00:40:23Z`。
