@@ -5,7 +5,7 @@
 ## v0.10.4 · 已正式发布并核验
 
 - [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.4)：非草稿、非预发行，GitHub API `published_at = 2026-11-23T01:25:25Z`。
-- 类型：PATCH；源码提交 `c03aeec87bba63ee4b06cbac062285d97a968a2b`，`v0.10.4` Tag 与 `main` 同一提交。
+- 类型：PATCH；发布源码提交 `c03aeec87bba63ee4b06cbac062285d97a968a2b`，发布时 `v0.10.4` Tag 与 `main` 同一提交；随后仅追加本记录文档提交 `fa0f959b9e901e8c06994e95e91231079694999f`，未移动 Tag。
 - [Release 流水线 45093871022](https://github.com/yuchen0x1/apkstart/actions/runs/45093871022) 与 [main CI 45093854604](https://github.com/yuchen0x1/apkstart/actions/runs/45093854604)：版本核验、Windows Node 20/22、Linux Node 22、双平台 Electron UI、Windows portable/NSIS、Linux AppImage/deb、清单签名、草稿核对和正式发布全部成功。
 - 上游开放 Issue 审计覆盖当前 92 项；本版落地修复 [#116](https://github.com/RoutineMiku/apkstart/issues/116)（Microsoft Store 只读运行时暂存）、[#5](https://github.com/RoutineMiku/apkstart/issues/5)（SetParent 拒绝后的独立窗口回退）、[#11](https://github.com/RoutineMiku/apkstart/issues/11)（嵌入窗口 Home/Overview/Back 快捷键）和 [#111](https://github.com/RoutineMiku/apkstart/issues/111)（多显示器启动跳动）。其余平台、硬件、真实 APK/设备和蓝屏归因边界未冒充为已修复，详见 [上游问题审计](docs/UPSTREAM-ISSUES-AUDIT.md)。
 
