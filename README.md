@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.10.4**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.10.5**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,16 +46,15 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.10.4
+### v0.10.5
 
-> 修复上游 Issue 审计中仍可落地的运行时、窗口嵌入、快捷键和多显示器启动体验问题。正式发行状态以 GitHub Releases 为准。
+> 设置热路径性能优化与生态研究记录。正式发行状态以 GitHub Releases 为准。
 
-- 修复 Microsoft Store 版把 `WindowsApps` 内只读运行时写入为当前目录的问题。启动时会把完整内置运行时一次性暂存到用户数据目录，按内容指纹复用；复制不完整、磁盘空间不足或校验失败时不会切换到半成品，也不会覆盖用户自选的可写运行时（反馈 #116）。
-- 修复混合 DPI 或跨进程上下文导致 `SetParent` 被拒绝后应用窗口停在黑色启动遮罩的问题。明确的原生嵌入拒绝会回退到可用的独立模拟器窗口；独立窗口脱离失败时保留明确的未就绪状态（反馈 #5）。
-- 为嵌入应用窗口补充 `Ctrl+H`（Home）、`Ctrl+O`（最近任务）和 `Ctrl+B`（返回）快捷键，按键通过受限 IPC 发送到当前安卓客机（反馈 #11）。
-- 稳定应用启动定位：主界面可见时沿用其所在显示器，创建应用窗口后立即隐藏主界面，减少多显示器启动时窗口左右跳动（反馈 #111）。
-- 新增运行时暂存、嵌入拒绝回退和 IPC 白名单回归；窗口原生 PowerShell 行为测试在本机因执行策略跳过，未修改系统策略。
-- 尚未在真实 Store 沙箱、完整大运行时复制、混合 DPI 多显示器、真实 APK 快捷键焦点、安装升级和签名发行资产上完成验收。Linux GNOME 原生嵌入、macOS、Windows ARM64、Magisk 和蓝牙仍不在支持范围内。
+- 为设置读取增加基于文件大小、mtime 和 ctime 的进程内缓存；高频运行时状态轮询不再反复同步读取和解析同一份 `settings.json`。
+- 缓存只返回防御性副本；成功保存后重新走统一迁移/规范化流程，外部修改、删除、损坏或权限错误仍按原有 fail-closed 语义处理。
+- 新增 19 项持久化回归中的缓存命中与外部变更失效覆盖，并记录 Android Emulator、scrcpy、Android-x86、Bliss OS、Genymotion、Waydroid、Anbox 与多开产品的公开架构对比。
+- Windows 本机 `npm test` 全部通过：355 个 node:test 用例中 354 通过、1 项 PowerShell 原生窗口夹具因执行策略跳过；其余脚本套件全部 0 失败。
+- `npm audit --omit=dev --audit-level=high` 使用官方 registry 返回 0 个已知漏洞；未执行真实 Android 客机、GPU、安装升级、断电恢复或 Authenticode 验收。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

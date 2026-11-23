@@ -95,6 +95,25 @@ test('读取结果与补丁数组不共享默认对象或调用者引用', () =>
   assert.deepEqual(saved.guest.groups, ['one']);
 });
 
+test('设置读取缓存避免重复解析，并在外部文件变化后失效', (t) => {
+  reset();
+  let reads = 0;
+  const read = fs.readFileSync;
+  const mock = t.mock.method(fs, 'readFileSync', function (file, ...args) {
+    if (file === settingsFile) reads += 1;
+    return read.call(this, file, ...args);
+  });
+  assert.equal(store.getSettings().theme, 'system');
+  assert.equal(store.getSettings().theme, 'system');
+  assert.equal(reads, 1, '缺失配置只应探测一次');
+  fs.writeFileSync(settingsFile, JSON.stringify({ theme: 'dark' }));
+  assert.equal(store.getSettings().theme, 'dark');
+  assert.equal(reads, 2, '外部修改必须触发重新读取');
+  assert.equal(store.getSettings().theme, 'dark');
+  assert.equal(reads, 2, '未变化的配置不应再次解析');
+  mock.mock.restore();
+});
+
 test('非法 JSON/顶层设置保留唯一恢复副本，下一次保存不覆盖副本', () => {
   reset();
   for (const text of ['{broken', 'null', '[]']) {

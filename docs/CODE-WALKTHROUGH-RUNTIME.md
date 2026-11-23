@@ -507,7 +507,7 @@ main.js ──> engine.js ──> provision.js ──> sources.js ──> versio
 
 ### 坑点与不变量
 
-- **`getSettings()` 每次调用都 `readFileSync + JSON.parse`，没有内存缓存**（175-186）。而 `provision.paths()` 每次调用要读 2~4 次 settings（193、207、209 等），`checkEnv()` 在多处被状态轮询调用 → 高频小文件读。要做性能优化这里是第一个下手点。
+- **设置读取使用文件指纹缓存**：`getSettings()` 按配置文件大小、mtime 和 ctime 复用解析后的防御性副本；`saveSettings()` 写入成功后立即更新缓存，外部修改或删除文件会自动触发重新读取。`provision.paths()` 与运行状态轮询不再反复解析同一份 JSON，但权限错误、损坏文件备份和原子写入仍沿用原有 fail-closed 语义。
 - **`saveSettings` 写的是「合并后的完整对象」**（189-194），所以 settings.json 会带上当时的所有默认值；升级后新增的默认值不会被写入，只在读时合并——这正是迁移可以放在读时的原因。
 - 迁移是**单向强制**（179-184），未来若要允许用户重新打开 headless，必须改这里而不是改 UI。
 - `writeJson` 的 `renameSync` 在跨卷时会失败（`os.tmpdir` 与 `DATA_DIR` 同卷时没事；测试里改 `APPDATA` 后仍在同卷）。
