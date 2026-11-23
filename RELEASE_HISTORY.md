@@ -2,6 +2,27 @@
 
 更新：2026-11-23。仅记录已核验的正式发布与实际证据；候选、失败运行不计作发布成功。
 
+## v0.10.7 · 已正式发布并核验
+
+- [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.7)：GitHub API 显示 `published_at = 2026-11-23T08:58:36Z`，`isDraft = false`、`isPrerelease = false`。
+- 类型：PATCH；Tag 为带注释 Tag `62046ce7ae4f8cb2a407da7b637545a15f64c86d`，目标提交 `b96630b4288cc4010ccc984bdf20472a2a16e035`，与远程 `main` 一致。
+- [Release 流水线 45142252115](https://github.com/yuchen0x1/apkstart/actions/runs/45142252115)：版本核验、Windows Node 20/22、Linux Node 22、双平台 Electron UI、Windows portable/NSIS、Linux AppImage/deb、清单签名与正式发布全部成功。
+- 本版修复短剧类应用首页黑屏、`netsimd` 控制台黑窗未隐藏、远程控制客户端与全局鼠标钩子冲突，并加固私有 ADB 监听规格回退；实现边界见 [CHANGELOG](CHANGELOG.md) 与 [发行说明](docs/releases/release-notes.md)。
+
+### 发布资产清单
+
+| 资产 | 字节数 |
+| --- | ---: |
+| `ApkStart-v0.10.7-win64-portable.zip` | 149998606 |
+| `ApkStart-0.10.7-Setup.exe` | 121382608 |
+| `ApkStart-0.10.7-x86_64.AppImage` | 135180344 |
+| `ApkStart-0.10.7-amd64.deb` | 109068568 |
+| `ApkStart-update.json` | 628 |
+| `ApkStart-update.json.sig` | 64 |
+| `SHA256SUMS` | 384 |
+
+- 本次未下载并运行任何安装程序或执行真实升级，也未在真实 Android 客机、WHPX 主机或向日葵远程会话上复测；上述结果只证明构建与发布流程成功，不证明安装、升级、回滚或设备运行成功。
+
 ## v0.10.5 · 已正式发布并核验
 
 - [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.5)：GitHub API 显示 `published_at = 2026-11-23T02:04:43Z`，`isDraft = false`、`isPrerelease = false`。
