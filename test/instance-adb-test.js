@@ -92,8 +92,20 @@ function fixture(t, { isChild = true, id = 'child-a', allocator = { next: 49163 
       calls.spawn.push(call);
       if (args.includes('server') && args.includes('nodaemon')) {
         assert.equal(exe, binary);
+        const spec = args[args.indexOf('-L') + 1];
         queueMicrotask(() => {
           if (state.behavior === 'ready') p.stderr.emit('data', 'adb D main.cpp: Event loop starting\n');
+          else if (state.behavior === 'reject-localhost' && spec.includes('localhost')) {
+            p.stderr.emit('data', 'F adb.exe : main.cpp:172 could not install *smartsocket* listener: '
+              + 'listening on specified hostname currently unsupported\n');
+            p.exit(3221226505);
+          } else if (state.behavior === 'reject-localhost') {
+            p.stderr.emit('data', 'adb D main.cpp: Event loop starting\n');
+          } else if (state.behavior === 'reject-all-specs') {
+            p.stderr.emit('data', 'F adb.exe : main.cpp:172 could not install *smartsocket* listener: '
+              + 'listening on specified hostname currently unsupported\n');
+            p.exit(3221226505);
+          }
           else if (state.behavior === 'bind-race') {
             p.stderr.emit('data', 'could not install *smartsocket* listener: address already in use\n');
             p.exit(1);
@@ -342,7 +354,28 @@ test('stolen reservation fails closed without kill-server, fallback or reallocat
   assert.throws(() => new f.AdbClient({ adbPath: binary }));
   assert.equal(f.calls.listen.length, 1);
   assert.equal(f.calls.kill.length + f.calls.exec.length + f.calls.connect.length, 0);
+  // A bind race is NOT a listener-spec refusal: it must never trigger the
+  // `tcp:<port>` fallback and quietly grab a second daemon.
+  assert.equal(daemonCalls(f).length, 1, 'bind race must not retry a second listen spec');
   assert.equal(f.env.ANDROID_ADB_SERVER_PORT, undefined);
+});
+test('listener spec refusal falls back to the bare loopback port on the same port', async (t) => {
+  const f = fixture(t, { behavior: 'reject-localhost' });
+  const route = await f.init();
+  const calls = daemonCalls(f);
+  assert.deepEqual(calls.map((c) => c.args[1]), ['tcp:localhost:' + route.port, 'tcp:' + route.port]);
+  assert.equal(f.calls.listen.length, 1, 'the fallback must reuse the same reserved port');
+  assert.equal(f.helper.route(), route);
+  assert.equal(f.calls.connect.length, 0);
+});
+test('unsupported listener spec on every candidate fails closed with the real adb output', async (t) => {
+  const f = fixture(t, { behavior: 'reject-all-specs' });
+  const error = await f.init().then(() => null, (e) => e);
+  assert.equal(error && error.code, 'INSTANCE_ADB_EXITED');
+  assert.match(error.message, /smartsocket/);
+  assert.equal(daemonCalls(f).length, 2, 'both loopback specs are tried exactly once');
+  assert.throws(() => f.helper.route(), { code: 'INSTANCE_ADB_NOT_READY' });
+  assert.equal(f.calls.connect.length + f.calls.exec.length, 0);
 });
 test('spawn error and OS reservation errors cannot fall back to PATH or 5044', async (t) => {
   const a = fixture(t, { behavior: 'spawn-error' });
@@ -483,6 +516,14 @@ test('network and wifi calls use the same private binary/route as AdbClient', as
   assert.equal((await emu.checkNetwork('unrelated-adb')).ok, true);
   assert.equal((await emu.repairWifi('unrelated-adb')).reason, 'already-connected');
   for (const call of f.calls.exec) assertPrivate(call, route.port);
+});
+test('network readiness rejects an address left behind after Wi-Fi disconnects', async (t) => {
+  const f = fixture(t); await f.init(); const emu = f.makeEmulator();
+  f.state.execHook = (_call, args) => args.includes('cmd wifi status')
+    ? { stdout: 'Wifi is disconnected\n' } : undefined;
+  const result = await emu.checkNetwork();
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'wifi-not-connected');
 });
 test('emulator repair re-registers only the same birth-pinned owned guest', async (t) => {
   const f = fixture(t); const route = await f.init(); const emu = f.makeEmulator();

@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.10.6**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.10.7**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,15 +46,16 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.10.6
+### v0.10.7
 
-> 修复硬件加速回退到 TCG 后，纯软件模拟启动仍受硬件档短超时限制的问题。
+> 修复反馈中的短剧首页黑屏、模拟器命令行窗口不自动关闭、远程控制软件被反复重启，并加固私有 ADB 监听。
 
-- 当启动方案因硬件驱动问题切换为 TCG（`accel=off`）时，启动等待至少延长至 10 分钟，避免较慢的软件模拟被 4 分钟硬件档超时误判为启动失败；原方案设置的更长等待时间仍会保留。
-- 增加超时选择回归，覆盖 TCG 下限、较长自定义预算保留和硬件档默认等待时间。
-- 修复 Windows 下下载连接中断后，失败返回早于文件句柄关闭导致紧接着读取部分文件可能失败的问题；现在会等待写入关闭后再返回，不改变可续传数据和摘要校验规则。
-- Windows 本机全量 `npm test` 通过；下载身份与下载生命周期回归也在 Node 20 下单独通过。1 项 PowerShell 原生窗口行为用例因本机执行策略跳过，缺少外部 APK fixture 的用例按设计跳过。
-- 本轮没有在真实 Android 客机、不同硬件加速驱动或 TCG 慢速主机上完成启动时长与设备验收；正式发行资产、签名清单和跨平台构建以 GitHub Actions / Release 结果为准。
+- 私有 ADB 监听改用按次尝试的回环规格：`-L tcp:localhost:<port>` 被该 adb 构建拒绝时，在同一端口改用 `-L tcp:<port>` 重试一次。回退只对 `could not install *smartsocket* listener … hostname currently unsupported` 这一条明确的监听规格拒绝生效；端口被抢占、拉起失败或超时仍然在第一次尝试上直接失败，不换端口、不 kill-server（反馈 [#23](https://github.com/yuchen0x1/apkstart/issues/23)）。
+- 短剧类应用打开后只有底部导航、内容区整块黑屏时，不再把「残留的 IPv4 地址」当成网络就绪：`cmd wifi status` 明确显示 disconnected / disabled / unavailable 时继续等待或修复 Wi‑Fi，避免联网首页停留在永久黑色加载层（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 模拟器自带的 `netsimd` / `qemu` 控制台窗口现在能被常驻压制隐藏。它们由 `emulator.exe` 拉起且自身命令行不带 `-avd` / `-datadir`，此前会被判成「不是本实例的进程」而漏藏；现在只对已通过精确 AVD 身份校验的 emulator 父进程做有限层级的归属继承，作用域之外的用户终端仍然不受影响（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 检测到向日葵（Sunlogin / awesun）、ToDesk、RustDesk 等远程控制客户端在运行时，不再为安卓窗口叠加全局 `WH_MOUSE_LL` 鼠标钩子；钩子已装则先卸载。远程控制本身会注入输入，叠加钩子会增加整机输入延迟并可能触发其看门狗重启（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 引导第 4–7 页的异步设置回填不再覆盖用户刚改的下拉框选项；同一次回填仍会刷新硬件加速状态文案，不受用户输入影响。
+- Windows 本机全量 `npm test` 通过（354 项 node:test 用例中 353 通过、1 项 PowerShell 原生窗口行为用例因本机执行策略跳过）；`test/agent-compile.ps1` 对窗口代理内嵌 C# 编译通过。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

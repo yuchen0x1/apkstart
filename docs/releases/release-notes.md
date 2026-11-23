@@ -9,6 +9,30 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 > 本节记录下一版候选变更；尚未对应正式发布版本。
 
+## [0.10.7] — 2026-11-23
+
+> 修复短剧首页黑屏、模拟器命令行黑窗不自动关闭、远程控制软件被反复重启，并加固私有 ADB 监听规格。
+
+### 修复
+
+- 私有 ADB 监听：`-L tcp:localhost:<port>` 被个别 adb 构建拒绝时，在同一端口改用 `-L tcp:<port>` 重试一次；两种写法都只绑定回环地址。回退仅在明确收到 `could not install *smartsocket* listener … hostname currently unsupported` 时发生，端口抢占、拉起失败或超时仍然直接失败，不换端口、不 kill-server（反馈 [#23](https://github.com/yuchen0x1/apkstart/issues/23)）。
+- 短剧/联网应用首页不再把残留 IPv4 地址当成网络就绪：`cmd wifi status` 明确报告断开、禁用或不可用时继续等待或修复 Wi‑Fi，避免内容区停在整块黑屏（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 模拟器自带的 `netsimd` / `qemu` 控制台窗口现在会被常驻压制隐藏；它们不带 `-avd` / `-datadir`，以前会被判成非本实例进程而漏藏。归属只能沿已通过精确 AVD 身份校验的 emulator 父进程继承，作用域之外的用户终端不受影响（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 检测到向日葵（Sunlogin / awesun）、ToDesk、RustDesk 等远程控制客户端时，不再为安卓窗口叠加全局鼠标钩子，已装则先卸载，降低整机输入延迟与其看门狗重启风险（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 引导第 4–7 页的异步设置回填不再覆盖用户刚改的选项，同时继续刷新硬件加速状态文案。
+
+### 文件与验证边界
+
+| 平台 | 文件 | 安装或升级方式 |
+|---|---|---|
+| Windows 10/11 x64 安装版 | `ApkStart-0.10.7-Setup.exe` | 退出后以同一用户覆盖原安装，不先卸载。 |
+| Windows x64 便携版 | `ApkStart-v0.10.7-win64-portable.zip` | 只替换程序文件，不覆盖自选运行时、AVD 和安卓数据。 |
+| Linux x86_64 AppImage | `ApkStart-0.10.7-x86_64.AppImage` | 原路径允许替换时可应用内更新，否则退出后手动换包。 |
+| Debian / Ubuntu x86_64 | `ApkStart-0.10.7-amd64.deb` | 交由系统包管理器安装或升级。 |
+| 应用更新清单 | `ApkStart-update.json` / `.sig` | 仅接受签名有效且资产摘要匹配的版本。 |
+
+- Windows 本机全量 `npm test` 通过；1 项 PowerShell 原生窗口行为用例受本机执行策略限制而跳过。用真实 platform-tools 37.0.3 实测了三种 `-L` 规格。真实 Android 客机、WHPX 主机、向日葵远程会话和具体镜像上的短剧首页未在本轮验收；签名与正式资产以 GitHub Actions / Release 证据为准。
+
 ## [0.10.6] — 2026-11-23
 
 > 硬件加速故障切换为 TCG 后，延长启动等待，减少慢速软件模拟被过早判定失败。

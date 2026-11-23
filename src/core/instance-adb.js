@@ -146,6 +146,7 @@ function startOwned(target, timeoutMs) {
     let timer;
     let settled = false;
     let output = '';
+    let specIndex = 0;
     const finish = (error) => {
       if (settled) return;
       settled = true;
@@ -154,42 +155,62 @@ function startOwned(target, timeoutMs) {
       if (error) { phase = 'failed'; reject(error); }
       else { phase = 'ready'; resolve(target); }
     };
-    try {
-      const env = serverEnvironment(target);
-      // AOSP client/commandline.cpp accepts `-L SOCKET server nodaemon`.
-      // `tcp:localhost:<port>` is the portable loopback listen form; adb rejects
-      // an explicit `tcp:127.0.0.1:<port>` listen spec on current Windows builds.
-      // --reply-fd is a Windows HANDLE, not a Node stdio index: don't fake fd 3.
-      // With ADB_TRACE=adb, client/main.cpp emits this process's "Event loop
-      // starting" only AFTER install_listener succeeds. An unrelated open port
-      // is never sufficient readiness evidence. Bind races therefore fail closed.
-      env.ADB_TRACE = 'adb';
-      const proc = spawn(target.adbPath, ['-L', `tcp:localhost:${target.port}`, 'server', 'nodaemon'], {
-        cwd: path.dirname(target.adbPath), env, windowsHide: true,
-        detached: false, stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      record = { proc, exited: false };
-      owned = record;
-      proc.once('exit', (code, signal) => {
-        record.exited = true;
-        if (owned === record) phase = disposed ? 'disposed' : 'failed';
-        finish(fault('INSTANCE_ADB_EXITED', `私有 ADB 在确认就绪前退出（${signal || code}）：${output.slice(-800)}`));
-      });
-      proc.once('error', (error) => {
-        if (!proc.pid) record.exited = true;
-        if (owned === record) phase = disposed ? 'disposed' : 'failed';
-        finish(fault('INSTANCE_ADB_SPAWN_FAILED', `无法启动私有 ADB：${error.message}`));
-      });
-      const consume = (chunk) => {
-        output = (output + String(chunk)).slice(-8192);
-        if (!disposed && live(record) && /\bEvent loop starting\b/.test(output)) finish();
-      };
-      proc.stdout.on('data', consume);
-      proc.stderr.on('data', consume);
-      cancelStart = () => finish(fault('INSTANCE_ADB_DISPOSED', '私有 ADB 初始化已取消'));
-      timer = setTimeout(() => finish(fault('INSTANCE_ADB_START_TIMEOUT', `私有 ADB 未确认绑定成功：${output.slice(-800)}`)), timeoutMs);
-      if (disposed) cancelStart();
-    } catch (error) { finish(error); }
+    // AOSP client/commandline.cpp accepts `-L SOCKET server nodaemon`, but which
+    // loopback spellings are accepted has changed between adb versions:
+    // `tcp:127.0.0.1:<port>` is rejected outright, and a few builds also refuse
+    // `tcp:localhost:<port>` while accepting the bare `tcp:<port>` form. Both
+    // candidates bind loopback only, so try them in order on the SAME port and
+    // only when the failure is that explicit listener refusal. Any other failure
+    // (bind race, spawn error, timeout) still fails closed on the first attempt.
+    const specs = [`tcp:localhost:${target.port}`, `tcp:${target.port}`];
+    const spawnAttempt = () => {
+      // A superseded attempt must not keep a deadline that could fail the retry.
+      clearTimeout(timer);
+      try {
+        const env = serverEnvironment(target);
+        // --reply-fd is a Windows HANDLE, not a Node stdio index: don't fake fd 3.
+        // With ADB_TRACE=adb, client/main.cpp emits this process's "Event loop
+        // starting" only AFTER install_listener succeeds. An unrelated open port
+        // is never sufficient readiness evidence. Bind races therefore fail closed.
+        env.ADB_TRACE = 'adb';
+        output = '';
+        const proc = spawn(target.adbPath, ['-L', specs[specIndex], 'server', 'nodaemon'], {
+          cwd: path.dirname(target.adbPath), env, windowsHide: true,
+          detached: false, stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        record = { proc, exited: false };
+        owned = record;
+        proc.once('exit', (code, signal) => {
+          record.exited = true;
+          // Only an explicit "listener spec unsupported" refusal may fall back;
+          // the next spec must be the only difference.
+          const unsupported = /could not install \*?smartsocket\*? listener[\s\S]*hostname currently unsupported/i.test(output);
+          if (unsupported && specIndex + 1 < specs.length && !disposed && owned === record) {
+            specIndex += 1;
+            record = null;
+            spawnAttempt();
+            return;
+          }
+          if (owned === record) phase = disposed ? 'disposed' : 'failed';
+          finish(fault('INSTANCE_ADB_EXITED', `私有 ADB 在确认就绪前退出（${signal || code}）：${output.slice(-800)}`));
+        });
+        proc.once('error', (error) => {
+          if (!proc.pid) record.exited = true;
+          if (owned === record) phase = disposed ? 'disposed' : 'failed';
+          finish(fault('INSTANCE_ADB_SPAWN_FAILED', `无法启动私有 ADB：${error.message}`));
+        });
+        const consume = (chunk) => {
+          output = (output + String(chunk)).slice(-8192);
+          if (!disposed && live(record) && /\bEvent loop starting\b/.test(output)) finish();
+        };
+        proc.stdout.on('data', consume);
+        proc.stderr.on('data', consume);
+        cancelStart = () => finish(fault('INSTANCE_ADB_DISPOSED', '私有 ADB 初始化已取消'));
+        timer = setTimeout(() => finish(fault('INSTANCE_ADB_START_TIMEOUT', `私有 ADB 未确认绑定成功：${output.slice(-800)}`)), timeoutMs);
+        if (disposed) cancelStart();
+      } catch (error) { finish(error); }
+    };
+    spawnAttempt();
   });
 }
 

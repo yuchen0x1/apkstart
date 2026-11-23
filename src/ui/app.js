@@ -3219,6 +3219,8 @@ const wizard = {
   driveSave: Promise.resolve(null),
   bar: 0,
   version: '',
+  configDirty: false,
+  configLoad: 0,
 };
 
 /** 向导进度条的阶段映射：把各阶段（adb / 引擎 / 镜像 / 整包）的 percent 折算成单调递增的 0-100 */
@@ -3287,33 +3289,39 @@ function wizardShowPage(n) {
 }
 
 /** 把当前设置回填到引导里的控件；每次进设置页都刷新，避免用户在外面改过又被覆盖 */
-async function wizardFillConfig() {
+async function wizardFillConfig(loadId = wizard.configLoad) {
   const s = await api.getSettings().catch(() => null) || state.settings || {};
-  const eng = s.engine || {};
-  const rt = s.runtime || {};
-  const put = (id, v) => { const el = document.getElementById(id); if (el) el.value = String(v == null ? '' : v); };
-  put('wizMemory', eng.memoryMB || 0);
-  put('wizCores', eng.cores || 0);
-  put('wizResourceMode', eng.resourceMode || 'balanced');
-  put('wizRenderSize', eng.renderSize || 'auto');
-  // 引导页默认给出推荐值，而不是「自动」那个 6GB 的老默认
-  put('wizDataGB', eng.dataPartitionGB || 0);
-  // 没手动指定过就按最大剩余空间给推荐值。必须在 getSettings 返回后再算，
-  // 否则会被这次异步回填覆盖掉（用户看到「自动」、最终却存了旧值）。
-  const data = document.getElementById('wizDataGB');
-  if (data && !Number(data.value)) {
-    // 推荐值要按「本次安装的那个盘」算，不是随便拿剩余最大的盘（可能根本没往那儿装）
-    const picked = (wizard.drives || []).find((d) => d.drive === wizard.selectedDrive);
-    const free = picked ? (Number(picked.free) || 0)
-      : (wizard.drives || []).reduce((max, d) => Math.max(max, Number(d.free) || 0), 0);
-    const gb = !free || free < 12 * 1073741824 ? 4
-      : free < 32 * 1073741824 ? 8
-        : free < 60 * 1073741824 ? 16 : 24;
-    data.value = String(gb);
+  // 这次设置读取回来时，用户可能已经改了下拉框（或已经离开本页重新回填）：
+  // 此时绝不能用读到的旧值覆盖用户刚做的选择。
+  const stale = loadId !== wizard.configLoad || wizard.configDirty;
+  if (!stale) {
+    const eng = s.engine || {};
+    const rt = s.runtime || {};
+    const put = (id, v) => { const el = document.getElementById(id); if (el) el.value = String(v == null ? '' : v); };
+    put('wizMemory', eng.memoryMB || 0);
+    put('wizCores', eng.cores || 0);
+    put('wizResourceMode', eng.resourceMode || 'balanced');
+    put('wizRenderSize', eng.renderSize || 'auto');
+    // 引导页默认给出推荐值，而不是「自动」那个 6GB 的老默认
+    put('wizDataGB', eng.dataPartitionGB || 0);
+    // 没手动指定过就按最大剩余空间给推荐值。必须在 getSettings 返回后再算，
+    // 否则会被这次异步回填覆盖掉（用户看到「自动」、最终却存了旧值）。
+    const data = document.getElementById('wizDataGB');
+    if (data && !Number(data.value)) {
+      // 推荐值要按「本次安装的那个盘」算，不是随便拿剩余最大的盘（可能根本没往那儿装）
+      const picked = (wizard.drives || []).find((d) => d.drive === wizard.selectedDrive);
+      const free = picked ? (Number(picked.free) || 0)
+        : (wizard.drives || []).reduce((max, d) => Math.max(max, Number(d.free) || 0), 0);
+      const gb = !free || free < 12 * 1073741824 ? 4
+        : free < 32 * 1073741824 ? 8
+          : free < 60 * 1073741824 ? 16 : 24;
+      data.value = String(gb);
+    }
+    put('wizGpuMode', eng.gpuMode || 'auto');
+    put('wizImageFlavor', rt.systemImageFlavor || 'google_apis_playstore');
+    put('wizLanguage', s.language || 'auto');
   }
-  put('wizGpuMode', eng.gpuMode || 'auto');
-  put('wizImageFlavor', rt.systemImageFlavor || 'google_apis_playstore');
-  put('wizLanguage', s.language || 'auto');
+  // 硬件加速是「当场探测」的只读文案，不涉及用户输入，任何情况下都刷新。
   const accelText = document.getElementById('wizAccelText');
   if (accelText) {
     const response = await api.accelStatus().catch(() => null);
@@ -3328,7 +3336,13 @@ async function wizardFillConfig() {
 
 /** 进入资源页时用当前设置 + 磁盘余量回填控件 */
 function wizardSetupConfigPage() {
-  wizardFillConfig().catch(() => {});
+  wizard.configDirty = false;
+  const loadId = ++wizard.configLoad;
+  wizardFillConfig(loadId).catch(() => {});
+}
+
+function markWizardConfigDirty() {
+  if (wizard.page >= 4 && wizard.page <= 7) wizard.configDirty = true;
 }
 
 /** 引导页点击下一步才应用设置；容量必须先经过真实扩容，失败留在当前页。 */
@@ -3356,6 +3370,7 @@ async function wizardCollectConfig() {
   try {
     await api.setSettings({ engine: { resourceMode: mode } });
     state.settings = await api.setSettings(patch);
+    wizard.configDirty = false;
     return true;
   } catch (e) {
     toast({ title: '保存设置失败', body: e?.message || '请稍后重试。', type: 'error' });
@@ -3581,6 +3596,10 @@ async function bindWizard() {
   });
   $('wizardDrives').addEventListener('change', selectWizardDrive);
   $('wizardDrives').addEventListener('click', selectWizardDrive);
+  for (const id of ['wizMemory', 'wizCores', 'wizResourceMode', 'wizRenderSize', 'wizDataGB',
+    'wizGpuMode', 'wizImageFlavor', 'wizLanguage']) {
+    document.getElementById(id)?.addEventListener('change', markWizardConfigDirty);
+  }
   // 第 1 页的语言选择：保存设置 + 现场重翻整页（与设置页 setLanguage 同一机制）
   const langFirst = document.getElementById('wizLanguageFirst');
   if (langFirst) langFirst.addEventListener('change', () => changeLanguage(langFirst.value || 'auto'));

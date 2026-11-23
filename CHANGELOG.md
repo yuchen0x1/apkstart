@@ -5,6 +5,24 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.10.7] — 2026-11-23
+
+> 修复反馈中的短剧首页黑屏、模拟器命令行窗口不自动关闭、远程控制软件被反复重启，并加固私有 ADB 监听。
+
+### 修复
+
+- 私有 ADB 监听改用按次尝试的回环规格：`-L tcp:localhost:<port>` 被该 adb 构建拒绝时，在同一端口改用 `-L tcp:<port>` 重试一次。回退只对 `could not install *smartsocket* listener … hostname currently unsupported` 这一条明确的监听规格拒绝生效；端口被抢占、拉起失败或超时仍然在第一次尝试上直接失败，不换端口、不 kill-server（反馈 [#23](https://github.com/yuchen0x1/apkstart/issues/23)）。
+- 短剧类应用打开后只有底部导航、内容区整块黑屏时，不再把「残留的 IPv4 地址」当成网络就绪：`cmd wifi status` 明确显示 disconnected / disabled / unavailable 时继续等待或修复 Wi‑Fi，避免联网首页停留在永久黑色加载层（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 模拟器自带的 `netsimd` / `qemu` 控制台窗口现在能被常驻压制隐藏。它们由 `emulator.exe` 拉起且自身命令行不带 `-avd` / `-datadir`，此前会被判成「不是本实例的进程」而漏藏；现在只对已通过精确 AVD 身份校验的 emulator 父进程做有限层级的归属继承，作用域之外的用户终端仍然不受影响（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 检测到向日葵（Sunlogin / awesun）、ToDesk、RustDesk 等远程控制客户端在运行时，不再为安卓窗口叠加全局 `WH_MOUSE_LL` 鼠标钩子；钩子已装则先卸载。远程控制本身会注入输入，叠加钩子会增加整机输入延迟并可能触发其看门狗重启（反馈 [#19](https://github.com/yuchen0x1/apkstart/issues/19)）。
+- 引导第 4–7 页的异步设置回填不再覆盖用户刚改的下拉框选项；同一次回填仍会刷新硬件加速状态文案，不受用户输入影响。
+
+### 验证边界
+
+- Windows 本机全量 `npm test` 通过（354 项 node:test 用例中 353 通过、1 项 PowerShell 原生窗口行为用例因本机执行策略跳过）；`test/agent-compile.ps1` 对窗口代理内嵌 C# 编译通过。
+- 用真实 platform-tools `adb 1.0.41 / 37.0.3` 实测：`tcp:127.0.0.1:<port>` 复现 3221226505 并报 smartsocket 拒绝，`tcp:localhost:<port>` 与 `tcp:<port>` 均只绑定 127.0.0.1 并正常进入 Event loop。
+- 本轮没有在真实 Android 客机、WHPX 主机或向日葵远程会话上做端到端验收，也没有验证短剧应用在具体镜像上的首页加载；这些结论以对应环境复测为准。
+
 ## [0.10.6] — 2026-11-23
 
 > 修复硬件加速回退到 TCG 后，纯软件模拟启动仍受硬件档短超时限制的问题。

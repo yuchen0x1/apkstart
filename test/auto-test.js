@@ -6,6 +6,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const vm = require('vm');
 
 const TMP = path.join(os.tmpdir(), `apkstart-auto-test-${Date.now()}`);
 process.env.APPDATA = TMP;
@@ -1226,6 +1227,7 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(!/forceWipeOnNextStart|resetAndroidData/.test(repair), '修复网络绝不能隐式重置应用数据');
     const emuSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'emulator.js'), 'utf8');
     assert(/_forceWipe/.test(emuSrc) && /async checkNetwork/.test(emuSrc), '模拟器要提供一次性 wipe 标记与网络体检');
+    assert(/disconnected\|disabled\|unavailable/.test(emuSrc), '网络体检应识别 Wi-Fi 断开，避免联网首页永久黑屏');
   });
 
   await test('新版 emulator 写的 ram.bin 必须被认作完整快照（否则刚存好的 3GB 会被当空壳删掉）', () => {
@@ -1532,6 +1534,9 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(/Poll\(50,\s*SelectMode\.SelectRead\)/.test(agentPs1), '主循环应短轮询保持消息泵响应');
     assert(/now - _embedAt < 8000/.test(agentPs1), '窗口巡检必须限时，不能永久每 2 秒 EnumWindows');
     assert(/setLiteMode/.test(uiHtml) && /setDeepTrim/.test(uiHtml), '设置页需暴露轻量容器选项');
+    assert(/static bool IsOwnedAncestor\(uint pid\)/.test(agentPs1), 'netsimd/qemu 必须能沿已验证的 emulator 父链继承归属');
+    assert(/if \(!ours && IsRuntimeChild\(file\)\) ours = IsOwnedAncestor\(pid\)/.test(agentPs1), '子进程归属只能从已验证候选进程继承');
+    assert(/static bool RemoteInputActive\(\)/.test(agentPs1) && /SunloginClient/.test(agentPs1), '远程控制软件运行时不能叠加全局鼠标钩子');
   });
 
   await test('WinAgent.setHook(false) 在默认状态下不会拉起 PowerShell 代理', async () => {
@@ -2556,6 +2561,48 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(parseResolvedActivity('com.phoenix.read', out)
       === 'com.phoenix.read/com.dragon.read.pages.splash.SplashActivity', '应跳过空行取到最后一行组件');
     assert(parseResolvedActivity('com.other', out) === '', '别的包名不能拿来用');
+  });
+
+  // 引导第 4–7 页的下拉框只在进入页面时才异步回填。若用户已经改过控件（或已经
+  // 离开本页重新进入），迟到的 getSettings 结果不能把用户的选择覆盖回去。
+  await test('引导配置回填：迟到的设置读取不能覆盖用户刚改的选项，且每次都刷新硬件加速文案', async () => {
+    const app = fs.readFileSync(path.join(__dirname, '..', 'src', 'ui', 'app.js'), 'utf8');
+    const start = app.indexOf('async function wizardFillConfig(');
+    const end = app.indexOf('/** 进入资源页时用当前设置 + 磁盘余量回填控件 */');
+    assert(start >= 0 && end > start, 'wizardFillConfig 必须独立可测');
+    const source = app.slice(start, end);
+    const ids = ['wizMemory', 'wizCores', 'wizResourceMode', 'wizRenderSize', 'wizDataGB',
+      'wizGpuMode', 'wizImageFlavor', 'wizLanguage', 'wizAccelText'];
+    const elements = () => Object.fromEntries(ids.map((id) => [id, { value: '', textContent: '' }]));
+
+    const run = async ({ dirty = false, accel = { ok: true, kind: 'whpx' } } = {}) => {
+      const el = elements();
+      el.wizMemory.value = '4096';
+      const api = {
+        getSettings: async () => ({ engine: { memoryMB: 2048, cores: 2 }, runtime: {}, language: 'auto' }),
+        accelStatus: async () => ({ accel }),
+      };
+      const context = {
+        wizard: { configDirty: dirty, configLoad: 1, drives: [], selectedDrive: '' },
+        state: { settings: {} },
+        api,
+        document: { getElementById: (id) => el[id] || null },
+      };
+      vm.createContext(context);
+      vm.runInContext(source + '\nthis.fill = wizardFillConfig;', context);
+      // 显式传入本次加载号：与 wizardSetupConfigPage 发生的那次回填一致
+      await context.fill(1);
+      return el;
+    };
+    // 正常回填：读到什么就填什么
+    const fresh = await run();
+    assert(fresh.wizMemory.value === '2048', '正常回填应写入读取到的值');
+    assert(/已启用/.test(fresh.wizAccelText.textContent), '正常回填应更新硬件加速文案');
+    // 用户已经改过下拉框：值必须保留，但硬件加速文案仍然刷新
+    const dirty = await run({ dirty: true });
+    assert(dirty.wizMemory.value === '4096', '迟到回填不得覆盖用户选择');
+    assert(/已启用/.test(dirty.wizAccelText.textContent), '硬件加速文案是只读探测，仍要刷新');
+    assert(/WHPX/.test(dirty.wizAccelText.textContent), '硬件加速文案应反映真实后端');
   });
 
   await test('首启引导：关键设置都在引导里，且「完成并重启」是真的重启', () => {

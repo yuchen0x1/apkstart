@@ -1074,7 +1074,8 @@ class EmulatorEngine {
       m = re.exec(addr);
     }
     const wifi = await sh('cmd wifi status');
-    const connected = /Wifi is connected/i.test(wifi);
+    const connected = /Wi[- ]?Fi\s+is\s+connected/i.test(wifi);
+    const disconnected = /(?:Wi[- ]?Fi|wifi)\s+(?:is\s+)?(?:disconnected|disabled|unavailable|not\s+connected)/i.test(wifi);
     if (!ips.length) {
       // Wi-Fi 关联 + DHCP 往往比 sys.boot_completed 晚几十秒才完成。
       // 调用方给了 waitMs 就继续等，不要在这一刻就断定「没有网络」。
@@ -1090,6 +1091,7 @@ class EmulatorEngine {
       }
       return { ok: false, reason: connected ? 'no-ip-address' : 'wifi-not-connected', addrs: ips };
     }
+    if (disconnected) return { ok: false, reason: 'wifi-not-connected', addrs: ips };
     const ip = ips[0];
     const gw = /^10\.0\.2\./.test(ip) ? '10.0.2.2' : ip.replace(/\.\d+$/, '.1');
     return { ok: true, reason: '', gateway: gw, ip, wifiConnected: connected };

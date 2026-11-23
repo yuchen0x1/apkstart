@@ -409,12 +409,44 @@ public class ApkAgent
                 long started = p.StartTime.ToUniversalTime().ToFileTimeUtc();
                 string file = RealPath(p.MainModule.FileName);
                 bool ours = CandidateOwned(pid, file, started);
+                if (!ours && IsRuntimeChild(file)) ours = IsOwnedAncestor(pid);
                 // The original process must still be alive after WMI; a recycled PID may
                 // not reuse an old positive result (cache keys include fresh birth + exe).
                 return ours && !p.HasExited;
             }
         }
         catch { return false; }
+    }
+
+    static bool IsRuntimeChild(string file)
+    {
+        string name = System.IO.Path.GetFileName(file);
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name,
+            @"^(qemu-system-(x86_64|i386|aarch64|armel)|netsimd)\.exe$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase)) return false;
+        for (int i = 0; i < _scopeDirs.Count; i++)
+            if (file.StartsWith(_scopeDirs[i], StringComparison.Ordinal)) return true;
+        return false;
+    }
+
+    static bool IsOwnedAncestor(uint pid)
+    {
+        uint parent = ParentOf(pid);
+        for (int i = 0; i < 8 && parent != 0; i++)
+        {
+            try
+            {
+                using (Process p = Process.GetProcessById((int)parent))
+                {
+                    long started = p.StartTime.ToUniversalTime().ToFileTimeUtc();
+                    string file = RealPath(p.MainModule.FileName);
+                    if (CandidateOwned(parent, file, started)) return true;
+                }
+            }
+            catch { }
+            parent = ParentOf(parent);
+        }
+        return false;
     }
 
     static bool IsOurWindow(IntPtr hwnd)
@@ -1283,6 +1315,12 @@ public class ApkAgent
 
     static void HookOn()
     {
+        if (RemoteInputActive())
+        {
+            if (_hook != IntPtr.Zero || (_hookThread != null && _hookThread.IsAlive)) HookOff();
+            _hookReady.Set();
+            return;
+        }
         if (_hookThread != null && _hookThread.IsAlive) return;
         _hookRun = true;
         _hookReady.Reset();
@@ -1292,6 +1330,18 @@ public class ApkAgent
         // Reply must reflect the real hook state; otherwise the JS side sees
         // hooked:false and thinks enabling failed.
         _hookReady.WaitOne(1000);
+    }
+
+    static bool RemoteInputActive()
+    {
+        string[] names = { "SunloginClient", "SunloginRemote", "SunloginControl", "SunloginService", "awesun", "awesun_guard", "OrayRemote", "ToDesk", "RustDesk" };
+        try
+        {
+            for (int i = 0; i < names.Length; i++)
+                if (Process.GetProcessesByName(names[i]).Length > 0) return true;
+        }
+        catch { }
+        return false;
     }
     static void HookOff()
     {
