@@ -1,6 +1,29 @@
 # 正式发布历史与交付记录
 
-更新：2026-11-21。仅记录已核验的正式发布与实际证据；候选、失败运行不计作发布成功。
+更新：2026-11-23。仅记录已核验的正式发布与实际证据；候选、失败运行不计作发布成功。
+
+## v0.10.3 · 已正式发布并核验
+
+- [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.3)：非草稿、非预发行，GitHub API `published_at = 2026-11-23T00:40:23Z`。
+- 类型：PATCH；源码提交 `f413d5b820d8768fc605206efd19c17ac8680424`，`v0.10.3` Tag 与 `main` 同一提交。
+- [Release 流水线 45089589127](https://github.com/yuchen0x1/apkstart/actions/runs/45089589127)：版本核验、Windows Node 20/22、Linux Node 22、双平台 Electron UI、Windows portable/NSIS、Linux AppImage/deb、清单签名与草稿核对全部成功。
+- 议题 [#18](https://github.com/yuchen0x1/apkstart/issues/18)（Windows 私有 ADB listen spec）和 [#13](https://github.com/yuchen0x1/apkstart/issues/13)（视频渲染卡顿）已回复修复并关闭；#13 的真实 Android 视频流帧率和音画同步仍需报告者机器复验。
+
+### 正式资产逐项核对
+
+以下信息来自正式 Release API；下载的更新清单、签名和 `SHA256SUMS` 已在本地用 `src/core/release-public.pem` 验签，并确认清单内四项程序资产与 `SHA256SUMS` 逐项一致。未执行任何安装程序或真实升级。
+
+| 资产 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `ApkStart-v0.10.3-win64-portable.zip` | 149993676 | `d0be85ab18090a0e8af5ccd9f4981349284479206407bb3c044eabdb4df94bac` |
+| `ApkStart-0.10.3-Setup.exe` | 121377969 | `ae1420198e24a487c940000bdd666094876c833fb4cb45f41d8a0e70a3e5a03c` |
+| `ApkStart-0.10.3-x86_64.AppImage` | 135176270 | `ba783d306db88461f1c6e4935695e32223376be4066e91b8e15e1fd6d763e233` |
+| `ApkStart-0.10.3-amd64.deb` | 109071932 | `214c1211e525104be1161de04bcf4e0680c9baab0821cb0284fcda78ed6ae893` |
+| `ApkStart-update.json` | 628 | `f739aa99f219ff6936be6520013fe991301587f2a3e88721a2854e2ec01d854d` |
+| `ApkStart-update.json.sig` | 64 | `631df36a32a55234428a0cf92132ec1d6f62c3550cd61300000dc170ec18ed3e` |
+| `SHA256SUMS` | 384 | `35acc0674cb9fa8d797ee27715519a8888d1425b58c3ecdaae8276aa3cf63674` |
+
+- 本地 `npm test` 通过；现有 PowerShell 原生窗口夹具因本机执行策略被跳过，CI 的 UI 与跨平台测试均成功。真实 Android 客机、视频流、安装升级、回滚和 Authenticode 签名未在本轮宣称已验收。
 
 ## v0.9.2 · 已正式发布并核验
 
