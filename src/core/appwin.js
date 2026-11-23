@@ -217,7 +217,11 @@ class AppWindow {
       landscape: this.lcdLandscape,
     };
 
-    const area = this._area();
+    const requestedArea = o.area;
+    const area = requestedArea && [requestedArea.x, requestedArea.y, requestedArea.w, requestedArea.h]
+      .every(value => Number.isFinite(Number(value)))
+      ? { x: Number(requestedArea.x), y: Number(requestedArea.y), w: Number(requestedArea.w), h: Number(requestedArea.h) }
+      : this._area();
     const size = AppWindow.sizeFor(area, this.portrait, false);
     const w = Math.max(320, size.w);
     const h = Math.max(420, size.h + TITLEBAR_H);
@@ -480,6 +484,17 @@ class AppWindow {
           return false;
         }
         return true;
+      }
+      const refusal = String(r.error || '').trim();
+      if (/^(?:set-parent-failed|embed-parent-mismatch|set-style-failed|render-fit-failed|emu-fit-failed)$/.test(refusal)) {
+        this.lastEmbedError = refusal;
+        const detached = await this.standalone();
+        if (detached) {
+          this.lastEmbedError = `${refusal};standalone-fallback`;
+          return false;
+        }
+        this.lastEmbedError = `${refusal};${this.lastEmbedError || 'standalone-fallback-failed'}`;
+        return false;
       }
       // eslint-disable-next-line no-await-in-loop
       await sleep(attempt < 2 ? 300 : 800);

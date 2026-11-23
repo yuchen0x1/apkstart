@@ -24,7 +24,10 @@ window.addEventListener('contextmenu', (e) => e.preventDefault());
 
 // Ctrl+R 旋转，F11 最大化（和 Windows 习惯一致）
 window.addEventListener('keydown', (e) => {
-  if (e.ctrlKey && (e.key === 'r' || e.key === 'R')) { e.preventDefault(); api.shell.rotate(); }
+  if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'r' || e.key === 'R')) { e.preventDefault(); api.shell.rotate(); }
+  else if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'h' || e.key === 'H')) { e.preventDefault(); api.shell.home(); }
+  else if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'o' || e.key === 'O')) { e.preventDefault(); api.shell.recent(); }
+  else if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); api.shell.back(); }
   else if (e.key === 'F11') { e.preventDefault(); api.shell.maximize(); }
   else if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); api.shell.back(); }
   else if (e.altKey && e.key === 'ArrowRight') { e.preventDefault(); api.shell.forward(); }

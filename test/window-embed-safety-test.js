@@ -164,6 +164,31 @@ test('a failed black-frame detach does not claim that the standalone window is r
   assert(!h.commands.includes('host:hide'));
 });
 
+test('a native SetParent refusal falls back to a visible standalone emulator window', async () => {
+  const h = harness();
+  h.app.agent.embed = async () => ({ ok: false, error: 'set-parent-failed' });
+  h.app.agent.detach = async () => ({ ok: true });
+  h.win.visible = true;
+  assert.equal(await h.app.embed(), false);
+  assert.equal(h.app.standaloneActive, true);
+  assert.equal(h.app.blackDetached, false);
+  assert.equal(h.win.isVisible(), false);
+  assert.match(h.app.lastEmbedError, /^set-parent-failed;standalone-fallback$/);
+  assert.deepEqual(h.commands, ['host:hide']);
+});
+
+test('a native SetParent refusal with failed detach keeps the startup overlay', async () => {
+  const h = harness();
+  h.app.agent.embed = async () => ({ ok: false, error: 'embed-parent-mismatch' });
+  h.app.agent.detach = async () => ({ ok: false, error: 'detach-failed' });
+  h.win.visible = true;
+  assert.equal(await h.app.embed(), false);
+  assert.equal(h.app.standaloneActive, false);
+  assert.equal(h.app.blackDetached, false);
+  assert.equal(h.win.isVisible(), true);
+  assert.match(h.app.lastEmbedError, /^embed-parent-mismatch;detach-failed$/);
+});
+
 test('queued host commands cannot run after a successful detach', async () => {
   const h = harness();
   let acknowledge, started;

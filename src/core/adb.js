@@ -977,6 +977,8 @@ class AdbClient {
 
   async keyBack() { return this._key(4); }
   async keyForward() { return this._key(125); }
+  async keyHome() { return this._key(3); }
+  async keyRecent() { return this._key(187); }
 
   /**
    * 横竖屏切换 = 切换「手机排版 / 平板排版」。

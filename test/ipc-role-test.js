@@ -38,7 +38,8 @@ function harness() {
       scheduleFit() {}, rotate: () => calls.shell.push('rotate'), close: () => calls.shell.push('close') },
     BrowserWindow: { fromWebContents: wc => [mainWindow, shellWindow].find(w => w.webContents === wc) },
     runtime: { resetAndroidData: async () => { calls.reset++; return { ok: true, reclaimed: 1048576 }; },
-      client: () => ({ keyBack: async () => calls.shell.push('back'), keyForward: async () => calls.shell.push('forward') }) },
+      client: () => ({ keyBack: async () => calls.shell.push('back'), keyForward: async () => calls.shell.push('forward'),
+        keyHome: async () => calls.shell.push('home'), keyRecent: async () => calls.shell.push('recent') }) },
     store: { DATA_DIR: path.join(ROOT, 'fake-data'), getSettings: () => settings,
       saveSettings: p => { calls.patches.push(p); return { ...settings, ...p }; } },
     i18n: { payload: () => ({ language: 'zh-CN' }) }, app: { getLocale: () => 'zh-CN' },
@@ -81,7 +82,7 @@ test('child instances cannot mutate shared components or global integration', as
 test('existing main channels remain available and shell-only or future channels fail closed', async () => {
   const h = harness();
   const shellOnly = new Set(['shell:state', 'shell:minimize', 'shell:maximize', 'shell:close',
-    'shell:rotate', 'shell:back', 'shell:forward']);
+    'shell:rotate', 'shell:back', 'shell:forward', 'shell:home', 'shell:recent']);
   // Replace the business body only; retain the real guard installed by production registration.
   for (const channel of h.handlers.keys()) {
     h.context.ipcMain.handle(channel, () => 'allowed');
@@ -96,12 +97,12 @@ test('existing main channels remain available and shell-only or future channels 
 test('shell retains titlebar, Android navigation, i18n and theme read capabilities', async () => {
   const h = harness();
   h.context.appWin.isOpen = true;
-  for (const channel of ['shell:state', 'shell:minimize', 'shell:maximize', 'shell:rotate', 'shell:back', 'shell:forward', 'app:i18n']) {
+  for (const channel of ['shell:state', 'shell:minimize', 'shell:maximize', 'shell:rotate', 'shell:back', 'shell:forward', 'shell:home', 'shell:recent', 'app:i18n']) {
     await h.invoke(h.shellWindow, channel);
   }
   assert.deepEqual(JSON.parse(JSON.stringify(await h.invoke(h.shellWindow, 'app:theme'))), { theme: 'dark' });
   await h.invoke(h.shellWindow, 'shell:close');
-  assert.deepEqual(h.calls.shell, ['rotate', 'back', 'forward', 'close']);
+  assert.deepEqual(h.calls.shell, ['rotate', 'back', 'forward', 'home', 'recent', 'close']);
   await assert.rejects(h.invoke(h.shellWindow, 'settings:get'), /IPC/);
 });
 test('trusted URL, copied webContents id, or shell navigation to index never grants main privileges', async () => {
@@ -394,6 +395,9 @@ test('shell preload exposes only needed capabilities, including theme without se
   assert.deepEqual(subscriptions.map(s => s[0]), ['theme:changed']);
   await api.shell.rotate();
   assert.equal(invocations[1][0], 'shell:rotate');
+  await api.shell.home();
+  await api.shell.recent();
+  assert.deepEqual(invocations.slice(2).map(args => args[0]), ['shell:home', 'shell:recent']);
 });
 test('main preload preserves public API; an unspecified preload role is never privileged', () => {
   const { api } = preload('main');

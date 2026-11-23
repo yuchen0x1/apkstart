@@ -9,6 +9,28 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 > 本节记录下一版候选变更；尚未对应正式发布版本。
 
+## [0.10.4] — 2026-11-23
+
+> 上游 Issue 审计修复：Store 只读运行时暂存、嵌入拒绝回退、应用窗口快捷键和多显示器启动定位。正式发行状态以 GitHub Releases 为准。
+
+### 修复
+
+- Microsoft Store 版发现 `WindowsApps` 只读运行时后，会将完整运行时复制到用户数据目录并按指纹复用；只有复制和 emulator、ADB、系统镜像校验全部完成后才切换配置，用户自选的可写运行时不受影响（反馈 [#116](https://github.com/yuchen0x1/apkstart/issues/116)）。
+- Windows 原生嵌入明确收到 `SetParent` 拒绝或父窗口不匹配时，自动尝试显示模拟器独立窗口；脱离失败保留启动遮罩和错误原因，不把黑屏报告为就绪（反馈 [#5](https://github.com/yuchen0x1/apkstart/issues/5)）。
+- 应用窗口支持 `Ctrl+H` 返回 Android Home、`Ctrl+O` 打开最近任务、`Ctrl+B` 返回；快捷键只通过 shell 角色白名单 IPC 发送到当前设备（反馈 [#11](https://github.com/yuchen0x1/apkstart/issues/11)）。
+- 应用窗口初始工作区跟随可见的主窗口所在显示器，应用窗口创建后立即隐藏主界面，降低多显示器启动时的左右跳动（反馈 [#111](https://github.com/yuchen0x1/apkstart/issues/111)）。
+
+### 文件与验证边界
+
+| 平台 | 文件 | 安装或升级方式 |
+|---|---|---|
+| Windows 10/11 x64 安装版 | `ApkStart-0.10.4-Setup.exe` | 退出后以同一用户覆盖原安装，不先卸载。 |
+| Windows x64 便携版 | `ApkStart-v0.10.4-win64-portable.zip` | 只替换程序文件，不覆盖自选运行时、AVD 和安卓数据。 |
+| Linux x86_64 AppImage | `ApkStart-0.10.4-x86_64.AppImage` | 原路径允许替换时可应用内更新，否则退出后手动换包。 |
+| Debian / Ubuntu x86_64 | `ApkStart-0.10.4-amd64.deb` | 交由系统包管理器安装或升级。 |
+
+- Node 回归覆盖运行时暂存、窗口拒绝回退、快捷键 IPC 和启动定位；本机 PowerShell 原生行为测试受执行策略限制而跳过，未修改系统策略。真实 Store 沙箱、完整大包复制、混合 DPI 多显示器、真实 APK 快捷键焦点、安装升级、签名和正式发行资产以 GitHub Actions / Release 证据为准。Linux GNOME 原生嵌入、macOS、Windows ARM64、Magisk 和蓝牙不在本版本支持范围内。
+
 ## [0.10.3] — 2026-11-23
 
 > 修复 Windows 私有 ADB 启动失败，并让自动窗口模式不再默认牺牲视频渲染性能。正式发行状态以本项目 GitHub Releases 为准。

@@ -1091,7 +1091,7 @@ const { adbKeyHint } = require('../src/core/engine');
     const launch = main.indexOf('let r = await installer.launch(pkg, launchOptions)');
     assert(preflight >= 0 && launch > preflight, '无头检测必须先于正常应用启动');
     const embedCall = main.indexOf('embedded = await appWin.embed();');
-    const detachedMark = main.indexOf('detached = !embedded && !!appWin.blackDetached', embedCall);
+    const detachedMark = main.indexOf('detached = !embedded && !!(appWin.blackDetached || appWin.standaloneActive)', embedCall);
     assert(embedCall >= 0 && detachedMark > embedCall, '必须能定位「启动完成后嵌入」这一段');
     const afterStart = main.slice(embedCall, detachedMark);
     assert(/stopHeadlessRuntime\(\)/.test(afterStart), '启动与嵌入之间丢窗口时必须停止旧运行时');

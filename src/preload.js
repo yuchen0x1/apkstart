@@ -16,6 +16,8 @@ const shell = {
   rotate: () => invoke('shell:rotate'),
   back: () => invoke('shell:back'),
   forward: () => invoke('shell:forward'),
+  home: () => invoke('shell:home'),
+  recent: () => invoke('shell:recent'),
   onState: (cb) => subscribe('shell:state', cb),
 };
 
@@ -206,6 +208,8 @@ if (isMain) contextBridge.exposeInMainWorld('apkstart', {
     rotate: () => invoke('shell:rotate'),
     back: () => invoke('shell:back'),
     forward: () => invoke('shell:forward'),
+    home: () => invoke('shell:home'),
+    recent: () => invoke('shell:recent'),
     onState: (cb) => {
       const handler = (_e, payload) => cb(payload);
       ipcRenderer.on('shell:state', handler);

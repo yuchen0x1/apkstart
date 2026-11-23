@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.10.3**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.10.4**（2026-11-23）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,14 +46,16 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.10.3
+### v0.10.4
 
-> 修复 Windows 私有 ADB 启动失败，并让自动窗口模式不再默认牺牲视频渲染性能。实际发行状态以 GitHub Releases 为准。
+> 修复上游 Issue 审计中仍可落地的运行时、窗口嵌入、快捷键和多显示器启动体验问题。正式发行状态以 GitHub Releases 为准。
 
-- 修复 Windows 私有 ADB 使用 `-L tcp:127.0.0.1:<port>` 被 ADB 37.x 拒绝的问题，改用兼容的 `tcp:localhost:<port>` 监听形式；客户端仍只连接本机回环地址，保留私有服务边界（反馈 [#18](https://github.com/yuchen0x1/apkstart/issues/18)）。
-- 修复自动窗口模式默认强制 `swangle` 软件渲染导致视频应用卡顿、音画不同步的问题。自动模式和独立窗口现在先使用自动选择的硬件后端；只有明确选择「始终嵌入」时才优先软件渲染。若自动嵌入出现黑帧，仍会摘出到独立窗口并记住结果（反馈 [#13](https://github.com/yuchen0x1/apkstart/issues/13)）。
-- 更新 ADB 与 GPU 选路回归断言，覆盖私有端口参数和自动窗口的首选渲染后端。
-- Node 回归覆盖 ADB 参数、GPU 选路和现有启动安全边界；本轮未在报告者的真实 Android 客机、Windows GPU 或视频流上测量帧率与音画同步，安装升级、签名和发行资产以 GitHub Actions / Release 实际结果为准。应用内更新继续使用 Ed25519 清单与 SHA-256 资产校验。
+- 修复 Microsoft Store 版把 `WindowsApps` 内只读运行时写入为当前目录的问题。启动时会把完整内置运行时一次性暂存到用户数据目录，按内容指纹复用；复制不完整、磁盘空间不足或校验失败时不会切换到半成品，也不会覆盖用户自选的可写运行时（反馈 #116）。
+- 修复混合 DPI 或跨进程上下文导致 `SetParent` 被拒绝后应用窗口停在黑色启动遮罩的问题。明确的原生嵌入拒绝会回退到可用的独立模拟器窗口；独立窗口脱离失败时保留明确的未就绪状态（反馈 #5）。
+- 为嵌入应用窗口补充 `Ctrl+H`（Home）、`Ctrl+O`（最近任务）和 `Ctrl+B`（返回）快捷键，按键通过受限 IPC 发送到当前安卓客机（反馈 #11）。
+- 稳定应用启动定位：主界面可见时沿用其所在显示器，创建应用窗口后立即隐藏主界面，减少多显示器启动时窗口左右跳动（反馈 #111）。
+- 新增运行时暂存、嵌入拒绝回退和 IPC 白名单回归；窗口原生 PowerShell 行为测试在本机因执行策略跳过，未修改系统策略。
+- 尚未在真实 Store 沙箱、完整大运行时复制、混合 DPI 多显示器、真实 APK 快捷键焦点、安装升级和签名发行资产上完成验收。Linux GNOME 原生嵌入、macOS、Windows ARM64、Magisk 和蓝牙仍不在支持范围内。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

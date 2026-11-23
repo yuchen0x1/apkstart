@@ -55,7 +55,7 @@ function checkEvent(root, event) {
 const SHELL_CHANNELS = new Set([
   'app:i18n', 'app:theme',
   'shell:state', 'shell:minimize', 'shell:maximize', 'shell:close',
-  'shell:rotate', 'shell:back', 'shell:forward',
+  'shell:rotate', 'shell:back', 'shell:forward', 'shell:home', 'shell:recent',
 ]);
 const MAIN_CHANNELS = new Set([
   'app:info', 'app:i18n', 'app:theme', 'dialog:openDir', 'apps:list',

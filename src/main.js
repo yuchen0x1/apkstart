@@ -56,6 +56,7 @@ const lcd = require('./core/lcd');
 const { WinAgent } = require('./core/agent');
 const pointer = require('./core/pointer');
 const { AppWindow, TITLEBAR_H } = require('./core/appwin');
+const { stageBundledRuntime, isWindowsAppsPath, canWriteDirectory } = require('./core/runtime-staging');
 const { NotifyBridge } = require('./core/notify');
 const { AndroidSettings } = require('./core/android');
 const { Updater } = require('./core/updater');
@@ -249,6 +250,20 @@ function bootstrapBundledRuntime() {
     const sameTree = path.resolve(current).toLowerCase()
       .startsWith(path.resolve(exeDir).toLowerCase());
     const currentOk = fs.existsSync(currentExe) && sameTree;
+    const bundledReadOnly = isWindowsAppsPath(bundled) || !canWriteDirectory(bundled);
+    const currentIsBundled = path.resolve(current).toLowerCase() === path.resolve(bundled).toLowerCase();
+
+    const runtimeDirForBundled = () => {
+      if (!bundledReadOnly) return bundled;
+      try {
+        const staged = stageBundledRuntime({ source: bundled, dataDir: store.DATA_DIR, platform: process.platform });
+        appLog(`bundled runtime staged source=${bundled} target=${staged.root} reused=${staged.reused}`);
+        return staged.root;
+      } catch (error) {
+        appLog(`bundled runtime staging failed code=${error.code || ''} error=${error.message}`);
+        return '';
+      }
+    };
     // 用户自己挑的目录（不在 EXE 目录树里，例如 D:\ApkStartRuntime 或别的盘）
     // 一律尊重：他可能就是为了省 C 盘空间、或让多个便携版共用一个运行时。
     // 旧版在这里无条件覆盖成 exe 旁边的 bundled runtime，表现就是
@@ -263,6 +278,15 @@ function bootstrapBundledRuntime() {
       return;
     }
     // 已有可用运行时（含在线版）就尊重它：AVD 用户数据就在该目录下，不能悄悄搬走
+    if (currentOk && currentIsBundled && bundledReadOnly) {
+      const staged = runtimeDirForBundled();
+      if (!staged) {
+        try { store.saveSettings({ runtime: { dir: path.join(store.DATA_DIR, 'runtime') } }); } catch (_) { /* online fallback will report the original error */ }
+        return;
+      }
+      store.saveSettings({ runtime: { dir: staged } });
+      return;
+    }
     if (currentOk) {
       // 但仍把自动参数打开，旧配置里的硬编码 4G/4核/弃用 GPU 模式不能继续用
       if (legacyEngineDefaults(s)) {
@@ -286,9 +310,16 @@ function bootstrapBundledRuntime() {
     } catch (_) { /* 忽略 */ }
     const bundledFlavor = playBundled ? 'google_apis_playstore'
       : (googleApisBundled ? 'google_apis' : (aospBundled ? 'default' : 'google_apis_playstore'));
+    const runtimeDir = runtimeDirForBundled();
+    if (!runtimeDir) {
+      if (currentIsBundled || (explicit && isWindowsAppsPath(explicit))) {
+        try { store.saveSettings({ runtime: { dir: path.join(store.DATA_DIR, 'runtime') } }); } catch (_) { /* online fallback will report the original error */ }
+      }
+      return;
+    }
     store.saveSettings({
       runtime: {
-        dir: bundled,
+        dir: runtimeDir,
         compatImage: bundledFlavor === 'google_apis_playstore',
         systemImageFlavor: bundledFlavor,
       },
@@ -436,6 +467,21 @@ function refreshPointerMapping() {
   else if (winAgent && winAgent.hooked) winAgent.setHook(false).catch(() => {});
 }
 
+function launchDisplayArea() {
+  try {
+    let display;
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
+      display = screen.getDisplayMatching(mainWindow.getBounds());
+    } else {
+      display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    }
+    const area = display.workArea || display.bounds;
+    return { x: area.x, y: area.y, w: area.width, h: area.height };
+  } catch (_) {
+    return null;
+  }
+}
+
 /**
  * 打开（或复用）那个「一个应用一个干净窗口」。
  * @param {object} [box] 模拟器 LCD 尺寸；横屏应用传 1920x1080，窗口按它定比例
@@ -449,6 +495,7 @@ function openAppWindow(pkg, tip, box = null, opts = {}) {
     label: (rec && rec.label) || pkg,
     iconPath: rec && rec.icoPath,
     lcd: box || (runtime && runtime.emulator && runtime.emulator.lcd) || null,
+    area: opts.area || launchDisplayArea(),
     fullscreen: displaySettings().mode === 'fullscreen',
     // 独立窗口模式下不显示宿主窗口：用户要看的画面在模拟器自己的窗口里
     hidden: !!opts.hidden,
@@ -1316,13 +1363,12 @@ async function runLaunchInner(pkg) {
     const launchWindow = openAppWindow(pkg, '正在启动安卓运行时…', want ? lcd.orientBox(portraitSize(), want) : windowBox(),
       { hidden: wantStandalone });
     const launchCancelled = () => quitting || appWin.win !== launchWindow || launchWindow.isDestroyed();
+    if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
     // 1) 先把「应用窗口」打开显示启动动画：整个过程看不到安卓桌面，也看不到模拟器窗口
     // 开机阶段把模拟器主窗 + qemu / netsimd 的控制台黑窗藏起来，避免任何闪现。
     // 压制是常驻的（embed 后它会自动跳过被嵌入的那一个窗口，见 appwin.embed）。
     // 这里必须 await：不等压制生效就往下走，黑窗会在启动瞬间露出来。
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
-    if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
-
     // 「无头运行时」自愈（上游 issue #42）：即使 qemu 是上一个 ApkStart 进程
     // 接管过来的（没有当前进程的 emulator child handle），只要 ADB 已在线、guest
     // 已启动且 Qt 画面窗口两次探测都不存在，就安全重启；开机中途不做破坏性操作。
@@ -1463,7 +1509,7 @@ async function runLaunchInner(pkg) {
       }
       // 嵌入成功但宿主画黑帧时，appwin 会自己摘成独立窗口：这不是「嵌入失败」，
       // 而是「换了一条能看见画面的路」，顶层不能再去重试 SetParent（必然再黑一次）。
-      detached = !embedded && !!appWin.blackDetached;
+      detached = !embedded && !!(appWin.blackDetached || appWin.standaloneActive);
       if (!embedded && !detached) appLog(`embed failed: ${appWin.lastEmbedError || 'unknown'}`);
     }
     if (launchCancelled()) throw new Error('应用窗口已关闭或 ApkStart 正在退出，已取消窗口接管');
@@ -3940,6 +3986,8 @@ function registerIpc() {
   ipcMain.handle('shell:rotate', () => appWin.rotate());
   ipcMain.handle('shell:back', async () => { await runtime.client().keyBack(); });
   ipcMain.handle('shell:forward', async () => { await runtime.client().keyForward(); });
+  ipcMain.handle('shell:home', async () => { await runtime.client().keyHome(); });
+  ipcMain.handle('shell:recent', async () => { await runtime.client().keyRecent(); });
 
   // ---------------- 安卓系统设置（不用进安卓桌面） ----------------
 
