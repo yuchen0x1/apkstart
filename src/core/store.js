@@ -125,15 +125,11 @@ const DEFAULT_SETTINGS = {
     downloadConnections: 8,
     proxyUrl: '',            // 网络代理（可选）：空=自动检测系统代理/环境变量；off=强制直连
     githubToken: '',         // GitHub API token（可选）：认证后 5000 次/小时；留空自动读本机 gh CLI 登录账号
-    // 更新/下载的源选择。auto = 同时问 GitHub 与 Gitee、并对每个下载地址实测
-    // 128KB 速度，谁快用谁；也可以强制只走某一边（企业网络只放行一个域名时有用）。
-    sourcePreference: 'github',   // fork 只有 GitHub 一个源：查新/整包只走本仓库
+    // 保留旧配置键以兼容升级；当前 fork 的查新和整包下载只使用 GitHub。
+    sourcePreference: 'github',
     // 自动尝试公共 GitHub 加速镜像（ghfast / gh-proxy）。关掉后只用直连 + 自定义前缀。
     // 这两个是第三方服务，只是转发公开的 release 文件，不涉及账号信息。
     autoMirror: true,
-    // Gitee 的 releases 接口对公开仓库也要求 access_token（无 token 直接 404），
-    // 想用 Gitee 作为更新源就在这里填一个只读 token；留空则只用 GitHub + 镜像。
-    giteeToken: '',
     // 多系统（Provider 架构）：当前选择的系统 id、远程目录地址、系统安装模式。
     // 系统镜像本体永远不写进设置，只在用户主动选择时按需下载到 systems/<id>/。
     selectedSystemId: 'google-play',

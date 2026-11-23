@@ -23,10 +23,11 @@ jobs:
   verify:
     name: 测试（Windows / Node ${{ matrix.node }}）
     runs-on: windows-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22]
+        node: [22, 24]
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -48,6 +49,7 @@ jobs:
   verify-linux:
     name: 测试（Linux）
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -70,6 +72,7 @@ jobs:
 
   version:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -90,6 +93,7 @@ jobs:
     name: 构建 Windows 便携版
     needs: [version, verify, verify-linux, verify-ui]
     runs-on: windows-latest
+    timeout-minutes: 45
     env:
       TAG: ${{ needs.version.outputs.tag }}
 
@@ -137,6 +141,7 @@ jobs:
     name: 构建 Windows 在线安装版
     needs: [version, verify, verify-linux, verify-ui]
     runs-on: windows-latest
+    timeout-minutes: 45
     env:
       TAG: ${{ needs.version.outputs.tag }}
 
@@ -155,10 +160,17 @@ jobs:
       - name: 下载 Electron 二进制
         run: node node_modules/electron/install.js
 
+      # 先生成便携目录；test:packaged 会同时校验便携版和 NSIS 展开目录。
+      - name: 打包便携版供最终产物校验
+        run: npm run pack
+
       - name: 构建在线安装包
         run: npx electron-builder --win nsis --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: 校验最终 Windows 构建包
+        run: npm run test:packaged
 
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
@@ -173,6 +185,7 @@ jobs:
     name: 构建 Linux 版（AppImage / deb，在线运行时）
     needs: [version, verify, verify-linux, verify-ui]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       TAG: ${{ needs.version.outputs.tag }}
 
@@ -209,6 +222,7 @@ jobs:
     if: github.ref_type == 'tag'
     needs: [version, build, full, linux]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: release
     permissions:
       contents: write

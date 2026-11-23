@@ -10,7 +10,7 @@ jobs:
   fixture:
     name: Electron 沙箱与界面（${{ matrix.platform }} 能力夹具）
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

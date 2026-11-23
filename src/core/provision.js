@@ -1247,7 +1247,7 @@ class Provisioner {
           if (j.xz) {
             // LZMA2 解压：必须直接引原生绑定 index.js。
             // 包默认入口 main.js / xz.js 内部会 require('stream-polyfill.mjs')，
-            // Electron 的 Node 20 不支持 require(ESM) 会抛错；而 exports 又不允许
+            // Electron 内置 Node 不一定支持 require(ESM)，而 exports 又不允许
             // 直接写 '@napi-rs/lzma/index.js'，所以用 require.resolve 定位目录后按文件路径引。
             const path0 = require('path');
             const lzmaDir = path0.dirname(require.resolve('@napi-rs/lzma'));

@@ -70,7 +70,7 @@
   ${If} ${Errors}
     ${If} ${FileExists} "$INSTDIR\resources\app\build\uninstall-data.ps1"
       DetailPrint "正在清理 ApkStart 数据、应用和运行时…"
-      nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\app\build\uninstall-data.ps1" -DataDir "$APPDATA\apkstart"'
+      nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\app\build\uninstall-data.ps1" -DataDir "$APPDATA\apkstart" -PreservedRuntimeDir "$INSTDIR.preserved-runtime"'
     ${EndIf}
   ${Else}
     DetailPrint "检测到覆盖安装：保留用户数据（应用、设置与运行时镜像）"

@@ -1405,8 +1405,8 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(have(out) > 0, '压缩产物不能是 0 字节');
     let back;
     if (/\.xz$/i.test(out)) {
-      // 不依赖 @napi-rs/lzma 原生 binding：CI 的 Node 20 job 会因
-      // npm optional dependencies 的已知 bug 加载不到它（Node 22 正常）。
+      // 不依赖 @napi-rs/lzma 原生 binding：压缩回归应保持可在不同
+      // Node ABI 环境中执行，直接用 Python lzma 读取并校验产物。
       // 这里用与压缩端同一个 python 的 lzma 读回，并校验 XZ 魔数，
       // 运行时的解压兼容性由真实安装包端到端验证覆盖。
       assert(fs.readFileSync(out).subarray(0, 6).equals(

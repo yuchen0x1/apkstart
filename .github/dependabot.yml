@@ -5,7 +5,16 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    groups:
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      github-actions:
+        patterns:
+          - '*'

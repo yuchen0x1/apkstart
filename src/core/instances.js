@@ -399,7 +399,6 @@ class InstanceManager {
       systemCatalogUrl: '',
       systemInstallMode: 'guided',
       githubToken: '',
-      giteeToken: '',
     };
     settings.adbPath = '';
     settings.device = '';

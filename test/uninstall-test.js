@@ -16,6 +16,7 @@ if (process.platform !== 'win32') {
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-uninstall-test-'));
 const data = path.join(root, 'data');
 const runtime = path.join(root, 'runtime');
+const preservedRuntime = path.join(root, 'ApkStart.exe.preserved-runtime');
 const avd = path.join(root, 'avd');
 const shared = path.join(root, 'shared');
 const tempRoot = path.join(root, 'temp');
@@ -33,13 +34,14 @@ const unrelatedShortcut = path.join(desktop, 'Keep Me.lnk');
 const source = path.join(__dirname, '..', 'build', 'uninstall-data.ps1');
 
 try {
-  for (const dir of [data, runtime, avd, shared, tempRoot, leftover, desktop, startMenu, iconDir]) fs.mkdirSync(dir, { recursive: true });
+  for (const dir of [data, runtime, avd, shared, tempRoot, leftover, desktop, startMenu, iconDir, preservedRuntime]) fs.mkdirSync(dir, { recursive: true });
   const ownedRuntime = path.join(runtime, 'emulator');
   const ownedAvd = path.join(avd, 'apkstart.avd');
   for (const dir of [ownedRuntime, ownedAvd]) fs.mkdirSync(dir);
   fs.writeFileSync(path.join(ownedRuntime, 'emulator.exe'), 'fixture');
   fs.writeFileSync(path.join(ownedAvd, 'userdata-qemu.img'), 'fixture');
   fs.writeFileSync(path.join(runtime, 'keep-runtime-notes.txt'), 'personal');
+  fs.writeFileSync(path.join(preservedRuntime, 'old-emulator.exe'), 'owned runtime');
   fs.writeFileSync(path.join(avd, 'keep-avd-notes.txt'), 'personal');
   fs.writeFileSync(path.join(shared, 'valuable.txt'), 'personal');
   fs.writeFileSync(path.join(leftover, 'active-session.txt'), 'personal');
@@ -75,11 +77,11 @@ try {
   const r = spawnSync('powershell.exe', [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
     '-DataDir', data, '-TempDir', tempRoot, '-DesktopDir', desktop,
-    '-StartMenuDir', path.dirname(startMenu),
+    '-StartMenuDir', path.dirname(startMenu), '-PreservedRuntimeDir', preservedRuntime,
   ], { windowsHide: true, encoding: 'utf8', timeout: 30000, env: windowsPowerShellEnv() });
   assert.strictEqual(r.error, undefined, r.error && r.error.message);
   assert.strictEqual(r.status, 0, `${r.stdout}\n${r.stderr}`);
-  for (const dir of [data, ownedRuntime, ownedAvd, desktopShortcut, startMenuShortcut, legacyDesktopShortcut, legacyStartMenuShortcut]) {
+  for (const dir of [data, ownedRuntime, ownedAvd, preservedRuntime, desktopShortcut, startMenuShortcut, legacyDesktopShortcut, legacyStartMenuShortcut]) {
     assert(!fs.existsSync(dir), `卸载后仍残留：${dir}`);
   }
   for (const file of [path.join(runtime, 'keep-runtime-notes.txt'), path.join(avd, 'keep-avd-notes.txt'), path.join(shared, 'valuable.txt'), path.join(leftover, 'active-session.txt')]) {

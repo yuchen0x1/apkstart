@@ -123,7 +123,7 @@ npm run build:exe
 | `npm test` 里 axml/apk 用例显示「跳过」 | 没有真实夹具；合成 APK 用例仍会跑（`test/lib/make-apk.js`） |
 | 模拟器 `0xC0000005`（3221225477） | 渲染后端崩溃；新版本会自动换后端并写 `last-failure.json`，报告在 `logs\diagnostic-*.txt` |
 | 「Running multiple emulators with the same AVD」 | 残留 qemu 占锁；`node tools\emu-clean.ps1` 或重新开机（新版会自动清孤儿） |
-| 更新检查里 Gitee 403 | 匿名 API 限流，客户端熔断 15 分钟并只用 GitHub；不是故障 |
+| 更新检查失败 | 当前 fork 只使用 GitHub Releases；检查代理、网络和可选的 `githubToken` |
 | 沙箱里 `reg.exe` / `sc.exe` 被拦 | 只影响自动化测试；产品运行在用户桌面不受影响 |
 | 便携版启动 1 秒就退出、无窗口 | 单实例锁被别的 ApkStart 进程占着（可能是没退干净的旧实例），先 `Stop-Process -Name ApkStart` |
 
@@ -136,11 +136,9 @@ npm run build:exe
 # 3. 提交 + 打 tag
 git add -A; git commit -m "chore(release): v0.3.5"
 git tag -a v0.3.5 -m "ApkStart v0.3.5"
-# 4. 推两个仓库（GitHub 走 SSH，Gitee 走 https；按需）
+# 4. 推送 GitHub（工作流会按 tag 触发 Release）
 git push origin main; git push origin v0.3.5
-git push gitee main;  git push gitee v0.3.5
 ```
 
-CI：`release.yml` 会构建便携版（95MB zip）、完整版 Setup（~1.35GB）与运行时整包
-（~1.36GB），同步便携版到 Gitee（需要 `GITEE_TOKEN` secret，缺了会直接失败而不是静默跳过）。
-`full` job 的 xz 压缩约 40 分钟，属正常。
+CI：`release.yml` 会先运行 Windows/Linux 测试和 UI 夹具，再构建 Windows 便携版、NSIS 安装版与 Linux AppImage/deb，
+最后签署 GitHub Release 清单并核对上传资产。当前不再同步 Gitee 发行版。

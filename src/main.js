@@ -4179,7 +4179,7 @@ if (!gotLock) {
       exePath: process.execPath,
       isPackaged: app.isPackaged,
       dataDir: store.DATA_DIR,
-      // 让更新器能读到「只走 GitHub / 只走 Gitee / 自动选快」和镜像前缀设置
+      // 让更新器能读到 GitHub 源偏好和镜像前缀设置（fork 不再发布 Gitee 资产）
       settings: () => store.getSettings(),
       onProgress: (p) => send('update:progress', p),
     });

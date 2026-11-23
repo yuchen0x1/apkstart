@@ -1,16 +1,14 @@
 'use strict';
 /**
- * 双源（GitHub / Gitee）+ 镜像前缀的统一下载来源管理。
+ * GitHub + 镜像前缀的统一下载来源管理。
  *
  * 国内直连 GitHub 有两个坑：
  *   1. api.github.com 经常几十秒才响应，甚至直接超时 —— 表现是「检查更新转圈」；
  *   2. 资产下载（objects.githubusercontent.com）单连接限速，常在 100KB/s 上下 ——
  *      1.5 GB 的运行时包要下 4 个小时。
  *
- * 所以这里不预设「谁是主源」，而是每次用真实字节测速：
- *   - 版本信息：GitHub / Gitee 两边**并发**问，谁先给出更高版本用谁的；
- *   - 下载地址：把「GitHub 直连 / Gitee 同名资产 / 镜像前缀拼接」全部列出来，
- *     每个地址真下 128KB，按实测速度排序，取最快的那个。
+ * 版本信息只来自本项目的 GitHub Releases；下载地址则包含 GitHub 直连和
+ * 可选的 GitHub 镜像前缀，每个地址真下一小段后按实测速度排序。
  *
  * 测速结果在内存里缓存 30 分钟（同一进程内反复检查更新/下多个组件不必重复测）。
  */
@@ -23,7 +21,6 @@ const proxyMod = require('./proxy');
 
 // fork 版更新源：只认本仓库（GitHub），不再检查上游 RoutineMiku 的发布
 const OWNER_GH = 'yuchen0x1';
-const OWNER_GITEE = 'daily-miku';
 const REPO = 'apkstart';
 
 const SOURCES = {
@@ -32,12 +29,6 @@ const SOURCES = {
     name: 'GitHub',
     api: `https://api.github.com/repos/${OWNER_GH}/${REPO}`,
     web: `https://github.com/${OWNER_GH}/${REPO}`,
-  },
-  gitee: {
-    id: 'gitee',
-    name: 'Gitee',
-    api: `https://gitee.com/api/v5/repos/${OWNER_GITEE}/${REPO}`,
-    web: `https://gitee.com/${OWNER_GITEE}/${REPO}`,
   },
 };
 
@@ -231,8 +222,7 @@ function withMirror(url, prefix) {
 }
 
 /**
- * Gitee 发行版附件单文件上限 100MB，安装包 105~110MB 装不下，所以发布时切成
- * xxx.zip.part1 / xxx.zip.part2。这里把分片还原成一个逻辑资产：
+ * 兼容历史分片资产：把 xxx.zip.part1 / xxx.zip.part2 还原成一个逻辑资产：
  *   { name: 'xxx.zip', size: 总和, parts: [{index, size, urls:[...]}] }
  * 分片必须从 part1 开始连续，否则视为残缺、丢弃（宁可用整包，也不下一个坏包）。
  */
@@ -262,9 +252,8 @@ function groupParts(assets) {
     g.parts.sort((x, y) => x.index - y.index);
     const contiguous = g.parts.every((p, i) => p.index === i + 1);
     g.size = g.parts.reduce((n, p) => n + (Number(p.size) || 0), 0);
-    // 注意：Gitee 的发行版资产条目只有 name/url，**没有 size**。
-    // 以「size>0」作为完整性条件会把整组分片判成残缺而丢弃（实测踩过），
-    // 所以这里只要求「分片连续 + 每个分片有地址」；大小未知时进度按已收字节显示。
+    // 某些历史镜像资产没有 size 字段。以「size>0」作为完整性条件会把整组
+    // 分片判成残缺，所以这里只要求「分片连续 + 每个分片有地址」。
     if (!contiguous || !g.parts.every((p) => p.urls.length)) g.broken = true;
   }
   return { list: out.filter((a) => !a.broken), broken: [...groups.values()].filter((g) => g.broken).map((g) => g.name) };
@@ -284,8 +273,7 @@ class Sources {
     this.settings = typeof settingsFn === 'function' ? settingsFn : () => ({});
     this._rankCache = new Map();   // url -> {at, speed, ok}
     this._rankTtl = 30 * 60 * 1000;
-    // 版本检查结果缓存：Gitee 的匿名调用限流很紧（连续几次就 403），
-    // 而「有没有新版本」本来也不需要秒级新鲜度。
+    // 「有没有新版本」不需要秒级新鲜度，避免重复请求 GitHub API。
     this._relCache = { at: 0, key: '', value: null };
     this._relTtl = 10 * 60 * 1000;
     // 熔断：某个源被限流/报错后，一段时间内直接跳过它，不再每次启动都撞墙
@@ -300,9 +288,7 @@ class Sources {
     return `暂时跳过（${Math.ceil((until - Date.now()) / 60000)} 分钟内不再尝试）`;
   }
 
-  /** 最新 release。fork 版只认 GitHub 本仓库（yuchen0x1/apkstart），不走 Gitee：
-   *  Gitee 镜像同步的是上游仓库，版本号只会更旧，回退过去反而会把
-   *  「已有新版本」误判成「已是最新」。 */
+  /** 最新 release，只认本仓库 GitHub（yuchen0x1/apkstart）。 */
   async fetchReleases() {
     const ids = ['github'];
 
@@ -315,7 +301,7 @@ class Sources {
         const rel = await getJson(`${s.api}/releases/latest`, 9000, auth);
         return { source: id, name: s.name, web: s.web, rel };
       } catch (e) {
-        // Gitee 没有正式 release、或 GitHub 被墙，都退回列表取第一条
+        // latest 接口暂时不可用时退回 release 列表。
         try {
           const list = await getJson(`${s.api}/releases?per_page=10`, 9000, ghApiHeaders(await getGithubToken(this.settings())));
           const first = (Array.isArray(list) ? list : []).find((r) => r && !r.draft && !r.prerelease);
@@ -323,9 +309,7 @@ class Sources {
         } catch (_) { /* 这个源彻底不可用 */ }
         const limited = /\b(403|429)\b/.test(e.message);
         if (limited) this._blocked.set(id, Date.now() + this._blockMs);
-        const hint = limited
-          ? '（被限流，已暂停使用该源一段时间）'
-          : (id === 'gitee' && !token ? '（可稍后重试，或在设置里填只读 token 提高额度）' : '');
+        const hint = limited ? '（被限流，已暂停使用该源一段时间）' : '';
         return { source: id, name: s.name, web: s.web, error: `${e.message}${hint}` };
       }
     });
@@ -333,8 +317,7 @@ class Sources {
   }
 
   /**
-   * 合并两边的最新版本：版本号更高的胜出，但**资产列表取并集**，
-   * 这样即使 Gitee 只放了元数据、资产在 GitHub，也能两条路都试。
+   * 处理 GitHub 的最新版本和资产列表。
    */
   async latest({ force = false } = {}) {
     const pref = String((this.settings().runtime || {}).sourcePreference || 'auto');
@@ -372,9 +355,7 @@ class Sources {
       for (const a of (item.rel.assets || [])) {
         const key = String(a.name || '');
         if (!key) continue;
-        // Gitee 会把「源码包」自动挂成资产（v0.3.2.zip / v0.3.2.tar.gz），
-        // 这些不是安装包，`\.zip$` 的匹配规则会把它当成更新包下载下来 —— 必须排除。
-        // 我们自己的发布资产统一以 ApkStart 开头，按这个前缀白名单更安全。
+        // 发布资产统一以 ApkStart 开头，按这个前缀白名单更安全。
         if (!/^ApkStart/i.test(key)) continue;
         raw.push({
           name: key,
@@ -389,11 +370,7 @@ class Sources {
     const wholeNames = new Set(grouped.list.filter((a) => !a.partial).map((a) => a.name));
     raw = grouped.list.filter((a) => !(a.partial && wholeNames.has(a.name)));
 
-    // 同名资产两个源都有（整包不再切分片以后就是这种常态）：把地址都留着当候选。
-    // 以前是「按名字去重、谁先来用谁」—— GitHub 排在前面，Gitee 的地址就被丢掉了，
-    // 「自动选网络更好的源」实际退化成只走 GitHub。现在按实测速度挑（见 rank()）。
-    // 每个地址的大小单独记：两个源的包不是同一份字节（压缩器/构建机不同，能差几 MB），
-    // downloadMulti 只会混用「声明总大小一致」的地址，所以绝不能把两者的大小平均掉。
+    // 同名资产的多个地址都保留，交给 rank() 选择最快的直连或镜像地址。
     const assets = [];
     const byName = new Map();
     for (const a of raw) {
@@ -428,8 +405,7 @@ class Sources {
 
   /**
    * 某个资产在所有源 + 镜像下的候选地址（去重、保序：源站优先，其次镜像）。
-   * 镜像只套在 GitHub 的地址上：ghfast / gh-proxy 只代理 GitHub，
-   * 把 Gitee 的链接拼上去只会得到一个 403，白白多测一次速。
+   * 镜像只套在 GitHub 的地址上：ghfast / gh-proxy 只代理 GitHub。
    */
   candidates(assetOrUrl) {
     // 支持三种入参：单个地址、资产对象（url）、合并后的资产对象（urls 数组，含两个源）

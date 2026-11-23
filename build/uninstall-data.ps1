@@ -5,6 +5,7 @@
   [string]$SharedDir = '',
   [string]$TempDir = '',
   [string]$InstallDir = '',
+  [string]$PreservedRuntimeDir = '',
   [string]$DesktopDir = '',
   [string]$StartMenuDir = '',
   [int]$WaitPid = 0,
@@ -177,6 +178,12 @@ Remove-KnownChildren $DataDir @('apps.json', 'settings.json', 'icons', 'apks', '
 
 if ($RemoveInstallDir -and $InstallDir) {
   Remove-KnownChildren $InstallDir @('ApkStart.exe', 'resources', 'locales', 'swiftshader', 'chrome_100_percent.pak', 'chrome_200_percent.pak', 'resources.pak', 'icudtl.dat', 'snapshot_blob.bin', 'v8_context_snapshot.bin', 'libEGL.dll', 'libGLESv2.dll', 'ffmpeg.dll', 'd3dcompiler_47.dll', 'vulkan-1.dll', 'vk_swiftshader.dll', 'vk_swiftshader_icd.json', 'chrome_crashpad_handler.exe', 'LICENSE', 'LICENSES.chromium.html')
+}
+
+# 覆盖安装会暂存旧版内置运行时到安装目录旁，供新版本首次启动接管。
+# 只有用户确认卸载时才删除它；--updated 分支不会调用本脚本，因此不会破坏升级接管。
+if ($PreservedRuntimeDir) {
+  Remove-OwnedTree $PreservedRuntimeDir
 }
 
 # 便携版把脚本复制到 TEMP，安装目录删除后这里也要自删；源码和 NSIS 资源脚本保留。

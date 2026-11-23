@@ -55,7 +55,7 @@ class Updater {
     this.dataDir = o.dataDir;
     this.onProgress = o.onProgress || (() => {});
     this.settings = typeof o.settings === 'function' ? o.settings : () => (o.settings || {});
-    // settings() 给 sources 用：决定「走 GitHub 还是 Gitee」「有没有镜像前缀」
+    // settings() 给 sources 用：决定 GitHub 源偏好和镜像前缀
     this.sources = new Sources(this.settings);
     this.latest = null;
     this._last = null;
@@ -108,7 +108,7 @@ class Updater {
   }
 
   /**
-   * 检查更新：GitHub / Gitee 并发问，取版本号更高的，资产取并集。
+   * 检查更新：从 GitHub 读取版本和资产；下载阶段再对直连/镜像测速。
    * 具体下载地址在 prepare() 里再做一次真实测速排序。
    */
   /**
@@ -131,15 +131,15 @@ class Updater {
       stale: !!merged.stale,
       htmlUrl: merged.htmlUrl,
       publishedAt: merged.publishedAt,
-      // 注意带上 parts：Gitee 的分片包没有单一 url，丢掉 parts 就变成「有资产但没地址」
+      // 保留 parts 结构，兼容历史分片更新载荷，避免丢失下载地址。
       asset: asset
         ? {
           name: asset.name,
           digest: asset.digest,
           size: asset.size,
           url: asset.url,
-          // 同名资产在 GitHub / Gitee 都有：两个地址都带着，prepare() 里测速择快。
-          // sizes 是「每个地址各自的大小」——两个源压出来的字节数并不相同。
+            // 同名资产可能包含多个直连/镜像地址，prepare() 里测速择快。
+            // sizes 是「每个地址各自的大小」。
           urls: asset.urls,
           sizes: asset.sizes,
           source: asset.source,
@@ -195,8 +195,7 @@ class Updater {
       } catch (_) { /* 读不到就重新下 */ }
     }
 
-    // Gitee 附件单文件上限 100MB，所以发布时会把包切成 .part1/.part2。
-    // 每个分片单独测速选源（可以一部分来自 Gitee、一部分来自 GitHub 镜像），
+    // 历史版本可能仍带 .part1/.part2 分片载荷；每个分片单独测速，
     // 下完按顺序拼回整包 —— 对用户来说仍然只是「下载 + 解压」。
     if (reused) {
       // 跳过下载，直接进入下面的完整性校验 / 解压
@@ -209,8 +208,7 @@ class Updater {
       // 按域名猜没用，同一天不同时段差别很大。
       const cands = this.sources.candidates(it.asset);
       const ranked = await this.sources.rank(cands, { onProgress: (p) => this.onProgress(p) }).catch(() => cands);
-      // 进度用的总大小要取「真正在下那个源」的：GitHub 与 Gitee 的包不是同一份字节
-      // （压缩器不同，能差好几 MB），拿错就会一直显示 92% 再突然跳到完成。
+      // 进度用的总大小取实际选中的地址，避免镜像返回不同长度时进度卡住。
       const sizes = it.asset.sizes || {};
       for (const u of ranked) {
         if (sizes[u]) { total = sizes[u]; break; }
@@ -245,7 +243,7 @@ class Updater {
       const st = fs.statSync(file);
       if (!st.size) throw new Error('下载到的更新包是空文件，请重试');
       if (it.asset.size && st.size !== it.asset.size) {
-        // GitHub 与 Gitee 压出来的字节数不同：只要等于其中任意一个已知大小即可
+        // 多地址载荷可能记录多个已知大小：只要命中其中一个即可。
         const known = new Set([it.asset.size, ...Object.values(it.asset.sizes || {}).map(Number)]);
         if (!known.has(st.size)) {
           throw new Error(`更新包大小异常（${st.size} 字节，期望 ${it.asset.size}），可能下载不完整，请重试`);
@@ -309,7 +307,7 @@ class Updater {
     const known = new Set(
       [asset.size, ...Object.values(asset.sizes || {}).map(Number)].filter((n) => Number(n) > 0),
     );
-    // GitHub 与 Gitee 压出来的字节数不同：等于其中任意一个已知大小即可
+    // 多地址载荷可能记录多个已知大小：只要命中其中一个即可。
     if (known.size && !known.has(st.size)) {
       throw new Error(`安装包大小异常（${st.size} 字节，期望 ${[...known].join(' 或 ')}），可能下载不完整，请重试`);
     }

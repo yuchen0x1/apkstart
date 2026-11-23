@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ui:
     uses: ./.github/workflows/ui.yml
@@ -16,10 +20,11 @@ jobs:
   test:
     name: 单元测试（Windows / Node ${{ matrix.node }}）
     runs-on: windows-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22]
+        node: [22, 24]
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -64,6 +69,7 @@ jobs:
   test-linux:
     name: 单元测试（Linux / Node 22）
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
