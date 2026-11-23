@@ -8,7 +8,7 @@
 | 命令 | 文件 | 覆盖内容 | 需要什么 |
 |------|------|----------|----------|
 | `npm test` | — | 依次运行 `package.json` 中声明的全部 Node 套件 | Node ≥ 20 |
-| `node --test test/store-integrity-test.js` | 持久化保护 | 类型边界、默认值隔离、损坏文件备份、权限与磁盘故障、原子保存 | 独立临时数据目录 |
+| `node --test test/store-integrity-test.js` | 持久化保护 | 类型边界、默认值隔离、设置读取缓存失效、损坏文件备份、权限与磁盘故障、原子保存 | 独立临时数据目录 |
 | `npm run test:packaged` | 构建包关键源码与持久化 | 校验便携版/安装版展开目录的 store、目录、主进程与界面源码哈希及版本，再用各自内置 Node 执行隔离保存 | Windows，先运行 `npm run pack` 和 `npm run build:exe` |
 | `node test/run-tests.js` | 解析与存储 | ZIP / AXML / ARSC / APK 解析、ICO、设置白名单、CHANGELOG 一致性 | 无 |
 | `node test/engine-test.js` | 引擎链路 | QEMU 参数、AVD 配置、启动就绪判定、快照指纹、日志滚动、镜像校验 | 无 |

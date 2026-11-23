@@ -18,6 +18,9 @@ const APK_DIR = path.join(DATA_DIR, 'apks');
 const APPS_FILE = path.join(DATA_DIR, 'apps.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
+let settingsCache = null;
+let settingsCacheSignature = null;
+
 const DEFAULT_SETTINGS = {
   adbPath: '',
   device: '127.0.0.1:5555',
@@ -256,6 +259,22 @@ function writeJson(file, data) {
   }
 }
 
+function settingsSignature() {
+  try {
+    const stat = fs.statSync(SETTINGS_FILE);
+    const mtime = stat.mtimeNs === undefined ? String(Math.trunc(stat.mtimeMs * 1e6)) : String(stat.mtimeNs);
+    const ctime = stat.ctimeNs === undefined ? String(Math.trunc(stat.ctimeMs * 1e6)) : String(stat.ctimeNs);
+    return `${stat.size}:${mtime}:${ctime}`;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return 'missing';
+    throw error;
+  }
+}
+
+function cloneSettings(value) {
+  return structuredClone(value);
+}
+
 function deepMerge(base, patch) {
   const out = {};
   for (const [k, v] of Object.entries(base)) {
@@ -315,6 +334,8 @@ const store = {
   isChild: instanceContext.isChild,
 
   getSettings() {
+    const signature = settingsSignature();
+    if (settingsCache && settingsCacheSignature === signature) return cloneSettings(settingsCache);
     const s = deepMerge(DEFAULT_SETTINGS, readJson(SETTINGS_FILE, {}));
     s.theme = normalizePreference(s.theme);
     // 旧版曾把「兼容模式」保存成 google_apis + compatImage=true，实际却应使用
@@ -349,7 +370,9 @@ const store = {
       s.createStartMenuShortcut = false;
       s.update.autoUpdate = false;
     }
-    return s;
+    settingsCache = cloneSettings(s);
+    settingsCacheSignature = settingsSignature();
+    return cloneSettings(settingsCache);
   },
 
   saveSettings(patch) {
@@ -382,7 +405,9 @@ const store = {
       Object.assign(next.engine, resourcePreset(next.engine.resourceMode));
     }
     writeJson(SETTINGS_FILE, next);
-    return next;
+    settingsCache = null;
+    settingsCacheSignature = null;
+    return this.getSettings();
   },
 
   getApps() {

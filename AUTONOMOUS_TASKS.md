@@ -33,4 +33,13 @@
 | P3 | Windows Authenticode | 证书与私钥的安全供给需单独配置，不创建自签名替代可信签名，不关闭更新清单签名 |
 | P4 | 测试文档与真实套件同步 | 更新陈旧的“8 套件”描述，保留历史报告的日期与边界 |
 
+## 2026-11-23 状态更新 · v0.10.5
+
+- [x] 复核当前 `main`、远程 Releases、上游 PR #17 与现有测试入口；工作树基线为 `v0.10.4`，未覆盖用户修改。
+- [x] 确认隔离 Electron UI 已由 `.github/workflows/ci.yml` 与 Release 工作流调用 `.github/workflows/ui.yml`；本机 `test:electron` 20/0、`test:ui` 419 屏/0 错误、`test:app` 自检通过。
+- [x] 处理 `store.getSettings()` 高频同步读盘：增加文件指纹缓存、防御性副本和外部变更失效，保存后继续执行旧配置迁移；新增持久化回归。
+- [x] 对比 Android Emulator、scrcpy、Android-x86、Bliss OS、Genymotion、Waydroid、Anbox 与多开产品，结果记录在 `docs/ECOSYSTEM-RESEARCH-0.10.5.md`，未复制第三方代码。
+- [x] 官方 npm registry 依赖审计返回 0 个已知漏洞；镜像 registry 不支持 audit API，未把 404 当作安全通过。
+- [ ] 真实 Android 客机/GPU、长时间视频流、安装升级、断电恢复、Authenticode 和签名发行资产仍需对应环境验收，不能由本机夹具替代。
+
 已有每小时自动化处于暂停状态。本轮不擅自恢复被暂停的任务；恢复后应先读取六份记录并刷新本地/远程基线，避免重复发布。
