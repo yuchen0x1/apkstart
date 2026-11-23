@@ -5,7 +5,7 @@
 ## v0.10.5 · 已正式发布并核验
 
 - [正式 Release](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.5)：GitHub API 显示 `published_at = 2026-11-23T02:04:43Z`，`isDraft = false`、`isPrerelease = false`。
-- 类型：PATCH；Tag 为带注释 Tag `f89d0fe7f431e9d5d3240fdedbda61417e62ad23`，目标提交 `11cbaf2b78fa25702b07fba2ff736eae334a8329`，与远程 `main` 和本地 `HEAD` 一致。
+- 类型：PATCH；Tag 为带注释 Tag `f89d0fe7f431e9d5d3240fdedbda61417e62ad23`，目标提交 `11cbaf2b78fa25702b07fba2ff736eae334a8329`，发布时与远程 `main` 一致；随后仅追加本证据文档提交 `01418448ae88bd0dcb01a2c22f2e581067d1c3c9`，Tag 未移动。
 - [Release 流水线 45097567562](https://github.com/yuchen0x1/apkstart/actions/runs/45097567562)：版本核验、Windows Node 20/22、Linux Node 22、双平台 Electron UI、Windows portable/NSIS、Linux AppImage/deb、清单签名、草稿核对和正式发布全部成功。
 - 本版落地设置读取缓存和生态研究记录；实现边界与测试证据见 [CHANGELOG](CHANGELOG.md) 和 [生态研究](docs/ECOSYSTEM-RESEARCH-0.10.5.md)。
 

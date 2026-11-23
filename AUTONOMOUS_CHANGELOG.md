@@ -4,7 +4,7 @@
 
 ### 交付证据
 
-- `main` 提交 `11cbaf2b78fa25702b07fba2ff736eae334a8329` 已标注 `v0.10.5`；Tag 目标与远程 `main` 一致。
+- `main` 提交 `11cbaf2b78fa25702b07fba2ff736eae334a8329` 已标注 `v0.10.5`，发布时与远程 `main` 一致；随后仅追加本证据文档提交 `01418448ae88bd0dcb01a2c22f2e581067d1c3c9`，Tag 未移动。
 - Release 流水线 `45097567562` 的版本核验、Windows Node 20/22、Linux Node 22、双平台 UI、Windows portable/NSIS、Linux AppImage/deb、签名清单和公开步骤全部成功。
 - Release 已于 `2026-11-23T02:04:43Z` 正式公开。7 项资产已独立下载，大小、SHA-256、Ed25519 签名清单、`SHA256SUMS` 与正文隐藏清单全部核对一致。
 
