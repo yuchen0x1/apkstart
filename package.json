@@ -68,7 +68,7 @@
     "test:iso-source": "node test/iso-source-probe.js"
   },
   "devDependencies": {
-    "electron": "^45.3.4",
+    "electron": "^45.4.1",
     "electron-builder": "^26.18.0"
   },
   "dependencies": {
