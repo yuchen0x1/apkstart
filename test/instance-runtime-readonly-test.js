@@ -131,6 +131,8 @@ function harness({ child = true, host = 'win32', marker = child, missingRoot = f
     child_process: { spawn: forbidden, spawnSync: forbidden, execFile: forbidden },
     './instance-context': { current: () => { if (contextError) throw new Error('context unavailable'); return context; } },
     './store': store, './doctor': { freeDiskMB: forbidden }, './platform': {},
+    // 纯函数宿主画像（无 fs / 无子进程），直接注入真实实现即可，不改变本用例的「只读」边界。
+    './host/profile': require('../src/core/host/profile'),
     './download': { download: forbidden, downloadAny: forbidden, downloadAnyParallel: forbidden, head: forbidden, openStream: forbidden },
     './runtime-integrity': { resolveAdbComponent: forbidden, resolveQemuComponent: forbidden, verifyComponent: forbidden },
     './zip': { ZipArchive: class { constructor() { forbidden(); } }, ZipFile: class { constructor() { forbidden(); } } },

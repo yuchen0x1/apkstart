@@ -19,8 +19,13 @@ const { ImageStore } = require('./images');
 
 const IS_WIN = process.platform === 'win32';
 const IS_LINUX = process.platform === 'linux';
-// emulator 的包名按宿主系统分叉；platform-tools 的宿主/版本/摘要由官方索引绑定。
-const HOST_TAG = IS_WIN ? 'windows' : IS_LINUX ? 'linux' : 'mac';
+// 宿主 → 官方产物名 / 默认镜像 ABI 的唯一出处（见 src/core/host/profile.js）。
+// 之前的写法是 `HOST_TAG = IS_WIN ? 'windows' : IS_LINUX ? 'linux' : 'mac'` 再拼 `_x64`，
+// 有两处真实缺陷：macOS 官方前缀是 `darwin` 不是 `mac`；`_x64` 写死导致 Apple Silicon
+// 永远解析不到 `emulator-darwin_aarch64-N.zip`。现在统一由 hostProfile 决定。
+const hostProfile = require('./host/profile');
+const HOST_EMULATOR_PREFIX = hostProfile.emulatorArchivePrefix();
+const HOST_SYSIMG_ABI = hostProfile.defaultSysimgAbi() || 'x86_64';
 
 // 提权包的版本和 SHA-256 必须由发布方独立核验并一同固定，不能取自镜像、设置或缓存。
 const AEHD_ARCHIVE_URL = 'https://dl.google.com/android/repository/aehd-windows_v2.2.zip';
@@ -44,7 +49,9 @@ const SOURCES = {
   // 实测记录见 docs/PLATFORM-LINUX-VALIDATION.md）
   emulatorFallback: IS_WIN
     ? 'https://dl.google.com/android/repository/emulator-windows_x64-16847572.zip'
-    : 'https://dl.google.com/android/repository/emulator-linux_x64-16847572.zip',
+    : IS_LINUX
+      ? 'https://dl.google.com/android/repository/emulator-linux_x64-16847572.zip'
+      : 'https://dl.google.com/android/repository/emulator-darwin_x64-16847572.zip',
   sysimgFallback: 'https://dl.google.com/android/repository/sys-img/google_apis/x86_64-34_r14.zip',
   // ARM 兼容镜像（Google Play 版，内置 native bridge）
   playImgIndex: 'https://dl.google.com/android/repository/sys-img/google_apis_playstore/sys-img2-3.xml',
@@ -383,7 +390,26 @@ class Provisioner {
   /** 当前内置系统镜像档位。自定义镜像仍由 ImageStore 独立管理。 */
   imageProfile(flavor = null) {
     const selected = normalizeImageFlavor(flavor || (store.getSettings().runtime || {}).systemImageFlavor);
-    return IMAGE_PROFILES[selected] || DEFAULT_SYSIMG;
+    const base = IMAGE_PROFILES[selected] || DEFAULT_SYSIMG;
+    // 按宿主架构覆盖 ABI：ARM64 宿主必须用 arm64-v8a 镜像（x86_64 镜像在 arm64
+    // 上跑不起来，是指令集问题而不是性能问题）；x64 宿主维持 x86_64（含 ARM 转译层）。
+    // Apple silicon 与 ARM64 Linux 都走这条，避免「下载了 x86_64 镜像再黑屏」。
+    // 只在档位未显式指定 ABI 时才覆盖，保证已有自定义/旧配置不被静默改写。
+    const hostAbi = HOST_SYSIMG_ABI;
+    if (!hostAbi || base.abi === hostAbi) return base;
+    // 兜底 URL 里的文件名也带 ABI（…/x86_64-34_r14.zip），必须一起换掉，
+    // 否则索引不可用时会去下一份架构不对的镜像。
+    const arm64 = hostAbi === 'arm64-v8a';
+    const fallback = base.fallback && arm64
+      ? base.fallback.replace(/\/x86_64-(\d+)/, '/arm64-v8a-$1')
+      : base.fallback;
+    return {
+      ...base,
+      abi: hostAbi,
+      // ARM 镜像本身就是 ARM，不存在「在 ARM 镜像里转译 ARM」这回事。
+      armTranslation: base.armTranslation && hostAbi === 'x86_64',
+      fallback,
+    };
   }
 
   imageProfiles() {
@@ -559,7 +585,17 @@ class Provisioner {
       };
       return this._hypervisor;
     }
-    if (!IS_WIN) { this._hypervisor = { whpx: false, note: '非 Windows 平台' }; return this._hypervisor; }
+    if (process.platform === 'darwin') {
+      // macOS：加速走 Hypervisor.framework（HVF），没有 /dev/kvm、也没有 WHPX/AEHD。
+      // 这里只给「机制」结论，可用性仍由 emulatorAccel() 的 -accel-check 裁定。
+      this._hypervisor = {
+        whpx: false,
+        hvf: true,
+        note: 'macOS 使用 Hypervisor.framework（HVF）硬件加速（可用性由运行时引擎检测）',
+      };
+      return this._hypervisor;
+    }
+    if (!IS_WIN) { this._hypervisor = { whpx: false, note: '当前平台没有已实现的硬件加速检测' }; return this._hypervisor; }
     // 只做毫秒级的文件检查。真正"WHPX 是否可用"由 emulator -accel-check 给出权威答案，
     // 避免在这里拉起 PowerShell（冷启动 1-2 秒）拖慢每次状态轮询。
     const dll = fs.existsSync('C:\\Windows\\System32\\WinHvPlatform.dll');
@@ -1041,10 +1077,17 @@ class Provisioner {
       const block = /<remotePackage path="emulator"[\s\S]*?<\/remotePackage>/.exec(xml);
       if (block) {
         const base = baseOf(SOURCES.sdkIndex);
-        // emulator 包按宿主分叉（emulator-windows_x64-N.zip / emulator-linux_x64-N.zip），
-        // 版本号两边一致；mac 上是 mac_x64 / darwin，本项目暂不支持 mac。
+        // emulator 包按「宿主_架构」分叉，官方真实前缀只有四种：
+        //   windows_x64 / linux_x64 / darwin_x64 / darwin_aarch64
+        // 用 hostProfile 给出的真实前缀匹配（不再写死 `_x64`，也不再拼错的 `mac`）。
+        // 该宿主没有官方 emulator 发行物（例如 linux/arm64）时前缀为空串：
+        // 此时**不**去下载别的架构的包，直接落到兜底地址，由调用方按
+        // hostFacts.emulatorAvailable=false 给出明确提示。
+        const prefixRe = HOST_EMULATOR_PREFIX
+          ? new RegExp(`${HOST_EMULATOR_PREFIX}-\\d+\\.zip$`, 'i')
+          : null;
         const entries = this._parseArchiveEntries(block[0], base)
-          .filter((x) => new RegExp(`${HOST_TAG}_x64.*\\.zip$`, 'i').test(x.url));
+          .filter((x) => (prefixRe ? prefixRe.test(x.url) : false));
         const win = entries.find((x) => x.sha1) || entries[0];
         if (win) {
           this._cache.emulatorUrl = win.url;
@@ -1079,8 +1122,11 @@ class Provisioner {
         const block = re.exec(xml);
         if (block) {
           const base = baseOf(idx);
+          // 按当前档位的真实 ABI 过滤（arm64 宿主用 arm64-v8a，x64 宿主用 x86_64）。
+          // 以前写死 x86_64，ARM64 宿主永远解析不到自己的镜像。
+          const abiRe = new RegExp(`${profile.abi.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*\\.zip$`, 'i');
           const entries = this._parseArchiveEntries(block[0], base)
-            .filter((x) => /x86_64.*\.zip$/i.test(x.url));
+            .filter((x) => abiRe.test(x.url));
           // 与 resolveEmulatorUrl 统一：取带校验值的最后一条（即最新版本）
           const hit = entries.filter((x) => x.sha1).pop() || entries[entries.length - 1];
           if (hit) {
@@ -1326,25 +1372,35 @@ class Provisioner {
       }
     }
 
-    // Linux：没有 WHPX/AEHD 那套驱动概念，加速就是 /dev/kvm（模拟器 -accel-check
-    // 输出与 Windows 同构，能复用同一段解析）。检测不出来时给出加组提示。
+    // 非 Windows：Linux 用 /dev/kvm，macOS 用 Hypervisor.framework（HVF）。
+    // 两者都能复用 emulator 的 `-accel-check`（输出与 Windows 同构），但**种类标签**与
+    // 修复提示不同：在 macOS 上把它标成 'kvm' 会给用户一条在 macOS 上根本不存在的
+    // 「加入 kvm 组」建议。这里按宿主区分 kind 与提示文案。
     if (!IS_WIN) {
       const r = await run(exe, ['-accel-check'], { timeout: 30000 });
       const text = `${r.stdout}${r.stderr}`;
       const usable = /accel:\s*\n?0\b/.test(text) && !/ERROR_ACCESS_DENIED|not installed/i.test(text);
-      const kvm = platform.acceleration();
+      const isMacHost = process.platform === 'darwin';
+      const backend = isMacHost ? 'hvf' : 'kvm';
+      const kvm = isMacHost ? null : platform.acceleration();
       let result;
       if (usable) {
-        result = { ok: true, kind: 'kvm', note: 'KVM 硬件加速已启用' };
+        result = {
+          ok: true,
+          kind: backend,
+          note: isMacHost ? 'Hypervisor.framework 硬件加速已启用' : 'KVM 硬件加速已启用',
+        };
       } else {
         result = {
           ok: false,
           kind: 'none',
           viaTcg: true,
-          kvmOk: !!kvm.ok,
-          note: kvm.ok
-            ? 'KVM 就绪但模拟器报告加速不可用（多为权限问题：确认当前用户在 kvm 组里）'
-            : (kvm.hint || '没有可用的硬件虚拟化（KVM 不可用），只能走软件模拟'),
+          kvmOk: kvm ? !!kvm.ok : undefined,
+          note: isMacHost
+            ? 'Hypervisor.framework 不可用：确认是受支持的 Mac 硬件，且没有把模拟器跑在嵌套虚拟化里'
+            : (kvm.ok
+              ? 'KVM 就绪但模拟器报告加速不可用（多为权限问题：确认当前用户在 kvm 组里）'
+              : (kvm.hint || '没有可用的硬件虚拟化（KVM 不可用），只能走软件模拟')),
         };
       }
       result.v = ACCEL_CACHE_VER;
@@ -1613,14 +1669,17 @@ class Provisioner {
   /** 解析 Google Play 版镜像地址（<url> 相对索引文件所在目录） */
   async resolvePlayUrl() {
     if (this._cache.playUrl) return this._cache.playUrl;
+    const profile = this.imageProfile('google_apis_playstore');
     try {
       const xml = await this._fetchText(SOURCES.playImgIndex);
-      const want = `system-images;android-${PLAY_SYSIMG.api};${PLAY_SYSIMG.tag};${PLAY_SYSIMG.abi}`;
+      // 用当前宿主的真实档位（含按架构覆盖后的 ABI），不再引用写死 x86_64 的 PLAY_SYSIMG。
+      const want = `system-images;android-${profile.api};${profile.tag};${profile.abi}`;
       const block = new RegExp(`<remotePackage path="${want}"[\\s\\S]*?</remotePackage>`).exec(xml);
       if (block) {
         const base = baseOf(SOURCES.playImgIndex);
+        const abiRe = new RegExp(`${profile.abi.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*\\.zip$`, 'i');
         const entries = this._parseArchiveEntries(block[0], base)
-          .filter((x) => /x86_64.*\.zip$/i.test(x.url));
+          .filter((x) => abiRe.test(x.url));
         const hit = entries.filter((x) => x.sha1).pop() || entries[entries.length - 1];
         if (hit) {
           this._cache.playUrl = hit.url;
@@ -1629,7 +1688,7 @@ class Provisioner {
         }
       }
     } catch (_) { /* 落兜底 */ }
-    this._cache.playUrl = SOURCES.playImgFallback;
+    this._cache.playUrl = profile.fallback || SOURCES.playImgFallback;
     this._cache.playSha1 = '';
     return this._cache.playUrl;
   }

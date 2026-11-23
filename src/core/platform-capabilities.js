@@ -88,6 +88,13 @@ const CAPABILITIES = Object.freeze({
       level: SUPPORT_LEVELS.absent,
       code: OBSTACLE_CODES.UNSUPPORTED_PLATFORM,
       source: '',
+      // 事实核对（2026-11-23 读取 Google 官方索引）：Google **确实**发布了 macOS 版
+      // emulator（darwin_x64 / darwin_aarch64，注意前缀是 darwin 不是 mac）与
+      // platform-tools（darwin），且索引里有架构匹配的 arm64-v8a / x86_64 系统镜像。
+      // 因此「官方运行时产物可获取」为真（见 src/core/host/profile.js 及其测试）。
+      // 但产物可得 ≠ 本项目的部署路径、dmg 打包、Developer ID 签名/公证、真机实测已完成；
+      // 平台整体门禁仍是 absent，acquirable 仅用于诊断与路线图，禁止当作「已支持」依据。
+      acquirable: true,
       blockers: Object.freeze([
         OBSTACLE_CODES.NO_MAC_PACKAGING,
         OBSTACLE_CODES.NO_NOTARIZATION,

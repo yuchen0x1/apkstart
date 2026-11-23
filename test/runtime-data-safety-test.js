@@ -122,6 +122,7 @@ function provision(dir, download) {
   const { Provisioner } = load('provision.js', {
     './store': { getSettings: () => settings, saveSettings: ({ runtime }) => Object.assign(settings.runtime, runtime) },
     './doctor': {}, './platform': {}, './download': { downloadAnyParallel: download },
+    './host/profile': require('../src/core/host/profile'),
     './zip': {}, './sources': {}, './images': {},
   });
   const settings = { runtime: {} };

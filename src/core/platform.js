@@ -143,6 +143,14 @@ function acceleration() {
 
 /** 诊断报告用：与具体平台相关、但排障时一定要看到的信息 */
 function describe() {
+  // 宿主事实（官方产物名 / 默认镜像 ABI / 加速后端种类）来自 host 适配层，
+  // 让诊断报告能一眼看出「这台机器需要哪份官方运行时、用哪个 ABI 的镜像」。
+  let host = null;
+  try {
+    // 惰性引入：host/index.js 依赖 platform-capabilities（本文件也依赖它），
+    // 但彼此没有循环；惰性只是为了不在最早期启动阶段多 require 一次。
+    host = require('./host').current().describe();
+  } catch (_) { host = null; }
   return {
     platform,
     release: os.release(),
@@ -155,6 +163,9 @@ function describe() {
     // 结构化障碍代码（upstream #112）：诊断报告与 UI 可以据此给出「为什么不行」，
     // 而不是一句含糊的「不支持」。unsupported 平台才有内容。
     blockers: capabilities.platformBlockers(platform),
+    // 官方产物可获得性（可获取 ≠ 已验证）：运行时要下载哪份 emulator / platform-tools、
+    // 用哪个 ABI 的系统镜像，都从这里读，避免再分散写死平台的字符串。
+    host,
   };
 }
 
