@@ -26,8 +26,9 @@ ApkStart 的版本变更记录。每个版本的完整发行说明见 GitHub Rel
 
 ### 验证边界
 
-- 本机真实执行：进程安全场景 9 通过 / 2 跳过、自动回归 121、引擎 39、更新器 79、归属 34、低配 16、GPU 信息 5、UI 审计 419 屏 0 错误 0 未标注 0 越界、IPC 安全 11，全部 0 失败。
-- 真实 Android 客机性能基线（FPS / 帧时间 / 播放期 CPU / GPU）因本机无已部署运行时与 AVD 未测量（NOT TESTED）；`tools/bench-runtime.js` 提供后续可复现测量入口。
+- 本机 Windows 真实进程安全场景 9 通过 / 2 跳过；本地 `npm test`、PR 的 Windows Node 22/24、Linux Node 22、双 UI 能力夹具、CodeQL 与依赖审查均通过。多用户会话和真实 GUI 窗口正向路径仍未测试。
+- 本机已有真实 Android AVD；本轮观察到的 `swangle` 客机实际报告 SwiftShader。一次约 232 秒启动后的 10 秒 CPU/RSS 采样包含开机后活动，不作为稳态空闲基线；未测视频播放、FPS、帧时间或播放期 GPU 占用（NOT TESTED）。`tools/bench-runtime.js` 提供等待稳态后的多轮采样入口。
+- 当前 419 屏 UI 报告未能在仓库中找到，不能作为本版验收证据；本版可验证的 UI 状态仅为 CI 中两个 Electron 能力夹具回归通过。真实 Windows DPI/多显示器与原生 Linux UI 未测试。
 - 多 Windows 用户会话场景（E）需要第二交互账户，本轮未测试。
 
 ## [0.10.9] — 2026-11-24
