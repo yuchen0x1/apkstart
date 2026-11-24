@@ -12,6 +12,9 @@
 - [x] `gh auth token` 回退增加 1 小时 TTL 缓存（含负结果）与 token 形状校验。
 - [x] 补充更新脚本、窗口控制、优先级、GitHub 认证四组回归；本地全量 `npm test` 通过。
 - [x] 同步 `0.10.9` 版本、CHANGELOG、README 生成段落与自主记录。
+- [x] PR #27 六项检查（Windows Node 22/24、Linux Node 22、UI win32/linux、review）全绿后 squash 合并为 `fc0d967`。
+- [x] `v0.10.9` Tag 触发 Release 流水线 `45356991448`，Windows NSIS/便携、Linux AppImage/deb、签名清单与草稿核对后正式公开。
+- [x] 下载全部 7 项资产，重算 SHA-256 与 `SHA256SUMS`、GitHub digest、Ed25519 清单逐一核对一致；未执行任何下载的安装程序。
 
 ## 本轮：Windows 更新恢复可靠性（v0.9.2 已交付）
 

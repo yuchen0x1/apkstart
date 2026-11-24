@@ -22,6 +22,12 @@
 - `test/auto-test.js` / `test/updater-test.js`：新增更新脚本不得出现 `Stop-Process -Id`、必须先取证再按凭据终止、窗口控制拒绝无 PID、优先级脚本无枚举兜底、空 / 非法 PID 列表 `CHANGED=0`、`gh` 负结果缓存与非法提示文本拒绝等回归。
 - 版本与文档：`package.json` / `package-lock.json`、`CHANGELOG.md`、`README.md` 同步到 `0.10.9`，`docs/UPSTREAM-ISSUES-AUDIT.md` 增加 2026-11-24 复核表。
 
+### 交付证据
+
+- PR [#27](https://github.com/yuchen0x1/apkstart/pull/27) 的 `review`、Windows Node 22 / 24、Linux Node 22、UI win32、UI linux 六项检查全部通过后 squash 合并，`main` 为 `fc0d967e4bde8cf73d9ba1d0c2325f177fb01236`。
+- `v0.10.9` Tag 指向该合并提交；Release 流水线 [`45356991448`](https://github.com/yuchen0x1/apkstart/actions/runs/45356991448) 的版本核验、双平台测试、双平台 UI、Windows 便携/NSIS、Linux AppImage/deb、签名清单与草稿核对后公开全部成功。
+- Release 于 `2026-11-24T08:38:40Z` 正式公开：[`v0.10.9`](https://github.com/yuchen0x1/apkstart/releases/tag/v0.10.9)。7 项资产已逐个下载，本地重算 SHA-256 与 `SHA256SUMS`、GitHub `digest`、Ed25519 签名清单三方一致。
+
 ### 验收边界
 
 - 本地全量 `npm test` 通过；`node --test` 批次 359 项（358 通过 / 1 按执行策略跳过 / 0 失败），自动回归 121 项、更新器 53 项、下载身份 29 项、拆分包备份 19 项、备份恢复 11 项。
