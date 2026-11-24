@@ -23,11 +23,21 @@ const stopAfter = args.includes('--stop');
 const attach = args.includes('--attach');
 const jsonIdx = args.indexOf('--json');
 const jsonOut = jsonIdx >= 0 ? args[jsonIdx + 1] : '';
+const gpuIdx = args.indexOf('--force-gpu');
+const forceGpu = gpuIdx >= 0 ? String(args[gpuIdx + 1] || '') : '';
+const noSnapshot = args.includes('--no-snapshot');
 const argValue = (name, fallback = 0) => {
   const i = args.indexOf(name);
-  return i >= 0 ? Number(args[i + 1]) || fallback : fallback;
+  if (i < 0) return fallback;
+  const value = Number(args[i + 1]);
+  return Number.isFinite(value) ? value : fallback;
 };
+const settleSeconds = Math.max(0, Math.min(300, argValue('--settle-seconds', 30)));
+const sampleSeconds = Math.max(1, Math.min(60, argValue('--sample-seconds', 10)));
+const sampleCount = Math.max(3, Math.min(20, argValue('--samples', 5)));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let emu = null;
+let startedByScript = false;
 
 function adb(serial, argv, timeout = 12000, adbPort = 0, attempts = 1) {
   const adbPath = store.getSettings().adbPath || 'adb';
@@ -54,8 +64,8 @@ async function probe({ port, adbPort }) {
   return 'ok';
 }
 
-function processSnapshot(pids) {
-  if (!pids.length) return { rssMB: 0, cpuSec: 0, rows: [] };
+function processSnapshot(pids, requiredPid) {
+  if (!pids.length) throw new Error('cannot sample an empty process tree');
   const quoted = pids.map((p) => `Get-Process -Id ${Number(p)} -ErrorAction SilentlyContinue`).join('; ');
   // ConvertTo-Json cannot serialize TimeSpan; project plain numbers here.
   const script = `@(${quoted}) | Select-Object Id,ProcessName,`
@@ -69,7 +79,12 @@ function processSnapshot(pids) {
     }).trim();
     const parsed = out ? JSON.parse(out.replace(/^\uFEFF/, '')) : [];
     rows = Array.isArray(parsed) ? parsed : [parsed];
-  } catch (_) { rows = []; }
+  } catch (error) {
+    throw new Error(`process sampling failed: ${error.message || error}`);
+  }
+  if (!rows.length || (requiredPid && !rows.some((row) => Number(row.Id) === Number(requiredPid)))) {
+    throw new Error('process sampling returned no data for the runtime root process');
+  }
   let rss = 0;
   let cpuSec = 0;
   for (const row of rows) {
@@ -80,7 +95,15 @@ function processSnapshot(pids) {
 }
 
 (async () => {
-  const emu = new EmulatorEngine(ROOT);
+  if (attach && stopAfter) throw new Error('--stop cannot be used with --attach; attached runtimes are not owned by this benchmark');
+  if (forceGpu) {
+    const supported = require('../src/core/doctor').gpuCandidates('37.4.2.0');
+    if (!supported.includes(forceGpu)) throw new Error(`unsupported GPU backend: ${forceGpu}`);
+    store.saveSettings({ engine: { gpuMode: forceGpu, badGpu: '', ...(noSnapshot ? { keepSnapshot: false } : {}) } });
+  } else if (noSnapshot) {
+    store.saveSettings({ engine: { keepSnapshot: false } });
+  }
+  emu = new EmulatorEngine(ROOT);
   const logs = [];
   const onLog = (line) => {
     logs.push(String(line));
@@ -98,18 +121,19 @@ function processSnapshot(pids) {
   } else {
     console.error('[bench] starting runtime...');
     const startedAt = Date.now();
+    startedByScript = true;
     result = await emu.start({ headless, probe, onLog, maxAttempts: 2 });
     bootMs = Date.now() - startedAt;
     adbPort = emu.adbPort;
     console.error(`[bench] start returned ok=${!!result && result.ok} after ${bootMs}ms`);
     if (!result || !result.ok) {
       console.error(JSON.stringify({ ok: false, bootMs, result, logs }, null, 2));
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
   }
   const serial = `emulator-${result.port}`;
-  // Let the freshly booted guest settle before idle sampling.
-  await sleep(15000);
+  await sleep(settleSeconds * 1000);
   const rootPid = attach ? await processOwner.pidOnPort(result.port) : (emu.proc && emu.proc.pid);
   if (!rootPid) throw new Error('cannot resolve running qemu PID for this port');
   const tree = await processOwner.getProcessTree(rootPid);
@@ -121,11 +145,27 @@ function processSnapshot(pids) {
     return m ? (m[1] || m[2] || '') : '';
   };
   const gpuInfo = await require('../src/core/gpu').probe().catch(() => null);
-  const first = processSnapshot(pids);
-  const sampleMs = 10000;
-  await sleep(sampleMs);
-  const second = processSnapshot(pids);
-  const cpuPctOneCore = Math.max(0, ((second.cpuSec - first.cpuSec) / (sampleMs / 1000)) * 100);
+  const samples = [];
+  let previous = processSnapshot(pids, rootPid);
+  for (let i = 0; i < sampleCount; i += 1) {
+    await sleep(sampleSeconds * 1000);
+    const current = processSnapshot(pids, rootPid);
+    const cpuPercentOfOneCore = Math.max(0,
+      ((current.cpuSec - previous.cpuSec) / sampleSeconds) * 100);
+    samples.push({
+      cpuPercentOfOneCore: Number(cpuPercentOfOneCore.toFixed(1)),
+      rssMB: current.rssMB,
+    });
+    previous = current;
+  }
+  const median = (values) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  };
+  const cpuPctOneCore = median(samples.map((sample) => sample.cpuPercentOfOneCore));
+  const rssMB = median(samples.map((sample) => sample.rssMB));
+  const finalSnapshot = processSnapshot(pids, rootPid);
   const report = {
     ok: true,
     at: new Date().toISOString(),
@@ -158,21 +198,29 @@ function processSnapshot(pids) {
     },
     processTree: tree.map((p) => ({ pid: p.pid, exe: p.exe })),
     idle: {
-      sampleSeconds: sampleMs / 1000,
+      settleSeconds,
+      sampleSeconds,
+      sampleCount,
+      cpuPercentOfOneCoreSamples: samples.map((sample) => sample.cpuPercentOfOneCore),
       cpuPercentOfOneCore: Number(cpuPctOneCore.toFixed(1)),
       cpuPercentOfMachine: Number((cpuPctOneCore / require('os').cpus().length).toFixed(1)),
-      rssMB: second.rssMB,
-      processes: second.rows.map((r) => ({ pid: r.Id, name: r.ProcessName, rssMB: Number(r.rssMB) || 0 })),
+      rssMB,
+      rssSamplesMB: samples.map((sample) => sample.rssMB),
+      processes: finalSnapshot.rows.map((r) => ({ pid: r.Id, name: r.ProcessName, rssMB: Number(r.rssMB) || 0 })),
     },
     logs: logs.slice(-80),
   };
   console.log(JSON.stringify(report, null, 2));
   if (jsonOut) fs.writeFileSync(jsonOut, JSON.stringify(report, null, 2));
-  if (stopAfter) {
-    adb(serial, ['emu', 'kill'], 8000, adbPort);
-  }
-  process.exit(0);
 })().catch((e) => {
   console.error(e && (e.stack || e.message));
-  process.exit(1);
+  process.exitCode = 1;
+}).finally(async () => {
+  if (stopAfter && emu && startedByScript) {
+    const stopped = await emu.stop().catch(() => false);
+    if (!stopped) {
+      console.error('[bench] failed to stop benchmark-owned runtime safely');
+      process.exitCode = 1;
+    }
+  }
 });
