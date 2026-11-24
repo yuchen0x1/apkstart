@@ -248,6 +248,8 @@ jobs:
             echo '该版本已有发行记录，请检查现有发行或草稿' >&2; exit 1
           fi
           gh release create "$TAG" --draft --verify-tag --title "ApkStart $TAG" --notes-file RELEASE_NOTES.md artifacts/*
+          mkdir -p uploaded-latest
+          gh release download "$TAG" --pattern latest.json --dir uploaded-latest
           gh release view "$TAG" --json assets > uploaded.json
-          node tools/sign-release.js --check-upload artifacts uploaded.json
+          node tools/sign-release.js --check-upload artifacts uploaded.json uploaded-latest/latest.json
           gh release edit "$TAG" --draft=false --latest

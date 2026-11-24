@@ -879,7 +879,7 @@ function buildTray() {
         click: async () => {
           showWindow();
           send('ui:navigate', 'settings');
-          const info = await updater.check().catch(() => null);
+          const info = await updater.check({ force: true }).catch(() => null);
           if (info) { updateInfo = info; send('update:state', info); }
           if (info && info.hasUpdate && info.asset) {
             const r = await dialog.showMessageBox(mainWindow || undefined, {
@@ -989,9 +989,10 @@ async function runInstall(filePath) {
 //  - prepare（下载+解压）随时可做，不打扰任何人；
 //  - apply（重启安装）只在「没有应用窗口在前台」时自动执行 —— 正在玩的应用
 //    不能被重启打断，等窗口关闭（onWindowClosed 钩子）再装；
-//  - 设置里可整体关掉（update.autoUpdate = false），退回「只通知、手动更新」。
+//  - 用户可以在设置中关闭自动下载与安装（update.autoUpdate = false）。
 let autoUpdateJob = null;
 let autoUpdateTag = '';
+let lastUpdateNoticeTag = '';
 
 /**
  * 更新已经交给升级脚本后退出。
@@ -1018,7 +1019,7 @@ function notifyUpdateFailure() {
   // 先看「升级脚本到底跑没跑起来」：
   //   stalled = 脚本连「等到 App 退出」都没写下来 —— 十有八九是启动方式被拦
   //            （App 退出把子进程一起带走了 / 安全软件拦了 PowerShell）。
-  //            这种情况重试同一个按钮仍然没用，必须引导用户手动装。
+  //            仍可在设置中的更新页重试，已下载载荷会保留。
   try {
     const p = typeof updater.pendingApply === 'function' ? updater.pendingApply() : { state: 'none' };
     if (p.state !== 'none' && p.version) updater.blockAutoApply(p.version);
@@ -1028,7 +1029,7 @@ function notifyUpdateFailure() {
         type: 'warn',
         sticky: true,
         message: `上次更新到 ${p.version} 没装成：安装程序根本没被拉起来。`
-          + '安装包已经下好了，到「设置 → 软件更新」点「手动安装」即可（不会重新下载）。',
+          + '已下载的安装包会保留，可在「设置 → 软件更新」重试。',
       });
       return;
     }
@@ -1051,7 +1052,7 @@ function notifyUpdateFailure() {
       type: 'warn',
       sticky: true,
       message: `上次更新到 ${v || '新版本'} 没有装成功。${detail}`
-        + '安装包已经下载好了，可在「设置 → 软件更新」重试或选择手动安装。',
+        + '安装包已经下载好了，可在「设置 → 软件更新」重试。',
     });
   } catch (_) { /* 标记损坏无关紧要 */ }
 }
@@ -1066,8 +1067,8 @@ function notifyUpdateFailure() {
 let applyingUpdate = false;
 function startApplyUpdate(job, label) {
   if (!job || applyingUpdate) return false;
-  // Linux 发行形态（AppImage/deb）没有自更新通道：升级脚本、explorer、
-  // powershell 都是 Windows 的东西，跑了只会坏。明确引导到发布页。
+  // Linux deb 交由系统软件安装器确认；AppImage 使用独立 shell 更新脚本。
+  // Windows 升级脚本不能用于其它 Linux 安装形态。
   if (process.platform !== 'win32' && job.mode !== 'appimage') {
     appLog('update apply blocked: platform linux has no auto-update channel');
     send('update:progress', { stage: 'error', percent: 0, message: 'Linux 版暂不支持应用内自动更新，请到项目发布页下载新版本' });
@@ -1085,7 +1086,7 @@ function startApplyUpdate(job, label) {
     applyingUpdate = false;
     appLog(`update apply launch failed: ${e.message}`);
     send('update:progress', { stage: 'error', percent: 0, message: e.message });
-    notify('自动安装启动失败', `${e.message}；可在「设置 → 软件更新」点「手动安装」`);
+    notify('自动安装启动失败', `${e.message}；可在「设置 → 软件更新」重试`);
     return false;
   }
   quitForUpdate();
@@ -1101,12 +1102,16 @@ function applyAutoUpdate() {
 }
 
 async function autoUpdateFlow(info) {
-  if (updateBusy || autoUpdateJob || updater.autoApplyBlocked(info.version || info.tag)) return;
+  const version = info.version || info.tag;
+  if (updateBusy || autoUpdateJob || updater.autoApplyBlocked(version)) return;
+  if (typeof updater.autoDownloadRetryAt === 'function'
+      && updater.autoDownloadRetryAt(version) > Date.now()) return;
   notify('发现新版本', `ApkStart ${info.tag}，正在自动下载（完成后自动重启安装）…`);
   send('update:state', info);
   updateBusy = true;
   try {
     const job = await updater.prepare(info);
+    updater.clearAutoDownloadFailure?.(version);
     autoUpdateJob = job;
     autoUpdateTag = info.tag || info.version;
     appLog(`auto update payload ready: ${job.mode} v${job.version}`);
@@ -1124,7 +1129,11 @@ async function autoUpdateFlow(info) {
     }
   } catch (e) {
     appLog(`auto update failed: ${e.message}`);
-    notify('自动更新下载失败', `${e.message}（可在「设置 → 软件更新」手动重试）`);
+    send('update:progress', { stage: 'error', percent: 0, message: e.message });
+    const failure = updater.recordAutoDownloadFailure?.(version);
+    if (!failure || failure.shouldNotify !== false) {
+      notify('自动更新暂时无法完成', '可以在「设置 → 软件更新」中重试');
+    }
   } finally {
     updateBusy = false;
   }
@@ -1136,10 +1145,25 @@ function handleUpdateFound(info) {
   send('update:state', info);
   if (!info.hasUpdate) return;
   appLog(`update available ${info.tag} (current v${app.getVersion()}, asset=${info.asset ? info.asset.name : 'none'})`);
-  if (info.canAutoApply && info.flavor !== 'deb' && store.getSettings().update.autoUpdate === true
-      && !updater.autoApplyBlocked(info.version || info.tag)) {
+  if (info.stale) {
+    appLog(`stale update result for ${info.tag}; background notification suppressed`);
+    return;
+  }
+  const autoEnabled = store.getSettings().update.autoUpdate === true;
+  const version = info.version || info.tag;
+  if (info.canAutoApply && info.flavor !== 'deb' && autoEnabled) {
+    if (updater.autoApplyBlocked(version)) {
+      appLog(`automatic update for ${info.tag} suppressed after a previous install attempt`);
+      return;
+    }
+    if (typeof updater.autoDownloadRetryAt === 'function'
+        && updater.autoDownloadRetryAt(version) > Date.now()) {
+      appLog(`automatic update for ${info.tag} deferred by download backoff`);
+      return;
+    }
     autoUpdateFlow(info).catch((e) => appLog(`auto update error: ${e.message}`));
-  } else {
+  } else if (lastUpdateNoticeTag !== info.tag) {
+    lastUpdateNoticeTag = info.tag;
     notify('发现新版本', 'ApkStart ' + info.tag + ' 已发布，可在设置中查看更新详情');
   }
 }
@@ -1158,8 +1182,8 @@ async function runUpdate() {
       autoUpdateJob = null;
       sendProgress({ stage: 'apply', percent: 100, message: '已下载完成，正在替换程序并重启…' });
       if (!startApplyUpdate(job, info.version || autoUpdateTag)) {
-        autoUpdateJob = job;   // 没启动成，载荷还留在本地，下次点「手动安装」直接用它
-        return { ok: false, code: 'apply-launch-failed', error: '自动安装没启动起来，请在「设置 → 软件更新」点「手动安装」' };
+        autoUpdateJob = job;   // 没启动成，载荷还留在本地，重试时直接复用
+        return { ok: false, code: 'apply-launch-failed', error: '自动安装没启动起来，请在「设置 → 软件更新」重试' };
       }
       return { ok: true, version: info.version || autoUpdateTag, mode: job.mode };
     }
@@ -1192,7 +1216,7 @@ async function runUpdate() {
     sendProgress({ stage: 'apply', percent: 100, message: '正在替换程序并重启…' });
     if (!startApplyUpdate(job, info.version)) {
       autoUpdateJob = job;
-      return { ok: false, code: 'apply-launch-failed', error: '自动安装没启动起来，请在「设置 → 软件更新」点「手动安装」' };
+      return { ok: false, code: 'apply-launch-failed', error: '自动安装没启动起来，请在「设置 → 软件更新」重试' };
     }
     return { ok: true, version: info.version, mode: job.mode };
   } catch (e) {
@@ -1778,7 +1802,7 @@ function installIpcGuards() {
           'system:status', 'system:tasks', 'system:diskUsage', 'assoc:status']);
         const sharedMutation = /^(provision:|system:|image:|assoc:|instances:)/.test(channel) && !readShared.has(channel);
         const globalAction = ['app:shortcut', 'shortcut:rebuild', 'app:clearLocks', 'app:removeSelf', 'app:updateCheck',
-          'app:updateOpen', 'app:updateApply', 'app:updateRunPayload', 'runtime:autoDeploy',
+          'app:updateOpen', 'app:updateApply', 'runtime:autoDeploy',
           'runtime:repairRun', 'runtime:cleanup', 'runtime:installVcRedist', 'runtime:setImageFlavor',
           'runtime:startInstaller', 'runtime:markInstalled', 'runtime:resetInstall'].includes(channel);
         if (sharedMutation || globalAction) {
@@ -2107,15 +2131,11 @@ function registerIpc() {
     )) {
       refreshPointerMapping();
     }
-    // 换了更新源 / 镜像前缀 / 整包地址：之前那套「谁最快」的结论不再成立，清掉测速缓存；
-    // 运行时整包 / 引擎 / 镜像的地址还缓存在 provisioner._cache 里，不清掉就要重启进程才生效。
+    // 运行时整包或组件地址变更时，清掉 provisioner 的解析缓存。
     if (patch && patch.runtime && (
-      'sourcePreference' in patch.runtime || 'mirrorPrefix' in patch.runtime
-      || 'autoMirror' in patch.runtime || 'runtimePackUrl' in patch.runtime
-      || 'emulatorUrl' in patch.runtime || 'sysimgUrl' in patch.runtime
+      'runtimePackUrl' in patch.runtime || 'emulatorUrl' in patch.runtime || 'sysimgUrl' in patch.runtime
     )) {
       try {
-        updater?.sources?.reset();
         runtime?.provisioner?.sources?.reset();
         runtime?.provisioner?.invalidateEnvCache?.();
       } catch (_) { /* ignore */ }
@@ -3938,12 +3958,6 @@ function registerIpc() {
     };
   });
 
-  /** 代理探测结果缓存重置（设置页改了 runtime.proxyUrl 后立即生效） */
-  ipcMain.handle('proxy:reset', () => {
-    require('./core/proxy').resetCache();
-    return { ok: true };
-  });
-
   /** 引导向导的开关：打开期间 autoDeploy 直接让路（见 autoDeploy 顶部的 wizardOpen 分支） */
   ipcMain.handle('wizard:open', () => {
     wizardOpen = true;
@@ -4038,8 +4052,7 @@ function registerIpc() {
 
   ipcMain.handle('app:updateCheck', async (_e, opts = {}) => {
     try {
-      // 用户主动点「检查更新」→ 跳过缓存，必定重新问一次两个源
-      const info = await updater.check({ force: opts.force !== false });
+      const info = await updater.check({ force: !!(opts && opts.force) });
       updateInfo = info;
       // 后台已经把包下好了（autoUpdateJob 就绪）：把状态一起带上，
       // 否则重查一次后按钮会从「重启并安装」退回「立即更新」，看着像白下了。
@@ -4062,37 +4075,6 @@ function registerIpc() {
   });
 
   ipcMain.handle('app:updateApply', () => runUpdate());
-
-  /**
-   * 手动安装：自动安装没拉起来时的兜底出口。
-   *
-   * 只做一件事 —— 把已经下好的安装包交给系统（弹出安装向导/UAC），用户点两下就装完。
-   * 不做静默安装、不碰文件锁，因此不受「子进程被 App 退出带走」这类问题影响。
-   */
-  ipcMain.handle('app:updateRunPayload', async () => {
-    try {
-      if (process.platform !== 'win32' || updater.flavor !== 'setup') {
-        return { ok: false, error: '手动安装仅适用于 Windows 安装版，请打开发布页' };
-      }
-      if (updateBusy) return { ok: false, error: '正在更新中' };
-      updateBusy = true;
-      let payload, err;
-      try {
-        const info = await updater.check({ force: true });
-        if (!info.hasUpdate || !info.canAutoApply) throw new Error('缺少可验证的新版本');
-        const job = await updater.prepare(info);
-        payload = job.payload;
-        err = await shell.openPath(payload);
-      } finally { updateBusy = false; }
-      if (err) return { ok: false, error: err };
-      // 用户手里已经有安装向导了，别再反复弹「上次没装成」
-      updater.clearPending();
-      appLog(`update manual install: ${path.basename(payload)}`);
-      return { ok: true, payload };
-    } catch (e) {
-      return { ok: false, error: e.message };
-    }
-  });
 
   ipcMain.handle('app:updateCancel', () => ({ ok: !updateBusy }));
 
@@ -4183,7 +4165,7 @@ if (!gotLock) {
       exePath: process.execPath,
       isPackaged: app.isPackaged,
       dataDir: store.DATA_DIR,
-      // 让更新器能读到 GitHub 源偏好和镜像前缀设置（fork 不再发布 Gitee 资产）
+      // Legacy network settings remain readable but are not used by update checks/downloads.
       settings: () => store.getSettings(),
       onProgress: (p) => send('update:progress', p),
     });
@@ -4404,12 +4386,13 @@ if (!gotLock) {
       // 先看上次更新有没有装成功：失败标记要尽快告诉用户，别等 8 秒后的检查
       notifyUpdateFailure();
       setTimeout(() => {
-        updater.check().then((info) => handleUpdateFound(info))
+        if (store.getSettings().update.autoCheck === false) return;
+        updater.check({ force: false }).then((info) => handleUpdateFound(info))
           .catch((e) => appLog(`update check failed: ${e.message}`));
       }, 8000).unref?.();
       setInterval(() => {
-        if (updateBusy || autoUpdateJob) return;   // 上一轮还没处理完就不叠上来
-        updater.check().then((info) => handleUpdateFound(info))
+        if (store.getSettings().update.autoCheck === false || updateBusy || autoUpdateJob) return;
+        updater.check({ force: false }).then((info) => handleUpdateFound(info))
           .catch(() => { /* 后台定时检查失败不打扰 */ });
       }, 6 * 3600 * 1000).unref?.();
     }

@@ -14,6 +14,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { BaseProvider, PROVIDER_IDS } = require('./base-provider');
 const { QemuBackend } = require('./qemu-backend');
 
@@ -76,8 +77,7 @@ class QemuIsoProvider extends BaseProvider {
     if (!info || !info.url) throw new Error('无合法下载地址');
     const { downloadMulti } = require('../download');
     const dest = this.isoPath();
-    const settings = this.settings;
-    const connections = Math.max(1, Number(settings.runtime.downloadConnections) || 8);
+    const connections = Math.max(2, Math.min(8, Number(os.cpus().length) || 4));
     const urls = [info.url].concat(info.mirrors || []).filter(Boolean);
 
     this.log(`开始下载 ${info.version}：${info.fileSize} 字节，SHA-256=${info.sha256 || '(下载后计算)'}`);

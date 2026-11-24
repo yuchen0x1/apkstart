@@ -1281,12 +1281,8 @@ function fillSettings(s) {
     (v) => `${Math.round((Number(v) / 1024) * 10) / 10} GB（自定义）`);
   fillChoice($('setCores'), Number(s.engine.cores) || 0, (v) => `${v} 核（自定义）`);
   $('setIdle').value = s.engine.idleShutdownMinutes;
-  if ($('setSourcePref')) $('setSourcePref').value = (s.runtime && s.runtime.sourcePreference) || 'auto';
-  if ($('setAutoMirror')) $('setAutoMirror').checked = (s.runtime && s.runtime.autoMirror) !== false;
-  if ($('setGithubToken')) $('setGithubToken').value = (s.runtime && s.runtime.githubToken) || '';
-  if ($('setMirrorPrefix')) $('setMirrorPrefix').value = (s.runtime && s.runtime.mirrorPrefix) || '';
-  if ($('setProxyUrl')) $('setProxyUrl').value = (s.runtime && s.runtime.proxyUrl) || '';
-  if ($('setConnections')) $('setConnections').value = Number((s.runtime && s.runtime.downloadConnections) || 8);
+  if ($('setAutoCheck')) $('setAutoCheck').checked = !(s.update && s.update.autoCheck === false);
+  if ($('setAutoUpdate')) $('setAutoUpdate').checked = !(s.update && s.update.autoUpdate === false);
   $('setAudio').checked = s.engine.audio !== false;
   if ($('setMicrophone')) $('setMicrophone').checked = s.engine.microphone !== false;
   $('setLiteMode').checked = s.engine.liteMode !== false;
@@ -1841,31 +1837,9 @@ function closeSettings() {
 
 let lastUpdate = null;
 
-/**
- * 主按钮该是什么状态。三种情况必须分开，否则用户点下去不知道会发生什么：
- *   ready  → 安装包已经在本地，「重启并安装」
- *   auto   → 有可下载的安装包，「立即更新」会下载 + 自动重启安装
- *   retry  → 只看到发布页、安装包还没传上来（CI 构建 10~20 分钟），
- *            点一下会强制重查，传完了就直接下载安装
- */
 function updateAction(info) {
-  if (info && info.downloaded) return { text: '重启并安装', mode: 'ready' };
-  if (info && info.asset) return { text: '立即更新', mode: 'auto' };
-  return { text: '重新检查并下载', mode: 'retry' };
-}
-
-/** 「已下载，可立即重启安装」那一行 */
-function renderUpdateReady(info) {
-  const row = $('updateReady');
-  const txt = $('updateReadyText');
-  if (!row || !txt) return;
-  const on = !!(info && info.downloaded);
-  row.hidden = !on;
-  row.style.display = on ? '' : 'none';
-  if (on) {
-    txt.textContent = `v${String(info.downloadedVersion || info.version || '').replace(/^v/i, '')} 已下载完成`
-      + '，随时可以重启安装（正在用的安卓应用会被一起关掉）';
-  }
+  if (info && info.downloaded) return '安装更新';
+  return '下载并安装';
 }
 
 /** 把一次检查结果画到设置面板（也用于启动时静默检查推送过来的状态） */
@@ -1878,56 +1852,41 @@ function renderUpdate(info) {
   if (!cur || !st || !btn) return;
   if (!info) return;
   if (info.current) cur.textContent = `v${info.current}`;
-  // 每次重画都先清掉「已下载」提示，避免上次的残留一直挂着
-  renderUpdateReady(info.hasUpdate && info.downloaded ? info : null);
-  const pendingRow = $('updatePending');
-  if (pendingRow) { pendingRow.hidden = true; pendingRow.style.display = 'none'; }
+  const retry = $('btnUpdateRetry');
+  const note = $('updateNote');
 
   if (info.ok === false) {
-    st.textContent = `检查失败：${info.error || '网络不可用'}`;
+    st.textContent = '暂时无法检查更新，请检查网络后重试。';
     showUpdateBtn(false);
-    showPageBtn(false);
+    if (retry) retry.hidden = false;
+    if (note) {
+      note.innerHTML = '';
+      note.classList.remove('notes');
+    }
     if (bar) bar.hidden = true;
     return;
   }
   if (info.hasUpdate) {
-    // 如实说明这次是哪个源给出的版本、另一个源为什么没参与 ——
-    // 用户排查「为什么检查更新很慢」时，这一行比任何日志都直接。
-    const src = (info.sources || []).map((x) => `${x.name} ${x.tag || ''}`.trim()).join(' / ');
-    const bad = (info.unreachable || []).map((x) => x.name).join('、');
-    const stale = info.stale ? '（离线缓存，可能不是最新）' : '';
-    st.textContent = `发现新版本 ${info.tag}${src ? `（${src}）` : ''}${bad ? `；${bad} 不可达` : ''}${stale}`;
-    showUpdateBtn(true);
-    const a = updateAction(info);
-    btn.textContent = a.text;
-    btn.dataset.mode = a.mode;
-    // 已下载时下面那行自带「重启并安装」，主按钮就不再重复出现同一个动作
-    showUpdateBtn(info.canAutoApply && !info.downloaded);
-    if (!info.canAutoApply) st.textContent += ' · 请通过发布页下载';
-    // 发布页兜底入口：不管能不能自动更新，用户都得有一条自己拿包的路
-    showPageBtn(true);
-    // 只看得到发布页 = 安装包还在上传：把「为什么点不到自动更新」直接写在面板上
-    if (pendingRow && !info.asset && !info.proof) { pendingRow.hidden = false; pendingRow.style.display = ''; }
-    // 更新日志 = 该版本的发布说明（GitHub Release body），完整展示（可滚动）。
-    // 按轻量 markdown 渲染成 HTML，面板里不再露出 #、**、表格竖线这些记号。
-    const note = $('updateNote');
+    st.textContent = info.canAutoApply === false
+      ? `发现新版本 ${info.tag}，安装包暂不可用。`
+      : `发现新版本 ${info.tag}。`;
+    showUpdateBtn(info.canAutoApply !== false);
+    btn.textContent = updateAction(info);
+    if (retry) retry.hidden = info.canAutoApply !== false;
+    const body = String(info.notes || '').trim();
     if (note) {
-      const body = String(info.notes || '').trim();
-      if (body) {
-        note.innerHTML = `<div class="n-title">更新日志（${esc(info.tag)}）</div>${mdToHtml(body)}`;
-        note.classList.add('notes');
-      } else {
-        note.classList.remove('notes');
-        note.innerHTML = '';
-      }
+      note.innerHTML = body ? `<div class="n-title">更新日志（${esc(info.tag)}）</div>${mdToHtml(body)}` : '';
+      note.classList.toggle('notes', !!body);
     }
     if (bar) bar.hidden = true;
   } else {
-    const src = (info.sources || []).map((x) => x.name).join(' / ');
-    const stale = info.stale ? '（离线缓存）' : '';
-    st.textContent = `已是最新版本（v${info.current}）${src ? ` · 经由 ${src}` : ''}${stale}`;
+    st.textContent = `已是最新版本（v${info.current}）。`;
     showUpdateBtn(false);
-    showPageBtn(false);
+    if (retry) retry.hidden = true;
+    if (note) {
+      note.innerHTML = '';
+      note.classList.remove('notes');
+    }
     if (bar) bar.hidden = true;
   }
 }
@@ -1940,25 +1899,26 @@ function showUpdateBtn(on) {
   btn.style.display = on ? '' : 'none';
 }
 
-function showPageBtn(on) {
-  const btn = $('btnUpdatePage');
-  if (!btn) return;
-  btn.hidden = !on;
-  btn.style.display = on ? '' : 'none';
-}
-
 function renderUpdateProgress(p) {
   if (!p) return;
   const st = $('updateState');
   const bar = $('updateBar');
   const fill = $('updateBarFill');
   if (p.stage === 'error') {
-    if (st) st.textContent = `更新失败：${p.message || ''}`;
+    if (st) st.textContent = '更新未能完成，请重试。';
     if (bar) bar.hidden = true;
-    toast({ title: '更新失败', body: p.message || '', type: 'error' });
+    showUpdateBtn(false);
+    const retry = $('btnUpdateRetry');
+    if (retry) retry.hidden = false;
     return;
   }
-  if (st) st.textContent = p.message || '正在更新…';
+  if (st) {
+    if (p.stage === 'ready') st.textContent = '更新已下载，正在准备安装…';
+    else if (p.stage === 'check') st.textContent = '正在检查更新…';
+    else if (p.stage === 'download') st.textContent = '正在下载更新…';
+    else if (p.stage === 'apply') st.textContent = '正在安装更新…';
+    else st.textContent = '正在更新…';
+  }
   if (bar && fill) {
     bar.hidden = false;
     const percent = Math.max(0, Math.min(100, Number(p.percent) || 0));
@@ -1966,112 +1926,92 @@ function renderUpdateProgress(p) {
     if (p.percent == null) bar.removeAttribute('aria-valuenow');
     else bar.setAttribute('aria-valuenow', String(percent));
   }
-  // 下载校验完 → 载荷在本地等着装：主按钮让位给下面那行「重启并安装」，
-  // 不然用户会以为还得再点一次「立即更新」重新下载一遍
   if (p.stage === 'ready') {
-    showUpdateBtn(false);
-    if (lastUpdate) {
-      lastUpdate = { ...lastUpdate, downloaded: true, downloadedVersion: lastUpdate.version };
-      renderUpdateReady(lastUpdate);
+    if (lastUpdate) lastUpdate = { ...lastUpdate, downloaded: true, downloadedVersion: lastUpdate.version };
+    showUpdateBtn(true);
+    const btn = $('btnDoUpdate');
+    if (btn) {
+      btn.textContent = '安装更新';
+      btn.disabled = false;
     }
+  } else if (p.stage === 'download' || p.stage === 'apply' || p.stage === 'check') {
+    const retry = $('btnUpdateRetry');
+    if (retry) retry.hidden = true;
+    const btn = $('btnDoUpdate');
+    if (btn) btn.disabled = true;
   }
 }
 
 function bindUpdate() {
   const check = $('btnCheckUpdate');
   const go = $('btnDoUpdate');
-  if (!check || !go) return;
+  if (!check || !go) return null;
 
-  const runCheck = async (silent) => {
+  const runCheck = async (silent, force = false) => {
     if (!silent) {
       check.disabled = true;
       const old = check.textContent;
       check.textContent = '检查中…';
-      $('updateState').textContent = '正在连接 GitHub…';
+      $('updateState').textContent = '正在检查更新…';
       try {
-        const info = await api.updateCheck();
+        const info = await api.updateCheck({ force });
         renderUpdate(info);
-        if (info && info.hasUpdate) toast({ title: `发现新版本 ${info.tag}`, body: info.canAutoApply ? '可在软件更新中下载已验证的安装包' : '请打开发布页查看详情', type: 'info' });
+        if (info && info.hasUpdate) toast({ title: `发现新版本 ${info.tag}`, body: '可在软件更新中下载并安装', type: 'info' });
         else if (info && info.ok !== false) toast({ title: '已是最新版本', body: `v${info.current}`, type: 'ok' });
       } catch (e) {
-        $('updateState').textContent = `检查失败：${e.message}`;
+        $('updateState').textContent = '暂时无法检查更新，请稍后重试。';
+        lastUpdate = null;
+        showUpdateBtn(false);
+        const retry = $('btnUpdateRetry');
+        if (retry) retry.hidden = false;
       } finally {
         check.disabled = false;
         check.textContent = old;
       }
       return;
     }
-    const info = await api.updateCheck().catch(() => null);
+    const info = await api.updateCheck({ force }).catch(() => null);
     if (info) renderUpdate(info);
   };
 
-  check.addEventListener('click', () => runCheck(false));
+  check.addEventListener('click', () => runCheck(false, true));
 
   const applyNow = async () => {
     if (go.disabled) return;
     const label = go.textContent;
     go.disabled = true;
-    go.textContent = '更新中…';
+    go.textContent = '正在更新…';
     const r = await api.updateApply().catch((e) => ({ ok: false, error: e.message }));
     if (!r || !r.ok) {
       go.disabled = false;
-      // 失败后按「当前是否已有安装包」还原文案，而不是永远回到「立即更新」
-      const a = updateAction(lastUpdate);
-      go.textContent = a.text;
-      go.dataset.mode = a.mode;
-      if (r && r.code === 'no-asset') {
-        // 用固定句式，别把长错误串直接糊到界面上（也更方便英文界面翻译）
-        const msg = '安装包还没上传完，稍后再试一次';
-        $('updateState').textContent = msg;
-        toast({ title: '安装包还没上传完', body: msg, type: 'warn' });
-      } else if (r && r.error && !r.manual) {
-        $('updateState').textContent = `更新失败：${r.error}`;
-        toast({ title: '更新失败', body: r.error, type: 'error' });
-      }
-      if (label === '重启并安装') go.textContent = '重启并安装';
+      go.textContent = updateAction(lastUpdate);
+      $('updateState').textContent = '更新未能完成，请重试。';
+      showUpdateBtn(false);
+      const retry = $('btnUpdateRetry');
+      if (retry) retry.hidden = false;
       return;
     }
-    if (r.mode === 'deb') { go.disabled = false; go.textContent = label; $('updateState').textContent = '请在系统安装器中确认升级'; return; }
-    $('updateState').textContent = `已下载 v${r.version}，正在重启完成安装…`;
+    if (r.mode === 'deb') {
+      go.disabled = false;
+      go.textContent = label;
+      $('updateState').textContent = '请在系统安装器中确认升级。';
+      return;
+    }
+    $('updateState').textContent = '更新已下载，正在重启完成安装…';
   };
 
   go.addEventListener('click', applyNow);
 
-  // 「已下载」那一行的重启按钮：和主按钮走同一条路径（不会重新下载）
-  const restart = $('btnUpdateRestart');
-  if (restart) restart.addEventListener('click', applyNow);
-
-  // 手动安装：自动安装拉不起来时的兜底出口。
-  // 直接运行已经下好的安装包（弹安装向导），不依赖后台脚本，点了就一定有反应。
-  const manual = $('btnUpdateManual');
-  if (manual) {
-    manual.addEventListener('click', async () => {
-      manual.disabled = true;
-      try {
-        const r = await api.updateRunPayload().catch((e) => ({ ok: false, error: e.message }));
-        if (r && r.ok) {
-          toast({
-            title: '已启动安装向导',
-            body: '按提示完成安装即可。安装前建议先退出正在使用的安卓应用。',
-            type: 'info',
-          });
-        } else {
-          toast({ title: '手动安装失败', body: (r && r.error) || '没找到已下载的安装包', type: 'error' });
-        }
-      } finally {
-        manual.disabled = false;
-      }
-    });
-  }
-
-  // 发布页：始终保留的手动出口（安装包还在上传、或想自己挑安装版/便携版时用）
-  const page = $('btnUpdatePage');
-  if (page) {
-    page.addEventListener('click', () => {
-      api.updateOpenRelease((lastUpdate && lastUpdate.htmlUrl)
-        || 'https://github.com/yuchen0x1/apkstart/releases');
-    });
-  }
+  const retry = $('btnUpdateRetry');
+  if (retry) retry.addEventListener('click', async () => {
+    retry.disabled = true;
+    try {
+      if (lastUpdate && lastUpdate.hasUpdate) await applyNow();
+      else await runCheck(false, true);
+    } finally {
+      retry.disabled = false;
+    }
+  });
 
   // 失败报告开关：默认开（只落本机），关掉后连摘要也不生成
   const ra = $('setReportAuto');
@@ -2099,13 +2039,13 @@ function bindUpdate() {
     au.addEventListener('change', async () => {
       const s = await api.setSettings({ update: { autoUpdate: au.checked } }).catch(() => null);
       if (s) state.settings = s;
-      toast({
-        title: au.checked ? '已开启自动更新' : '已关闭自动更新',
-        body: au.checked
-          ? '发现新版本会自动下载并重启安装；正在使用的应用不会被重启打断'
-          : '发现新版本时只通知，更新需在设置里手动进行',
-        type: 'ok',
-      });
+    });
+  }
+  const ac = $('setAutoCheck');
+  if (ac) {
+    ac.addEventListener('change', async () => {
+      const s = await api.setSettings({ update: { autoCheck: ac.checked } }).catch(() => null);
+      if (s) state.settings = s;
     });
   }
   // 更新日志按钮：有新版本看该版本发布页，否则看仓库的 CHANGELOG
@@ -2118,8 +2058,9 @@ function bindUpdate() {
     });
   }
 
-  // 打开设置时如果还没结果，就顺手查一次（放后台，不打扰）
-  runCheck(true).catch(() => {});
+  return {
+    checkSilently: () => runCheck(true, false),
+  };
 }
 
 let languageBusy = false;
@@ -2431,36 +2372,6 @@ function bindSettings() {
     $('btnGrowData').addEventListener('click', () => applyDataCapacity(Number($('setDataGB').value) || 0));
   }
   $('setIdle').addEventListener('change', (e) => save({ engine: { idleShutdownMinutes: Number(e.target.value) || 0 } }));
-  if ($('setProxyUrl')) {
-    $('setProxyUrl').addEventListener('change', (e) => {
-      const v = e.target.value.trim();
-      save({ runtime: { proxyUrl: v } });
-      // 主进程的代理探测结果有 10 分钟缓存：设置改完立即失效重测
-      api.proxyReset().catch(() => {});
-      toast({
-        title: '代理设置已更新',
-        body: v === 'off' ? '已强制直连（不使用任何代理）'
-          : (v ? `代理已设为 ${v}，立即生效` : '将自动检测系统代理 / 环境变量'),
-        type: 'ok',
-      });
-    });
-  }
-  if ($('setAutoMirror')) {
-    $('setAutoMirror').addEventListener('change', (e) => save({ runtime: { autoMirror: e.target.checked } }));
-  }
-  if ($('setGithubToken')) {
-    $('setGithubToken').addEventListener('change', (e) => save({ runtime: { githubToken: e.target.value.trim() } }));
-  }
-  if ($('setMirrorPrefix')) {
-    $('setMirrorPrefix').addEventListener('change', (e) => save({ runtime: { mirrorPrefix: e.target.value.trim() } }));
-  }
-  if ($('setConnections')) {
-    $('setConnections').addEventListener('change', (e) => {
-      const n = Math.max(1, Math.min(16, Number(e.target.value) || 8));
-      e.target.value = n;
-      save({ runtime: { downloadConnections: n } });
-    });
-  }
   $('setAudio').addEventListener('change', (e) => save({ engine: { audio: e.target.checked } }));
   if ($('setMicrophone')) {
     $('setMicrophone').addEventListener('change', (e) => save({ engine: { microphone: e.target.checked } }));
@@ -3685,12 +3596,17 @@ async function init() {
   bindEvents();
   bindSettings();
   bindSettingsNav();
-  bindUpdate();
+  const updateControls = bindUpdate();
   bindAndroid();
   state.settings = await api.getSettings();
-  // 自动更新开关按设置回填（bindUpdate 在 settings 加载前绑定，只能在这里回填）
+  // 开关要等设置读取完成后回填；只有启用自动检查时才静默查一次。
+  const ac = $('setAutoCheck');
+  if (ac) ac.checked = !(state.settings && state.settings.update && state.settings.update.autoCheck === false);
   const au = $('setAutoUpdate');
   if (au) au.checked = !!(state.settings && state.settings.update && state.settings.update.autoUpdate !== false);
+  if (!state.settings || !state.settings.update || state.settings.update.autoCheck !== false) {
+    updateControls?.checkSilently().catch(() => {});
+  }
   const ra = $('setReportAuto');
   if (ra) ra.checked = !!(state.settings && state.settings.report && state.settings.report.auto !== false);
   await refreshStatus();

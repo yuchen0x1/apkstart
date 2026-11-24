@@ -855,11 +855,7 @@ class Provisioner {
     return { ok: true, path: file, root: p.root };
   }
 
-  /**
-   * 下载地址候选：直连优先，其次镜像前缀。
-   * 走 Sources 统一处理，好处是「自动镜像（ghfast / gh-proxy）」与用户自定义前缀
-   * 只在一个地方维护，且能和多线程下载共用同一份测速缓存。
-   */
+  /** Normalize runtime download URLs through the shared transport source helper. */
   _downloadUrls(url) {
     return this.sources.candidates(url);
   }

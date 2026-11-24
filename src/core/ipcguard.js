@@ -92,11 +92,11 @@ const MAIN_CHANNELS = new Set([
   'image:restore', 'image:remove', 'image:reveal',
   'assoc:status', 'assoc:register', 'assoc:unregister', 'share:sync', 'share:open',
   'app:clearLocks', 'app:removeSelf', 'shell:open', 'shell:openPath', 'sys:drives',
-  'proxy:reset', 'wizard:open', 'wizard:close',
+  'wizard:open', 'wizard:close',
   'window:minimize', 'window:maximize', 'window:close', 'window:hide',
   'android:status', 'android:set', 'android:open', 'android:tune',
   'android:permissions', 'android:grantAll', 'app:foreground',
-  'app:updateCheck', 'app:updateOpen', 'app:updateApply', 'app:updateRunPayload',
+  'app:updateCheck', 'app:updateOpen', 'app:updateApply',
   'app:updateCancel', 'app:restart',
 ]);
 

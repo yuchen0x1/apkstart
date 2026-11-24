@@ -345,7 +345,7 @@ async function main() {
     const data = Buffer.from(JSON.stringify({ schema: 1, repository: repo, tag: 'v' + version,
       assets: [{ name, size, sha256: hash }] }));
     const sig = crypto.sign(null, data, privateKey).toString('base64');
-    const info = { version, tag: 'v' + version,
+    const info = { version, tag: 'v' + version, manifestKind: 'legacy',
       proof: '<!-- apkstart-manifest ' + data.toString('base64') + ' ' + sig + ' -->',
       asset: { name, size, digest: 'sha256:' + hash, url: repo + '/releases/download/v' + version + '/' + name } };
     u.sources.rank = () => { throw new Error('fixture must not access network'); };
@@ -728,6 +728,7 @@ async function main() {
     const info = {
       version,
       tag: `v${version}`,
+      manifestKind: 'legacy',
       asset: { name: `ApkStart-${version}-Setup.exe`, size: fs.statSync(setup).size, urls: [], sizes: {} },
     };
     const { repo } = require('../src/core/release-manifest');
@@ -993,6 +994,83 @@ async function main() {
   }
 
   console.log('\n[自动重试限制：持久化阻止循环，保留手动入口]');
+
+  await test('离线缓存中的旧版本只更新界面，不重复弹出后台更新通知', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+    const found = source.match(/function handleUpdateFound\(info\) \{[\s\S]*?\n\}/);
+    assert(found, '应定位真实的更新通知处理函数');
+    const notices = [];
+    const logs = [];
+    const states = [];
+    const context = {
+      updateInfo: null,
+      info: { tag: 'v9.9.9', version: '9.9.9', hasUpdate: true, stale: true, canAutoApply: false },
+      send: (channel, value) => states.push({ channel, value }),
+      appLog: (message) => logs.push(message),
+      app: { getVersion: () => '0.0.1' },
+      notify: (...args) => notices.push(args),
+      store: { getSettings: () => ({ update: { autoUpdate: true } }) },
+      updater: { autoApplyBlocked: () => false },
+      autoUpdateFlow: () => { throw new Error('stale cache must not trigger automatic install'); },
+    };
+    require('vm').runInNewContext(`${found[0]}\nhandleUpdateFound(info);`, context);
+    eq(notices.length, 0, '离线 stale 缓存不能弹发现新版本系统通知');
+    eq(states.length, 1, '缓存状态仍应发送到更新界面');
+    assert(logs.some((message) => /notification suppressed/.test(message)), '应将抑制原因写入本地日志');
+  });
+
+  await test('自动更新退避或安装失败时不重复通知，但状态仍送到设置页', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+    const found = source.match(/function handleUpdateFound\(info\) \{[\s\S]*?\n\}/);
+    assert(found, '应定位真实的更新通知处理函数');
+    const notices = [];
+    const logs = [];
+    const states = [];
+    const context = {
+      updateInfo: null,
+      info: { tag: 'v9.9.9', version: '9.9.9', hasUpdate: true, stale: false, canAutoApply: true, flavor: 'setup' },
+      send: (channel, value) => states.push({ channel, value }),
+      appLog: (message) => logs.push(message),
+      app: { getVersion: () => '0.0.1' },
+      notify: (...args) => notices.push(args),
+      store: { getSettings: () => ({ update: { autoUpdate: true } }) },
+      updater: {
+        autoApplyBlocked: () => false,
+        autoDownloadRetryAt: () => Date.now() + 60000,
+      },
+      autoUpdateFlow: () => { throw new Error('backoff must defer automatic download'); },
+    };
+    require('vm').runInNewContext(`${found[0]}\nhandleUpdateFound(info);`, context);
+    eq(notices.length, 0, '退避期内不能重复弹更新失败/发现更新通知');
+    eq(states.length, 1, '更新状态仍发送到界面');
+    assert(logs.some((message) => /deferred by download backoff/.test(message)), '应记录退避状态');
+  });
+
+  await test('自动下载失败跨启动退避，重复失败不重复通知，成功后清除记录', () => {
+    const root = mkTmp();
+    const originalNow = Date.now;
+    let now = 1795521600000;
+    Date.now = () => now;
+    try {
+      const u = mkUpdater(root);
+      const first = u.recordAutoDownloadFailure('v9.9.9');
+      eq(first.shouldNotify, true, '同版本首次失败应通知一次');
+      eq(first.retryAt, now + 5 * 60 * 1000, '首次失败退避 5 分钟');
+      eq(u.autoDownloadRetryAt('9.9.9'), first.retryAt);
+
+      now = first.retryAt + 1;
+      const second = u.recordAutoDownloadFailure('9.9.9');
+      eq(second.shouldNotify, false, '同版本后续失败不重复通知');
+      eq(second.retryAt, now + 10 * 60 * 1000, '重复失败按指数退避');
+      const reopened = mkUpdater(root);
+      eq(reopened.autoDownloadRetryAt('v9.9.9'), second.retryAt, '退避跨启动持久化');
+      reopened.clearAutoDownloadFailure('9.9.9');
+      eq(reopened.autoDownloadRetryAt('9.9.9'), 0, '成功后清除重试凭条');
+    } finally {
+      Date.now = originalNow;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   await test('自动更新的三个入口均检查重试凭条，手动更新仍可安装', async () => {
     const root = mkTmp();

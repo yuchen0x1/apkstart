@@ -361,10 +361,10 @@ console.log('\n[apk.js 矢量图标转 SVG]');
 
 /* ---------------- 自动更新设置与更新日志 ---------------- */
 console.log('[update]');
-test('update.autoUpdate 默认提示更新，由用户选择安装', () => {
+test('update.autoUpdate 默认开启自动下载与安装', () => {
   const { DEFAULT_SETTINGS } = require('../src/core/store');
-  assert(DEFAULT_SETTINGS.update && DEFAULT_SETTINGS.update.autoUpdate === false,
-    'update.autoUpdate 应默认为 false');
+  assert(DEFAULT_SETTINGS.update && DEFAULT_SETTINGS.update.autoUpdate === true,
+    'update.autoUpdate 应默认为 true');
 });
 test('settings 写入白名单放行 update.autoUpdate', () => {
   const tmpAppData = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-set-'));

@@ -7,9 +7,9 @@
  * 走代理实测能到十几 MB/s。这里统一解决「下载与查新走代理」：
  *
  * 检测顺序（命中即停）：
- *   1. 设置 runtime.proxyUrl 显式指定（填 off 强制直连）；
- *   2. 环境变量 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY；
- *   3. Windows 系统代理（注册表 Internet Settings，Clash 开系统代理就会写这里）。
+ *   1. 环境变量 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY；
+ *   2. Windows Internet Settings 静态代理；
+ *   3. GNOME 桌面静态代理设置。
  *
  * 检测结果缓存 10 分钟：reg query 一次几十毫秒，而代理开关不会每分钟变。
  * 连接层提供 CONNECT 隧道（https）与绝对路径转发（http），供 download.js /
@@ -18,11 +18,10 @@
 const http = require('http');
 const tls = require('tls');
 const { execFile } = require('child_process');
-// 惰性引入会破坏缓存一致性，直接引：store 不依赖任何网络模块，无环
-const store = require('./store');
 
 const REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
 const CACHE_TTL = 10 * 60 * 1000;
+const GNOME_PROXY = 'org.gnome.system.proxy';
 
 let _cache = { at: 0, proxy: '' };
 
@@ -51,6 +50,34 @@ function fromEnv() {
     || process.env.ALL_PROXY || process.env.all_proxy || '';
 }
 
+/** Common NO_PROXY semantics: wildcard, exact host, domain suffix and optional port. */
+function isNoProxy(hostname, port) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  const entries = String(process.env.NO_PROXY || process.env.no_proxy || '')
+    .split(',').map((item) => item.trim().toLowerCase()).filter(Boolean);
+  return entries.some((entry) => {
+    if (entry === '*') return true;
+    let domain = entry;
+    let entryPort = '';
+    if (entry.startsWith('[')) {
+      const end = entry.indexOf(']');
+      if (end > 0) {
+        domain = entry.slice(1, end);
+        if (entry[end + 1] === ':') entryPort = entry.slice(end + 2);
+      }
+    } else {
+      const colon = entry.lastIndexOf(':');
+      if (colon > 0 && /^\d+$/.test(entry.slice(colon + 1))) {
+        domain = entry.slice(0, colon);
+        entryPort = entry.slice(colon + 1);
+      }
+    }
+    domain = domain.replace(/^\./, '');
+    if (entryPort && Number(entryPort) !== Number(port)) return false;
+    return host === domain || host.endsWith(`.${domain}`);
+  });
+}
+
 /** 读 Windows 系统代理（reg query 两次；非 Windows / 读不到都返回空） */
 function fromRegistry() {
   if (process.platform !== 'win32') return Promise.resolve('');
@@ -63,6 +90,28 @@ function fromRegistry() {
       });
     });
   });
+}
+
+function readCommand(command, args, timeout = 2000) {
+  return new Promise((resolve) => {
+    execFile(command, args, { windowsHide: true, timeout }, (error, stdout) => {
+      resolve(error ? '' : String(stdout || '').trim().replace(/^['"]|['"]$/g, ''));
+    });
+  });
+}
+
+/** Read a static GNOME proxy; PAC mode is intentionally left to the desktop/browser. */
+async function fromGnome() {
+  if (process.platform !== 'linux') return '';
+  const command = await readCommand('gsettings', ['get', `${GNOME_PROXY}`, 'mode']);
+  if (command !== "'manual'" && command !== 'manual') return '';
+  const useHttps = await readCommand('gsettings', ['get', `${GNOME_PROXY}.https`, 'host']);
+  const httpsPort = await readCommand('gsettings', ['get', `${GNOME_PROXY}.https`, 'port']);
+  const httpHost = await readCommand('gsettings', ['get', `${GNOME_PROXY}.http`, 'host']);
+  const httpPort = await readCommand('gsettings', ['get', `${GNOME_PROXY}.http`, 'port']);
+  const host = useHttps || httpHost;
+  const port = useHttps ? httpsPort : httpPort;
+  return host && /^\d+$/.test(port) && Number(port) > 0 ? `http://${host}:${port}` : '';
 }
 
 /** 把 "http://127.0.0.1:7890" 解析成 {host, port, protocol}；解析不了返回 null */
@@ -80,21 +129,14 @@ function toProxyObj(s) {
 
 /**
  * 当前应使用的代理（{host, port, protocol} 或 null）。
- * @param {object} [settings] store.getSettings()（检测显式 runtime.proxyUrl 用）
  * @param {{force?:boolean}} [opts] force=true 跳过缓存（设置改完立即生效）
  */
 async function getActiveProxy(settings, opts = {}) {
   const now = Date.now();
   if (!opts.force && _cache.at && now - _cache.at < CACHE_TTL) return _cache.proxy;
-  // 调用方（download.js）没带 settings 时自己读：保证显式 runtime.proxyUrl 生效
-  if (settings === undefined) settings = store.getSettings();
-  let proxy = '';
-  const explicit = String((settings && settings.runtime && settings.runtime.proxyUrl) || '').trim();
-  if (explicit) {
-    proxy = /^off$/i.test(explicit) ? '' : normalize(explicit);
-  } else {
-    proxy = fromEnv() || await fromRegistry();
-  }
+  // Preserve the old argument shape for callers, but never read proxyUrl from settings.
+  void settings;
+  const proxy = fromEnv() || await fromRegistry() || await fromGnome();
   const obj = toProxyObj(proxy);
   _cache = { at: now, proxy: obj };
   return obj;
@@ -128,4 +170,7 @@ function tunnel(proxy, host, port, timeoutMs = 15000) {
   });
 }
 
-module.exports = { getActiveProxy, tunnel, parseProxyServer, normalize, resetCache, fromEnv, toProxyObj };
+module.exports = {
+  getActiveProxy, tunnel, parseProxyServer, normalize, resetCache, fromEnv,
+  toProxyObj, isNoProxy, fromRegistry, fromGnome,
+};

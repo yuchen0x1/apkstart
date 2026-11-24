@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.11.0**（2026-11-24）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.11.1**（2026-11-24）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,16 +46,16 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.11.0
+### v0.11.1
 
-> 优先级、窗口与更新器操作全部钉死在已验证进程身份上；新增 GPU 只读探测与软件渲染自动回退；补齐真机进程安全场景测试与静态扫描。
+> 默认更新流程开箱即用：静态签名清单优先，受控 API 回退，安装包下载与版本元数据完全分离。
 
-- 模拟器优先级脚本改为身份凭据协议：调用方传入 base64 身份列表（出生时间 + 真实镜像路径 + 命令行 SHA-256），脚本在单个活进程句柄上复核后调整优先级；空凭据、非法凭据、伪造身份与跨 Windows 会话进程一律不改，裸 PID 调用被拒绝。
-- 窗口控制要求调用方携带进程身份凭据：脚本持单句柄复核出生时间、真实镜像路径与命令行哈希；qemu 子进程窗口回退限定「qemu-system-*.exe + 位于已验证运行时目录内 + 出生晚于已验证父进程 + 同一会话」；JS 层 `present` / `focus` / `getBounds` 无凭据直接返回失败。
-- 更新器在 60 秒等待窗开始前固化本程序完整身份，PID 复用或同目录另一实例都不能命中终止凭据；归属断言抛错时失败关闭，不再杀死任何进程。
-- 窗口代理的运行时子进程祖先判定要求父进程出生早于子进程：被回收复用的父 PID 不能借用其他实例的归属。
-- 新增 GPU 只读探测模块：按 Win32_VideoController 分类伪显卡（Basic Display / 远程显示适配器）与远程桌面会话，识别混合显卡；无宿主 GL 可用的机器自动把软件渲染排到第一顺位，手动指定的渲染后端永不覆盖；引擎启动路径与设置页均接入。
-- 新增可复现基线工具 `tools/bench-runtime.js`：用生产引擎真实开机，记录启动耗时、渲染模式与已验证进程树的 CPU / 内存采样，探测失败不产出数字。
+- 正式发布自动生成 `latest.json`，包含版本、发行说明、平台资产、文件大小与 SHA-256，并使用 Ed25519 签名；私钥只从 GitHub `release` 环境 Secret 读取。
+- 客户端固定验证公钥，先读 GitHub Release 静态清单；清单不可用时最多回退一次 `/releases/latest`，不调用 Releases 列表端点，也不读取 Token 或 `gh` CLI。
+- 更新信息缓存签名清单与 API 冷却状态；按 `Retry-After`、`X-RateLimit-Reset` 和指数退避控制备用请求，断网时可使用已验证缓存继续启动。
+- 新安装默认开启自动检查和自动下载/安装；用户保存的关闭状态继续保留。更新设置页去除 Token、镜像、代理和连接数等网络技术选项。
+- 下载自动识别系统代理和标准代理环境变量；仅从签名清单声明的官方 HTTPS 资产地址下载，并在安装前校验版本、文件大小与 SHA-256。
+- 下载源选择与版本信息查询解耦，不再依赖公共下载转发服务，也不会把用户凭据发送给第三方服务。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。
