@@ -296,7 +296,7 @@ function lowSpecProfile({ host = hostInfo(), emulatorVersion = '', diskMB = 0 } 
  */
 function chooseProfile({
   host = hostInfo(), accel, emulatorVersion = '', diskMB = 0,
-  port = 5554, adbPort = 5044, overrides = {}, settings = null,
+  port = 5554, adbPort = 5044, overrides = {}, settings = null, gpuInfo = null,
 } = {}) {
   const accelOk = accelUsable(accel);
   const engine = (settings && settings.engine) || {};
@@ -362,7 +362,14 @@ function chooseProfile({
   const gpus = gpuCandidates(emulatorVersion);
   const gpuPinned = !!(overrides.gpuMode && overrides.gpuMode !== 'auto' && gpus.includes(overrides.gpuMode));
   // 低配档把软件渲染排到最前；用户手动指定后端（gpuPinned）时完全不干预
-  const orderedGpus = !gpuPinned && spec ? [spec.gpu, ...gpus.filter((g) => g !== spec.gpu)] : gpus;
+  let orderedGpus = !gpuPinned && spec ? [spec.gpu, ...gpus.filter((g) => g !== spec.gpu)] : gpus;
+  // 远程桌面 / 只有 Microsoft Basic Display 的机器没有可用的宿主 OpenGL
+  // 交换链。host 会白等 20 多秒再失败，直接把软件渲染排到第一位。
+  if (!gpuPinned && gpuInfo && gpuInfo.preferSoftware) {
+    const soft = gpus.find((g) => /swangle/.test(g))
+      || gpus.find((g) => /software|swiftshader/.test(g));
+    if (soft) orderedGpus = [soft, ...gpus.filter((g) => g !== soft)];
+  }
   const gpu = gpuPinned ? overrides.gpuMode : orderedGpus[0];
 
   // 渲染分辨率：auto 时按加速状态选（软件模拟降到 540x960 保流畅）。
@@ -400,6 +407,7 @@ function chooseProfile({
     gpu,
     gpuCandidates: orderedGpus,
     gpuPinned,
+    gpuInfo: gpuInfo || null,
     // on 表示检测到可用加速器，不等于本次客机已确认使用硬件加速。
     // emulator.js 对 on 保留官方默认选择（省略 -accel），兼容部分 Windows
     // emulator 37.x 对显式 on 的崩溃；仅 off 显式传 -accel off。
@@ -443,9 +451,9 @@ function overridesFromSettings(engine = {}) {
  * 之前设置页直接调 chooseProfile()（不带版本和加速状态），会在 37.x 机器上
  * 错误地显示已弃用的 swiftshader_indirect / 软件模拟，和实跑参数对不上。
  */
-function autoProfile({ settings = {}, accel, emulatorVersion = '', diskMB = 0, port = 5554, adbPort = 5044 } = {}) {
+function autoProfile({ settings = {}, accel, emulatorVersion = '', diskMB = 0, port = 5554, adbPort = 5044, gpuInfo = null } = {}) {
   return chooseProfile({
-    accel, emulatorVersion, diskMB, port, adbPort, settings,
+    accel, emulatorVersion, diskMB, port, adbPort, settings, gpuInfo,
     overrides: overridesFromSettings(settings && settings.engine),
   });
 }
@@ -912,6 +920,7 @@ function describeProfile(p) {
         : p.accelOk ? '检测到加速器（本次运行待确认）' : '未检测到可用加速器';
   return `${p.tuned ? '低配自动降级' : '自动'}：${(p.memoryMB / 1024).toFixed(1)}GB 内存 · ${p.cores} 核`
     + `${lcd ? ` · ${lcd}` : ''} · ${p.gpu} 渲染 · ${accel} · ${snap}`
+    + `${p.gpuInfo && p.gpuInfo.preferSoftware ? ' · 未检测到可用显卡，已自动软件渲染' : ''}`
     + `${p.lite ? ' · 轻量容器' : ''} · 端口 ${p.port}`;
 }
 
