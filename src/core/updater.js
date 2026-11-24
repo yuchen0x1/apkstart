@@ -551,6 +551,14 @@ class Updater {
     fs.mkdirSync(this.updateDir, { recursive: true });
     try { fs.rmSync(failFile, { force: true }); } catch (_) { /* 上次的标记先清掉 */ }
     const waitPid = opts.waitPid || process.pid;
+    // Normal updates run in the app itself: capture the exact birth identity
+    // BEFORE the updater waits up to 60 seconds. A recycled PID (even another
+    // ApkStart instance from the same install) can never satisfy all fields.
+    const selfIdentity = opts.expectedIdentity
+      || (opts.spawn !== false && process.platform === 'win32'
+        ? processOwner.getProcessInfoSync(waitPid) : null);
+    const expectedIdentity = selfIdentity
+      ? Buffer.from(JSON.stringify(selfIdentity), 'utf8').toString('base64') : '';
 
     // 替换前最后一道闸：载荷必须真的是 ApkStart，否则宁可放弃更新
     let payloadFiles;
@@ -590,13 +598,20 @@ class Updater {
       `Note 'updater start'`,
       `$owner = ${psq(ownerScript)}`,
       `$expectExe = ${psq(selfExe)}`,
+      `$expectB64 = ${psq(expectedIdentity)}`,
       `$appIdentity = ''`,
       `if ($expectExe -and (Test-Path -LiteralPath $owner -PathType Leaf)) {`,
       `  try {`,
       `    $probe = (& $owner -Action Inspect -TargetPid ${waitPid} | Out-String).Trim()`,
       `    if ($probe) {`,
       `      $obj = ConvertFrom-Json -InputObject $probe -ErrorAction Stop`,
-      `      if ([string]$obj.exe -ieq $expectExe) { $appIdentity = $probe }`,
+      `      if ($expectB64) {`,
+      `        $want = ConvertFrom-Json -InputObject ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($expectB64))) -ErrorAction Stop`,
+      `        if ([int]$obj.pid -eq [int]$want.pid -and [string]$obj.started -ceq [string]$want.started -and [string]$obj.exe -ieq [string]$want.exe -and [string]$obj.commandLine -ceq [string]$want.commandLine) { $appIdentity = $probe }`,
+      `      } elseif ([string]$obj.exe -ieq $expectExe) {`,
+      `        # Fallback for script-only tests. Production always embeds $expectB64.`,
+      `        $appIdentity = $probe`,
+      `      }`,
       `    }`,
       `  } catch { }`,
       `}`,

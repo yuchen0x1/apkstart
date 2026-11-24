@@ -479,6 +479,7 @@ async function main() {
         if (name === 'path') return p;
         if (name === 'child_process') return fakeChild;
         if (name === 'net') return net;
+        if (name === 'crypto') return require('crypto');
         if (name === './store') return { DATA_DIR: '/safe/data' };
         if (name.startsWith('./')) return {};
         throw new Error(`未声明 mock 依赖: ${name}`);

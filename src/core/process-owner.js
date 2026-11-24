@@ -2,7 +2,7 @@
 /** 进程归属验证失败即拒绝操作：PID、端口或名称单独都不是终止依据。 */
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawnSync } = require('child_process');
 
 const WIN_HELPER = path.join(__dirname, 'win', 'process-owner.ps1');
 const validPid = (pid) => Number.isSafeInteger(Number(pid)) && Number(pid) > 0 && Number(pid) !== process.pid;
@@ -165,6 +165,23 @@ async function getProcessInfo(pid) {
   } catch (_) { return null; }
 }
 
+/**
+ * Synchronous variant for the update path: the identity of the running app
+ * must be captured before its PID can be recycled. Only used once per update.
+ */
+function getProcessInfoSync(pid) {
+  if (!validPid(pid) || process.platform !== 'win32') return null;
+  try {
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', WIN_HELPER, '-Action', 'Inspect', '-TargetPid', String(pid)],
+    { windowsHide: true, timeout: 10000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8' });
+    if (r.status !== 0) return null;
+    const data = JSON.parse(String(r.stdout || '').trim().replace(/^\uFEFF/, ''));
+    return data && Number(data.pid) === Number(pid) && data.started && realPath(data.exe)
+      ? { ...data, exe: realPath(data.exe) } : null;
+  } catch (_) { return null; }
+}
+
 /** Direct/descendant identities of one already-verified process (Windows only). */
 async function getProcessTree(pid) {
   if (process.platform !== 'win32' || !validPid(pid)) return [];
@@ -196,9 +213,13 @@ except Exception: sys.exit(1)
 `;
 
 async function terminateOwnedProcess(info, owns, signal = 'SIGKILL') {
-  if (!info || !validPid(info.pid) || !owns(info)) return false;
+  if (!info || !validPid(info.pid)) return false;
+  let owned = false;
+  try { owned = !!owns(info); } catch (_) { return false; }
+  if (!owned) return false;
   const current = await getProcessInfo(info.pid);
-  if (!sameIdentity(info, current) || !owns(current)) return false;
+  if (!sameIdentity(info, current)) return false;
+  try { if (!owns(current)) return false; } catch (_) { return false; }
   const expected = Buffer.from(JSON.stringify(current)).toString('base64');
   if (process.platform === 'win32') {
     return (await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', WIN_HELPER,
@@ -242,4 +263,4 @@ async function pidOnPort(port) {
 }
 
 module.exports = { realPath, samePath, emulatorRoot, emulatorScopes, windowsArgv, optionValues,
-  ownsEmulator, sameIdentity, getProcessInfo, getProcessTree, terminateOwnedProcess, listeners, pidOnPort };
+  ownsEmulator, sameIdentity, getProcessInfo, getProcessInfoSync, getProcessTree, terminateOwnedProcess, listeners, pidOnPort };

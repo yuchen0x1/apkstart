@@ -691,6 +691,27 @@ async function main() {
     assert(/if \(-not \$ok\) \{ exit 1 \}[\s\S]*Remove-Item -LiteralPath/.test(script), '验证未通过不得清除载荷');
   });
 
+  await test('apply 在退出前先固化本程序完整身份，PID 复用/同目录另一实例都不能命中', () => {
+    const root = mkTmp();
+    const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
+    const u = mkUpdater(root);
+    const identity = {
+      pid: 4321, started: '133900000000000000',
+      exe: 'c:\\apps\\apkstart\\apkstart.exe',
+      commandLine: '"C:\\apps\\ApkStart\\ApkStart.exe" --updated',
+    };
+    const script = u.apply({ mode: 'setup', payload: setup, version: '9.9.9', size: 409600 }, {
+      spawn: false, waitPid: identity.pid, expectedIdentity: identity,
+    });
+    const encoded = Buffer.from(JSON.stringify(identity), 'utf8').toString('base64');
+    assert(script.includes(`$expectB64 = '${encoded}'`), '脚本必须带退出前捕获的完整身份');
+    assert(/FromBase64String\(\$expectB64\)/.test(script), '脚本必须解码预期身份');
+    assert(/\[string\]\$obj\.started -ceq \[string\]\$want\.started/.test(script), '出生时间必须精确比较');
+    assert(/\[string\]\$obj\.exe -ieq \[string\]\$want\.exe/.test(script), '真实镜像路径必须比较');
+    assert(/\[string\]\$obj\.commandLine -ceq \[string\]\$want\.commandLine/.test(script), '命令行必须精确比较');
+    assert(/-Action Terminate -TargetPid 4321 -Expected/.test(script), '终止仍走同一份身份凭据');
+  });
+
   await test('已经下好的安装包会被复用，不会因为上次装失败又重下 1.4GB', async () => {
     const root = mkTmp();
     const crypto = require('crypto');
