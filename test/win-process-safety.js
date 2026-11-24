@@ -236,7 +236,11 @@ test('Windows process safety: coexisting QEMU/terminal/instances never cross-kil
 
     fs.writeFileSync(json, JSON.stringify({
       pid: Number(info.pid), action: 'get',
-      identity: { started: String(Number(info.started) + 1), exe: info.exe, cmdHash: sha256(info.commandLine) },
+      identity: {
+        started: String(info.started).replace(/.$/, (digit) => (digit === '0' ? '1' : '0')),
+        exe: info.exe,
+        cmdHash: sha256(info.commandLine),
+      },
     }));
     const forged = runPs(['-File', WINDOWCTL, json]);
     assert.match(String(forged.stdout), /ERR=identity-mismatch/);
