@@ -251,5 +251,9 @@ jobs:
           mkdir -p uploaded-latest
           gh release download "$TAG" --pattern latest.json --dir uploaded-latest
           gh release view "$TAG" --json assets > uploaded.json
-          node tools/sign-release.js --check-upload artifacts uploaded.json uploaded-latest/latest.json
+          node tools/sign-release.js --check-draft artifacts uploaded.json uploaded-latest/latest.json
           gh release edit "$TAG" --draft=false --latest
+          mkdir -p published-latest
+          gh release download "$TAG" --pattern latest.json --dir published-latest
+          gh release view "$TAG" --json assets > published.json
+          node tools/sign-release.js --check-upload artifacts published.json published-latest/latest.json
