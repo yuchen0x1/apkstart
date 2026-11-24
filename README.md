@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.11.1**（2026-11-24）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.11.2**（2026-11-24）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,14 +46,14 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.11.1
+### v0.11.2
 
 > 默认更新流程开箱即用：静态签名清单优先，受控 API 回退，安装包下载与版本元数据完全分离。
 
 - 正式发布自动生成 `latest.json`，包含版本、发行说明、平台资产、文件大小与 SHA-256，并使用 Ed25519 签名；私钥只从 GitHub `release` 环境 Secret 读取。
 - 客户端固定验证公钥，先读 GitHub Release 静态清单；清单不可用时最多回退一次 `/releases/latest`，不调用 Releases 列表端点，也不读取 Token 或 `gh` CLI。
 - 更新信息缓存签名清单与 API 冷却状态；按 `Retry-After`、`X-RateLimit-Reset` 和指数退避控制备用请求，断网时可使用已验证缓存继续启动。
-- 新安装默认开启自动检查和自动下载/安装；用户保存的关闭状态继续保留。更新设置页去除 Token、镜像、代理和连接数等网络技术选项。
+- 新安装默认开启自动检查和自动下载/安装；旧版默认关闭会一次性迁移为开启，新版本显式关闭会继续保留。更新设置页去除 Token、镜像、代理和连接数等网络技术选项。
 - 下载自动识别系统代理和标准代理环境变量；仅从签名清单声明的官方 HTTPS 资产地址下载，并在安装前校验版本、文件大小与 SHA-256。
 - 下载源选择与版本信息查询解耦，不再依赖公共下载转发服务，也不会把用户凭据发送给第三方服务。
 <!-- latest:end -->

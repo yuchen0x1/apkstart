@@ -179,6 +179,9 @@ const DEFAULT_SETTINGS = {
     // 发现新版本：通知后自动下载；没有应用窗口在前台时自动重启安装，
     // 有应用窗口则等窗口关闭再装（不打断正在玩的应用）。关掉则只通知、手动更新。
     autoUpdate: true,
+    // 0.11.0 及以前的默认值是 false，无法与用户主动关闭区分；读取旧配置时迁移为开启。
+    // 新版本设置页显式保存的选择通过此版本标记保留。
+    autoUpdatePreferenceVersion: 1,
   },
   report: {
     // 开机失败时在本机自动生成一份「脱敏诊断报告」，供用户一键上报。
@@ -328,7 +331,25 @@ const store = {
   getSettings() {
     const signature = settingsSignature();
     if (settingsCache && settingsCacheSignature === signature) return cloneSettings(settingsCache);
-    const s = deepMerge(DEFAULT_SETTINGS, readJson(SETTINGS_FILE, {}));
+    const raw = readJson(SETTINGS_FILE, {});
+    const s = deepMerge(DEFAULT_SETTINGS, raw);
+    if (!instanceContext.isChild) {
+      const storedUpdate = isRecord(raw.update) ? raw.update : {};
+      const preferenceVersion = storedUpdate.autoUpdatePreferenceVersion;
+      if (!Number.isSafeInteger(preferenceVersion) || preferenceVersion < 1) {
+        // 0.11.0 的默认 false 与用户主动关闭无法区分；迁移旧配置时采用新的开箱即用默认值。
+        // 只改写 update 分区，保留历史字段及其它所有用户配置。
+        if (!isRecord(raw.update)) raw.update = {};
+        if (s.update.autoUpdate !== true) raw.update.autoUpdate = true;
+        raw.update.autoUpdatePreferenceVersion = 1;
+        if (signature !== 'missing') {
+          try { writeJson(SETTINGS_FILE, raw); } catch (_) {
+            // 迁移是尽力而为；只读配置或短暂 I/O 故障不能阻止应用启动。
+          }
+        }
+        s.update.autoUpdate = true;
+      }
+    }
     s.theme = normalizePreference(s.theme);
     // 旧版曾把「兼容模式」保存成 google_apis + compatImage=true，实际却应使用
     // Google Play 镜像。只迁移这一种矛盾组合；显式关闭兼容模式的高级档位不改写。

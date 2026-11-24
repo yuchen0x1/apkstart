@@ -49,12 +49,40 @@ test('麦克风开关可持久化，且非法类型不会覆盖默认值', () =>
   assert.equal(store.saveSettings({ engine: { microphone: true } }).engine.microphone, true);
 });
 
-test('自动更新默认开启，显式关闭会持久保留', () => {
+test('自动更新默认开启，旧版默认关闭配置迁移为开启', () => {
   reset();
   assert.equal(store.getSettings().update.autoUpdate, true);
   assert.equal(store.getSettings().update.autoCheck, true);
+  write(settingsFile, {
+    update: { autoUpdate: false },
+    theme: 'dark',
+    unrelatedLegacySetting: { preserve: true },
+  });
+  assert.equal(store.getSettings().update.autoUpdate, true);
+  const migrated = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.equal(migrated.update.autoUpdate, true);
+  assert.equal(migrated.update.autoUpdatePreferenceVersion, 1);
+  assert.deepEqual(migrated.unrelatedLegacySetting, { preserve: true });
+  assert.equal(migrated.theme, 'dark');
+});
+
+test('新版本中用户显式关闭自动更新后会跨设置保存与读取保留', () => {
+  reset();
+  assert.equal(store.getSettings().update.autoUpdate, true);
   assert.equal(store.saveSettings({ update: { autoUpdate: false } }).update.autoUpdate, false);
   assert.equal(store.getSettings().update.autoUpdate, false);
+  const persisted = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.equal(persisted.update.autoUpdate, false);
+  assert.equal(persisted.update.autoUpdatePreferenceVersion, 1);
+});
+
+test('较新的自动更新偏好迁移标记不会被旧版逻辑覆盖', () => {
+  reset();
+  write(settingsFile, { update: { autoUpdate: false, autoUpdatePreferenceVersion: 2 } });
+  assert.equal(store.getSettings().update.autoUpdate, false);
+  const persisted = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.equal(persisted.update.autoUpdate, false);
+  assert.equal(persisted.update.autoUpdatePreferenceVersion, 2);
 });
 
 test('旧网络配置在迁移和无关设置保存后保留，但更新代码可不依赖它们', () => {
@@ -68,7 +96,7 @@ test('旧网络配置在迁移和无关设置保存后保留，但更新代码�
       downloadConnections: 6,
       sourcePreference: 'github',
     },
-    update: { autoUpdate: false },
+    update: { autoUpdate: false, autoUpdatePreferenceVersion: 1 },
     theme: 'dark',
   });
   const before = store.getSettings();

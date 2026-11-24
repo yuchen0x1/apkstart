@@ -8,8 +8,21 @@ const {
 } = require('../src/core/release-manifest');
 const { sha256File } = require('../src/core/download');
 
+function isExpectedAssetUrl(value, tag, name, allowDraft) {
+  const expected = `${repo}/releases/download/${tag}/${name}`;
+  if (value === expected) return true;
+  if (!allowDraft || typeof value !== 'string') return false;
+  let url;
+  try { url = new URL(value); } catch (_) { return false; }
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const draftPath = new RegExp(`^/yuchen0x1/apkstart/releases/download/untagged-[A-Za-z0-9-]+/${escapedName}$`);
+  return url.origin === 'https://github.com' && !url.username && !url.password
+    && !url.search && !url.hash && draftPath.test(url.pathname);
+}
+
 async function run(command, dir, arg, uploadedLatestPath) {
-  if (command === '--check-upload') {
+  if (command === '--check-upload' || command === '--check-draft') {
+    const checkDraft = command === '--check-draft';
     const tag = process.env.TAG;
     if (!tag) throw Error('TAG 未设置，不能验证上传清单');
     const uploaded = JSON.parse(fs.readFileSync(arg, 'utf8')).assets;
@@ -20,8 +33,11 @@ async function run(command, dir, arg, uploadedLatestPath) {
       const file = path.join(dir, name);
       const asset = uploaded.find((entry) => entry.name === name);
       if (!asset || asset.size !== fs.statSync(file).size
-        || asset.digest !== 'sha256:' + await sha256File(file)
-        || asset.url !== `${repo}/releases/download/${tag}/${name}`) {
+        || asset.digest !== 'sha256:' + await sha256File(file)) {
+        throw Error('上传校验失败 ' + name);
+      }
+      if (!isExpectedAssetUrl(asset.url, tag, name, checkDraft)) {
+        if (checkDraft) throw Error('草稿资产 URL 无效 ' + name);
         throw Error('上传校验失败 ' + name);
       }
     }
@@ -36,7 +52,13 @@ async function run(command, dir, arg, uploadedLatestPath) {
     const assets = uploaded.filter((entry) => ![
       'ApkStart-update.json', 'ApkStart-update.json.sig', 'SHA256SUMS', 'latest.json',
     ].includes(entry.name));
-    if (assets.length !== latest.assets.length || assets.some((asset) => !matchLatestAsset(latest, asset))) {
+    if (assets.length !== latest.assets.length || latest.assets.some((entry) => {
+      const uploadedAsset = assets.find((asset) => asset.name === entry.name);
+      return !uploadedAsset || uploadedAsset.size !== entry.fileSize
+        || uploadedAsset.digest !== 'sha256:' + entry.sha256
+        || entry.downloadUrl !== `${repo}/releases/download/${tag}/${entry.name}`
+        || (!checkDraft && !matchLatestAsset(latest, uploadedAsset));
+    })) {
       throw Error('latest.json 与已上传 Release 资产不一致');
     }
 
@@ -99,4 +121,8 @@ async function sha256FileBuffer(bytes) {
   return crypto.createHash('sha256').update(bytes).digest('hex');
 }
 
-run(...process.argv.slice(2)).catch(err => { console.error(err.message); process.exitCode = 1; });
+module.exports = { isExpectedAssetUrl };
+
+if (require.main === module) {
+  run(...process.argv.slice(2)).catch(err => { console.error(err.message); process.exitCode = 1; });
+}
