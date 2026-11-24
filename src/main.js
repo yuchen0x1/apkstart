@@ -3008,6 +3008,7 @@ function registerIpc() {
 
   ipcMain.handle('doctor:profile', async () => {
     const doctor = require('./core/doctor');
+    const gpu = require('./core/gpu');
     // 设置页展示的是「按当前设置，下次开机会用的参数」：用户刚改完内存/画质就该看到结果。
     // 引擎版本与加速状态走真实探测（checkEnv 有落盘缓存，status 每 6 秒也在用它，代价极小），
     // 否则 37.x 机器上会显示已弃用的 swiftshader_indirect，和实跑对不上。
@@ -3015,11 +3016,13 @@ function registerIpc() {
     // 探测失败时用「上次开机的加速状态」兜底，别把有加速的机器显示成软件模拟
     const accel = (env && env.accel)
       || (runtime.emulator.profile ? { ok: runtime.emulator.profile.accelOk } : undefined);
+    const gpuInfo = await gpu.probe().catch(() => null);
     const p = doctor.autoProfile({
       settings: store.getSettings(),
       accel,
       emulatorVersion: (env && env.emulator && env.emulator.version) || '',
       diskMB: doctor.freeDiskMB(store.DATA_DIR),
+      gpuInfo,
     });
     // 运行时正在用另一组参数（改完设置还没重开）时说明一句，避免「改了没反应」的错觉
     const running = runtime.emulator.profile;
@@ -3034,6 +3037,7 @@ function registerIpc() {
       manual: doctor.describeManual(p),
       tier: p.tier || '',
       tuned: !!p.tuned,
+      gpu: p.gpuInfo ? { summary: gpu.summary(p.gpuInfo), hybrid: !!p.gpuInfo.hybrid, preferSoftware: !!p.gpuInfo.preferSoftware, adapters: p.gpuInfo.adapters } : null,
       running: running ? doctor.describeProfile(running) : '',
     };
   });

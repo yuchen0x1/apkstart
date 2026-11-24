@@ -13,9 +13,11 @@
 const { spawn, spawnSync, execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const store = require('./store');
 const { Provisioner } = require('./provision');
 const doctor = require('./doctor');
+const gpu = require('./gpu');
 const userdata = require('./userdata');
 const processOwner = require('./process-owner');
 const peripherals = require('./peripherals');
@@ -956,10 +958,24 @@ class EmulatorEngine {
     const tree = await processOwner.getProcessTree(rootPid);
     const verified = tree.filter((p) => this.ownsProcess(p));
     if (!verified.length) return 0;
+    // The helper re-verifies these exact identities on one live process handle
+    // immediately before changing priority. CommandLine is represented by a
+    // hash so a long QEMU command line does not overflow the Windows command
+    // line limit.
+    const expected = verified
+      .filter((p) => p && p.started && p.exe && typeof p.commandLine === 'string')
+      .map((p) => ({
+        pid: Number(p.pid),
+        started: String(p.started),
+        exe: processOwner.realPath(p.exe),
+        cmdHash: crypto.createHash('sha256').update(p.commandLine, 'utf8').digest('hex'),
+      }));
+    if (!expected.length) return 0;
+    const payload = Buffer.from(JSON.stringify(expected), 'utf8').toString('base64');
     return new Promise((resolve) => {
       execFile('powershell.exe', [
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', script, '-Pids', verified.map((p) => p.pid).join(','), '-Level', level,
+        '-File', script, '-Expected', payload, '-Level', level,
       ], { windowsHide: true, timeout: 15000 }, (_err, out) => {
         const m = /CHANGED=(\d+)/.exec(String(out || ''));
         resolve(m ? Number(m[1]) : 0);
@@ -1279,8 +1295,10 @@ class EmulatorEngine {
         this.provisioner.emulatorVersion(),
         doctor.freePortPair(5554),
         this._resetAdbServer(adbPort),
+        gpu.probe().catch(() => null),
       ]);
       [accelInfo, verInfo, startPort] = results;
+      this.gpuInfo = results[4] || null;
       if (results[3] === false) throw new Error('ADB 服务未就绪');
     } catch (error) {
       const code = error.code || 'INSTANCE_ADB_START_FAILED';
@@ -1300,7 +1318,7 @@ class EmulatorEngine {
     // 与设置页共用选档入口；检测结果只影响选档，实际传参与日志确认另行记录。
     const profile = doctor.autoProfile({
       settings: s, accel: accelInfo, emulatorVersion: emuVersion, diskMB,
-      port: startPort, adbPort,
+      port: startPort, adbPort, gpuInfo: this.gpuInfo,
     });
     // 「低配模式」：一键修复里由用户点一下才启用，只对本次启动生效，不写进设置。
     // 目的不是让机器变快，而是让「本来就慢但能跑」的机器有机会开完机：

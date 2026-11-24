@@ -409,7 +409,7 @@ public class ApkAgent
                 long started = p.StartTime.ToUniversalTime().ToFileTimeUtc();
                 string file = RealPath(p.MainModule.FileName);
                 bool ours = CandidateOwned(pid, file, started);
-                if (!ours && IsRuntimeChild(file)) ours = IsOwnedAncestor(pid);
+                if (!ours && IsRuntimeChild(file)) ours = IsOwnedAncestor(pid, started);
                 // The original process must still be alive after WMI; a recycled PID may
                 // not reuse an old positive result (cache keys include fresh birth + exe).
                 return ours && !p.HasExited;
@@ -429,7 +429,7 @@ public class ApkAgent
         return false;
     }
 
-    static bool IsOwnedAncestor(uint pid)
+    static bool IsOwnedAncestor(uint pid, long childStarted)
     {
         uint parent = ParentOf(pid);
         for (int i = 0; i < 8 && parent != 0; i++)
@@ -439,6 +439,10 @@ public class ApkAgent
                 using (Process p = Process.GetProcessById((int)parent))
                 {
                     long started = p.StartTime.ToUniversalTime().ToFileTimeUtc();
+                    // A recycled parent PID points at a process born AFTER the
+                    // child. It cannot be that child's creator, no matter how
+                    // well its exe/AVD arguments match another instance.
+                    if (started > childStarted) { parent = ParentOf(parent); continue; }
                     string file = RealPath(p.MainModule.FileName);
                     if (CandidateOwned(parent, file, started)) return true;
                 }

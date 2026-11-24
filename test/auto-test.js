@@ -1374,8 +1374,12 @@ const { adbKeyHint } = require('../src/core/engine');
     const ps1 = fs.readFileSync(w.SCRIPT, 'utf8');
     assert(await w.present({}) === null, '没有 PID 必须直接拒绝');
     assert(await w.present({ pid: 0 }) === null, 'PID=0 不能触发按进程名扫描');
-    assert(/if \(\$procId -le 0\) \{ return \[IntPtr\]::Zero \}/.test(ps1),
-      '脚本收到无 PID 时必须直接返回，不做扫描');
+    assert(await w.present({ pid: 1234 }) === null, '没有进程身份凭据时不得操作窗口');
+    assert(await w.getBounds(1234) === null, '没有进程身份凭据时不得读取窗口');
+    assert(/ERR=identity-required/.test(ps1), '脚本必须要求调用方提供进程身份凭据');
+    assert(/ProcessIdToSessionId/.test(ps1), '脚本必须拒绝其他 Windows 会话的进程');
+    assert(/GetFinalPathNameByHandleW/.test(ps1), '脚本必须按真实路径复核进程身份');
+    assert(/ERR=no-pid/.test(ps1), '脚本收到无 PID 时必须直接返回，不做扫描');
     assert(!/ProcessName\s+-match\s+'emulator\|qemu'/.test(ps1),
       '不得按 emulator/qemu 进程名匹配任何窗口');
     assert(!/Get-Process[^\r\n]*emulator[^\r\n]*|Get-Process[^\r\n]*qemu/i.test(ps1),
@@ -1386,10 +1390,14 @@ const { adbKeyHint } = require('../src/core/engine');
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     const script = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'win', 'priority.ps1'), 'utf8');
-    assert(/\[string\]\$Pids = ''/.test(script), '优先级脚本只接受调用方给的 PID 列表');
+    assert(/\[string\]\$Expected = ''/.test(script), '优先级脚本只接受调用方给的进程身份列表');
+    assert(/OpenProcess/.test(script) && /SetPriorityClass/.test(script), '必须在同一进程句柄上复核并改优先级');
+    assert(/ProcessIdToSessionId/.test(script), '不得操作其他 Windows 会话中的进程');
+    assert(/cmdHash/.test(script), '必须复核命令行哈希');
     assert(!/\$Avd/.test(script), '不得按 AVD 名匹配进程');
     assert(!/CommandLine -like/.test(script), '不得按命令行子串匹配');
-    assert(!/Get-CimInstance/.test(script), '脚本内部不得枚举进程');
+    assert(!/Get-CimInstance\s+Win32_Process(?!\s+-Filter\s+"ProcessId=)/.test(script),
+      '脚本内部只能按精确 PID 读取进程信息，不得全表枚举');
     assert(!/qemu-system|ProcessName/i.test(script), '脚本内部不得再按镜像名兜底');
 
     // 拿不到经归属验证的进程树时必须失败关闭（返回 0），不能回退成扫名字。
@@ -1419,11 +1427,16 @@ const { adbKeyHint } = require('../src/core/engine');
       if (probe.status !== 0 || !['RemoteSigned', 'Unrestricted', 'Bypass'].includes(policy)) {
         console.log(`  跳过优先级脚本执行：PowerShell ${policy || 'unknown'}；不覆盖系统执行策略`);
       } else {
-        const run = (pids) => spawnSync(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-          '-File', path.join(__dirname, '..', 'src', 'core', 'win', 'priority.ps1'), '-Pids', pids, '-Level', 'idle'],
+        const run = (expected) => spawnSync(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+          '-File', path.join(__dirname, '..', 'src', 'core', 'win', 'priority.ps1'), '-Expected', expected, '-Level', 'idle'],
         { encoding: 'utf8', timeout: 30000, windowsHide: true });
-        assert(run.status === 0 && /CHANGED=0/.test(String(run.stdout || '')), '空 PID 列表不得改动任何进程');
-        assert(run('not-a-pid').status === 0 && /CHANGED=0/.test(String(run.stdout || '')), '非法 PID 不得改动任何进程');
+        const emptyRun = run('');
+        assert(emptyRun.status === 0 && /CHANGED=0/.test(String(emptyRun.stdout || '')), '空凭据不得改动任何进程');
+        const badRun = run('not-base64');
+        assert(badRun.status === 0 && /CHANGED=0/.test(String(badRun.stdout || '')), '非法凭据不得改动任何进程');
+        const forged = Buffer.from(JSON.stringify([{ pid: process.pid, started: '1', exe: 'x', cmdHash: 'y' }])).toString('base64');
+        const forgedRun = run(forged);
+        assert(forgedRun.status === 0 && /CHANGED=0/.test(String(forgedRun.stdout || '')), '伪造身份不得改动任何进程');
       }
     }
   });
@@ -1595,8 +1608,9 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(/Poll\(50,\s*SelectMode\.SelectRead\)/.test(agentPs1), '主循环应短轮询保持消息泵响应');
     assert(/now - _embedAt < 8000/.test(agentPs1), '窗口巡检必须限时，不能永久每 2 秒 EnumWindows');
     assert(/setLiteMode/.test(uiHtml) && /setDeepTrim/.test(uiHtml), '设置页需暴露轻量容器选项');
-    assert(/static bool IsOwnedAncestor\(uint pid\)/.test(agentPs1), 'netsimd/qemu 必须能沿已验证的 emulator 父链继承归属');
-    assert(/if \(!ours && IsRuntimeChild\(file\)\) ours = IsOwnedAncestor\(pid\)/.test(agentPs1), '子进程归属只能从已验证候选进程继承');
+    assert(/static bool IsOwnedAncestor\(uint pid, long childStarted\)/.test(agentPs1), 'netsimd/qemu 必须能沿已验证的 emulator 父链继承归属');
+    assert(/if \(!ours && IsRuntimeChild\(file\)\) ours = IsOwnedAncestor\(pid, started\)/.test(agentPs1), '子进程归属只能从已验证候选进程继承');
+    assert(/if \(started > childStarted\)/.test(agentPs1), '父 PID 被复用到更晚创建的进程时不得继承归属');
     assert(/static bool RemoteInputActive\(\)/.test(agentPs1) && /SunloginClient/.test(agentPs1), '远程控制软件运行时不能叠加全局鼠标钩子');
   });
 
