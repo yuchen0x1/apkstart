@@ -936,17 +936,30 @@ class EmulatorEngine {
   }
 
   /**
-   * 调整本机 qemu/emulator 进程的优先级（只匹配命令行里带本 AVD 名的进程）。
+   * 调整本实例运行时进程的优先级。
+   *
+   * 先枚举本实例进程树，再逐个用「真实模拟器路径 + 本 AVD 的
+   * -datadir/-android-hw + 出生时间」验证，只把通过验证的 PID 交给脚本。
+   * 绝不按进程名 / 命令行子串扫描：同机另一个模拟器可能用同一个 AVD 名。
    * level: idle（容器停放）| below（有应用在前台）| normal（性能优先）。
    */
-  setPriority(level = 'below') {
+  async setPriority(level = 'below') {
     if (process.platform !== 'win32') return Promise.resolve(0);
     const script = path.join(__dirname, 'win', 'priority.ps1');
-    if (!fs.existsSync(script)) return Promise.resolve(0);
+    if (!fs.existsSync(script)) return 0;
+    let rootPid = this.proc && this.proc.pid ? Number(this.proc.pid) : 0;
+    if (!rootPid) {
+      const target = await this.ownedProcessOnPort().catch(() => null);
+      rootPid = target ? Number(target.pid) : 0;
+    }
+    if (!rootPid) return 0;
+    const tree = await processOwner.getProcessTree(rootPid);
+    const verified = tree.filter((p) => this.ownsProcess(p));
+    if (!verified.length) return 0;
     return new Promise((resolve) => {
       execFile('powershell.exe', [
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', script, '-Avd', this.avdName, '-Level', level,
+        '-File', script, '-Pids', verified.map((p) => p.pid).join(','), '-Level', level,
       ], { windowsHide: true, timeout: 15000 }, (_err, out) => {
         const m = /CHANGED=(\d+)/.exec(String(out || ''));
         resolve(m ? Number(m[1]) : 0);

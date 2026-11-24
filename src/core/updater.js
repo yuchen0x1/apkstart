@@ -23,6 +23,7 @@ const { ZipFile, safeEntryPath } = require('./zip');
 const { cmpVer } = require('./version');
 const { assetNames, readManifest, matchAsset, marker } = require('./release-manifest');
 const { Sources } = require('./sources');
+const processOwner = require('./process-owner');
 
 const OWNER = 'yuchen0x1';   // 只检查本仓库的发布
 const REPO = 'apkstart';
@@ -551,17 +552,6 @@ class Updater {
     try { fs.rmSync(failFile, { force: true }); } catch (_) { /* 上次的标记先清掉 */ }
     const waitPid = opts.waitPid || process.pid;
 
-    // 落一张「有活要干」的凭条：下次启动若版本没变、日志里又没有 updater done，
-    // 就说明这次自动安装根本没跑起来，必须明确告诉用户而不是让他对着旧界面猜。
-    try {
-      fs.writeFileSync(path.join(this.updateDir, 'pending.json'), JSON.stringify({
-        version: String(job.version || '').replace(/^v/i, ''),
-        mode: job.mode,
-        payload: job.payload,
-        at: Date.now(),
-      }), 'utf8');
-    } catch (_) { /* 凭条写不进去不影响更新本身 */ }
-
     // 替换前最后一道闸：载荷必须真的是 ApkStart，否则宁可放弃更新
     let payloadFiles;
     if (job.mode === 'zip') {
@@ -575,20 +565,58 @@ class Updater {
       // 后台若又查到了更新的版本，latest 已经换成别人的大小了。
       this._assertSetup(job.payload, { size: job.size });
     }
+    // 只有载荷通过前置校验才落「有活要干」的凭条：否则下次启动会把一次
+    // 根本没开始的安装报成「更新卡住了」。凭条本身写不进去不影响更新。
+    try {
+      fs.writeFileSync(path.join(this.updateDir, 'pending.json'), JSON.stringify({
+        version: String(job.version || '').replace(/^v/i, ''),
+        mode: job.mode,
+        payload: job.payload,
+        at: Date.now(),
+      }), 'utf8');
+    } catch (_) { /* 凭条写不进去不影响更新本身 */ }
     // 先持久化再交给外部脚本；即使脚本没跑起来或故障标记写失败，也不自动循环。
     this.blockAutoApply(job.version);
 
+    // PID 不是身份：脚本启动时先为「本程序」留一份进程出生凭据（开始时间 +
+    // 真实镜像路径 + 命令行），等超时后只允许用这份凭据终止同一个进程。
+    // 60 秒等待期内 PID 被系统复用、或本程序根本不在这个 PID 上，都不再强杀。
+    const selfExe = process.platform === 'win32' ? processOwner.realPath(this.exePath) : '';
+    const ownerScript = path.join(__dirname, 'win', 'process-owner.ps1');
     const lines = [
       `$ErrorActionPreference = 'SilentlyContinue'`,
       `$log = ${psq(logFile)}`,
       `function Note($m) { Add-Content -LiteralPath $log -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }`,
       `Note 'updater start'`,
+      `$owner = ${psq(ownerScript)}`,
+      `$expectExe = ${psq(selfExe)}`,
+      `$appIdentity = ''`,
+      `if ($expectExe -and (Test-Path -LiteralPath $owner -PathType Leaf)) {`,
+      `  try {`,
+      `    $probe = (& $owner -Action Inspect -TargetPid ${waitPid} | Out-String).Trim()`,
+      `    if ($probe) {`,
+      `      $obj = ConvertFrom-Json -InputObject $probe -ErrorAction Stop`,
+      `      if ([string]$obj.exe -ieq $expectExe) { $appIdentity = $probe }`,
+      `    }`,
+      `  } catch { }`,
+      `}`,
       // 等本进程真正退出（最多 60 秒），否则 exe/dll 仍被占用
       `try { Wait-Process -Id ${waitPid} -Timeout 60 } catch { }`,
       // 退出被清理流程卡住时（模拟器收尾、窗口代理回包慢），安装器和文件复制都会
       // 因为「文件被占用」而静默失败 —— 用户看到的就是「点了重启并安装，没反应，
       // 版本还是旧的」。这里补一刀强制结束，宁可少存一次现场，也不能让更新白做。
-      `try { if (Get-Process -Id ${waitPid} -ErrorAction SilentlyContinue) { Stop-Process -Id ${waitPid} -Force; Note 'app still alive, force stopped' } } catch { }`,
+      // 但只允许终止「脚本启动时那个本程序」：身份不一致就不再动它。
+      `try {`,
+      `  $app = Get-Process -Id ${waitPid} -ErrorAction SilentlyContinue`,
+      `  if ($null -ne $app) {`,
+      `    if ($appIdentity) {`,
+      `      $expected = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($appIdentity))`,
+      `      $verdict = (& $owner -Action Terminate -TargetPid ${waitPid} -Expected $expected | Out-String).Trim()`,
+      `      if ($verdict -eq 'STOPPED') { Note 'app still alive, force stopped (identity verified)' }`,
+      `      else { Note ('app still alive, force stop refused: ' + $verdict) }`,
+      `    } else { Note 'app still alive, no verified identity; force stop skipped' }`,
+      `  }`,
+      `} catch { }`,
       `Start-Sleep -Milliseconds 1200`,
       // 心跳：脚本能走到这一行，说明它真的活着等到了 App 退出。下次启动检查这段日志，
       // 就能把「没跑起来」和「跑了但装失败」区分开（两者给用户的建议完全不同）。

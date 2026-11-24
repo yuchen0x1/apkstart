@@ -15,6 +15,7 @@
 const https = require('https');
 const http = require('http');
 const tls = require('tls');
+const { execFile } = require('child_process');
 const { URL } = require('url');
 const { cmpVer } = require('./version');
 const proxyMod = require('./proxy');
@@ -32,9 +33,36 @@ const SOURCES = {
   },
 };
 
-/** 允许用户显式提供只读令牌；默认匿名访问。 */
+/**
+ * GitHub API 的认证凭据（可选）。认证后限额 5000 次/小时（匿名只有 60 次/小时，
+ * 而且 Clash 出口是共享 IP，更容易被别人打光）。取用顺序：
+ *   1. 设置 runtime.githubToken（用户手动填）；
+ *   2. 本机 gh CLI 已登录的账号（gh auth token，凭据由 gh 保存在系统凭据管理器）。
+ * 都没有就返回空串（匿名 60 次/小时，检查更新仍可用）。
+ * token 只发往 api.github.com，绝不写日志。结果缓存 1 小时（含「没有 token」），
+ * 免得机器上没有 gh 时每次检查更新都要重新拉起一次进程。
+ */
+let _ghTokenCache = { at: 0, token: '' };
+const GH_TOKEN_TTL = 60 * 60 * 1000;
+// gh 未登录时 stdout 里可能是一句提示；长度够长也不代表是凭据。
+const GH_TOKEN_SHAPE = /^(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})$/;
+
 async function getGithubToken(settings) {
-  return String(settings?.runtime?.githubToken || '').trim();
+  const explicit = String(settings?.runtime?.githubToken || '').trim();
+  if (explicit) return explicit;
+  const now = Date.now();
+  if (now - _ghTokenCache.at < GH_TOKEN_TTL) return _ghTokenCache.token;
+  let token = '';
+  try {
+    token = await new Promise((resolve) => {
+      execFile('gh', ['auth', 'token'], { windowsHide: true, timeout: 5000 }, (error, stdout) => {
+        resolve(error ? '' : String(stdout || '').trim());
+      });
+    });
+  } catch (_) { token = ''; } // 没装 gh CLI：退回匿名 API
+  if (token && !GH_TOKEN_SHAPE.test(token)) token = '';
+  _ghTokenCache = { at: now, token };
+  return token;
 }
 
 /** api.github.com 请求头（有 token 就带上认证） */

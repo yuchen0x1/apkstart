@@ -165,6 +165,18 @@ async function getProcessInfo(pid) {
   } catch (_) { return null; }
 }
 
+/** Direct/descendant identities of one already-verified process (Windows only). */
+async function getProcessTree(pid) {
+  if (process.platform !== 'win32' || !validPid(pid)) return [];
+  try {
+    const out = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', WIN_HELPER, '-Action', 'Tree', '-TargetPid', String(pid)]);
+    const data = JSON.parse(out.replace(/^\uFEFF/, ''));
+    return (Array.isArray(data) ? data : (data ? [data] : []))
+      .filter((x) => x && Number(x.pid) > 0 && x.started && realPath(x.exe))
+      .map((x) => ({ ...x, exe: realPath(x.exe) }));
+  } catch (_) { return []; }
+}
+
 // Linux has no race-free process.kill(pid) API in Node. Pin a pidfd before comparing
 // /proc identity and signalling; if Python/pidfd is unavailable, refuse to kill.
 const PIDFD_STOP = `import os,sys,json,base64,signal,select
@@ -230,4 +242,4 @@ async function pidOnPort(port) {
 }
 
 module.exports = { realPath, samePath, emulatorRoot, emulatorScopes, windowsArgv, optionValues,
-  ownsEmulator, sameIdentity, getProcessInfo, terminateOwnedProcess, listeners, pidOnPort };
+  ownsEmulator, sameIdentity, getProcessInfo, getProcessTree, terminateOwnedProcess, listeners, pidOnPort };

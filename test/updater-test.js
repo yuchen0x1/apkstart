@@ -672,15 +672,20 @@ async function main() {
     eq(u.flavor, 'setup', 'uninstall.exe 也要认（判错会拿便携 zip 去覆盖安装目录）');
   });
 
-  await test('apply(setup) 会先强制结束没退干净的进程（安装器拿不到文件锁会静默失败）', async () => {
+  await test('apply(setup) 只会按出生凭据结束本程序残留进程（安装器拿不到文件锁会静默失败）', async () => {
     const root = mkTmp();
     const setup = fakeExe(path.join(root, 'ApkStart-9.9.9-Setup.exe'));
     const u = mkUpdater(root);
     const script = u.apply({ mode: 'setup', payload: setup, version: '9.9.9', size: 409600 }, { spawn: false });
-    assert(/Stop-Process -Id \d+ -Force/.test(script), '必须强制结束残留进程');
-    const stopAt = script.indexOf('Stop-Process');
+    // 裸 PID 会在 60 秒等待期内被系统复用，不能作为终止依据。
+    assert(!/Stop-Process -Id/.test(script), '不得按 PID 直接强杀（可能误杀复用该 PID 的用户程序）');
+    assert(/-Action Inspect -TargetPid \d+/.test(script), '启动时必须先记录本程序的出生凭据');
+    assert(/-Action Terminate -TargetPid \d+ -Expected/.test(script), '超时后只能按出生凭据终止同一个进程');
+    assert(/no verified identity; force stop skipped/.test(script), '身份不可验证时必须失败关闭，而不是硬杀');
+    const inspectAt = script.indexOf('-Action Inspect');
+    const stopAt = script.indexOf('-Action Terminate');
     const runAt = script.indexOf('run installer');
-    assert(stopAt > -1 && stopAt < runAt, '强制结束要在启动安装器之前');
+    assert(inspectAt > -1 && inspectAt < stopAt && stopAt < runAt, '先取证、再按凭据终止，最后才启动安装器');
     assert(/failed\.json/.test(script), '失败要落标记，下次启动告诉用户');
     assert(/payload kept for manual install/.test(script), '失败时应保留安装包，重试不用重下 1.4GB');
     assert(/if \(-not \$ok\) \{ exit 1 \}[\s\S]*Remove-Item -LiteralPath/.test(script), '验证未通过不得清除载荷');

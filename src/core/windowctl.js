@@ -70,8 +70,9 @@ async function getBounds(pid) {
  */
 async function present(o) {
   const { pid, label, icon, mode, bounds, screen } = o || {};
-  // pid=0 是合法输入：复用别的进程拉起的模拟器时没有句柄，交给脚本按进程名找窗口
-  if (pid === undefined || pid === null) return null;
+  // 只接受已验证的 PID。没有 PID 时宁可什么都不做，也不能按进程名去猜窗口 ——
+  // 那会改到别的用户/别的实例的模拟器窗口。
+  if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return null;
   return call({
     pid,
     action: mode === 'fullscreen' ? 'fullscreen' : 'window',
