@@ -27,6 +27,7 @@ const CSC = path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sha256 = (text) => crypto.createHash('sha256').update(String(text), 'utf8').digest('hex');
+const tamperStarted = (value) => String(value).replace(/.$/, (digit) => (digit === '0' ? '1' : '0'));
 
 function alive(pid) {
   try { process.kill(Number(pid), 0); return true; } catch (e) { return e && e.code === 'EPERM'; }
@@ -163,7 +164,7 @@ test('Windows process safety: coexisting QEMU/terminal/instances never cross-kil
     assert.equal(await processOwner.terminateOwnedProcess(infoA1, () => true), false, 'stale identity must be refused');
     const alpha2 = launchEmu('alpha2', avdArgs('alpha', alphaDir));
     const infoA2 = await waitInfo(alpha2.pid);
-    const staleBirth = { ...infoA2, started: String(Number(infoA2.started) + 1) };
+    const staleBirth = { ...infoA2, started: tamperStarted(infoA2.started) };
     assert.equal(await processOwner.terminateOwnedProcess(staleBirth, () => true), false, 'tampered birth time must be refused');
     assert.equal(alive(alpha2.pid), true, 'target with tampered identity must stay alive');
     const staleExe = { ...infoA2, exe: infoCmd.exe };
@@ -171,7 +172,7 @@ test('Windows process safety: coexisting QEMU/terminal/instances never cross-kil
     assert.equal(alive(alpha2.pid), true, 'target with tampered image path must stay alive');
 
     // The PowerShell helper has its own handle-pinned check, not just the JS caller.
-    const forged = Buffer.from(JSON.stringify({ ...infoA2, started: String(Number(infoA2.started) + 1) }), 'utf8').toString('base64');
+    const forged = Buffer.from(JSON.stringify({ ...infoA2, started: tamperStarted(infoA2.started) }), 'utf8').toString('base64');
     const direct = runPs(['-File', OWNER, '-Action', 'Terminate', '-TargetPid', String(infoA2.pid), '-Expected', forged]);
     assert.notEqual(direct.status, 0, 'helper must reject forged identity');
     assert.equal(alive(alpha2.pid), true, 'helper must not terminate on forged identity');
@@ -207,7 +208,7 @@ test('Windows process safety: coexisting QEMU/terminal/instances never cross-kil
     assert.match(String(normal.stdout), /CHANGED=1/, 'priority should be restored');
     assert.equal(priorityClass(victim.pid), 'Normal');
 
-    const wrongBirth = setPriority(info, 'idle', { started: String(Number(info.started) + 1) });
+    const wrongBirth = setPriority(info, 'idle', { started: tamperStarted(info.started) });
     assert.match(String(wrongBirth.stdout), /CHANGED=0/, 'tampered birth time must not change priority');
     assert.equal(priorityClass(victim.pid), 'Normal', 'priority must stay unchanged');
 
