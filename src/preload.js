@@ -172,7 +172,6 @@ if (isMain) contextBridge.exposeInMainWorld('apkstart', {
   // 在线更新（GitHub Releases）
   updateCheck: (opts) => invoke('app:updateCheck', opts || {}),
   updateApply: () => invoke('app:updateApply'),
-  updateRunPayload: () => invoke('app:updateRunPayload'),
   updateCancel: () => invoke('app:updateCancel'),
   updateOpenRelease: (url) => invoke('app:updateOpen', url),
   restartApp: () => invoke('app:restart'),
@@ -192,7 +191,6 @@ if (isMain) contextBridge.exposeInMainWorld('apkstart', {
   sysDrives: () => invoke('sys:drives'),
   wizardOpen: () => invoke('wizard:open'),
   wizardClose: () => invoke('wizard:close'),
-  proxyReset: () => invoke('proxy:reset'),
   winMinimize: () => invoke('window:minimize'),
   winMaximize: () => invoke('window:maximize'),
   winClose: () => invoke('window:close'),

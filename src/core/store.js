@@ -113,22 +113,16 @@ const DEFAULT_SETTINGS = {
     // 三档各自使用独立 AVD。发布包随带的系统镜像也是 Google Play。
     systemImageFlavor: 'google_apis_playstore',
     compatImage: true,       // 旧兼容开关保留，并与默认 Google Play 档位一致
-    // 轻量版的运行时整包：默认从本项目 GitHub Release 下载（与「软件更新」同源），
+    // 轻量版的运行时整包：默认从本项目 GitHub Release 下载，
     // 拿不到时自动退回 dl.google.com 分组件下载。可在这里换成自建镜像地址。
     preferGithubRuntime: true,
     runtimePackUrl: '',
-    // GitHub 加速镜像前缀（可选）。国内直连 GitHub Releases 经常只有几十 KB/s，
-    // 填成 https://ghfast.top/ 之类的镜像前缀即可把 downloads 请求转过去。
-    // 留空 = 直连（也会先用 8 线程分块试，能跑满带宽）。
+    // 旧版本下载设置保留以免升级覆盖已有配置；软件更新不再读取这些字段。
     mirrorPrefix: '',
-    // 下载并发数：分块下载的连接数。默认 8，弱网/被限速时可调到 16。
     downloadConnections: 8,
-    proxyUrl: '',            // 网络代理（可选）：空=自动检测系统代理/环境变量；off=强制直连
-    githubToken: '',         // GitHub API token（可选）：认证后 5000 次/小时；留空自动读本机 gh CLI 登录账号
-    // 保留旧配置键以兼容升级；当前 fork 的查新和整包下载只使用 GitHub。
+    proxyUrl: '',
+    githubToken: '',
     sourcePreference: 'github',
-    // 自动尝试公共 GitHub 加速镜像（ghfast / gh-proxy）。关掉后只用直连 + 自定义前缀。
-    // 这两个是第三方服务，只是转发公开的 release 文件，不涉及账号信息。
     autoMirror: true,
     // 多系统（Provider 架构）：当前选择的系统 id、远程目录地址、系统安装模式。
     // 系统镜像本体永远不写进设置，只在用户主动选择时按需下载到 systems/<id>/。
@@ -180,9 +174,11 @@ const DEFAULT_SETTINGS = {
     autoTrimDone: false,     // 已按默认分组（defaultOn）精简过预装应用
   },
   update: {
+    // Default to one quiet check after startup. Users may opt out without affecting Android runtime.
+    autoCheck: true,
     // 发现新版本：通知后自动下载；没有应用窗口在前台时自动重启安装，
     // 有应用窗口则等窗口关闭再装（不打断正在玩的应用）。关掉则只通知、手动更新。
-    autoUpdate: false,
+    autoUpdate: true,
   },
   report: {
     // 开机失败时在本机自动生成一份「脱敏诊断报告」，供用户一键上报。

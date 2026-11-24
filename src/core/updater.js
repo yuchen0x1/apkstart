@@ -16,12 +16,15 @@
  */
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { downloadAnyParallel, downloadMulti, sha256File } = require('./download');
 const { ZipFile, safeEntryPath } = require('./zip');
 const { cmpVer } = require('./version');
-const { assetNames, readManifest, matchAsset, marker } = require('./release-manifest');
+const {
+  assetNames, readManifest, matchAsset, marker, verifyLatestManifest, matchLatestAsset,
+} = require('./release-manifest');
 const { Sources } = require('./sources');
 const processOwner = require('./process-owner');
 
@@ -32,7 +35,19 @@ const REPO = 'apkstart';
 // 4GB 足够覆盖任何合理发行版，又能挡住解压炸弹把磁盘写满。
 const MAX_EXTRACT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_ENTRIES = 20000;
+const AUTO_DOWNLOAD_RETRY_BASE_MS = 5 * 60 * 1000;
+const AUTO_DOWNLOAD_RETRY_MAX_MS = 6 * 60 * 60 * 1000;
 const SKIP_ENTRY = /(^|\/)(__MACOSX|\.DS_Store|Thumbs\.db)(\/|$)/i;
+
+function isGithubDownloadHost(target) {
+  let url;
+  try { url = target instanceof URL ? target : new URL(target); } catch (_) { return false; }
+  if (url.protocol !== 'https:') return false;
+  const host = url.hostname.toLowerCase();
+  return host === 'github.com' || host === 'githubusercontent.com'
+    || host.endsWith('.githubusercontent.com')
+    || /^github-production-release-asset-[a-f0-9]+\.s3\.amazonaws\.com$/.test(host);
+}
 
 /** PowerShell 单引号字符串：内部的 ' 要写成 '' */
 function psq(s) {
@@ -56,8 +71,11 @@ class Updater {
     this.dataDir = o.dataDir;
     this.onProgress = o.onProgress || (() => {});
     this.settings = typeof o.settings === 'function' ? o.settings : () => (o.settings || {});
-    // settings() 给 sources 用：决定 GitHub 源偏好和镜像前缀
-    this.sources = new Sources(this.settings);
+    // 更新缓存独立于 settings.json；旧 token / 镜像配置不会参与更新决策。
+    this.sources = new Sources(this.settings, {
+      publicKey: this.publicKey,
+      cacheFile: path.join(this.dataDir, 'update-cache.json'),
+    });
     this.latest = null;
     this._last = null;
   }
@@ -108,6 +126,67 @@ class Updater {
     fs.writeFileSync(file, JSON.stringify({ versions }), 'utf8');
   }
 
+  _readAutoDownloadRetries() {
+    try {
+      const receipt = JSON.parse(fs.readFileSync(path.join(this.updateDir, 'auto-download-retries.json'), 'utf8'));
+      if (!receipt || receipt.schemaVersion !== 1 || !Array.isArray(receipt.versions)) return {};
+      return Object.fromEntries(receipt.versions
+        .filter((entry) => entry && /^\d+\.\d+\.\d+$/.test(entry.version)
+          && Number.isInteger(entry.failures) && entry.failures > 0
+          && Number.isFinite(entry.retryAt))
+        .map((entry) => [entry.version, {
+          failures: Math.min(10, entry.failures),
+          retryAt: entry.retryAt,
+          notified: entry.notified === true,
+        }]));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  _writeAutoDownloadRetries(retries) {
+    const file = path.join(this.updateDir, 'auto-download-retries.json');
+    const versions = Object.entries(retries).map(([version, entry]) => ({ version, ...entry })).slice(-16);
+    if (!versions.length) {
+      try { fs.rmSync(file, { force: true }); } catch (_) { /* retry state is non-critical */ }
+      return;
+    }
+    fs.mkdirSync(this.updateDir, { recursive: true });
+    const temp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    try {
+      fs.writeFileSync(temp, JSON.stringify({ schemaVersion: 1, versions }), { flag: 'wx', mode: 0o600 });
+      fs.renameSync(temp, file);
+    } catch (_) {
+      try { fs.rmSync(temp, { force: true }); } catch (_) { /* keep the previous record */ }
+    }
+  }
+
+  autoDownloadRetryAt(version) {
+    const normalized = String(version || '').replace(/^v/i, '');
+    return this._readAutoDownloadRetries()[normalized]?.retryAt || 0;
+  }
+
+  recordAutoDownloadFailure(version) {
+    const normalized = String(version || '').replace(/^v/i, '');
+    if (!/^\d+\.\d+\.\d+$/.test(normalized)) return { retryAt: 0, shouldNotify: false };
+    const retries = this._readAutoDownloadRetries();
+    const previous = retries[normalized];
+    const failures = Math.min(10, (previous?.failures || 0) + 1);
+    const delay = Math.min(AUTO_DOWNLOAD_RETRY_MAX_MS, AUTO_DOWNLOAD_RETRY_BASE_MS * (2 ** (failures - 1)));
+    const retryAt = Date.now() + delay;
+    retries[normalized] = { failures, retryAt, notified: true };
+    this._writeAutoDownloadRetries(retries);
+    return { retryAt, shouldNotify: !previous?.notified };
+  }
+
+  clearAutoDownloadFailure(version) {
+    const normalized = String(version || '').replace(/^v/i, '');
+    const retries = this._readAutoDownloadRetries();
+    if (!Object.hasOwn(retries, normalized)) return;
+    delete retries[normalized];
+    this._writeAutoDownloadRetries(retries);
+  }
+
   /**
    * 检查更新：从 GitHub 读取版本和资产；下载阶段再对直连/镜像测速。
    * 具体下载地址在 prepare() 里再做一次真实测速排序。
@@ -121,7 +200,14 @@ class Updater {
     const names = assetNames(merged.tag);
     const asset = this.arch === 'x64' && merged.assets.find(a => a.name === names[this.flavor]);
     const proof = (marker.exec(merged.notes || '') || [])[0] || '';
-    const verified = matchAsset(readManifest(proof, merged.tag, this.publicKey), merged.tag, asset);
+    let verified = false;
+    if (asset && merged.manifestKind === 'latest' && merged.manifest) {
+      try { verified = matchLatestAsset(verifyLatestManifest(merged.manifest, this.publicKey), asset); }
+      catch (_) { verified = false; }
+    } else if (asset && merged.manifestKind === 'legacy') {
+      try { verified = matchAsset(readManifest(proof, merged.tag, this.publicKey), merged.tag, asset); }
+      catch (_) { verified = false; }
+    }
 
     this.latest = {
       version: merged.version,
@@ -129,6 +215,8 @@ class Updater {
       name: merged.name,
       notes: String(merged.notes || '').replace(marker, '').trim(),
       proof,
+      manifest: merged.manifest || null,
+      manifestKind: merged.manifestKind || '',
       stale: !!merged.stale,
       htmlUrl: merged.htmlUrl,
       publishedAt: merged.publishedAt,
@@ -149,7 +237,6 @@ class Updater {
         }
         : null,
       assets: merged.assets,
-      // 两个源各自的最新版本 / 谁不可达，界面上可以如实显示「这次走的哪个源」
       sources: merged.sources,
       unreachable: merged.unreachable,
       flavor: this.flavor,
@@ -169,16 +256,24 @@ class Updater {
     const it = info || this.latest;
     if (!it || !it.asset) throw new Error('这个版本没有可自动安装的安装包，请到 GitHub 发布页手动下载');
     const names = assetNames(it.tag);
+    let verified = false;
+    try {
+      if (it.manifestKind === 'latest' && it.manifest) {
+        verified = matchLatestAsset(verifyLatestManifest(it.manifest, this.publicKey), it.asset);
+      } else if (it.manifestKind === 'legacy') {
+        verified = matchAsset(readManifest(it.proof, it.tag, this.publicKey), it.tag, it.asset);
+      }
+    } catch (_) { verified = false; }
     if (this.arch !== 'x64' || it.version !== it.tag.slice(1) || cmpVer(it.tag, this.current) <= 0
       || it.asset.name !== names[this.flavor] || it.stale
-      || !matchAsset(readManifest(it.proof, it.tag, this.publicKey), it.tag, it.asset)) {
+      || !verified) {
       throw new Error('此更新缺少匹配的发行签名、平台信息或官方摘要，请打开发布页');
     }
     const dir = path.join(this.updateDir, it.version);
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, it.asset.name);
     let total = it.asset.size || 0;
-    const conns = Math.max(1, Math.min(16, Number((this.settings().runtime || {}).downloadConnections) || 8));
+    const conns = Math.max(2, Math.min(8, Number(os.cpus().length) || 4));
 
     // 上次已经下完的包就不要再下一遍：安装器失败时载荷是故意留着的（见 apply），
     // 用户点「重试」如果又走 1.4GB 下载，这个更新就永远试不完了。
@@ -204,20 +299,16 @@ class Updater {
       await this._downloadParts(it.asset, file, conns, total);
     } else {
       this.onProgress({ stage: 'download', percent: 1, message: `正在下载 ${it.asset.name}…` });
-      // 候选地址 = 源站 + 镜像前缀；先各下 256KB 实测速度，再拿最快的那个分块下载。
-      // 这是「GitHub 直连几十 KB/s、镜像能跑几 MB/s」时唯一靠谱的选路方式：
-      // 按域名猜没用，同一天不同时段差别很大。
+      // The signed manifest supplies the only release URL; proxy handling is automatic.
       const cands = this.sources.candidates(it.asset);
       const ranked = await this.sources.rank(cands, { onProgress: (p) => this.onProgress(p) }).catch(() => cands);
-      // 进度用的总大小取实际选中的地址，避免镜像返回不同长度时进度卡住。
       const sizes = it.asset.sizes || {};
       for (const u of ranked) {
         if (sizes[u]) { total = sizes[u]; break; }
       }
-      // downloadMulti：分块同时从「GitHub 直连」和「镜像」拉，带宽叠加；
-      // 只有一个源可用或对方不支持 Range 时，它自己退回单源分块。
       await downloadMulti(ranked, file, {
         connections: conns,
+        redirectAllowlist: isGithubDownloadHost,
         onProgress: (pr) => {
           const pct = pr.percent != null ? pr.percent : (total ? Math.round((pr.got / total) * 100) : 0);
           const mb = `${(pr.got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`;
@@ -432,6 +523,7 @@ class Updater {
         // eslint-disable-next-line no-await-in-loop
         await downloadAnyParallel(ranked, tmp, {
           connections: conns,
+          redirectAllowlist: isGithubDownloadHost,
           onProgress: (pr) => {
             const got = doneBytes + (pr.got || 0);
             const pct = total ? Math.round((got / total) * 100) : 0;

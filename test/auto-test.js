@@ -1754,50 +1754,77 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(cmpVer('1.0.0', '1.0.1') === -1, '1.0.0 小于 1.0.1');
   });
 
-  await test('GitHub API 认证：手动 token 优先，空配置读取 gh CLI，失败回退匿名', async () => {
-    const modulePath = require.resolve('../src/core/sources');
+  await test('签名静态清单忽略旧 token/镜像配置且不调用 gh CLI', async () => {
+    const crypto = require('crypto');
+    const { Sources, getGithubToken, ghApiHeaders, withMirror } = require('../src/core/sources');
+    const { createLatestManifest, releaseAssetDescriptors, repo } = require('../src/core/release-manifest');
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+    const tag = 'v9.9.9';
+    const assets = releaseAssetDescriptors(tag).map((asset, index) => ({
+      ...asset,
+      fileSize: 1000 + index,
+      sha256: crypto.createHash('sha256').update(`${tag}:${asset.name}`).digest('hex'),
+      downloadUrl: `${repo}/releases/download/${tag}/${asset.name}`,
+    }));
+    const manifest = createLatestManifest({
+      tag,
+      releaseNotes: 'Fixture release notes.',
+      publishedAt: '2026-11-24T12:00:00.000Z',
+      assets,
+    }, privateKey);
+    const previousMirror = process.env.APKSTART_MIRROR;
+    process.env.APKSTART_MIRROR = 'https://legacy.mirror.invalid/';
     const childProcess = require('child_process');
     const originalExecFile = childProcess.execFile;
-    const originalModule = require.cache[modulePath];
-    const fixtureToken = 'ghp_fixture_token_1234567890abcdef';
-    const load = (handler) => {
-      childProcess.execFile = handler;
-      delete require.cache[modulePath];
-      return require(modulePath);
+    let ghCalls = 0;
+    childProcess.execFile = (...args) => {
+      ghCalls += 1;
+      throw new Error(`unexpected child process: ${args[0]}`);
     };
+    const requests = [];
+    const settings = () => ({
+      runtime: {
+        githubToken: 'ghp_legacy-user-setting-should-not-be-read',
+        mirrorPrefix: 'https://legacy-setting.invalid/',
+        autoMirror: true,
+        sourcePreference: 'github',
+      },
+    });
     try {
-      let calls = 0;
-      const fromGh = load((command, args, options, callback) => {
-        calls += 1;
-        assert(command === 'gh' && args.join(' ') === 'auth token', '应调用 gh auth token');
-        setImmediate(() => callback(null, `${fixtureToken}\n`, ''));
+      assert(getGithubToken === undefined, '不应再导出或使用 GitHub token 读取器');
+      assert(ghApiHeaders === undefined, '不应构造带凭据的 API 请求头');
+      assert(withMirror === undefined, '不应提供镜像 URL 改写器');
+      const sources = new Sources(settings, {
+        publicKey,
+        manifestUrl: 'https://static.fixture.invalid/latest.json',
+        apiBase: 'https://api.fixture.invalid/repos/yuchen0x1/apkstart',
+        requestJson: async (url, init) => {
+          requests.push({ url, init });
+          return { status: 200, headers: {}, body: manifest };
+        },
       });
-      assert(await fromGh.getGithubToken({ runtime: {} }) === fixtureToken, '空配置应读取 gh token');
-      assert(await fromGh.getGithubToken({ runtime: {} }) === fixtureToken, '第二次应命中缓存');
-      assert(calls === 1, '命中缓存不得再次拉起 gh');
-      assert(await fromGh.getGithubToken({ runtime: { githubToken: 'manual_fixture_token_1234567890' } }) === 'manual_fixture_token_1234567890', '手动 token 必须优先');
-      assert(calls === 1, '手动 token 不应触发 gh');
-      assert(fromGh.ghApiHeaders(fixtureToken).Authorization === `Bearer ${fixtureToken}`, 'token 应写入 Authorization');
-
-      // 未登录时 gh 输出的是提示语；长度够长也不能当成凭据发给 API。
-      const invalid = load((_command, _args, _options, callback) => {
-        setImmediate(() => callback(null, 'You are not logged in. Run gh auth login to authenticate.\n', ''));
-      });
-      assert(await invalid.getGithubToken({ runtime: {} }) === '', '提示语不能被当成 token');
-
-      // 没有 gh / gh 失败同样要缓存负结果，否则每次检查更新都要重新拉起进程。
-      let missingCalls = 0;
-      const unavailable = load((_command, _args, _options, callback) => {
-        missingCalls += 1;
-        setImmediate(() => callback(new Error('gh unavailable'), '', ''));
-      });
-      assert(await unavailable.getGithubToken({ runtime: {} }) === '', 'gh 失败时应回退匿名');
-      assert(await unavailable.getGithubToken({ runtime: {} }) === '', '负结果也要缓存');
-      assert(missingCalls === 1, '失败结果不得每次检查都重新拉起 gh');
+      const latest = await sources.latest();
+      assert(latest.manifestKind === 'latest', '应通过静态 latest 清单获取版本信息');
+      assert(latest.verified === true, '版本清单签名应已验证');
+      assert(latest.assets.length === assets.length, '资产数量应与签名清单一致');
+      for (const expected of assets) {
+        const asset = latest.assets.find((item) => item.name === expected.name);
+        assert(asset, `应映射清单资产 ${expected.name}`);
+        assert(asset.size === expected.fileSize, '文件大小来自签名清单');
+        assert(asset.digest === `sha256:${expected.sha256}`, '摘要来自签名清单');
+        assert(asset.url === expected.downloadUrl, '下载地址来自签名清单');
+        assert(JSON.stringify(sources.candidates(asset)) === JSON.stringify([expected.downloadUrl]),
+          '只允许清单声明的官方地址');
+      }
+      assert(requests.length === 1 && requests[0].url === 'https://static.fixture.invalid/latest.json',
+        '优先只请求静态清单');
+      assert(!Object.keys(requests[0].init.headers || {}).some((key) => key.toLowerCase() === 'authorization'),
+        '静态查新请求不能携带 Authorization');
+      assert(ghCalls === 0, '查新不得调用 gh CLI');
     } finally {
       childProcess.execFile = originalExecFile;
-      delete require.cache[modulePath];
-      if (originalModule) require.cache[modulePath] = originalModule;
+      if (previousMirror === undefined) delete process.env.APKSTART_MIRROR;
+      else process.env.APKSTART_MIRROR = previousMirror;
     }
   });
 
@@ -1844,30 +1871,9 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(info.canAutoApply === false, '没有可用资产时不能自动更新');
   });
 
-  await test('双源：候选地址含镜像前缀，自定义前缀优先于公共镜像', () => {
-    const { Sources, withMirror } = require('../src/core/sources');
-    const url = 'https://github.com/o/r/releases/download/v1/a.zip';
-    const auto = new Sources(() => ({ runtime: { autoMirror: true } }));
-    const list = auto.candidates(url);
-    assert(list[0] === url, '源站必须排第一（测速排序前保持原序）');
-    assert(list.length >= 2 && list.some((u) => u.includes('ghfast.top')), '自动镜像应被列入候选');
-
-    const custom = new Sources(() => ({ runtime: { autoMirror: true, mirrorPrefix: 'https://my.mirror/' } }));
-    const c2 = custom.candidates(url);
-    assert(c2.length === 2 && c2[1] === `https://my.mirror/${url}`, `自定义前缀应唯一生效，实际 ${JSON.stringify(c2)}`);
-
-    const off = new Sources(() => ({ runtime: { autoMirror: false } }));
-    assert(off.candidates(url).length === 1, '关掉自动镜像后只剩直连');
-    assert(withMirror(url, 'https://x/') === `https://x/${url}`, '前缀缺尾斜杠要自动补');
-
-    // 镜像只代理 GitHub：Gitee 的地址拼上镜像前缀只会 403，不该被列入候选
-    const giteeUrl = 'https://gitee.com/daily-miku/apkstart/releases/download/v1/a.zip.part1';
-    assert(auto.candidates(giteeUrl).length === 1, 'Gitee 资产不应套 GitHub 镜像前缀');
-  });
-
-  await test('双源：测速结果按速度排序，全部失败时保持原序不丢可用地址', async () => {
+  await test('官方下载地址测速排序：失败地址排最后但仍保留重试机会', async () => {
     const { Sources } = require('../src/core/sources');
-    const s = new Sources(() => ({ runtime: { autoMirror: false } }));
+    const s = new Sources(() => ({ runtime: {} }));
     // 直接注入测速缓存，避免测试依赖外网
     s._rankCache.set('https://slow/', { at: Date.now(), ok: true, speed: 1000 });
     s._rankCache.set('https://fast/', { at: Date.now(), ok: true, speed: 9000 });
@@ -1877,54 +1883,6 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(ranked[2] === 'https://dead/', '失败的地址排最后但仍保留（还有一次机会）');
     s.reset();
     assert(s._rankCache.size === 0, 'reset 要清空测速缓存（换源/换网后必须重测）');
-  });
-
-  await test('双源：Gitee 自动附带的源码包（v1.2.3.zip）绝不能被当成安装包', async () => {
-    const { Sources } = require('../src/core/sources');
-    const s2 = new Sources(() => ({ runtime: {} }));
-    s2.fetchReleases = async () => [
-      {
-        source: 'gitee',
-        name: 'Gitee',
-        web: 'e',
-        rel: {
-          tag_name: 'v0.3.2',
-          assets: [
-            { name: 'v0.3.2.zip', size: 999, browser_download_url: 'ge://src' },
-            { name: 'v0.3.2.tar.gz', size: 999, browser_download_url: 'ge://src2' },
-            { name: 'ApkStart-v0.3.2-win64-portable.zip', size: 10, browser_download_url: 'ge://ok' },
-          ],
-        },
-      },
-    ];
-    const m = await s2.latest();
-    assert(m.assets.length === 1 && m.assets[0].url === 'ge://ok',
-      `只应保留 ApkStart* 资产，实际 ${JSON.stringify(m.assets.map((a) => a.name))}`);
-  });
-
-  await test('Gitee 的资产没有 size 字段：分片组仍要成立（否则整包被丢掉）', async () => {
-    const { Sources } = require('../src/core/sources');
-    const s = new Sources(() => ({ runtime: {} }));
-    s.fetchReleases = async () => [{
-      source: 'gitee',
-      name: 'Gitee',
-      web: 'e',
-      rel: {
-        tag_name: 'v0.3.3',
-        // Gitee 发行版资产只有 name + url，没有 size（实测）
-        assets: [
-          { name: 'ApkStart-v0.3.3-win64-portable.zip.part1', browser_download_url: 'ge://p1' },
-          { name: 'ApkStart-v0.3.3-win64-portable.zip.part2', browser_download_url: 'ge://p2' },
-        ],
-      },
-    }];
-    const m = await s.latest();
-    assert(m.assets.length === 1, `应合并成 1 个资产，实际 ${m.assets.length}`);
-    const a = m.assets[0];
-    assert(a.name === 'ApkStart-v0.3.3-win64-portable.zip', `资产名应为整包名，实际 ${a.name}`);
-    assert(a.parts && a.parts.length === 2, '必须保留两片');
-    assert(a.parts[0].urls[0] === 'ge://p1' && a.parts[1].urls[0] === 'ge://p2', '分片地址顺序/内容要对');
-    assert(a.size === 0, '大小未知时应为 0（界面按已收字节显示进度）');
   });
 
   await test('分片资产必须一路传到 updater.asset，否则 prepare 会报「没有可用的下载地址」', async () => {
@@ -1940,26 +1898,14 @@ const { adbKeyHint } = require('../src/core/engine');
         name: 'ApkStart-v9.9.9-win64-portable.zip',
         size: 0,
         partial: true,
-        parts: [{ index: 1, size: 0, urls: ['https://gitee.com/x/p1'] }, { index: 2, size: 0, urls: ['https://gitee.com/x/p2'] }],
+        parts: [{ index: 1, size: 0, urls: ['https://github.com/yuchen0x1/apkstart/releases/download/v9.9.9/part1'] }, { index: 2, size: 0, urls: ['https://github.com/yuchen0x1/apkstart/releases/download/v9.9.9/part2'] }],
       }],
-      sources: [{ source: 'gitee', name: 'Gitee', tag: 'v9.9.9' }],
+      sources: [{ source: 'github-api', name: 'GitHub API', tag: 'v9.9.9' }],
       unreachable: [],
     });
     const info = await u.check({ force: true });
     assert(info.asset && info.asset.parts && info.asset.parts.length === 2, 'parts 必须保留到 asset 上');
     assert(info.canAutoApply === false, '未签名的分片不能自动更新');
-  });
-
-  await test('双源：合并版本时只认同版本的资产，不拿旧包冒充新包', async () => {
-    const { Sources } = require('../src/core/sources');
-    const s = new Sources(() => ({ runtime: {} }));
-    s.fetchReleases = async () => [
-      { source: 'github', name: 'GitHub', web: 'g', rel: { tag_name: 'v0.4.0', assets: [{ name: 'ApkStart-A-portable.zip', size: 10, browser_download_url: 'gh://a' }] } },
-      { source: 'gitee', name: 'Gitee', web: 'e', rel: { tag_name: 'v0.3.9', assets: [{ name: 'ApkStart-A-portable.zip', size: 10, browser_download_url: 'ge://a' }, { name: 'ApkStart-B.txt', size: 1, browser_download_url: 'ge://b' }] } },
-    ];
-    const m = await s.latest();
-    assert(m.version === '0.4.0', `应取更高版本，实际 ${m.version}`);
-    assert(m.assets.length === 1 && m.assets[0].url === 'gh://a', '旧版本同名资产不能覆盖新版本');
   });
 
   await test('窗口代理：scope 仅接受真实模拟器目录，滤掉空项和宽泛路径', async () => {
@@ -1994,25 +1940,6 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(/<option value="game"/.test(html), '设置页要能选游戏/低延迟模式');
     const appwin = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'appwin.js'), 'utf8');
     assert(/priorityMode === 'game'/.test(appwin), '游戏模式不能装全局鼠标钩子');
-  });
-
-  await test('双源：同名整包两边都有时，两个地址都要留着（否则 Gitee 永远轮不到）', async () => {
-    const { Sources } = require('../src/core/sources');
-    const s = new Sources(() => ({ runtime: { autoMirror: false } }));
-    const gh = 'https://github.com/o/r/releases/download/v0.3.3/a.zip';
-    const ge = 'https://gitee.com/o/r/releases/download/v0.3.3/a.zip';
-    s.fetchReleases = async () => [
-      { source: 'github', name: 'GitHub', web: 'g', rel: { tag_name: 'v0.3.3', assets: [{ name: 'ApkStart-v0.3.3-win64-portable.zip', size: 108200693, browser_download_url: gh }] } },
-      // Gitee 的资产没有 size（实测），不能拿 GitHub 的大小冒充它
-      { source: 'gitee', name: 'Gitee', web: 'e', rel: { tag_name: 'v0.3.3', assets: [{ name: 'ApkStart-v0.3.3-win64-portable.zip', browser_download_url: ge }] } },
-    ];
-    const m = await s.latest();
-    assert(m.assets.length === 1, `同名资产要合并成 1 个，实际 ${m.assets.length}`);
-    const a = m.assets[0];
-    assert(a.urls.length === 2 && a.urls[1] === ge, `两个源的地址都要留着，实际 ${JSON.stringify(a.urls)}`);
-    assert(a.sizes[gh] === 108200693 && !a.sizes[ge], '大小按地址分开记，未知就是未知');
-    const cands = s.candidates(a);
-    assert(cands.length === 2 && cands[0] === gh, `候选地址应含两个源，实际 ${JSON.stringify(cands)}`);
   });
 
   await test('多源并行下载：两个源体积不同时，跟最快的源走（不能固定挑体积大的）', async () => {
@@ -2373,63 +2300,6 @@ const { adbKeyHint } = require('../src/core/engine');
       srv.close();
       fs.rmSync(out, { force: true });
     }
-  });
-
-  await test('双源：版本结果缓存 10 分钟，force 时强制重查', async () => {
-    const { Sources } = require('../src/core/sources');
-    const s = new Sources(() => ({ runtime: {} }));
-    let calls = 0;
-    s.fetchReleases = async () => {
-      calls += 1;
-      return [{ source: 'github', name: 'GitHub', web: 'g', rel: { tag_name: 'v1.0.0', assets: [] } }];
-    };
-    await s.latest();
-    await s.latest();
-    assert(calls === 1, `缓存期内不应重复请求，实际请求 ${calls} 次`);
-    await s.latest({ force: true });
-    assert(calls === 2, 'force 必须绕过缓存');
-    s.reset();
-    await s.latest();
-    assert(calls === 3, 'reset 后应重新请求');
-  });
-
-  await test('双源：某个源 403 被限流后熔断跳过，不再每轮撞墙', async () => {
-    const { Sources } = require('../src/core/sources');
-    const s = new Sources(() => ({ runtime: {} }));
-    let giteeCalls = 0;
-    s.fetchReleases = async () => {
-      giteeCalls += 1;
-      return [
-        { source: 'github', name: 'GitHub', web: 'g', rel: { tag_name: 'v1.0.0', assets: [] } },
-        { source: 'gitee', name: 'Gitee', web: 'e', error: 'gitee.com 403 （被限流）' },
-      ];
-    };
-    // 第一次：Gitee 报 403，被记入熔断
-    await s.latest({ force: true });
-    assert(giteeCalls === 1, '第一轮应真实请求过');
-    const reason = s.blockedReason('gitee');
-    assert(!!reason, '403 必须触发熔断');
-    assert(s.blockedReason('github') === null, '没出错的源不应被熔断');
-    // 熔断期内的请求应被直接跳过（不再打网络）
-    assert(/暂时跳过/.test(reason), `跳过原因要能看懂，实际：${reason}`);
-    s.reset();
-    assert(s.blockedReason('gitee') === null, 'reset 后熔断应解除');
-  });
-
-  await test('双源：全部源不可达时退回上一次结果（标记 stale，不直接报错）', async () => {
-    const { Sources } = require('../src/core/sources');
-    const s = new Sources(() => ({ runtime: {} }));
-    s.fetchReleases = async () => [
-      { source: 'github', name: 'GitHub', web: 'g', rel: { tag_name: 'v1.2.3', assets: [] } },
-    ];
-    const first = await s.latest();
-    assert(first.tag === 'v1.2.3' && !first.stale, '第一次应正常');
-    s._relTtl = 0;   // 让缓存失效
-    s.fetchReleases = async () => [
-      { source: 'github', name: 'GitHub', web: 'g', error: '超时' },
-    ];
-    const second = await s.latest();
-    assert(second.tag === 'v1.2.3' && second.stale === true, '应退回旧结果并标记 stale');
   });
 
   await test('系统镜像落点：全新安装必须落在运行时目录（CI 组装运行时靠这个）', () => {

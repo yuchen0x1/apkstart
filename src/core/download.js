@@ -94,7 +94,9 @@ function assertDownloadBytes(written, size, total) {
   }
 }
 
-function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy = false, timeout = 30000, signal } = {}) {
+function openStream(url, {
+  method = 'GET', headers = {}, redirects = 0, noProxy = false, timeout = 30000, signal, redirectAllowlist,
+} = {}) {
   return new Promise((resolve, reject) => {
     if (signal && signal.aborted) return reject(new Error('下载已取消'));
     if (redirects > 6) return reject(new Error('重定向次数过多'));
@@ -114,13 +116,14 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
     const mod = u.protocol === 'http:' ? http : https;
 
     (async () => {
-      // 本地代理（Clash 等，经系统代理/环境变量/设置检测）：有就走代理，
+      // 自动检测本地代理（系统代理/环境变量）：有就走代理，
       // 代理本身连不上再回退直连 —— 挂着 Clash 的机器直连 GitHub 只有几十 KB/s，
       // 走代理实测十几 MB/s。noProxy 用于这次回退，避免死循环。
       // 回环地址（本地测试服务器/本地服务）永不走代理（标准 NO_PROXY 语义）
       const loopback = isLoopbackHost(u.hostname);
+      const bypassProxy = loopback || proxyMod.isNoProxy(u.hostname, Number(u.port) || (u.protocol === 'https:' ? 443 : 80));
       let proxy = null;
-      if (!noProxy && !loopback) {
+      if (!noProxy && !bypassProxy) {
         try { proxy = await proxyMod.getActiveProxy(); } catch (_) { proxy = null; }
       }
       if (signal && signal.aborted) { cleanup(); return; }
@@ -130,7 +133,7 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
         // 注意：agent:false 时 Node 会忽略 options.createConnection（agent:false 新建的
         // 默认 Agent 不带它）→ 直接对代理端口做 TLS 握手 → 必然失败。必须显式传一个
         // 自定义 Agent；隧道内是端到端请求，path 用纯路径、Host 用目标域名。
-                const tunnelAgent = new https.Agent({ keepAlive: false, maxSockets: 1 });
+        const tunnelAgent = new https.Agent({ keepAlive: false, maxSockets: 1 });
         // 关键：https.Agent 构造函数【不读】options.createConnection（那是 http.Agent 的行为），
         // 默认的 createConnection 会拿请求里的 host:port（代理地址）直接做 TLS 握手 —— 必挂。
         // 覆盖实例方法：先 CONNECT 隧道，再在隧道上 TLS（servername=目标域名），返回已握手的 TLSSocket。
@@ -176,7 +179,9 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
         // 注意不能用宽泛的 /connect/i —— 'disconnected' 里也有 connect，会误匹配。
         const etext = `${(e && e.code) || ''}${(e && e.name) || ''}${(e && e.message) || ''}`;
         if (proxy && !noProxy && /代理 CONNECT|ECONNREFUSED|ETIMEDOUT|AggregateError/i.test(etext)) {
-          return resolve(openStream(url, { method, headers, redirects, noProxy: true, timeout, signal }));
+          return resolve(openStream(url, {
+            method, headers, redirects, noProxy: true, timeout, signal, redirectAllowlist,
+          }));
         }
         reject(e);
       });
@@ -191,13 +196,18 @@ function openStream(url, { method = 'GET', headers = {}, redirects = 0, noProxy 
         try {
           const target = new URL(res.headers.location, u);
           assertSecureUrl(target, u);
+          if (redirectAllowlist && !redirectAllowlist(target)) {
+            throw new Error(`下载安全策略拒绝跳转到未授权主机：${target.hostname}`);
+          }
           next = target.href;
         } catch (e) {
           res.destroy();
           return reject(e);
         }
         res.resume();
-        return resolve(openStream(next, { method, headers, redirects: redirects + 1, noProxy, timeout, signal }));
+        return resolve(openStream(next, {
+          method, headers, redirects: redirects + 1, noProxy, timeout, signal, redirectAllowlist,
+        }));
       }
       res.downloadUrl = url; // strong ETag 只在同一最终资源 URL 内有意义。
       resolve(res);
@@ -333,7 +343,7 @@ async function download(url, dest, opt = {}) {
       if (resumable) headers['If-Range'] = m.etag;
     }
 
-    const res = await openStream(url, { headers, signal });
+    const res = await openStream(url, { headers, signal, redirectAllowlist: opt.redirectAllowlist });
     if (signal && signal.aborted) { res.destroy(); throw new Error('下载已取消'); }
 
     const etag = responseETag(res);
@@ -513,7 +523,9 @@ async function downloadParallel(url, dest, opt = {}) {
   let supportsRange = false;
   let identity = null;
   try {
-    const probe = await openStream(url, { headers: { Range: 'bytes=0-0' }, signal });
+    const probe = await openStream(url, {
+      headers: { Range: 'bytes=0-0' }, signal, redirectAllowlist: opt.redirectAllowlist,
+    });
     const cr = probe.statusCode === 206 ? contentRange(probe) : null;
     const length = probe.headers['content-length'] === undefined ? null : Number(probe.headers['content-length']);
     if (cr && cr.start === 0 && cr.end === 0 && (length === null || length === 1)) {
@@ -566,7 +578,9 @@ async function downloadParallel(url, dest, opt = {}) {
     if (signal && signal.aborted) throw new Error('下载已取消');
     const requestHeaders = { Range: `bytes=${c.pos}-${c.end}` };
     if (identity.etag) requestHeaders['If-Range'] = identity.etag;
-    const res = await openStream(url, { headers: requestHeaders, signal });
+    const res = await openStream(url, {
+      headers: requestHeaders, signal, redirectAllowlist: opt.redirectAllowlist,
+    });
     if (signal && signal.aborted) { res.destroy(); throw new Error('下载已取消'); }
     if (res.statusCode !== 206) {
       res.destroy();
@@ -725,7 +739,9 @@ async function downloadMulti(urls, dest, opt = {}) {
   // 1) 并行探测：总大小 + Range + 每个响应最终 URL 与 strong ETag。
   const probes = await Promise.all(list.map(async (u) => {
     try {
-      const res = await openStream(u, { headers: { Range: 'bytes=0-0' }, signal });
+      const res = await openStream(u, {
+        headers: { Range: 'bytes=0-0' }, signal, redirectAllowlist: opt.redirectAllowlist,
+      });
       const cr = res.statusCode === 206 ? contentRange(res) : null;
       const length = res.headers['content-length'] === undefined ? null : Number(res.headers['content-length']);
       const valid = cr && cr.start === 0 && cr.end === 0
@@ -833,7 +849,9 @@ async function downloadMulti(urls, dest, opt = {}) {
   const fetchChunk = async (c, signal) => {
     if (signal && signal.aborted) throw new Error('下载已取消');
     const url = same[c.src % same.length].url;
-    const res = await openStream(url, { headers: { Range: `bytes=${c.pos}-${c.end}` }, signal });
+    const res = await openStream(url, {
+      headers: { Range: `bytes=${c.pos}-${c.end}` }, signal, redirectAllowlist: opt.redirectAllowlist,
+    });
     if (signal && signal.aborted) { res.destroy(); throw new Error('下载已取消'); }
     if (res.statusCode !== 206) {
       res.destroy();

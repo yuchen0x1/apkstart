@@ -1,82 +1,32 @@
 'use strict';
 /**
- * GitHub + 镜像前缀的统一下载来源管理。
+ * Signed Release manifest metadata and verified download source selection.
  *
- * 国内直连 GitHub 有两个坑：
- *   1. api.github.com 经常几十秒才响应，甚至直接超时 —— 表现是「检查更新转圈」；
- *   2. 资产下载（objects.githubusercontent.com）单连接限速，常在 100KB/s 上下 ——
- *      1.5 GB 的运行时包要下 4 个小时。
- *
- * 版本信息只来自本项目的 GitHub Releases；下载地址则包含 GitHub 直连和
- * 可选的 GitHub 镜像前缀，每个地址真下一小段后按实测速度排序。
- *
- * 测速结果在内存里缓存 30 分钟（同一进程内反复检查更新/下多个组件不必重复测）。
+ * Version metadata comes from the signed latest.json asset; the REST API is a
+ * controlled fallback. Downloads never trust user-configured or public relays.
  */
 const https = require('https');
 const http = require('http');
 const tls = require('tls');
-const { execFile } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const { URL } = require('url');
 const { cmpVer } = require('./version');
 const proxyMod = require('./proxy');
+const {
+  assetNames, readManifest, matchAsset, marker, repo,
+  verifyLatestManifest, latestManifestName,
+} = require('./release-manifest');
 
-// fork 版更新源：只认本仓库（GitHub），不再检查上游 RoutineMiku 的发布
-const OWNER_GH = 'yuchen0x1';
-const REPO = 'apkstart';
+const OWNER = 'yuchen0x1';
+const REPOSITORY = 'apkstart';
+const API_BASE = `https://api.github.com/repos/${OWNER}/${REPOSITORY}`;
 
-const SOURCES = {
-  github: {
-    id: 'github',
-    name: 'GitHub',
-    api: `https://api.github.com/repos/${OWNER_GH}/${REPO}`,
-    web: `https://github.com/${OWNER_GH}/${REPO}`,
-  },
-};
-
-/**
- * GitHub API 的认证凭据（可选）。认证后限额 5000 次/小时（匿名只有 60 次/小时，
- * 而且 Clash 出口是共享 IP，更容易被别人打光）。取用顺序：
- *   1. 设置 runtime.githubToken（用户手动填）；
- *   2. 本机 gh CLI 已登录的账号（gh auth token，凭据由 gh 保存在系统凭据管理器）。
- * 都没有就返回空串（匿名 60 次/小时，检查更新仍可用）。
- * token 只发往 api.github.com，绝不写日志。结果缓存 1 小时（含「没有 token」），
- * 免得机器上没有 gh 时每次检查更新都要重新拉起一次进程。
- */
-let _ghTokenCache = { at: 0, token: '' };
-const GH_TOKEN_TTL = 60 * 60 * 1000;
-// gh 未登录时 stdout 里可能是一句提示；长度够长也不代表是凭据。
-const GH_TOKEN_SHAPE = /^(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})$/;
-
-async function getGithubToken(settings) {
-  const explicit = String(settings?.runtime?.githubToken || '').trim();
-  if (explicit) return explicit;
-  const now = Date.now();
-  if (now - _ghTokenCache.at < GH_TOKEN_TTL) return _ghTokenCache.token;
-  let token = '';
-  try {
-    token = await new Promise((resolve) => {
-      execFile('gh', ['auth', 'token'], { windowsHide: true, timeout: 5000 }, (error, stdout) => {
-        resolve(error ? '' : String(stdout || '').trim());
-      });
-    });
-  } catch (_) { token = ''; } // 没装 gh CLI：退回匿名 API
-  if (token && !GH_TOKEN_SHAPE.test(token)) token = '';
-  _ghTokenCache = { at: now, token };
-  return token;
-}
-
-/** api.github.com 请求头（有 token 就带上认证） */
-function ghApiHeaders(token) {
-  const h = { Accept: 'application/vnd.github+json' };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
-}
-
-/** 已知可用的 GitHub 加速前缀。只在用户开启 autoMirror 且未自定义时参与测速。 */
-const KNOWN_MIRRORS = [
-  'https://ghfast.top/',
-  'https://gh-proxy.com/',
-];
+const MANIFEST_URL = `https://github.com/${OWNER}/${REPOSITORY}/releases/latest/download/${latestManifestName}`;
+const CACHE_TTL = 30 * 60 * 1000;
+const MAX_BACKOFF_MS = 6 * 60 * 60 * 1000;
+const MAX_JSON_BYTES = 4 * 1024 * 1024;
 
 /**
  * 一次测速的采样字节数。
@@ -85,7 +35,84 @@ const KNOWN_MIRRORS = [
  */
 const SAMPLE_BYTES = 256 * 1024;
 
-function openUrl(url, { method = 'GET', timeout = 10000, headers = {}, redirects = 0, noProxy = false } = {}) {
+class HttpStatusError extends Error {
+  constructor(url, response) {
+    const status = Number(response.status) || 0;
+    super(`${new URL(url).host} HTTP ${status}`);
+    this.name = 'HttpStatusError';
+    this.status = status;
+    this.headers = response.headers || {};
+    this.body = response.body;
+    this.url = url;
+  }
+}
+
+function header(headers, name) {
+  if (!headers) return '';
+  if (typeof headers.get === 'function') return String(headers.get(name) || '');
+  const key = Object.keys(headers).find((item) => item.toLowerCase() === name.toLowerCase());
+  return key ? String(headers[key] || '') : '';
+}
+
+function responseJson(body) {
+  if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
+    return JSON.parse(Buffer.from(body).toString('utf8').replace(/^\uFEFF/, ''));
+  }
+  if (typeof body === 'string') return JSON.parse(body.replace(/^\uFEFF/, ''));
+  if (body && typeof body === 'object') return body;
+  throw new Error('更新服务器返回空数据');
+}
+
+function rateLimitUntil(response, now, floorMs) {
+  const retryAfter = header(response.headers, 'retry-after').trim();
+  let retryAt = 0;
+  if (/^\d+(?:\.\d+)?$/.test(retryAfter)) retryAt = now + Math.ceil(Number(retryAfter) * 1000);
+  else if (retryAfter) {
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) retryAt = date;
+  }
+  const reset = Number(header(response.headers, 'x-ratelimit-reset'));
+  const resetAt = Number.isSafeInteger(reset) && reset > 0 ? reset * 1000 : 0;
+  return Math.max(now + floorMs, retryAt, resetAt);
+}
+
+function isRateLimited(response) {
+  if (Number(response.status) === 429) return true;
+  if (Number(response.status) !== 403) return false;
+  const remaining = header(response.headers, 'x-ratelimit-remaining');
+  const message = typeof response.body === 'string'
+    ? response.body
+    : response.body && typeof response.body.message === 'string' ? response.body.message : '';
+  return remaining === '0' || !!header(response.headers, 'retry-after')
+    || /rate limit exceeded|secondary rate limit/i.test(message);
+}
+
+function classifyFailure(error, response) {
+  const status = response ? Number(response.status) : Number(error && error.status) || 0;
+  if (status === 403) return isRateLimited(response || error) ? 'rate-limit' : 'forbidden';
+  if (status === 429) return 'rate-limit';
+  if (status === 404) return 'not-found';
+  if (status >= 500) return 'server';
+  if (error && (error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN')) return 'dns';
+  if (error && (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED'
+    || /timeout|timed out|超时/i.test(error.message || ''))) return 'timeout';
+  if (status) return 'http';
+  return 'network';
+}
+
+function allowlistedManifestRedirect(raw) {
+  let url;
+  try { url = new URL(raw); } catch (_) { return false; }
+  if (url.protocol !== 'https:') return false;
+  const host = url.hostname.toLowerCase();
+  return host === 'github.com' || host === 'api.github.com'
+    || host === 'githubusercontent.com' || host.endsWith('.githubusercontent.com')
+    || /^github-production-release-asset-[a-f0-9]+\.s3\.amazonaws\.com$/.test(host);
+}
+
+function openUrl(url, {
+  method = 'GET', timeout = 10000, headers = {}, redirects = 0, noProxy = false, redirectAllowlist,
+} = {}) {
   return new Promise((resolve, reject) => {
     if (redirects > 6) return reject(new Error('重定向次数过多'));
     let u;
@@ -98,8 +125,9 @@ function openUrl(url, { method = 'GET', timeout = 10000, headers = {}, redirects
       // 「检查更新」从几十秒降到几百毫秒，测速结果也反映代理的真实带宽。
       // 回环地址（本地测试服务器/本地服务）永不走代理（标准 NO_PROXY 语义）
       const loopback = /^(127\.|localhost$|\[::1\]|::1$)/i.test(u.hostname);
+      const bypassProxy = loopback || proxyMod.isNoProxy(u.hostname, Number(u.port) || (u.protocol === 'https:' ? 443 : 80));
       let proxy = null;
-      if (!noProxy && !loopback) {
+      if (!noProxy && !bypassProxy) {
         try { proxy = await proxyMod.getActiveProxy(); } catch (_) { proxy = null; }
       }
       const base = {
@@ -144,7 +172,9 @@ function openUrl(url, { method = 'GET', timeout = 10000, headers = {}, redirects
         // 不能用宽泛的 /connect/i —— 'disconnected' 里也有 connect，会误匹配
         const etext = `${(e && e.code) || ''}${(e && e.name) || ''}${(e && e.message) || ''}`;
         if (proxy && !noProxy && /代理 CONNECT|ECONNREFUSED|ETIMEDOUT|AggregateError/i.test(etext)) {
-          return resolve(openUrl(url, { timeout, headers, redirects, noProxy: true }));
+          return resolve(openUrl(url, {
+            timeout, headers, redirects, noProxy: true, redirectAllowlist,
+          }));
         }
         reject(e);
       });
@@ -153,38 +183,58 @@ function openUrl(url, { method = 'GET', timeout = 10000, headers = {}, redirects
       function finishReq(res) {
         if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
           res.resume();
-          const next = new URL(res.headers.location, url).href;
+          let target;
+          try {
+            target = new URL(res.headers.location, u);
+          } catch (_) {
+            return reject(new Error('更新请求包含无效重定向地址'));
+          }
+          if (redirectAllowlist && !redirectAllowlist(target)) {
+            return reject(new Error(`更新请求重定向到未授权主机：${target.hostname}`));
+          }
+          if (target.protocol !== 'https:' && u.protocol === 'https:') {
+            return reject(new Error('下载源重定向到非 HTTPS 地址'));
+          }
           const nextHeaders = { ...headers };
-          if (new URL(next).origin !== u.origin) delete nextHeaders.Authorization;
-          if (!next.startsWith('https://') && u.protocol === 'https:') return reject(new Error('下载源重定向到非 HTTPS 地址'));
-          openUrl(next, { timeout, headers: nextHeaders, redirects: redirects + 1, noProxy }).then(resolve, reject);
+          if (target.origin !== u.origin) {
+            for (const key of Object.keys(nextHeaders)) {
+              if (key.toLowerCase() === 'authorization') delete nextHeaders[key];
+            }
+          }
+          openUrl(target.href, {
+            timeout, headers: nextHeaders, redirects: redirects + 1, noProxy, redirectAllowlist,
+          }).then(resolve, reject);
           return;
         }
+        res.responseUrl = url;
         resolve(res);
       }
     })().catch(reject);
   });
 }
 
-/** 取一小段 JSON（带重定向、超时、大小上限） */
-async function getJson(url, timeout = 10000, headers = {}) {
-  const res = await openUrl(url, { timeout, headers });
-  if (res.statusCode < 200 || res.statusCode >= 300) {
-    res.resume();
-    throw new Error(`${new URL(url).host} ${res.statusCode}`);
-  }
+/** 取 JSON 响应及状态、响应头（带重定向、超时、大小上限）。 */
+async function getJsonResponse(url, { timeout = 10000, headers = {}, redirectAllowlist } = {}) {
+  const res = await openUrl(url, { timeout, headers, redirectAllowlist });
   const chunks = [];
   let len = 0;
   await new Promise((resolve, reject) => {
     res.on('data', (c) => {
       len += c.length;
-      if (len > 4 * 1024 * 1024) { res.destroy(); resolve(); return; }
+      if (len > MAX_JSON_BYTES) {
+        res.destroy(new Error('更新服务器响应超过大小限制'));
+        reject(new Error('更新服务器响应超过大小限制'));
+        return;
+      }
       chunks.push(c);
     });
     res.on('end', resolve);
     res.on('error', reject);
   });
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  const text = Buffer.concat(chunks).toString('utf8').replace(/^\uFEFF/, '');
+  let body = text;
+  try { body = JSON.parse(text); } catch (_) { /* keep text for useful HTTP error classification */ }
+  return { status: res.statusCode, headers: res.headers, body, finalUrl: res.responseUrl || url };
 }
 
 /**
@@ -242,219 +292,330 @@ function measure(url, { bytes = SAMPLE_BYTES, timeoutMs = 9000 } = {}) {
   });
 }
 
-/** 把 GitHub 资产地址套上镜像前缀 */
-function withMirror(url, prefix) {
-  if (!prefix || !/^https?:\/\//i.test(prefix)) return '';
-  const p = prefix.endsWith('/') ? prefix : `${prefix}/`;
-  return `${p}${url}`;
-}
-
-/**
- * 兼容历史分片资产：把 xxx.zip.part1 / xxx.zip.part2 还原成一个逻辑资产：
- *   { name: 'xxx.zip', size: 总和, parts: [{index, size, urls:[...]}] }
- * 分片必须从 part1 开始连续，否则视为残缺、丢弃（宁可用整包，也不下一个坏包）。
- */
-function groupParts(assets) {
-  const groups = new Map();
-  const out = [];
-  for (const a of assets) {
-    const m = /^(.*)\.part(\d+)$/i.exec(String(a.name || ''));
-    if (!m) { out.push(a); continue; }
-    const base = m[1];
-    const idx = Number(m[2]);
-    let g = groups.get(base);
-    if (!g) {
-      g = { name: base, size: 0, parts: [], partial: true };
-      groups.set(base, g);
-      out.push(g);
+function atomicWriteJson(file, value) {
+  if (!file) return;
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true });
+  const temp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(temp, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify(value), 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temp, file);
+  } catch (_) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) { /* keep the original error */ }
     }
-    let p = g.parts.find((x) => x.index === idx);
-    if (!p) {
-      p = { index: idx, size: Number(a.size) || 0, urls: [] };
-      g.parts.push(p);
-    }
-    if (a.url && !p.urls.includes(a.url)) p.urls.push(a.url);
-    if (!p.size) p.size = Number(a.size) || 0;
+    try { fs.rmSync(temp, { force: true }); } catch (_) { /* cache failure is non-fatal */ }
   }
-  for (const g of groups.values()) {
-    g.parts.sort((x, y) => x.index - y.index);
-    const contiguous = g.parts.every((p, i) => p.index === i + 1);
-    g.size = g.parts.reduce((n, p) => n + (Number(p.size) || 0), 0);
-    // 某些历史镜像资产没有 size 字段。以「size>0」作为完整性条件会把整组
-    // 分片判成残缺，所以这里只要求「分片连续 + 每个分片有地址」。
-    if (!contiguous || !g.parts.every((p) => p.urls.length)) g.broken = true;
-  }
-  return { list: out.filter((a) => !a.broken), broken: [...groups.values()].filter((g) => g.broken).map((g) => g.name) };
-}
-
-/** mirrors 列表：用户自定义优先，其次内置（autoMirror 关掉就只用自定义的） */
-function mirrorList(settings) {
-  const r = (settings && settings.runtime) || {};
-  const custom = String(r.mirrorPrefix || process.env.APKSTART_MIRROR || '').trim();
-  if (custom) return [custom];
-  if (r.autoMirror === false) return [];
-  return KNOWN_MIRRORS.slice();
 }
 
 class Sources {
-  constructor(settingsFn) {
+  constructor(settingsFn, options = {}) {
     this.settings = typeof settingsFn === 'function' ? settingsFn : () => ({});
+    this.publicKey = options.publicKey;
+    this.manifestUrl = options.manifestUrl || MANIFEST_URL;
+    this.apiBase = options.apiBase || API_BASE;
+    this.now = typeof options.now === 'function' ? options.now : Date.now;
+    this.requestJson = typeof options.requestJson === 'function'
+      ? options.requestJson
+      : (url, init) => getJsonResponse(url, init);
+    this.cacheFile = options.cacheFile || '';
+    this.apiRetryFloorMs = Math.max(1000, Number(options.apiRetryFloorMs) || 60 * 1000);
     this._rankCache = new Map();   // url -> {at, speed, ok}
     this._rankTtl = 30 * 60 * 1000;
-    // 「有没有新版本」不需要秒级新鲜度，避免重复请求 GitHub API。
-    this._relCache = { at: 0, key: '', value: null };
-    this._relTtl = 10 * 60 * 1000;
-    // 熔断：某个源被限流/报错后，一段时间内直接跳过它，不再每次启动都撞墙
-    this._blocked = new Map();     // sourceId -> until(ms)
-    this._blockMs = 15 * 60 * 1000;
+    this._cachedAt = 0;
+    this._latest = null;
+    this._latestFlight = null;
+    this._apiRetryAt = 0;
+    this._apiFailures = 0;
+    this._cacheRecord = { schemaVersion: 1, cachedAt: 0, latest: null, apiRetryAt: 0, apiFailures: 0 };
+    this._loadCache();
   }
 
-  /** 该源是否处于熔断期；返回 null 表示可用，否则返回给用户看的原因 */
-  blockedReason(id) {
-    const until = this._blocked.get(id) || 0;
-    if (until <= Date.now()) return null;
-    return `暂时跳过（${Math.ceil((until - Date.now()) / 60000)} 分钟内不再尝试）`;
+  _loadCache() {
+    if (!this.cacheFile) return;
+    try {
+      const record = JSON.parse(fs.readFileSync(this.cacheFile, 'utf8'));
+      if (!record || record.schemaVersion !== 1) return;
+      this._cacheRecord = record;
+      this._apiRetryAt = Number(record.apiRetryAt) || 0;
+      this._apiFailures = Math.max(0, Number(record.apiFailures) || 0);
+      let result = null;
+      if (record.latest && record.latest.kind === 'manifest') {
+        const manifest = verifyLatestManifest(record.latest.value, this.publicKey);
+        result = this._fromManifest(manifest);
+      } else if (record.latest && record.latest.kind === 'api' && record.latest.value) {
+        result = this._fromApiRelease(record.latest.value);
+      }
+      if (result) {
+        this._latest = result;
+        this._cachedAt = Number(record.cachedAt) || 0;
+      }
+    } catch (_) {
+      // A damaged cache is ignored. It never replaces settings or blocks startup.
+    }
   }
 
-  /** 最新 release，只认本仓库 GitHub（yuchen0x1/apkstart）。 */
-  async fetchReleases() {
-    const ids = ['github'];
-
-    const jobs = ids.map(async (id) => {
-      const s = SOURCES[id];
-      const skip = this.blockedReason(id);
-      if (skip) return { source: id, name: s.name, web: s.web, error: skip };
-      try {
-        const auth = ghApiHeaders(await getGithubToken(this.settings()));
-        const rel = await getJson(`${s.api}/releases/latest`, 9000, auth);
-        return { source: id, name: s.name, web: s.web, rel };
-      } catch (e) {
-        // latest 接口暂时不可用时退回 release 列表。
-        try {
-          const list = await getJson(`${s.api}/releases?per_page=10`, 9000, ghApiHeaders(await getGithubToken(this.settings())));
-          const first = (Array.isArray(list) ? list : []).find((r) => r && !r.draft && !r.prerelease);
-          if (first) return { source: id, name: s.name, web: s.web, rel: first };
-        } catch (_) { /* 这个源彻底不可用 */ }
-        const limited = /\b(403|429)\b/.test(e.message);
-        if (limited) this._blocked.set(id, Date.now() + this._blockMs);
-        const hint = limited ? '（被限流，已暂停使用该源一段时间）' : '';
-        return { source: id, name: s.name, web: s.web, error: `${e.message}${hint}` };
-      }
-    });
-    return Promise.all(jobs);
-  }
-
-  /**
-   * 处理 GitHub 的最新版本和资产列表。
-   */
-  async latest({ force = false } = {}) {
-    const pref = String((this.settings().runtime || {}).sourcePreference || 'auto');
-    const cached = this._relCache;
-    if (!force && cached.value && cached.key === pref && Date.now() - cached.at < this._relTtl) {
-      return cached.value;
-    }
-    const all = await this.fetchReleases();
-    // 被限流的源记入熔断（放在这里而不是 fetchReleases 内部，是为了让「谁来提供
-    // 结果」这件事可被替换/测试，同时保证任何入口拿到的 403 都会触发熔断）
-    for (const x of all) {
-      if (x && x.error && /\b(403|429)\b/.test(x.error)) {
-        this._blocked.set(x.source, Date.now() + this._blockMs);
-      }
-    }
-    const ok = all.filter((x) => x && x.rel);
-    if (!ok.length) {
-      const why = all.map((x) => `${x.name || x.source}: ${x.error || '无数据'}`).join('；');
-      // 全挂了但手里有上一次的结果：宁可给一份「可能是旧的」版本信息，
-      // 也不要让界面直接报错 —— 用户至少还能看到当前版本和发布页入口。
-      if (cached.value) return { ...cached.value, stale: true, staleReason: why };
-      throw new Error(`连不上更新服务器（${why}）`);
-    }
-    ok.sort((a, b) => cmpVer(b.rel.tag_name || b.rel.name, a.rel.tag_name || a.rel.name));
-    const top = ok[0];
-    const tag = String(top.rel.tag_name || top.rel.name || '');
-    const version = tag.replace(/^v/i, '');
-
-    // 只有同版本的资产才算数（不同源的旧版本资产不能拿来装）。
-    // 同名整包 + 分片组同时存在时优先用整包：分片要拼装，多一个失败点。
-    let raw = [];
-    for (const item of ok) {
-      const t = String(item.rel.tag_name || item.rel.name || '').replace(/^v/i, '');
-      if (t !== version) continue;
-      for (const a of (item.rel.assets || [])) {
-        const key = String(a.name || '');
-        if (!key) continue;
-        // 发布资产统一以 ApkStart 开头，按这个前缀白名单更安全。
-        if (!/^ApkStart/i.test(key)) continue;
-        raw.push({
-          name: key,
-          size: Number(a.size) || 0,
-          url: a.browser_download_url || a.url || '',
-          source: item.source,
-          digest: item.source === 'github' ? a.digest : undefined,
-        });
-      }
-    }
-    const grouped = groupParts(raw);
-    const wholeNames = new Set(grouped.list.filter((a) => !a.partial).map((a) => a.name));
-    raw = grouped.list.filter((a) => !(a.partial && wholeNames.has(a.name)));
-
-    // 同名资产的多个地址都保留，交给 rank() 选择最快的直连或镜像地址。
-    const assets = [];
-    const byName = new Map();
-    for (const a of raw) {
-      const hit = byName.get(a.name);
-      if (!hit) {
-        const item = { ...a, urls: a.url ? [a.url] : [], sizes: {} };
-        if (a.url && a.size) item.sizes[a.url] = a.size;
-        byName.set(a.name, item);
-        assets.push(item);
-        continue;
-      }
-      if (a.url && !hit.urls.includes(a.url)) hit.urls.push(a.url);
-      if (a.url && a.size) hit.sizes[a.url] = a.size;
-      if (!hit.size && a.size) hit.size = a.size;
-    }
-
-    const result = {
-      version,
-      tag,
-      name: top.rel.name || tag,
-      notes: top.rel.body || '',
-      htmlUrl: top.rel.html_url || top.web,
-      publishedAt: top.rel.published_at || top.rel.created_at || '',
-      assets,
-      sources: ok.map((x) => ({ source: x.source, name: x.name, tag: x.rel.tag_name || x.rel.name || '' })),
-      unreachable: all.filter((x) => x && x.error).map((x) => ({ source: x.source, name: x.name, error: x.error })),
-      bySource: top.source,
+  _persistCache(latest = this._cacheRecord.latest, cachedAt = this._cacheRecord.cachedAt || 0) {
+    this._cacheRecord = {
+      schemaVersion: 1,
+      cachedAt,
+      latest,
+      apiRetryAt: this._apiRetryAt,
+      apiFailures: this._apiFailures,
     };
-    this._relCache = { at: Date.now(), key: pref, value: result };
+    atomicWriteJson(this.cacheFile, this._cacheRecord);
+  }
+
+  _fromManifest(manifest) {
+    const assets = manifest.assets.map((entry) => ({
+      name: entry.name,
+      size: entry.fileSize,
+      digest: `sha256:${entry.sha256}`,
+      url: entry.downloadUrl,
+      urls: [entry.downloadUrl],
+      sizes: { [entry.downloadUrl]: entry.fileSize },
+      source: 'github',
+      platform: entry.platform,
+      architecture: entry.architecture,
+      flavor: entry.flavor,
+    }));
+    return {
+      version: manifest.version,
+      tag: manifest.tag,
+      name: `ApkStart ${manifest.tag}`,
+      notes: manifest.releaseNotes,
+      htmlUrl: `${repo}/releases/tag/${manifest.tag}`,
+      publishedAt: manifest.publishedAt,
+      assets,
+      sources: [{ source: 'github-static', name: 'GitHub signed manifest', tag: manifest.tag }],
+      unreachable: [],
+      bySource: 'github-static',
+      verified: true,
+      manifestKind: 'latest',
+      manifest,
+      proof: '',
+    };
+  }
+
+  _fromApiRelease(release) {
+    if (!release || release.draft || release.prerelease) throw new Error('GitHub latest release 无效');
+    const tag = String(release.tag_name || '');
+    if (!/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(tag)) {
+      throw new Error('GitHub latest release tag 无效');
+    }
+    const names = new Set(Object.values(assetNames(tag)));
+    const tagUrl = `${repo}/releases/tag/${tag}`;
+    const expectedProof = new Map();
+    try {
+      const signed = readManifest(String(release.body || ''), tag, this.publicKey);
+      for (const entry of signed.assets) expectedProof.set(entry.name, entry);
+    } catch (_) {
+      // Unsigned or old-format-invalid metadata may be displayed, but cannot authorize install.
+    }
+    const assets = [];
+    for (const raw of Array.isArray(release.assets) ? release.assets : []) {
+      if (!raw || !names.has(raw.name)) continue;
+      const name = raw.name;
+      const url = `${repo}/releases/download/${tag}/${name}`;
+      const size = Number(raw.size) || 0;
+      const rawUrl = String(raw.browser_download_url || '');
+      const signedEntry = expectedProof.get(name);
+      if (rawUrl !== url || !Number.isSafeInteger(size) || size <= 0) continue;
+      let digest = String(raw.digest || '');
+      if (!/^sha256:[a-f0-9]{64}$/.test(digest) && signedEntry && signedEntry.size === size) {
+        digest = `sha256:${signedEntry.sha256}`;
+      }
+      if (!/^sha256:[a-f0-9]{64}$/.test(digest)) continue;
+      const asset = {
+        name, size, digest, url, urls: [url], sizes: { [url]: size }, source: 'github',
+      };
+      if (signedEntry && matchAsset(expectedProof.size ? { assets: [...expectedProof.values()] } : null, tag, asset)) {
+        asset.verified = true;
+      }
+      assets.push(asset);
+    }
+    const body = String(release.body || '');
+    const proof = (marker.exec(body) || [])[0] || '';
+    const verified = assets.some((asset) => asset.verified);
+    const result = {
+      version: tag.slice(1),
+      tag,
+      name: release.name || tag,
+      notes: body,
+      htmlUrl: tagUrl,
+      publishedAt: release.published_at || release.created_at || '',
+      assets,
+      sources: [{ source: 'github-api', name: 'GitHub API', tag }],
+      unreachable: [],
+      bySource: 'github-api',
+      verified,
+      manifestKind: 'legacy',
+      manifest: null,
+      proof,
+      _apiRelease: release,
+    };
     return result;
   }
 
-  /**
-   * 某个资产在所有源 + 镜像下的候选地址（去重、保序：源站优先，其次镜像）。
-   * 镜像只套在 GitHub 的地址上：ghfast / gh-proxy 只代理 GitHub。
-   */
+  _persistLatest(result, at) {
+    this._latest = result;
+    this._cachedAt = at;
+    const latest = result.manifest
+      ? { kind: 'manifest', value: result.manifest }
+      : result.verified && result._apiRelease
+        ? { kind: 'api', value: result._apiRelease }
+        : this._cacheRecord.latest;
+    const cachedAt = result.manifest || result.verified ? at : this._cacheRecord.cachedAt;
+    this._persistCache(latest, cachedAt);
+  }
+
+  async _readResponse(url, timeout, headers, redirectAllowlist) {
+    const response = await this.requestJson(url, { timeout, headers, redirectAllowlist });
+    if (!response || !Number.isInteger(Number(response.status))) {
+      throw new Error('更新服务器没有返回有效 HTTP 状态');
+    }
+    return { ...response, status: Number(response.status) };
+  }
+
+  async _fetchManifest() {
+    const response = await this._readResponse(this.manifestUrl, 12000, {
+      Accept: 'application/json',
+      'Cache-Control': 'no-cache',
+    }, allowlistedManifestRedirect);
+    if (response.status < 200 || response.status >= 300) throw new HttpStatusError(this.manifestUrl, response);
+    if (response.finalUrl && !allowlistedManifestRedirect(response.finalUrl)) {
+      throw new Error('更新清单重定向到不受信任的地址');
+    }
+    const manifest = verifyLatestManifest(responseJson(response.body), this.publicKey);
+    return this._fromManifest(manifest);
+  }
+
+  _backoff(error, response) {
+    const now = this.now();
+    const kind = classifyFailure(error, response);
+    if (kind === 'rate-limit') {
+      this._apiRetryAt = rateLimitUntil(response || error, now, this.apiRetryFloorMs);
+    } else {
+      this._apiFailures += 1;
+      const base = kind === 'not-found' || kind === 'forbidden' ? 5 * 60 * 1000 : 30 * 1000;
+      const wait = Math.min(MAX_BACKOFF_MS, base * (2 ** Math.min(10, this._apiFailures - 1)));
+      this._apiRetryAt = now + wait;
+    }
+    this._persistCache();
+    return kind;
+  }
+
+  async _fetchApiFallback() {
+    const now = this.now();
+    if (now < this._apiRetryAt) {
+      const waitMs = Math.max(1, this._apiRetryAt - now);
+      throw new Error(`GitHub API ${Math.ceil(waitMs / 1000)} 秒后重试`);
+    }
+    const url = `${this.apiBase}/releases/latest`;
+    try {
+      const response = await this._readResponse(url, 9000, {
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Cache-Control': 'no-cache',
+      }, (target) => {
+        try {
+          const final = target instanceof URL ? target : new URL(target);
+          return final.protocol === 'https:' && final.hostname.toLowerCase() === new URL(this.apiBase).hostname.toLowerCase();
+        } catch (_) { return false; }
+      });
+      if (response.status < 200 || response.status >= 300) {
+        const error = new HttpStatusError(url, response);
+        const kind = this._backoff(error, response);
+        error.kind = kind;
+        throw error;
+      }
+      if (response.finalUrl) {
+        const final = new URL(response.finalUrl);
+        if (final.protocol !== 'https:' || final.hostname.toLowerCase() !== new URL(this.apiBase).hostname.toLowerCase()) {
+          throw new Error('GitHub API 重定向到不受信任的地址');
+        }
+      }
+      const result = this._fromApiRelease(responseJson(response.body));
+      this._apiFailures = 0;
+      this._apiRetryAt = 0;
+      return result;
+    } catch (error) {
+      if (!error.kind) this._backoff(error);
+      throw error;
+    }
+  }
+
+  async _resolveLatest() {
+    let manifestError = null;
+    try {
+      const result = await this._fetchManifest();
+      this._persistLatest(result, this.now());
+      return result;
+    } catch (error) {
+      manifestError = error;
+    }
+
+    try {
+      const result = await this._fetchApiFallback();
+      result.unreachable = [{
+        source: 'github-static',
+        name: 'Signed manifest',
+        error: String(manifestError.message || manifestError),
+        kind: classifyFailure(manifestError),
+      }];
+      this._persistLatest(result, this.now());
+      return result;
+    } catch (apiError) {
+      const cached = this._latest;
+      if (cached) {
+        return {
+          ...cached,
+          stale: true,
+          staleReason: `${manifestError.message}; ${apiError.message}`,
+          unreachable: [
+            { source: 'github-static', name: 'Signed manifest', error: manifestError.message },
+            { source: 'github-api', name: 'GitHub API', error: apiError.message, kind: apiError.kind || classifyFailure(apiError) },
+          ],
+        };
+      }
+      const kind = apiError.kind || classifyFailure(apiError);
+      const error = new Error(`${apiError.message}（静态清单: ${manifestError.message}）`);
+      error.kind = kind;
+      error.status = apiError.status;
+      error.headers = apiError.headers;
+      throw error;
+    }
+  }
+
+  async latest({ force = false } = {}) {
+    const now = this.now();
+    if (!force && this._latest && now - this._cachedAt < CACHE_TTL) return this._latest;
+    if (this._latestFlight) return this._latestFlight;
+    this._latestFlight = this._resolveLatest();
+    try {
+      return await this._latestFlight;
+    } finally {
+      this._latestFlight = null;
+    }
+  }
+
+  /** Return only the declared download URLs; metadata and transport stay separate. */
   candidates(assetOrUrl) {
-    // 支持三种入参：单个地址、资产对象（url）、合并后的资产对象（urls 数组，含两个源）
     const urls = (typeof assetOrUrl === 'string'
       ? [assetOrUrl]
       : (assetOrUrl && (assetOrUrl.urls && assetOrUrl.urls.length ? assetOrUrl.urls : [assetOrUrl.url])))
       .filter(Boolean);
     const out = [];
-    if (!urls.length) return out;
-    const mirrors = mirrorList(this.settings());
     for (const url of urls) {
-      if (out.includes(url)) continue;
-      out.push(url);
-      let host = '';
-      try { host = new URL(url).host.toLowerCase(); } catch (_) { continue; }
-      const isGithub = /(^|\.)github\.com$/.test(host) || /(^|\.)githubusercontent\.com$/.test(host);
-      if (!isGithub) continue;
-      for (const m of mirrors) {
-        const u = withMirror(url, m);
-        if (u && !out.includes(u)) out.push(u);
-      }
+      let parsed;
+      try { parsed = new URL(url); } catch (_) { continue; }
+      if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && /^(localhost|127\.|::1|\[::1\])/i.test(parsed.hostname))) continue;
+      if (!out.includes(parsed.href)) out.push(parsed.href);
     }
     return out;
   }
@@ -511,12 +672,13 @@ class Sources {
     return c && c.ok ? c.speed : -1;
   }
 
-  /** 测速缓存清空（用户改了镜像前缀 / 换了网络后调用） */
+  /** 测速缓存清空（网络变化后调用）。 */
   reset() {
     this._rankCache.clear();
-    this._relCache = { at: 0, key: '', value: null };
-    this._blocked.clear();
   }
 }
 
-module.exports = { Sources, SOURCES, measure, KNOWN_MIRRORS, withMirror, mirrorList, getGithubToken, ghApiHeaders };
+module.exports = {
+  Sources, measure, openUrl, getJsonResponse, HttpStatusError,
+  rateLimitUntil, isRateLimited, classifyFailure,
+};

@@ -49,6 +49,47 @@ test('麦克风开关可持久化，且非法类型不会覆盖默认值', () =>
   assert.equal(store.saveSettings({ engine: { microphone: true } }).engine.microphone, true);
 });
 
+test('自动更新默认开启，显式关闭会持久保留', () => {
+  reset();
+  assert.equal(store.getSettings().update.autoUpdate, true);
+  assert.equal(store.getSettings().update.autoCheck, true);
+  assert.equal(store.saveSettings({ update: { autoUpdate: false } }).update.autoUpdate, false);
+  assert.equal(store.getSettings().update.autoUpdate, false);
+});
+
+test('旧网络配置在迁移和无关设置保存后保留，但更新代码可不依赖它们', () => {
+  reset();
+  write(settingsFile, {
+    runtime: {
+      githubToken: 'legacy-user-value',
+      mirrorPrefix: 'https://legacy.example/',
+      autoMirror: false,
+      proxyUrl: 'http://127.0.0.1:7890',
+      downloadConnections: 6,
+      sourcePreference: 'github',
+    },
+    update: { autoUpdate: false },
+    theme: 'dark',
+  });
+  const before = store.getSettings();
+  assert.equal(before.runtime.githubToken, 'legacy-user-value');
+  assert.equal(before.runtime.mirrorPrefix, 'https://legacy.example/');
+  assert.equal(before.runtime.autoMirror, false);
+  assert.equal(before.runtime.proxyUrl, 'http://127.0.0.1:7890');
+  assert.equal(before.runtime.downloadConnections, 6);
+  assert.equal(before.runtime.sourcePreference, 'github');
+  assert.equal(before.update.autoUpdate, false, '用户显式关闭的选择不得被迁移覆盖');
+
+  store.saveSettings({ theme: 'light' });
+  const persisted = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.equal(persisted.runtime.githubToken, 'legacy-user-value');
+  assert.equal(persisted.runtime.mirrorPrefix, 'https://legacy.example/');
+  assert.equal(persisted.runtime.proxyUrl, 'http://127.0.0.1:7890');
+  assert.equal(persisted.runtime.downloadConnections, 6);
+  assert.equal(persisted.update.autoUpdate, false);
+  assert.equal(persisted.theme, 'light');
+});
+
 test('错误的设置分区/叶值回退默认，合法同级值保留', () => {
   reset();
   write(settingsFile, { engine: null, runtime: [], display: 'broken', update: false, theme: 'dark',
@@ -57,7 +98,7 @@ test('错误的设置分区/叶值回退默认，合法同级值保留', () => {
   assert.equal(settings.engine.headless, false);
   assert.equal(settings.runtime.downloadConnections, 8);
   assert.equal(settings.display.mode, 'window');
-  assert.equal(settings.update.autoUpdate, false);
+  assert.equal(settings.update.autoUpdate, true);
   assert.equal(settings.theme, 'dark');
   assert.equal(settings.autoStart, false);
   assert.equal(settings.guest.locale, 'zh-CN');
