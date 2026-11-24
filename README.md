@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.10.8**（2026-11-24）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.10.9**（2026-11-24）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,16 +46,16 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.10.8
+### v0.10.9
 
-> 加固 CI/Release 工作流、更新源和卸载清理，降低发布失败与磁盘残留风险。
+> 收紧 Windows 进程与窗口归属边界，杜绝按 PID / 进程名误伤无关程序；GitHub API 认证回退更稳。
 
-- CI 与 Release 改用 Node 22/24 矩阵，最低 Node 版本与 Electron 45 依赖要求统一为 22.12.0。
-- 为测试、构建、发布和依赖审查任务增加超时与并发控制；分支治理正确声明 PR 读取权限，权限/API 错误不再被误报为无开放 PR。
-- Windows Release 在发布前校验便携版和 NSIS 展开目录中的源码、版本与持久化模块。
-- 更新链路明确只使用本仓库 GitHub Releases，移除失效的 Gitee 活跃配置与界面残留。
-- 卸载时清理覆盖安装留下的 `.preserved-runtime` 暂存目录，避免运行时副本长期占用磁盘。
-- 本地语法、卸载清理、更新器、下载身份、国际化、README 和体积闸门测试通过；完整 Electron 测试需在 CI 安装依赖后执行。
+- 更新安装脚本不再按 PID 强杀残留进程：启动时先记录本程序的进程出生凭据（真实镜像路径 + 出生时间 + 命令行），60 秒等待结束后只允许按同一份凭据终止同一个进程；无法验证时跳过强杀并写日志，避免 PID 被复用后误杀用户程序。
+- 更新器改为先校验更新载荷、再写 `pending.json` 凭条：载荷缺失或校验失败时不再留下「更新卡住」的假状态。
+- 窗口控制脚本删除按 `emulator` / `qemu` 进程名扫描窗口的兜底；没有已验证 PID 时直接拒绝操作，不会改到其他用户的模拟器窗口。
+- 模拟器优先级改为只作用于「本实例进程树中通过归属验证的 PID」（真实模拟器路径 + 本 AVD 的 `-datadir` / `-android-hw` + 出生时间），删除按 AVD 名、命令行子串匹配的宽泛扫描。
+- GitHub API 认证回退（空配置读取 `gh auth token`）：结果缓存 1 小时（含失败的负结果），并校验 token 形状，`gh` 未登录时的提示文本不再被当成凭据；手动 `runtime.githubToken` 仍然即时优先。
+- 本地全量 `npm test` 通过：语法 192 个文件、`node --test` 批次 359 项（358 通过 / 1 按策略跳过 / 0 失败）、自动回归 121 项、更新器 53 项、下载身份 29 项、拆分包备份 19 项、备份恢复 11 项，其余套件均 0 失败。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

@@ -30,13 +30,9 @@ public class ApkWin {
 Add-Type -TypeDefinition $src
 
 function Find-Win([int]$procId) {
-  # No pid (reused runtime started by another process): scan emulator/qemu windows.
-  if ($procId -le 0) {
-    $cand = Get-Process -ErrorAction SilentlyContinue |
-      Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.ProcessName -match 'emulator|qemu' }
-    foreach ($c in $cand) { return $c.MainWindowHandle }
-    return [IntPtr]::Zero
-  }
+  # Only an explicit PID may open a window. Never fall back to scanning by image
+  # name: that could rename/resize another user's emulator or QEMU window.
+  if ($procId -le 0) { return [IntPtr]::Zero }
   $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
   if ($null -ne $p -and $p.MainWindowHandle -ne [IntPtr]::Zero) { return $p.MainWindowHandle }
   # Qt builds usually expose the HWND on the qemu child process.

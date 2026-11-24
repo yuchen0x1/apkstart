@@ -4,6 +4,18 @@
 >
 > **已修**：当前代码有明确修复和回归覆盖。**本轮新修**：在 0.10.4 中新增。**部分**：有诊断、降级或安全兜底，但仍需要对应 APK、硬件或系统复验。**平台/功能边界**：不是当前 Windows/Linux x86_64 内置后端能承诺的功能。
 
+## 2026-11-24 复核（v0.10.9）
+
+| 上游问题 | 影响范围 | 本仓库是否存在 | 结论 |
+|---|---|---|---|
+| [#140 退出时自动关闭 Windows Terminal](https://github.com/RoutineMiku/apkstart/issues/140) | 进程 / 窗口生命周期 | 曾存在同源风险，已修 | 主进程没有 `taskkill` 或按名字 kill；本轮把更新脚本里「按 PID 强杀」改成启动时记录本程序的进程出生凭据、结束后只按该凭据终止，无法验证就跳过；`windowctl.ps1` 删除按 `emulator\|qemu` 进程名扫描窗口的兜底；`priority.ps1` 改为只作用于本实例进程树中通过归属验证的 PID。仍需在多用户会话、Windows Terminal / PowerShell / 其他 QEMU 并存的实机上复验。 |
+| [#139 拆分包备份后自动重装](https://github.com/RoutineMiku/pull/139) | Split APK / APKS / XAPK | 已覆盖 | `installer.finishInstall()` 对 bundle 走 `installMultiple(bundle.files)`；启动时缓存缺失的自动补装同样按 `parseBundle` + `installMultiple`；备份侧按分片打包，恢复时以 `kind: apks` 交回安装器。 |
+| [#94 音量设置改用 `cmd media_session volume`](https://github.com/RoutineMiku/pull/94) | Android 音量 | 已覆盖 | `android.js` 已改用 `cmd media_session volume`，带 `--get` 档位换算和音量键兜底。 |
+| [#22 `qemu-img` 参数顺序](https://github.com/RoutineMiku/pull/22) | 运行时磁盘 | 已覆盖 | `emulator.js` 的 `_qemuImg` 使用 `qemu-img <op> -f raw …` 的正确顺序。 |
+| [#91 并行下载未校验 Content-Range](https://github.com/RoutineMiku/issues/91) | 更新 / 镜像下载 | 已修 | `download.js` 校验 `Content-Range` 起点、终点、总长、`Content-Length`、strong ETag 与最终 URL 身份绑定；下载身份回归 29 项通过。 |
+| [#98 便携版更新死循环](https://github.com/RoutineMiku/issues/98) | 在线更新 | 已修并加固 | 载荷与 Setup 校验、装前备份、装后核验、失败回滚与失败凭条已具备；本轮 `pending.json` 凭条改为**通过载荷前置校验之后**才写，校验失败不再留下「更新卡住」的假状态。 |
+| 上游 `feat/pluggable-backend` 分支 | 架构 | 未移植 | 上游新分支与本仓库已有的引擎 / 运行时 / 分身适配层重叠，直接合并会覆盖独立实现；需要单独做接口对齐与迁移评估，不并入本轮补丁。 |
+
 ## 结论摘要
 
 - 本轮完成四个仍能在本仓库落地的缺陷：Store 版只读运行时（#116）、跨进程嵌入被 `SetParent` 拒绝时的独立窗口兜底（#5）、嵌入窗口的 Android Home/Overview/Back 快捷键（#11）、启动窗口按主窗口显示器定位并提前隐藏主界面（#111）。

@@ -1,5 +1,33 @@
 # 自主开发记录
 
+## 2026-11-24 · A003 · Windows 进程归属与更新器安全边界（v0.10.9）
+
+### 发现与范围
+
+按上游 [#140](https://github.com/RoutineMiku/apkstart/issues/140)（退出时误关 Windows Terminal）的同源思路复查本仓库的「宽泛进程操作」入口，定位到三处真实风险：
+
+1. `src/core/updater.js` 的升级脚本在等待 60 秒后执行 `Stop-Process -Id <pid> -Force`，只按 PID 终止；等待期内 PID 被系统复用时可能误杀无关程序。
+2. `src/core/win/windowctl.ps1` 在没有 PID 时按 `ProcessName -match 'emulator|qemu'` 枚举窗口，会改到其他用户的模拟器窗口（当前主进程只调用 `refreshShell()`，但脚本本身是可复用入口）。
+3. `src/core/win/priority.ps1` 按 `Name -match qemu|emulator` 且 `CommandLine -like "*<Avd>*"` 扫描并改优先级，同名 AVD 的其他实例会被一起改动。
+
+同时保留并加固了工作区里已有的「空配置读取 `gh auth token`」改动：增加结果 TTL 缓存（含负结果）与 token 形状校验。
+
+### 实际改动
+
+- `src/core/updater.js`：升级脚本启动时先用 `process-owner.ps1 -Action Inspect` 记录本程序的出生凭据（真实镜像路径 + 出生时间 + 命令行），超时后只允许 `-Action Terminate -Expected <凭据>` 终止同一进程，身份不可验证时跳过强杀并写日志；`pending.json` 凭条改为通过载荷前置校验之后才写。
+- `src/core/win/process-owner.ps1` / `src/core/process-owner.js`：新增 `Tree` 动作与 `getProcessTree()`，返回一个已验证进程的后代身份，供调用方逐个复核归属。
+- `src/core/win/priority.ps1` / `src/core/emulator.js`：优先级脚本只接受调用方给的 PID 列表，删除镜像名、AVD 名和命令行子串扫描；`setPriority()` 先取本实例进程树，再用 `ownsProcess()` 过滤，验证不过就不调用脚本。
+- `src/core/win/windowctl.ps1` / `src/core/windowctl.js`：删除按进程名扫描窗口的兜底；没有正整数 PID 时直接拒绝。
+- `src/core/sources.js`：`gh auth token` 结果缓存 1 小时（含失败），只接受 `ghp_/gho_/ghu_/ghs_/ghr_/github_pat_` 形状的 token；手动 `runtime.githubToken` 仍然即时优先。
+- `test/auto-test.js` / `test/updater-test.js`：新增更新脚本不得出现 `Stop-Process -Id`、必须先取证再按凭据终止、窗口控制拒绝无 PID、优先级脚本无枚举兜底、空 / 非法 PID 列表 `CHANGED=0`、`gh` 负结果缓存与非法提示文本拒绝等回归。
+- 版本与文档：`package.json` / `package-lock.json`、`CHANGELOG.md`、`README.md` 同步到 `0.10.9`，`docs/UPSTREAM-ISSUES-AUDIT.md` 增加 2026-11-24 复核表。
+
+### 验收边界
+
+- 本地全量 `npm test` 通过；`node --test` 批次 359 项（358 通过 / 1 按执行策略跳过 / 0 失败），自动回归 121 项、更新器 53 项、下载身份 29 项、拆分包备份 19 项、备份恢复 11 项。
+- 本机 PowerShell 执行策略为 `Restricted`，更新器的隔离脚本夹具按既有策略跳过，没有为测试改写系统策略。
+- 未在真实 Android 客机、多用户 Windows 会话或其他模拟器 / Windows Terminal 并存的场景做端到端验收；进程归属结论以对应环境复测为准。
+
 ## 2026-11-23 · A002 · 设置缓存与 v0.10.5 正式发布
 
 ### 交付证据

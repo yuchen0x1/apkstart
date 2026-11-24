@@ -1,6 +1,6 @@
 # Shared fail-closed Windows process identity/termination helper. No image-name kills.
 param(
-  [ValidateSet('', 'Inspect', 'Terminate')][string]$Action = '',
+  [ValidateSet('', 'Inspect', 'Terminate', 'Tree')][string]$Action = '',
   [int]$TargetPid = 0,
   [string]$Expected = ''
 )
@@ -79,6 +79,27 @@ function Get-ApkRuntimeIdentity([int]$ProcessId) {
   finally { [void][ApkRuntimeProcess]::CloseHandle($h) }
 }
 
+function Get-ApkRuntimeTree([int]$Root) {
+  $found = New-Object System.Collections.Generic.List[object]
+  $queue = New-Object System.Collections.Queue
+  $seen = @{}
+  $queue.Enqueue($Root)
+  while ($queue.Count -gt 0 -and $seen.Count -lt 512) {
+    $parent = [int]$queue.Dequeue()
+    if ($seen[[string]$parent]) { continue }
+    $seen[[string]$parent] = $true
+    $rows = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$parent" -ErrorAction SilentlyContinue)
+    foreach ($row in $rows) {
+      $child = [int]$row.ProcessId
+      if ($child -le 0 -or $seen[[string]$child]) { continue }
+      $queue.Enqueue($child)
+      $identity = Get-ApkRuntimeIdentity $child
+      if ($identity) { $found.Add($identity) }
+    }
+  }
+  return $found
+}
+
 function Stop-ApkRuntimeIdentity($Identity) {
   if (-not $Identity -or [int]$Identity.pid -le 0 -or [int]$Identity.pid -eq $PID) { return $false }
   # Query + terminate + synchronize on ONE handle: PID recycling cannot redirect termination.
@@ -103,5 +124,9 @@ if ($Action -eq 'Terminate') {
     $identity = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Expected)) | ConvertFrom-Json
     if ([int]$identity.pid -eq $TargetPid -and (Stop-ApkRuntimeIdentity $identity)) { 'STOPPED'; exit 0 }
   } catch { }
+  exit 1
+}
+if ($Action -eq 'Tree') {
+  try { Get-ApkRuntimeTree $TargetPid | ConvertTo-Json -Compress; exit 0 } catch { }
   exit 1
 }

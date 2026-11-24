@@ -1367,6 +1367,67 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(typeof w.present === 'function' && typeof w.getBounds === 'function');
   });
 
+  // 上游 #140 一类问题的同源隐患：任何按 image name / 窗口标题的兜底，都会操作
+  // 别的用户的模拟器窗口。窗口控制必须只认调用方已经验证过的 PID。
+  await test('窗口控制只认已验证 PID，没有 PID 时绝不按进程名猜窗口', async () => {
+    const w = require('../src/core/windowctl');
+    const ps1 = fs.readFileSync(w.SCRIPT, 'utf8');
+    assert(await w.present({}) === null, '没有 PID 必须直接拒绝');
+    assert(await w.present({ pid: 0 }) === null, 'PID=0 不能触发按进程名扫描');
+    assert(/if \(\$procId -le 0\) \{ return \[IntPtr\]::Zero \}/.test(ps1),
+      '脚本收到无 PID 时必须直接返回，不做扫描');
+    assert(!/ProcessName\s+-match\s+'emulator\|qemu'/.test(ps1),
+      '不得按 emulator/qemu 进程名匹配任何窗口');
+    assert(!/Get-Process[^\r\n]*emulator[^\r\n]*|Get-Process[^\r\n]*qemu/i.test(ps1),
+      '不得按进程名枚举窗口');
+  });
+
+  await test('模拟器优先级只作用于本实例已验证的 PID，绝不扫同名进程', async () => {
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    const script = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'win', 'priority.ps1'), 'utf8');
+    assert(/\[string\]\$Pids = ''/.test(script), '优先级脚本只接受调用方给的 PID 列表');
+    assert(!/\$Avd/.test(script), '不得按 AVD 名匹配进程');
+    assert(!/CommandLine -like/.test(script), '不得按命令行子串匹配');
+    assert(!/Get-CimInstance/.test(script), '脚本内部不得枚举进程');
+    assert(!/qemu-system|ProcessName/i.test(script), '脚本内部不得再按镜像名兜底');
+
+    // 拿不到经归属验证的进程树时必须失败关闭（返回 0），不能回退成扫名字。
+    const owner = require('../src/core/process-owner');
+    const originalTree = owner.getProcessTree;
+    const originalProc = emu.proc;
+    emu.proc = { pid: 4242 };
+    emu.ownedProcessOnPort = async () => null;
+    owner.getProcessTree = async () => [];
+    try {
+      assert(await emu.setPriority('idle') === 0, '进程树为空时不得调用脚本');
+      owner.getProcessTree = async () => [{ pid: 4242 }];
+      emu.ownsProcess = () => false;
+      assert(await emu.setPriority('idle') === 0, '归属验证不过的 PID 不得调整优先级');
+    } finally {
+      owner.getProcessTree = originalTree;
+      emu.proc = originalProc;
+    }
+
+    if (process.platform === 'win32') {
+      // 空 / 非法 PID 列表必须得到 CHANGED=0：脚本没有「按名字兜底」的第二条路径。
+      const { spawnSync } = require('child_process');
+      const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      const probe = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-Command', '[string](Get-ExecutionPolicy)'],
+        { encoding: 'utf8', timeout: 30000, windowsHide: true });
+      const policy = String((probe.stdout || '') + (probe.stderr || '')).trim();
+      if (probe.status !== 0 || !['RemoteSigned', 'Unrestricted', 'Bypass'].includes(policy)) {
+        console.log(`  跳过优先级脚本执行：PowerShell ${policy || 'unknown'}；不覆盖系统执行策略`);
+      } else {
+        const run = (pids) => spawnSync(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+          '-File', path.join(__dirname, '..', 'src', 'core', 'win', 'priority.ps1'), '-Pids', pids, '-Level', 'idle'],
+        { encoding: 'utf8', timeout: 30000, windowsHide: true });
+        assert(run.status === 0 && /CHANGED=0/.test(String(run.stdout || '')), '空 PID 列表不得改动任何进程');
+        assert(run('not-a-pid').status === 0 && /CHANGED=0/.test(String(run.stdout || '')), '非法 PID 不得改动任何进程');
+      }
+    }
+  });
+
   await test('xzFile 把源文件喂进 stdin 并产出可被运行时解压的镜像（CI 挂死回归）', async () => {
     const { xzFile } = require('../build/prepare-runtime');
     const zlib = require('zlib');
@@ -1677,6 +1738,53 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(cmpVer('0.3.1', 'v0.3.1') === 0, 'v 前缀不影响相等');
     assert(cmpVer('0.10.0', '0.9.9') === 1, '必须按数字比而不是字符串比');
     assert(cmpVer('1.0.0', '1.0.1') === -1, '1.0.0 小于 1.0.1');
+  });
+
+  await test('GitHub API 认证：手动 token 优先，空配置读取 gh CLI，失败回退匿名', async () => {
+    const modulePath = require.resolve('../src/core/sources');
+    const childProcess = require('child_process');
+    const originalExecFile = childProcess.execFile;
+    const originalModule = require.cache[modulePath];
+    const fixtureToken = 'ghp_fixture_token_1234567890abcdef';
+    const load = (handler) => {
+      childProcess.execFile = handler;
+      delete require.cache[modulePath];
+      return require(modulePath);
+    };
+    try {
+      let calls = 0;
+      const fromGh = load((command, args, options, callback) => {
+        calls += 1;
+        assert(command === 'gh' && args.join(' ') === 'auth token', '应调用 gh auth token');
+        setImmediate(() => callback(null, `${fixtureToken}\n`, ''));
+      });
+      assert(await fromGh.getGithubToken({ runtime: {} }) === fixtureToken, '空配置应读取 gh token');
+      assert(await fromGh.getGithubToken({ runtime: {} }) === fixtureToken, '第二次应命中缓存');
+      assert(calls === 1, '命中缓存不得再次拉起 gh');
+      assert(await fromGh.getGithubToken({ runtime: { githubToken: 'manual_fixture_token_1234567890' } }) === 'manual_fixture_token_1234567890', '手动 token 必须优先');
+      assert(calls === 1, '手动 token 不应触发 gh');
+      assert(fromGh.ghApiHeaders(fixtureToken).Authorization === `Bearer ${fixtureToken}`, 'token 应写入 Authorization');
+
+      // 未登录时 gh 输出的是提示语；长度够长也不能当成凭据发给 API。
+      const invalid = load((_command, _args, _options, callback) => {
+        setImmediate(() => callback(null, 'You are not logged in. Run gh auth login to authenticate.\n', ''));
+      });
+      assert(await invalid.getGithubToken({ runtime: {} }) === '', '提示语不能被当成 token');
+
+      // 没有 gh / gh 失败同样要缓存负结果，否则每次检查更新都要重新拉起进程。
+      let missingCalls = 0;
+      const unavailable = load((_command, _args, _options, callback) => {
+        missingCalls += 1;
+        setImmediate(() => callback(new Error('gh unavailable'), '', ''));
+      });
+      assert(await unavailable.getGithubToken({ runtime: {} }) === '', 'gh 失败时应回退匿名');
+      assert(await unavailable.getGithubToken({ runtime: {} }) === '', '负结果也要缓存');
+      assert(missingCalls === 1, '失败结果不得每次检查都重新拉起 gh');
+    } finally {
+      childProcess.execFile = originalExecFile;
+      delete require.cache[modulePath];
+      if (originalModule) require.cache[modulePath] = originalModule;
+    }
   });
 
   await test('安装形态决定挑哪个资产：安装版=Setup.exe，便携版=portable.zip', () => {
