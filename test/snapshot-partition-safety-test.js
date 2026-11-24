@@ -211,6 +211,8 @@ function fixture(t, { canEmbed = true } = {}) {
   const deps = {
     fs: tempFs, path, os: host, crypto: require('node:crypto'), net: { connect: forbidden },
     child_process: childProcess, './store': store, './provision': { Provisioner },
+    './gpu': { probe: async () => null },
+    './gpu': { probe: async () => null },
     './process-owner': processOwner, './adb': { AdbClient, isUnauthorizedError: () => false },
     './instance-adb': {
       route: () => ({ isChild: false, port: 5044, adbPath: p.adbExe }),
