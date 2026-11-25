@@ -155,7 +155,7 @@ async function main() {
     assert(!Object.keys(env).some(key => key.toLowerCase() === 'psmodulepath'), '应删除全部大小写变体');
     eq(Object.keys(env).length, Object.keys(source).length - 2, '只移除模块路径');
     for (const key of ['PSExecutionPolicyPreference', '__PSLockdownPolicy', 'PATH', 'SystemRoot']) {
-      eq(env[key], source[key], `${key} 必须原样保留`);
+      assert(env[key] === source[key], `${key} 必须原样保留`);
     }
     eq(JSON.stringify(source), before, '不得修改传入的父环境');
   });

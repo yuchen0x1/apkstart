@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.11.3**（2026-11-25）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.11.4**（2026-11-25）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,16 +46,16 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.11.3
+### v0.11.4
 
-> GitHub Release 下载先走官方线路，持续低速或失败时自动切换到受限的 GH-Proxy 备用线路。
+> 修正安全扫描指出的测试脚本写法，并复核上游近期问题的实际覆盖范围。
 
-- 已验签的 ApkStart 公共 Release 资产会按「GitHub 官方 → GH-Proxy」顺序下载；官方连接失败或吞吐连续 30 秒低于 128 KB/s 时自动切换，不再测速重排或并发混用两条线路。
-- 仅从精确匹配版本、仓库和发行资产名的官方 HTTPS 地址派生代理 URL；更新清单/API 不经代理，下载请求不附带凭据，跳转继续受 HTTPS 主机白名单约束。
-- 每条线路使用独立的可续传暂存文件；最终文件仅在签名清单 SHA-256 与文件大小验证通过后原子替换，所有线路失败时保留原版本并可在重试时续传。
-- 更新进度显示当前线路状态；现有安装、回滚及 Linux 更新行为不变。
-- 新增真实本地 HTTP Range 下载夹具，覆盖官方优先、低速自动切换、失败回退、线路独立断点续传、SHA-256/大小拒绝，以及 Updater 签名资产集成。
-- 本轮尚未在中国大陆网络环境验证 GH-Proxy 下载速度；该服务为有限备用传输通道，发布签名与资产摘要仍以项目签名清单为准。
+- UI 回归脚本使用完整的 JavaScript 字面量编码传递动态测试数据，避免不完整的源码转义；增加特殊字符与注入载荷的往返回归。
+- 收集接口与报告投递测试改用完整 URL 或独立目的地行的精确断言，不再依赖 URL 子串匹配。
+- 更新器的环境变量保留测试只断言比较结果，失败时不把环境变量值写进异常或控制台日志。
+- 更新上游审计：上游主线仍停留在 11 月 22 日；新增安装包和英文需求已覆盖，访问冲突 / ADB offline 仍需对应设备复验。
+- 明确 Vulkan 应用兼容性、Windows 物理显卡偏好以及非英语完整翻译的现有差距，不把诊断或降级逻辑写成实机问题已根治。
+- 保持当前签名更新清单与旧客户端兼容清单的发布方式；此次补丁不改变客户端的更新发现协议。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

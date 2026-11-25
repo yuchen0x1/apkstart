@@ -7,6 +7,7 @@ const path = require('path');
 const { createFixture } = require('./lib/ui-fixtures');
 const { contrastProbe } = require('./lib/ui-probes');
 const { runInteractions } = require('./lib/ui-interactions');
+const { scriptValue } = require('./lib/renderer-script');
 const phase = process.env.UI_AUDIT_PHASE || 'after';
 const out = process.env.UI_AUDIT_DIR || fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-ui-audit-'));
 fs.mkdirSync(path.join(out, phase), { recursive: true });
@@ -69,7 +70,7 @@ app.whenReady().then(async () => {
     const deadline = performance.now() + 5000;
     const poll = () => {
       if (${expression}) return resolve(true);
-      if (performance.now() > deadline) return reject(new Error('UI 条件等待超时：' + ${JSON.stringify(expression)}));
+      if (performance.now() > deadline) return reject(new Error('UI 条件等待超时：' + ${scriptValue(expression)}));
       setTimeout(poll, 20);
     };
     poll();
@@ -114,16 +115,16 @@ app.whenReady().then(async () => {
   };
   // 沿滚动正文逐屏取样，不把未出现在首屏的设置误记为已检测。
   const scanScrollable = async (name, selector) => {
-    const size = await js(`(() => { const el=document.querySelector(${JSON.stringify(selector)}); return el ? {height:el.clientHeight,max:el.scrollHeight-el.clientHeight} : {height:0,max:0}; })()`);
+    const size = await js(`(() => { const el=document.querySelector(${scriptValue(selector)}); return el ? {height:el.clientHeight,max:el.scrollHeight-el.clientHeight} : {height:0,max:0}; })()`);
     for (let top = Math.max(1, size.height * .85), page = 1; top < size.max; top += Math.max(1, size.height * .85), page++) {
-      await js(`document.querySelector(${JSON.stringify(selector)}).scrollTop=${top}`);
+      await js(`document.querySelector(${scriptValue(selector)}).scrollTop=${scriptValue(top)}`);
       await shot(`${name}-scroll${page}`, false);
     }
     if (size.max > 1) {
-      await js(`document.querySelector(${JSON.stringify(selector)}).scrollTop=${size.max}`);
+      await js(`document.querySelector(${scriptValue(selector)}).scrollTop=${scriptValue(size.max)}`);
       await shot(name + '-bottom', false);
     }
-    await js(`(() => { const el=document.querySelector(${JSON.stringify(selector)}); if(el) el.scrollTop=0; })()`);
+    await js(`(() => { const el=document.querySelector(${scriptValue(selector)}); if(el) el.scrollTop=0; })()`);
   };
   currentStage = 'load-main-ui';
   await win.loadFile(path.join(SRC, 'ui', 'index.html'));
@@ -159,8 +160,8 @@ app.whenReady().then(async () => {
     check('外观保存失败回滚实际主题、控件与忙碌状态并显示原因', await js("document.documentElement.dataset.theme==='light' && window.apkTheme.preference==='light' && document.getElementById('setTheme').value==='light' && !document.getElementById('setTheme').disabled && !document.getElementById('setTheme').hasAttribute('aria-busy') && [...document.querySelectorAll('.toast.error')].some(e=>e.textContent.includes('外观保存失败'))"));
     fixture.clearResponse('settings:set');
     const changeLanguage = async value => {
-      await js(`(() => { const select=document.getElementById('setLanguage'); select.value=${JSON.stringify(value)}; select.dispatchEvent(new Event('change',{bubbles:true})); })()`);
-      await waitFor(`!languageBusy && window.apkI18n.lang===${JSON.stringify(value)}`);
+      await js(`(() => { const select=document.getElementById('setLanguage'); select.value=${scriptValue(value)}; select.dispatchEvent(new Event('change',{bubbles:true})); })()`);
+      await waitFor(`!languageBusy && window.apkI18n.lang===${scriptValue(value)}`);
       await settle();
     };
     let releaseAccel, accelRequested;
@@ -218,7 +219,7 @@ app.whenReady().then(async () => {
     ]) {
       fixture.setResponse('share:sync', () => response);
       await js("document.getElementById('toastWrap').innerHTML=''; syncSharedNow()");
-      check('同步反馈区分：' + title, await js(`(() => { const toast=document.querySelector('#toastWrap .toast'); return toast?.querySelector('.t-title-text').textContent===${JSON.stringify(title)} && ${type === 'info' ? "!toast.classList.contains('warn') && !toast.classList.contains('error')" : `toast.classList.contains(${JSON.stringify(type)})`}; })()`));
+      check('同步反馈区分：' + title, await js(`(() => { const toast=document.querySelector('#toastWrap .toast'); return toast?.querySelector('.t-title-text').textContent===${scriptValue(title)} && ${type === 'info' ? "!toast.classList.contains('warn') && !toast.classList.contains('error')" : `toast.classList.contains(${scriptValue(type)})`}; })()`));
     }
     fixture.clearResponse('share:sync');
     await js("document.title=window.uiOriginalTitle; delete window.uiOriginalTitle; document.getElementById('uiI18nProbe').remove(); document.getElementById('toastWrap').innerHTML=''; closeSettings()");
@@ -320,16 +321,16 @@ app.whenReady().then(async () => {
     const capacityStart = fixture.calls.length;
     await js("document.getElementById('setDataGB').value='32'; document.getElementById('setDataGB').dispatchEvent(new Event('change',{bubbles:true}))");
     await settle();
-    check('选择容量只预览，不提前保存设置或扩容', !fixture.calls.slice(capacityStart).some(c=>c.channel==='runtime:setDataSize' || (c.channel==='settings:set' && c.payload?.engine?.dataPartitionGB !== undefined)) && await js(`Number(state.settings.engine.dataPartitionGB||0)===${savedCapacity}`));
+    check('选择容量只预览，不提前保存设置或扩容', !fixture.calls.slice(capacityStart).some(c=>c.channel==='runtime:setDataSize' || (c.channel==='settings:set' && c.payload?.engine?.dataPartitionGB !== undefined)) && await js(`Number(state.settings.engine.dataPartitionGB||0)===${scriptValue(savedCapacity)}`));
     fixture.setResponse('app:confirm', () => ({response:0}));
     await js("document.getElementById('btnGrowData').click()");
     await waitFor('!dataSizeBusy');
-    check('取消扩容不调用容量 IPC，控件回到已保存容量', !fixture.calls.slice(capacityStart).some(c=>c.channel==='runtime:setDataSize') && await js(`Number(document.getElementById('setDataGB').value)===${savedCapacity} && !document.getElementById('btnGrowData').disabled`));
+    check('取消扩容不调用容量 IPC，控件回到已保存容量', !fixture.calls.slice(capacityStart).some(c=>c.channel==='runtime:setDataSize') && await js(`Number(document.getElementById('setDataGB').value)===${scriptValue(savedCapacity)} && !document.getElementById('btnGrowData').disabled`));
     fixture.setResponse('app:confirm', () => ({response:1}));
     fixture.setResponse('runtime:setDataSize', () => ({ok:false,error:'UI 测试：磁盘被占用，容量未修改'}));
     await js("document.getElementById('setDataGB').value='32'; document.getElementById('btnGrowData').click()");
     await waitFor('!dataSizeBusy');
-    check('真实扩容失败保留保存值和实际显示，给出具体错误', await js(`Number(state.settings.engine.dataPartitionGB||0)===${savedCapacity} && Number(document.getElementById('setDataGB').value)===${savedCapacity} && !document.getElementById('setDataGB').disabled && !document.getElementById('btnGrowData').hasAttribute('aria-busy') && [...document.querySelectorAll('.toast.error')].some(e=>e.textContent.includes('磁盘被占用'))`));
+    check('真实扩容失败保留保存值和实际显示，给出具体错误', await js(`Number(state.settings.engine.dataPartitionGB||0)===${scriptValue(savedCapacity)} && Number(document.getElementById('setDataGB').value)===${scriptValue(savedCapacity)} && !document.getElementById('setDataGB').disabled && !document.getElementById('btnGrowData').hasAttribute('aria-busy') && [...document.querySelectorAll('.toast.error')].some(e=>e.textContent.includes('磁盘被占用'))`));
     await js("document.getElementById('btnGrowData').scrollIntoView({block:'center'})");
     await shot('capacity-apply-failed');
     fixture.clearResponse('runtime:setDataSize');
@@ -506,7 +507,7 @@ app.whenReady().then(async () => {
       const failedStopStart = fixture.calls.length;
       await js("document.getElementById('toastWrap').innerHTML=''; openSettingsSection('android'); document.querySelector('#sysCards [data-sys=android-x86] [data-act=stop]').click()");
       await waitFor('!sysUI.stopBusy && !sysUI.loading');
-      check(theme + '系统停止失败保留真实运行状态并释放忙碌：' + kind, fixture.calls.slice(failedStopStart).filter(c=>c.channel==='system:stop').length===1 && !fixture.calls.slice(failedStopStart).some(c=>c.channel==='runtime:stop') && await js(`sysUI.status.current.running && !document.getElementById('btnRuntimeStop').hasAttribute('aria-busy') && document.querySelector('#sysCards [data-sys=android-x86] [data-act=stop]').getAttribute('aria-busy')!=='true' && [...document.querySelectorAll('.toast.error')].some(e=>e.textContent.includes(${JSON.stringify(reason)})) && ![...document.querySelectorAll('#toastWrap .t-title-text')].some(e=>['当前系统已停止','切换已取消，当前系统已停止'].includes(e.textContent))`));
+      check(theme + '系统停止失败保留真实运行状态并释放忙碌：' + kind, fixture.calls.slice(failedStopStart).filter(c=>c.channel==='system:stop').length===1 && !fixture.calls.slice(failedStopStart).some(c=>c.channel==='runtime:stop') && await js(`sysUI.status.current.running && !document.getElementById('btnRuntimeStop').hasAttribute('aria-busy') && document.querySelector('#sysCards [data-sys=android-x86] [data-act=stop]').getAttribute('aria-busy')!=='true' && [...document.querySelectorAll('.toast.error')].some(e=>e.textContent.includes(${scriptValue(reason)})) && ![...document.querySelectorAll('#toastWrap .t-title-text')].some(e=>['当前系统已停止','切换已取消，当前系统已停止'].includes(e.textContent))`));
     }
     await js("document.querySelector('#sysCards [data-sys=android-x86]').scrollIntoView({block:'center'})");
     await shot(theme + '-system-stop-error');
@@ -574,7 +575,7 @@ app.whenReady().then(async () => {
     await js("delete window.uiStaleSystemStatus; document.getElementById('toastWrap').innerHTML=''; loadSystems()");
   };
   for (const theme of ['light', 'dark']) {
-    await js(`(async () => { if (window.apkTheme) await window.apkTheme.save(${JSON.stringify(theme)}); else { document.documentElement.dataset.theme=${JSON.stringify(theme)}; document.documentElement.style.colorScheme=${JSON.stringify(theme)}; } })()`);
+    await js(`(async () => { if (window.apkTheme) await window.apkTheme.save(${scriptValue(theme)}); else { document.documentElement.dataset.theme=${scriptValue(theme)}; document.documentElement.style.colorScheme=${scriptValue(theme)}; } })()`);
     if (phase !== 'before') {
       const colors = await js("({bg:getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),text:getComputedStyle(document.documentElement).getPropertyValue('--text').trim()})");
       const native = nativeColors.nativePalette(theme === 'dark');
@@ -584,7 +585,7 @@ app.whenReady().then(async () => {
     await shot(theme + '-library');
     await js('openSettings()');
     for (const section of ['general','runtime','performance','display','android','integration','update','advanced','about']) {
-      await js(`openSettingsSection(${JSON.stringify(section)})`);
+      await js(`openSettingsSection(${scriptValue(section)})`);
       await shot(theme + '-settings-' + section);
       if (section === 'update') {
         check(theme + '问题反馈明确默认只保存在本机且不会自动发送', await js("(() => { const group=document.getElementById('reportGroup'); const note=group?.querySelector('.inline-note'); const text=group?.textContent||''; const visible=!!(group && group.getClientRects().length && getComputedStyle(group).visibility!=='hidden'); return visible && note?.textContent.includes('默认只保存在本机，不会自动发送') && text.includes('完整报告只留在本机') && text.includes('确认后才发送'); })()"));
@@ -667,7 +668,7 @@ app.whenReady().then(async () => {
     const phaseAnnouncement = await js("document.getElementById('sysTaskAnnouncement').textContent");
     mainWin.webContents.send('system:task', { ...phaseTask, progress:43, currentStep:'下载速度变化', updatedAt:'2026-05-01T00:00:01Z' });
     await settle();
-    check(theme + '任务仅更新百分比时不重复播报', await js(`document.getElementById('sysTaskAnnouncement').textContent===${JSON.stringify(phaseAnnouncement)}`));
+    check(theme + '任务仅更新百分比时不重复播报', await js(`document.getElementById('sysTaskAnnouncement').textContent===${scriptValue(phaseAnnouncement)}`));
     mainWin.webContents.send('system:task', { ...phaseTask, status:'completed', progress:100, currentStep:'下载完成', updatedAt:'2026-05-01T00:00:02Z' });
     await settle();
     check(theme + '任务完成阶段会更新状态公告', await js("document.getElementById('sysTaskAnnouncement').textContent.includes('已完成')"));
@@ -688,7 +689,7 @@ app.whenReady().then(async () => {
     if (phase !== 'before') await auditSystemSession(theme);
     await js("document.getElementById('settingsMask').classList.remove('on'); openWizard()");
     for (let page = 1; page <= 8; page += 1) {
-      await js(`wizardShowPage(${page})`);
+      await js(`wizardShowPage(${scriptValue(page)})`);
       await shot(theme + '-wizard-' + page);
     }
     await js("document.getElementById('wizardMask').classList.remove('on'); openRepair(null)");
@@ -710,14 +711,14 @@ app.whenReady().then(async () => {
   }
   if (phase !== 'before') {
     for (const theme of ['light','dark']) {
-      await js(`window.apkTheme.save(${JSON.stringify(theme)})`);
+      await js(`window.apkTheme.save(${scriptValue(theme)})`);
       for (const [width,height] of [[1920,1080],[1600,900],[1366,768],[1280,720],[1024,768],[900,560]]) {
         win.setContentSize(width,height);
         await js("document.querySelectorAll('.modal-mask.on,.settings-page.on').forEach(e=>e.classList.remove('on'))");
         await shot(`${theme}-${width}x${height}-library`, width === 900 || width === 1920);
         await js('openSettings()');
         for (const section of ['general','performance','android','integration']) {
-          await js(`openSettingsSection(${JSON.stringify(section)})`);
+          await js(`openSettingsSection(${scriptValue(section)})`);
           await shot(`${theme}-${width}x${height}-${section}`, false);
           await js(`(() => { const body = document.querySelector('#settingsMask .set-body'); if (body) body.scrollTop = body.scrollHeight; })()`);
           await shot(`${theme}-${width}x${height}-${section}-lower`, false);
@@ -733,14 +734,14 @@ app.whenReady().then(async () => {
         win.webContents.setZoomFactor(zoom);
         await js('openSettings()');
         for (const section of ['general','runtime','performance','display','android','integration','update','advanced','about']) {
-          await js(`openSettingsSection(${JSON.stringify(section)})`);
+          await js(`openSettingsSection(${scriptValue(section)})`);
           await shot(`${theme}-zoom${zoom}-${section}`, zoom === 2 && section === 'general');
           await js(`(() => { const body = document.querySelector('#settingsMask .set-body'); if (body) body.scrollTop = body.scrollHeight; })()`);
           await shot(`${theme}-zoom${zoom}-${section}-lower`, zoom === 2 && section === 'android');
         }
         await js("document.getElementById('settingsMask').classList.remove('on'); openWizard()");
         for (const page of [1,2,4,8]) {
-          await js(`wizardShowPage(${page})`);
+          await js(`wizardShowPage(${scriptValue(page)})`);
           await shot(`${theme}-zoom${zoom}-wizard${page}`, zoom === 2 && page === 2);
         }
         await js("document.getElementById('wizardMask').classList.remove('on'); openRepair(null)");
@@ -761,9 +762,9 @@ app.whenReady().then(async () => {
   check('应用外壳通过 app:theme 读取主题，不读取完整设置', fixture.calls.slice(themeReadStart).some(c => c.channel === 'app:theme') && !fixture.calls.slice(themeReadStart).some(c => c.channel === 'settings:get'));
   await win.webContents.insertCSS('* { animation: none !important; transition: none !important; }');
   for (const shellTheme of ['light','dark']) {
-    await mainWin.webContents.executeJavaScript(`window.apkTheme.save(${JSON.stringify(shellTheme)})`);
+    await mainWin.webContents.executeJavaScript(`window.apkTheme.save(${scriptValue(shellTheme)})`);
     await settle();
-    check(shellTheme + '外壳通过主题推送跟随主界面，未写入设置', await js(`window.apkTheme.preference===${JSON.stringify(shellTheme)} && document.documentElement.dataset.theme===${JSON.stringify(shellTheme)}`));
+    check(shellTheme + '外壳通过主题推送跟随主界面，未写入设置', await js(`window.apkTheme.preference===${scriptValue(shellTheme)} && document.documentElement.dataset.theme===${scriptValue(shellTheme)}`));
     await js("applyState({label:'云端笔记 · 可恢复的加载状态',tip:'正在启动安卓运行时…',ready:false})");
     await shot(shellTheme + '-shell-loading');
     await js("applyState({label:'云端笔记', ready:true});");
@@ -787,9 +788,9 @@ app.whenReady().then(async () => {
     for (const width of [390,768,1024,1920]) {
       win.setContentSize(width,900);
       for (const siteTheme of ['light','dark']) {
-        await js(`document.getElementById('theme-${siteTheme}').click()`);
+        await js(`document.getElementById(${scriptValue('theme-' + siteTheme)}).click()`);
         for (const section of ['top','features','enhance','flow','requirements','download']) {
-          await js(`document.getElementById('${section}').scrollIntoView({block:'start',behavior:'instant'})`);
+          await js(`document.getElementById(${scriptValue(section)}).scrollIntoView({block:'start',behavior:'instant'})`);
           await shot(`website-${siteTheme}-${width}-${section}`, width === 390 || width === 1920);
         }
       }
