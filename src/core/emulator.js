@@ -1319,6 +1319,7 @@ class EmulatorEngine {
     const profile = doctor.autoProfile({
       settings: s, accel: accelInfo, emulatorVersion: emuVersion, diskMB,
       port: startPort, adbPort, gpuInfo: this.gpuInfo,
+      headless, canEmbed: require('./platform').canEmbed,
     });
     // 「低配模式」：一键修复里由用户点一下才启用，只对本次启动生效，不写进设置。
     // 目的不是让机器变快，而是让「本来就慢但能跑」的机器有机会开完机：
@@ -1340,32 +1341,14 @@ class EmulatorEngine {
     }
     profile.acceleration = this._accelerationState(profile);
     this.profile = profile;
-    // 只有明确选择「始终嵌入」时才为跨进程 SetParent 保留 swangle 优先级。
-    // auto 模式先用自动档的 host 后端，避免视频应用默认走软件渲染而卡顿；
-    // 如果宿主画黑，appwin 会摘出为独立窗口并记住 embeddedBlack，下一次不再嵌入。
-    // standalone 同样遵循自动档选出的 GPU，不强行走 CPU 软件渲染。
-    const { windowMode } = s.engine;
-    const preferSoftware = !headless && require('./platform').canEmbed && windowMode === 'embedded';
-    const variants = doctor.planVariants(profile, { preferSoftware }).slice(0, maxAttempts);
+    // Profile selection includes display compatibility and bounded GPU backoff,
+    // so Settings and the first launch attempt use the same candidate order.
+    const variants = doctor.planVariants(profile).slice(0, maxAttempts);
     // 报告里要写清这次是「带窗口」还是「无窗口」跑的：同一台机器上两者结果常常不同，
     // 少了这一个 bit，报告就没法区分「模拟器起不来」和「带窗口渲染起不来」（issue #29）。
     this.headlessMode = !!headless;
 
-    // 记住「上次拉起就崩」的 GPU 后端，下次把它排到最后。
-    // 实测：AMD Radeon 780M 上 `-gpu host` 能通过 emulator 自己的硬件检查，
-    // 但 VM 起来十几秒后进程直接 exit 1（日志里只有 "AEHD is operational"），
-    // 每次都要白等 20 多秒再退到 swangle。key 里带上 emulator 版本，
-    // 升级运行时后自动重新给它一次机会。
-    const badGpuKey = s.engine.badGpu || '';
-    const [badVer, badGpu] = badGpuKey.includes('|') ? badGpuKey.split('|') : ['', ''];
-    if (!profile.gpuPinned && badGpu && badVer === emuVersion) {
-      const firstGpu = variants[0]?.gpu;
-      const rank = (v) => (v.gpu === badGpu ? 1 : 0);
-      variants.sort((a, b) => rank(a) - rank(b));
-      if (firstGpu === badGpu && variants[0].gpu !== badGpu) {
-        onLog(`上次 ${badGpu} 渲染后端启动即崩溃，本次改用 ${variants[0].gpu} 先试`);
-      }
-    }
+    if (profile.gpuFallbackReason) onLog(profile.gpuFallbackReason);
 
     const logFile = path.join(store.DATA_DIR, 'logs', 'emulator.log');
     fs.mkdirSync(path.dirname(logFile), { recursive: true });
@@ -1589,6 +1572,7 @@ class EmulatorEngine {
           // host to swangle/software without changing the user's settings; keep
           // the concrete plan for runtime status and diagnostics.
           this.profile = plan;
+          this._noteGpuSuccess(plan);
           // 这一次真的起来了：清掉上次的失败记录，避免以后「诊断」翻出旧账
           this._clearFailure();
           // 快照只在设置、实际运行档与保存策略均允许时保存；显式 false 不因开机成功被覆盖。
@@ -1992,15 +1976,32 @@ class EmulatorEngine {
    */
   _noteGpuFailure(plan) {
     try {
-      // 授权对话框卡住不是渲染后端的问题，别把当前 GPU 记进「启动即崩」黑名单
-      // （上游 b7c4f06），否则下次启动会无缘无故跳过这台机器本来能用的后端。
-      if (this.lastDiagnosis && this.lastDiagnosis.code === 'ADB_UNAUTHORIZED') return;
-      const gpu = plan && plan.gpu;
-      if (!gpu) return;
-      // 软件渲染是兜底项，它已经是最慢/最稳的选择，没有更差的替代品可退
-      if (/software|swiftshader|swangle/.test(gpu)) return;
+      const reason = this.lastDiagnosis?.code;
+      // Timeouts, ADB/acceleration errors and generic crashes do not establish
+      // a graphics failure and must not disable hardware on subsequent starts.
+      if (!['GPU_INIT', 'GPU_MODE'].includes(reason)) return;
+      const backend = plan?.gpu;
+      if (!backend || /software|swiftshader|swangle|lavapipe/.test(backend)) return;
       if ((this.settings.engine.gpuMode || 'auto') !== 'auto') return;
-      store.saveSettings({ engine: { badGpu: `${this._emuVersion || ''}|${gpu}` } });
+      store.saveSettings({ engine: {
+        badGpu: `${this._emuVersion || ''}|${backend}`,
+        badGpuAt: Date.now(), badGpuReason: reason,
+        badGpuContext: plan.gpuContext || doctor.gpuFailureContext({
+          gpuInfo: this.gpuInfo, windowMode: this.settings.engine.windowMode,
+          headless: this.headlessMode, accel: plan.accel,
+        }),
+      } });
+    } catch (_) { /* ignore */ }
+  }
+
+  _noteGpuSuccess(plan) {
+    try {
+      // A completed boot on a recovered backend (including a manual trial)
+      // invalidates its old failure; a software fallback does not clear it.
+      if (this.settings.engine.badGpu !== `${this._emuVersion || ''}|${plan.gpu}`) return;
+      if (!plan.gpuPinned && this.settings.engine.badGpuContext
+        && this.settings.engine.badGpuContext !== plan.gpuContext) return;
+      store.saveSettings({ engine: { badGpu: '', badGpuAt: 0, badGpuContext: '', badGpuReason: '' } });
     } catch (_) { /* ignore */ }
   }
 

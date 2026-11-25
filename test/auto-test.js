@@ -215,7 +215,9 @@ async function withStartFixture(run) {
     assert(doctor.notes(['INFO | Platform does not support Guest Angle']).some((t) => /提示不是错误/.test(t)),
       '应在「无害噪音」里解释一句，免得用户去换显卡');
     assert(doctor.diagnose(['Failed to create Vulkan instance. Error VK_ERROR_INCOMPATIBLE_DRIVER.']).code === 'GPU_INIT');
-    assert(doctor.diagnose(['UpdateLayeredWindowIndirect failed']).code === 'GPU_INIT');
+    assert(doctor.diagnose(['UpdateLayeredWindowIndirect failed']).code === 'UNKNOWN',
+      'Qt 窗口合成警告不能触发 GPU 降级');
+    assert(doctor.notes(['UpdateLayeredWindowIndirect failed']).some((t) => /窗口合成警告/.test(t)));
   });
 
   await test('日志诊断：emulator 以 0xC0000005 退出判为进程访问冲突，不武断归咎显卡', () => {
@@ -805,8 +807,15 @@ async function withStartFixture(run) {
     const recorded = (src.match(/this\.profile = plan;/g) || []).length;
     assert(recorded >= 2,
       '启动从 host 自动回退到 swangle/software 后，运行时状态必须展示实际成功的 plan');
-    assert(/windowMode === 'embedded'/.test(src),
-      'auto 窗口不能默认强制软件渲染；只有明确嵌入模式才优先 swangle');
+    for (const windowMode of ['auto', 'standalone', 'embedded']) {
+      const profile = doctor.autoProfile({
+        settings: { engine: { windowMode, resourceMode: 'smooth' } },
+        accel: { ok: true }, emulatorVersion: '37.4.1', diskMB: 50000,
+        headless: false, canEmbed: true,
+      });
+      assert(doctor.planVariants(profile)[0].gpu === (windowMode === 'embedded' ? 'swangle' : 'host'),
+        'auto 窗口不能默认强制软件渲染；只有明确嵌入模式才优先 swangle');
+    }
   });
 
   console.log('\n[layers.js 容器式瘦身]');

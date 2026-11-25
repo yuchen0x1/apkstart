@@ -200,4 +200,31 @@ test('observer 新增节点立即翻译，skip 子树内新增节点保持原文
   assert.strictEqual(fresh.getAttribute('title'), '设置');
   body.children.pop(); body.children.pop();
 });
+test('性能选档依据的独立标题与含顿号的动态原因使用真实词典翻译并支持往返', () => {
+  const dict = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src/i18n/en-US.json'), 'utf8'));
+  const title = { nodeType: 3, nodeValue: '下次启动选档依据：' };
+  const reason = { nodeType: 3, nodeValue: '' };
+  const titleSpan = element({}, [title]); titleSpan.tagName = 'SPAN';
+  const reasonSpan = element({ id: 'profileFallbackReason' }, [reason]); reasonSpan.tagName = 'SPAN';
+  const row = element({ id: 'profileFallbackText' }, [titleSpan, reasonSpan]);
+  row.tagName = 'DIV'; row.parentElement = body; body.children.push(row);
+  const reasons = [
+    ['上次 host 渲染初始化失败，本次优先尝试 swangle；24 小时后或显卡驱动、显示环境变化后自动重试。',
+      /^The previous host renderer initialization failed.*Prefer swangle.*24 hours/],
+    ['当前资源策略按本机内存、CPU 和加速能力选择低配参数。',
+      /^The current resource policy selects conservative parameters/],
+  ];
+  for (const [original, expected] of reasons) {
+    api.retranslate({ lang: 'en-US', dict });
+    reason.nodeValue = original;
+    observer.callback([{ type: 'characterData', target: reason }]);
+    assert.strictEqual(title.nodeValue, 'Next-start selection reason:');
+    assert.match(reason.nodeValue, expected);
+    assert.doesNotMatch(reason.nodeValue, /[\u4e00-\u9fa5]/);
+    api.retranslate(chinese);
+    assert.strictEqual(title.nodeValue, '下次启动选档依据：');
+    assert.strictEqual(reason.nodeValue, original);
+  }
+  body.children.pop();
+});
 console.log(`界面语言往返回归：${passed} 通过，0 失败`);

@@ -589,18 +589,53 @@ for (const [name, engine, canEmbed, headless, gpu] of [
   ['external-only platform', { windowMode: 'auto' }, false, false, 'host'],
   ['headless start', { windowMode: 'auto' }, true, true, 'host'],
   ['manual host selection despite a stale auto failure', { windowMode: 'auto', gpuMode: 'host', badGpu: '37.4.1|host' }, true, false, 'host'],
-  ['automatic mode still backs off a known bad host GPU', { windowMode: 'standalone', badGpu: '37.4.1|host' }, true, false, 'swangle'],
+  ['legacy failure without evidence recovers host', { windowMode: 'standalone', badGpu: '37.4.1|host' }, true, false, 'host'],
+  ['forced embedding does not affect headless startup', { windowMode: 'embedded' }, true, true, 'host'],
+  ['forced embedding does not affect external-only platforms', { windowMode: 'embedded' }, false, false, 'host'],
 ]) {
   test(`first emulator GPU argument reflects ${name}`, async (t) => {
     const f = fixture(t, { canEmbed });
     Object.assign(f.settings.engine, engine);
+    const predicted = f.doctor.autoProfile({ settings: f.settings, accel: f.state.accel,
+      emulatorVersion: '37.4.1', diskMB: 1000000, gpuInfo: f.state.gpuInfo, canEmbed, headless });
     f.prepareStart();
     const result = await f.emu.start({ headless });
     assert.equal(result.ok, true);
     const { args } = f.calls.spawn[0];
     assert.equal(args[args.indexOf('-gpu') + 1], gpu);
     assert.equal(result.profile.gpu, gpu);
+    assert.equal(predicted.gpu, gpu, 'prediction and the real first spawn must share GPU selection');
     assert.equal(args.includes('-no-window'), headless);
+  });
+}
+
+function rememberHostFailure(f, overrides = {}) {
+  Object.assign(f.settings.engine, {
+    badGpu: '37.4.1|host', badGpuAt: f.time.Date.now() - 1000, badGpuReason: 'GPU_INIT',
+    badGpuContext: f.doctor.gpuFailureContext({ gpuInfo: f.state.gpuInfo,
+      windowMode: f.settings.engine.windowMode, accel: f.state.accel.ok ? 'on' : 'off' }),
+    ...overrides,
+  });
+}
+
+for (const expired of [false, true]) {
+  test(`production startup with maxAttempts=1 ${expired ? 'recovers an expired host failure' : 'honors recent evidenced host backoff'}`, async (t) => {
+    const f = fixture(t);
+    f.settings.engine.windowMode = 'standalone';
+    rememberHostFailure(f, expired ? { badGpuAt: f.time.Date.now() - f.doctor.GPU_BACKOFF_MS } : {});
+    const predicted = f.doctor.autoProfile({ settings: f.settings, accel: f.state.accel,
+      emulatorVersion: '37.4.1', diskMB: 1000000, gpuInfo: f.state.gpuInfo });
+    f.prepareStart();
+    const result = await f.emu.start({ maxAttempts: 1 });
+    const expected = expired ? 'host' : 'swangle';
+    assert.equal(result.ok, true);
+    assert.equal(f.calls.spawn.length, 1);
+    assert.equal(f.calls.spawn[0].args[f.calls.spawn[0].args.indexOf('-gpu') + 1], expected);
+    assert.equal(result.profile.gpu, predicted.gpu);
+    assert.equal(result.profile.accel, 'on');
+    assert(!f.calls.spawn[0].args.includes('-accel'), 'backoff must not prematurely select TCG');
+    assert.equal(f.settings.engine.badGpu, '37.4.1|host', 'unprobed startup is not recovery evidence');
+    assert(!f.writes.some(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')));
   });
 }
 
@@ -615,11 +650,165 @@ test('standalone launch retries software rendering after a failed host GPU', asy
     f.emu.proc = null;
     return true;
   };
-  const result = await f.emu.start();
+  const result = await f.emu.start({ probe: async () => 'ok' });
   assert.equal(result.ok, true);
   assert.deepEqual(f.calls.spawn.map(({ args }) => args[args.indexOf('-gpu') + 1]), ['host', 'swangle']);
   assert.equal(result.profile.gpu, 'swangle');
   assert.equal(f.settings.engine.badGpu, '37.4.1|host');
+  assert.equal(f.settings.engine.badGpuAt, f.time.Date.now());
+  assert.equal(f.settings.engine.badGpuReason, 'GPU_INIT');
+  assert.equal(f.settings.engine.badGpuContext, result.profile.gpuContext);
+  assert.equal(f.writes.filter(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')).length, 1,
+    'a successful software fallback must retain the failing host record');
+});
+
+for (const manual of [false, true]) {
+  test(`${manual ? 'manual' : 'automatic expired'} host boot success clears its matching failure only after guest readiness`, async (t) => {
+    const f = fixture(t);
+    f.settings.engine.windowMode = 'standalone';
+    rememberHostFailure(f, manual
+      ? { gpuMode: 'host' }
+      : { badGpuAt: f.time.Date.now() - f.doctor.GPU_BACKOFF_MS });
+    f.prepareStart();
+    const result = await f.emu.start({ maxAttempts: 1, probe: async () => 'ok' });
+    assert.equal(result.ok, true);
+    assert.equal(result.profile.gpu, 'host');
+    assert.equal(f.settings.engine.badGpu, '');
+    assert.equal(f.settings.engine.badGpuAt, 0);
+    assert.equal(f.settings.engine.badGpuContext, '');
+    assert.equal(f.settings.engine.badGpuReason, '');
+    assert.equal(f.writes.filter(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')).length, 1);
+  });
+}
+
+test('successful host boot does not clear a different runtime version failure', async (t) => {
+  const f = fixture(t);
+  rememberHostFailure(f, { badGpu: '37.4.0|host' });
+  f.prepareStart();
+  const result = await f.emu.start({ maxAttempts: 1, probe: async () => 'ok' });
+  assert.equal(result.profile.gpu, 'host');
+  assert.equal(f.settings.engine.badGpu, '37.4.0|host');
+  assert(!f.writes.some(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')));
+});
+
+for (const manual of [false, true]) {
+  test(`${manual ? 'manual' : 'automatic'} host success ${manual ? 'clears' : 'preserves'} another display-context failure`, async (t) => {
+    const f = fixture(t);
+    rememberHostFailure(f, { gpuMode: manual ? 'host' : 'auto', badGpuContext: 'previous-display-context' });
+    f.prepareStart();
+    const result = await f.emu.start({ maxAttempts: 1, probe: async () => 'ok' });
+    assert.equal(result.profile.gpu, 'host');
+    assert.notEqual(result.profile.gpuContext, 'previous-display-context');
+    assert.equal(f.settings.engine.badGpu, manual ? '' : '37.4.1|host');
+    assert.equal(f.settings.engine.badGpuContext, manual ? '' : 'previous-display-context');
+    assert.equal(f.writes.filter(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')).length, manual ? 1 : 0);
+  });
+}
+
+for (const [reason, line] of [
+  ['MEMORY', 'Cannot allocate memory'], ['ACCEL', 'WHPX failed'],
+  ['PORT_BUSY', 'Address already in use'], ['AVD_LOCK', 'AVD is in use'],
+  ['IMAGE', 'system.img not found'], ['DLL', 'STATUS_DLL_NOT_FOUND'],
+  ['UNKNOWN', 'Unknown option: -unrelated-flag'],
+  ['ACCESS_VIOLATION', 'emulator exit 3221225477'],
+]) {
+  for (const stage of ['early exit', 'guest probe']) {
+    test(`${reason} at ${stage} does not persist a GPU failure`, async (t) => {
+      const f = fixture(t);
+      f.prepareStart();
+      const fail = () => {
+        f.emu.log(line);
+        f.emu.lastExitCode = reason === 'ACCESS_VIOLATION' ? 3221225477 : 1;
+        f.emu.proc = null;
+      };
+      if (stage === 'early exit') f.emu._waitSpawnSettled = async () => { fail(); return true; };
+      await assert.rejects(f.emu.start({ maxAttempts: 1,
+        probe: stage === 'guest probe' ? async () => { fail(); return 'fatal'; } : undefined }));
+      assert.equal(f.calls.spawn.length, 1);
+      assert(!f.writes.some(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')));
+      assert.equal(f.settings.engine.badGpu, undefined);
+    });
+  }
+}
+
+test('Qt composition warning survives the early fatal check without recording a GPU failure', async (t) => {
+  const f = fixture(t);
+  const warning = 'UpdateLayeredWindowIndirect failed for ptDst=(0, 0), size=(375, 26), dirty=(375x26 0, 0)';
+  const diagnosis = f.doctor.diagnose([warning]);
+  assert.equal(diagnosis.code, 'UNKNOWN');
+  assert(f.doctor.notes([warning]).some(note => /窗口合成警告/.test(note)));
+  f.emu.lastDiagnosis = diagnosis;
+  f.emu._noteGpuFailure({ gpu: 'host' });
+  assert(!f.writes.some(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')));
+
+  f.prepareStart();
+  let probes = 0;
+  const outcome = f.emu.start({ maxAttempts: 1, probe: async () => {
+    if (++probes > 1) return 'ok';
+    f.emu.log(warning);
+    await f.time.tick(46000);
+    return 'pending';
+  } }).then(result => ({ result }), error => ({ error }));
+  await new Promise(resolve => setImmediate(resolve));
+  await f.time.tick(200);
+  const settled = await outcome;
+  assert.ifError(settled.error);
+  assert.equal(settled.result.ok, true);
+  assert.equal(probes, 2, 'the warning must not abort the boot before the next guest probe');
+  assert.equal(f.calls.spawn.length, 1);
+  assert.equal(settled.result.profile.gpu, 'host');
+  assert(!f.writes.some(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')));
+  assert.equal(f.settings.engine.badGpu, undefined);
+});
+
+test('ordinary boot timeout cannot persist a GPU failure', async (t) => {
+  const f = fixture(t);
+  f.prepareStart();
+  const outcome = f.emu.start({ maxAttempts: 1, probe: async () => 'pending' });
+  const rejected = assert.rejects(outcome, error => error.diagnosis.code === 'TIMEOUT');
+  for (let step = 0; step < 5; step++) {
+    await new Promise(resolve => setImmediate(resolve));
+    await f.time.tick(240000);
+  }
+  await rejected;
+  assert.equal(f.calls.spawn.length, 1);
+  assert(!f.writes.some(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')));
+});
+
+for (const terminal of [false, true]) {
+  test(`${terminal ? 'terminal ADB recovery failure' : 'ADB unauthorized guest'} cannot persist a GPU failure`, async (t) => {
+    const f = fixture(t);
+    f.prepareStart();
+    const diagnosis = { code: terminal ? 'ADB_SERVER_FAILED' : 'ADB_UNAUTHORIZED',
+      title: 'synthetic ADB failure', hint: 'synthetic ADB failure', terminal };
+    const start = f.emu.start({ maxAttempts: 1, probe: async () => {
+      f.emu.lastDiagnosis = diagnosis;
+      return 'fatal';
+    } });
+    if (terminal) {
+      const result = await start;
+      assert.equal(result.ok, false);
+      assert.equal(result.diagnosis, diagnosis);
+    } else await assert.rejects(start, error => error.diagnosis.code === 'ADB_UNAUTHORIZED');
+    assert.equal(f.calls.spawn.length, 1);
+    assert(!f.writes.some(patch => patch.engine && Object.hasOwn(patch.engine, 'badGpu')));
+  });
+}
+
+test('GPU mode refusal records bounded evidence rather than an unsupported general option', async (t) => {
+  const f = fixture(t);
+  f.prepareStart();
+  f.emu._waitSpawnSettled = async () => {
+    f.emu.log('Unsupported gpu host');
+    f.emu.lastExitCode = 1;
+    f.emu.proc = null;
+    return true;
+  };
+  await assert.rejects(f.emu.start({ maxAttempts: 1 }));
+  assert.equal(f.settings.engine.badGpu, '37.4.1|host');
+  assert.equal(f.settings.engine.badGpuAt, f.time.Date.now());
+  assert.equal(f.settings.engine.badGpuReason, 'GPU_MODE');
+  assert.equal(f.settings.engine.badGpuContext, f.emu.profile.gpuContext);
 });
 
 for (const backend of ['host', 'swangle', 'software', 'lavapipe']) {

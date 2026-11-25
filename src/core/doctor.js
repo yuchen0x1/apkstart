@@ -133,6 +133,27 @@ function gpuCandidates(emulatorVersion) {
 }
 
 const MANUAL_GPU_MODES = new Set(['host', 'swangle', 'software', 'swiftshader', 'swiftshader_indirect', 'lavapipe', 'guest']);
+const GPU_BACKOFF_MS = 24 * 60 * 60 * 1000;
+
+function gpuFailureContext({ gpuInfo, windowMode = 'auto', headless = false, accel = 'on' } = {}) {
+  const adapters = (gpuInfo?.adapters || []).map((a) => [a.name, a.driverVersion, a.status]).sort();
+  return crypto.createHash('sha256').update(JSON.stringify({
+    adapters, remote: !!gpuInfo?.remoteSession, windowMode, headless: !!headless, accel,
+  })).digest('hex');
+}
+
+function rememberedGpuFailure(engine, context, emulatorVersion, now = Date.now()) {
+  const [version, backend] = String(engine.badGpu || '').split('|');
+  const at = Number(engine.badGpuAt);
+  const age = now - at;
+  // Legacy records have no evidence, date or display context. Give hardware a
+  // recovery attempt rather than carrying an unverified failure across upgrades.
+  if (!at || !Number.isFinite(age) || age < 0 || age >= GPU_BACKOFF_MS
+    || !['GPU_INIT', 'GPU_MODE'].includes(engine.badGpuReason)
+    || !version || version !== emulatorVersion || engine.badGpuContext !== context
+    || !MANUAL_GPU_MODES.has(backend)) return '';
+  return backend;
+}
 
 /** Windows 8.3 短路径：中文用户名 / 中文安装目录时 emulator 会找不到文件 */
 /** 屏幕规格：有硬件加速就上 720x1280（清晰），纯软件模拟降到 540x960（流畅优先） */
@@ -299,6 +320,7 @@ function lowSpecProfile({ host = hostInfo(), emulatorVersion = '', diskMB = 0 } 
 function chooseProfile({
   host = hostInfo(), accel, emulatorVersion = '', diskMB = 0,
   port = 5554, adbPort = 5044, overrides = {}, settings = null, gpuInfo = null,
+  headless = false, canEmbed = process.platform === 'win32', now = Date.now(),
 } = {}) {
   const accelOk = accelUsable(accel);
   const engine = (settings && settings.engine) || {};
@@ -375,6 +397,25 @@ function chooseProfile({
       || gpus.find((g) => /software|swiftshader/.test(g));
     if (soft) orderedGpus = [soft, ...gpus.filter((g) => g !== soft)];
   }
+  const forcedEmbedding = !headless && canEmbed && engine.windowMode === 'embedded';
+  if (!gpuPinned && forcedEmbedding) {
+    const soft = gpus.find((g) => /swangle/.test(g))
+      || gpus.find((g) => /software|swiftshader/.test(g));
+    if (soft) orderedGpus = [soft, ...orderedGpus.filter((g) => g !== soft)];
+  }
+  const gpuContext = gpuFailureContext({ gpuInfo, windowMode: engine.windowMode, headless, accel: accelOk ? 'on' : 'off' });
+  const badGpu = !gpuPinned && rememberedGpuFailure(engine, gpuContext, emulatorVersion, now);
+  let gpuFallbackReason = '';
+  if (badGpu && orderedGpus[0] === badGpu && orderedGpus.length > 1) {
+    orderedGpus = [...orderedGpus.filter((g) => g !== badGpu), badGpu];
+    gpuFallbackReason = `上次 ${badGpu} 渲染初始化失败，本次优先尝试 ${orderedGpus[0]}；24 小时后或显卡驱动、显示环境变化后自动重试。`;
+  } else if (!gpuPinned && forcedEmbedding) {
+    gpuFallbackReason = '已选择始终嵌入窗口，优先使用软件渲染以兼容窗口合成。';
+  } else if (!gpuPinned && gpuInfo?.preferSoftware) {
+    gpuFallbackReason = gpuInfo.reasons?.[0] || '当前显示环境优先使用软件渲染。';
+  } else if (!gpuPinned && spec) {
+    gpuFallbackReason = '当前资源策略按本机内存、CPU 和加速能力选择低配参数。';
+  }
   const gpu = gpuPinned ? overrides.gpuMode : orderedGpus[0];
 
   // 渲染分辨率：auto 时按加速状态选（软件模拟降到 540x960 保流畅）。
@@ -413,6 +454,8 @@ function chooseProfile({
     gpuCandidates: orderedGpus,
     gpuPinned,
     gpuInfo: gpuInfo || null,
+    gpuContext,
+    gpuFallbackReason,
     // on 表示检测到可用加速器，不等于本次客机已确认使用硬件加速。
     // emulator.js 对 on 保留官方默认选择（省略 -accel），兼容部分 Windows
     // emulator 37.x 对显式 on 的崩溃；仅 off 显式传 -accel off。
@@ -456,9 +499,11 @@ function overridesFromSettings(engine = {}) {
  * 之前设置页直接调 chooseProfile()（不带版本和加速状态），会在 37.x 机器上
  * 错误地显示已弃用的 swiftshader_indirect / 软件模拟，和实跑参数对不上。
  */
-function autoProfile({ settings = {}, accel, emulatorVersion = '', diskMB = 0, port = 5554, adbPort = 5044, gpuInfo = null } = {}) {
+function autoProfile({ settings = {}, accel, emulatorVersion = '', diskMB = 0, port = 5554, adbPort = 5044, gpuInfo = null,
+  headless = false, canEmbed = process.platform === 'win32', now = Date.now() } = {}) {
   return chooseProfile({
     accel, emulatorVersion, diskMB, port, adbPort, settings, gpuInfo,
+    headless, canEmbed, now,
     overrides: overridesFromSettings(settings && settings.engine),
   });
 }
@@ -619,7 +664,9 @@ const RULES = [
     // 特别注意：`Platform does not support Guest Angle` 是一条 INFO（换宿主 ANGLE 渲染而已），
     // 曾经被算进这里，结果一条无害提示把「所有后端都崩在 0xC0000005」压成了 GPU_INIT，
     // 自动重试还继续换后端。它现在只在 notes() 里做解释。
-    re: /Failed to initialize GL emulation|Could not initialize (OpenGL|emulated framebuffer)|Failed to create .*GLES|EGL_(BAD|NOT_INITIALIZED|CONTEXT_LOST)|Failed to (load|initialize) .*vulkan|Failed to create Vulkan instance|vulkan.*(failed|error)|UpdateLayeredWindowIndirect failed|emuglConfig_init.*failed|initOpenglesEmulation.*failed|No OpenGL ES (driver|renderer)|ANGLE.*(fail|error)/i,
+    // Qt 的 UpdateLayeredWindowIndirect 警告也可能出现在正常硬件渲染和开机期间，
+    // 它本身不足以证明安卓图形初始化失败，不能触发自动降级。
+    re: /Failed to initialize GL emulation|Could not initialize (OpenGL|emulated framebuffer)|Failed to create .*GLES|EGL_(BAD|NOT_INITIALIZED|CONTEXT_LOST)|Failed to (load|initialize) .*vulkan|Failed to create Vulkan instance|vulkan.*(failed|error)|emuglConfig_init.*failed|initOpenglesEmulation.*failed|No OpenGL ES (driver|renderer)|ANGLE.*(fail|error)/i,
     title: '显卡渲染后端初始化失败',
     hint: '日志里出现了 GL / Vulkan / ANGLE 初始化失败（常见是 VK_ERROR_INCOMPATIBLE_DRIVER）。'
       + '启动流程会按当前配置进行有限重试；手动指定的渲染后端会保持不变。'
@@ -627,7 +674,7 @@ const RULES = [
   },
   {
     code: 'GPU_MODE',
-    re: /Unknown option|invalid .*-gpu|Unrecognized .*gpu|Unsupported gpu/i,
+    re: /Unknown option[^\n]*gpu|invalid [^\n]*-gpu|Unrecognized [^\n]*gpu|Unsupported gpu/i,
     title: '当前运行时不接受该 GPU 模式',
     hint: '当前选择可能不受该运行时支持。请切回「自动」或更新运行时；手动指定的 GPU 模式不会被自动替换。',
   },
@@ -757,6 +804,10 @@ function notes(lines) {
   if (/Platform does not support Guest Angle/i.test(text)) {
     out.push('"Platform does not support Guest Angle" 是提示不是错误：这台机器用宿主侧的 ANGLE 渲染，'
       + '模拟器会换一条等效路径，不影响开机。');
+  }
+  if (/UpdateLayeredWindowIndirect failed/i.test(text)) {
+    out.push('"UpdateLayeredWindowIndirect failed" 是宿主 Qt 窗口合成警告，'
+      + '单凭这条日志不能判断安卓显卡初始化失败；需结合窗口画面与安卓启动状态确认。');
   }
   if (/does not have the requested snapshot|Failed to load snapshot/i.test(text)) {
     out.push('"Failed to load snapshot" 说明快速启动快照失效，程序会自动改为冷启动，不是故障。');
@@ -924,7 +975,7 @@ function describeProfile(p) {
         : p.accelOk ? '检测到加速器（本次运行待确认）' : '未检测到可用加速器';
   const gpuReason = !p.gpuPinned && /^(swangle|software|swiftshader(?:_indirect)?|lavapipe)$/.test(p.gpu)
     && p.gpuInfo && p.gpuInfo.preferSoftware && p.gpuInfo.reasons && p.gpuInfo.reasons[0];
-  return `${p.tuned ? '低配自动降级' : '自动'}：${(p.memoryMB / 1024).toFixed(1)}GB 内存 · ${p.cores} 核`
+  return `${p.gpuPinned ? '手动渲染' : p.tuned ? '低配自动降级' : '自动'}：${(p.memoryMB / 1024).toFixed(1)}GB 内存 · ${p.cores} 核`
     + `${lcd ? ` · ${lcd}` : ''} · ${p.gpu} 渲染 · ${accel} · ${snap}`
     + `${gpuReason ? ` · 自动软件渲染：${gpuReason}` : ''}`
     + `${p.lite ? ' · 轻量容器' : ''} · 端口 ${p.port}`;
@@ -1086,6 +1137,7 @@ function vcRedistOk() {
 module.exports = {
   hostInfo, hostBranding, systemVendor, looksVirtual, freeDiskMB, isAsciiPath, shortPath, lcdFor, orientLcd, liteProfile,
   versionNumbers, gpuCandidates, machineTier, lowSpecProfile, chooseProfile, planVariants,
+  gpuFailureContext, rememberedGpuFailure, GPU_BACKOFF_MS,
   bootTimeoutFor, BOOT_TIMEOUT_MS,
   accelUsable,
   overridesFromSettings, autoProfile,

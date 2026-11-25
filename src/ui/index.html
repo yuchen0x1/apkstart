@@ -255,7 +255,7 @@
         <div class="field">
           <label for="wizGpuMode">渲染后端</label>
           <select id="wizGpuMode">
-            <option value="auto">自动（低配机器用软件渲染）</option>
+            <option value="auto">自动（按本机配置与运行结果选择）</option>
             <option value="host">显卡加速 · host（最跟手）</option>
             <option value="swangle">ANGLE 软件渲染 · swangle（合成最稳）</option>
             <option value="software">纯软件渲染 · software（最省显存）</option>
@@ -553,8 +553,11 @@
                 </select>
               </div>
             </div>
-            <div class="field">
-              <div class="inline-note" id="autoProfileText">正在检测…</div>
+            <div class="field" aria-live="polite">
+              <div class="inline-note"><span>当前运行实际参数：</span><span id="runningProfileText">正在读取…</span></div>
+              <div class="inline-note"><span>下次启动预期参数：</span><span id="autoProfileText">正在检测…</span></div>
+              <div class="inline-note" id="profileFallbackText" hidden><span>下次启动选档依据：</span><span id="profileFallbackReason"></span></div>
+              <div class="inline-note" id="profilePendingText" role="status" hidden></div>
               <span class="sub">这些参数会在停止运行时后重新启动时生效。关闭应用窗口只会停放安卓，不会立即应用新参数。</span>
             </div>
           </div>
@@ -629,13 +632,13 @@
             <div class="field">
               <label for="setGpuMode">渲染后端</label>
               <select id="setGpuMode">
-                <option value="auto">自动（低配机器用软件渲染）</option>
+                <option value="auto">自动（按本机配置与运行结果选择）</option>
                 <option value="host">显卡加速 · host（最跟手）</option>
                 <option value="swangle">ANGLE 软件渲染 · swangle（合成最稳）</option>
                 <option value="software">纯软件渲染 · software（最省显存）</option>
                 <option value="lavapipe">lavapipe 软件 Vulkan</option>
               </select>
-              <span class="sub">自动 = 先按机器性能挑一个（低配机器直接走软件渲染），失败后再逐级降级（显卡 → ANGLE → 纯软件），并把「拉起就崩」的后端记住。手动选一个后端就固定用它、不再自动切换，排障时很有用。</span>
+              <span class="sub">自动会按本机显卡、加速能力和本次运行结果选择渲染后端；显卡渲染失败时会回退软件渲染。上方会分别显示当前实际参数与下次启动预期参数。手动选一个后端就固定用它、不再自动切换，排障时很有用。</span>
             </div>
           </div>
 

@@ -1165,5 +1165,22 @@
   "请先打开并绑定前台应用": "Open and bind a foreground app first",
   "需手动核验": "Manual verification required",
   "启动中": "Starting",
-  "进程归属或启动状态未确认；请先手动核验，不会重复启动或终止该进程": "Process ownership or startup status is unconfirmed. Verify it manually first; the process will not be started again or terminated."
+  "进程归属或启动状态未确认；请先手动核验，不会重复启动或终止该进程": "Process ownership or startup status is unconfirmed. Verify it manually first; the process will not be started again or terminated.",
+  "自动（按本机配置与运行结果选择）": "Automatic (based on this PC and runtime results)",
+  "当前运行实际参数：": "Current runtime parameters:",
+  "下次启动预期参数：": "Expected next-start parameters:",
+  "下次启动选档依据：": "Next-start selection reason:",
+  "上次 \u0001 渲染初始化失败，本次优先尝试 \u0001；\u0001 小时后或显卡驱动、显示环境变化后自动重试。": "The previous \u0001 renderer initialization failed. Prefer \u0001 for now and automatically retry after \u0001 hours or a GPU driver/display environment change.",
+  "已选择始终嵌入窗口，优先使用软件渲染以兼容窗口合成。": "Always-embedded windows are selected, so software rendering is preferred for window composition compatibility.",
+  "当前显示环境优先使用软件渲染。": "The current display environment prefers software rendering.",
+  "当前资源策略按本机内存、CPU 和加速能力选择低配参数。": "The current resource policy selects conservative parameters using this PC's memory, CPU, and acceleration support.",
+  "当前运行参数与下次启动计划不同；停止运行时后重新启动将按计划重新尝试。": "Current runtime parameters differ from the next-start plan. Stop the runtime and start it again to retry with that plan.",
+  "已连接安卓，实际启动参数待确认": "Connected to Android; actual startup parameters are unconfirmed",
+  "安卓运行状态待确认": "Android runtime status is unconfirmed",
+  "正在读取…": "Reading...",
+  "读取失败，暂时无法确认": "Could not read the parameters; status is unconfirmed",
+  "安卓尚未运行": "Android is not running",
+  "设置已保存；当前安卓仍使用上次参数。停止运行时后重新启动生效。": "Settings saved. Android is still using the previous parameters. Stop the runtime and start it again to apply them.",
+  "参数已按本机配置与所选资源策略计算。": "Parameters are based on this PC and the selected resource policy.",
+  "自动会按本机显卡、加速能力和本次运行结果选择渲染后端；显卡渲染失败时会回退软件渲染。上方会分别显示当前实际参数与下次启动预期参数。手动选一个后端就固定用它、不再自动切换，排障时很有用。": "Automatic mode selects a renderer using this PC's GPU, acceleration support, and runtime results, with software fallback if hardware rendering fails. Current runtime and expected next-start parameters are shown separately above. A manually selected renderer stays fixed across retries."
 }
