@@ -237,6 +237,10 @@ test('Windows process safety: coexisting QEMU/terminal/instances never cross-kil
     const second = track(spawnSentinel('priority-batch-second', PS, ['-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 120']));
     t2.after(() => { for (const proc of [first, second]) { try { proc.kill(); } catch (_) { /* ignore */ } } });
     const infos = await Promise.all([waitInfo(first.pid), waitInfo(second.pid)]);
+    // Child processes can inherit a CI runner's priority; seed a known non-idle baseline.
+    const baseline = runPs(['-Command', `(Get-Process -Id ${Number(second.pid)} -ErrorAction Stop).PriorityClass = 'BelowNormal'`]);
+    assert.equal(baseline.status, 0, baseline.stderr || baseline.stdout);
+    assert.equal(priorityClass(second.pid), 'BelowNormal', 'forged sibling fixture must start below normal');
     const expected = infos.map((info) => ({
       pid: info.pid, started: info.started, exe: info.exe, cmdHash: sha256(info.commandLine),
     }));
@@ -246,7 +250,7 @@ test('Windows process safety: coexisting QEMU/terminal/instances never cross-kil
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.match(String(result.stdout), /CHANGED=1/, 'one matching row cannot authorize its forged sibling');
     assert.equal(priorityClass(first.pid), 'Idle');
-    assert.equal(priorityClass(second.pid), 'Normal');
+    assert.equal(priorityClass(second.pid), 'BelowNormal', 'forged sibling priority must stay unchanged');
   });
 
   await t.test('window helper refuses missing or forged identity', async (t2) => {
