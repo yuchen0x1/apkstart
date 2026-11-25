@@ -148,7 +148,8 @@ function toast({ title, body = '', type = 'info', progress = null, sticky = fals
   const wrap = $('toastWrap');
   // ① 去重：同样的标题 + 正文（4 秒内）只刷新那一条，不叠加
   const key = `${title}|${body}`;
-  const dup = [...wrap.children].find((n) => n.dataset.key === key && Date.now() - Number(n.dataset.at || 0) < 4000);
+  // A new operation owns its spinner and dismissal timer.
+  const dup = !spinner && [...wrap.children].find((n) => n.dataset.key === key && Date.now() - Number(n.dataset.at || 0) < 4000);
   if (dup) {
     dup.dataset.at = String(Date.now());
     return {
@@ -193,7 +194,10 @@ function toast({ title, body = '', type = 'info', progress = null, sticky = fals
       if (p2 !== undefined && el.querySelector('.bar i')) {
         el.querySelector('.bar i').style.width = `${Math.max(2, Math.min(100, p2))}%`;
       }
-      if (ty === 'error') el.classList.add('error');
+      if (ty === 'error') {
+        el.querySelector('.spinner')?.remove();
+        el.classList.add('error');
+      }
       if (ty === 'ok') {
         el.querySelector('.spinner')?.remove();
         el.classList.remove('error');
@@ -326,7 +330,12 @@ function renderRuntimeStatus() {
     const text = $('statusText');
     const tag = $('engineTag');
 
-    if (session.message) {
+    if (state.launching) {
+      dot.className = 'dot warn';
+      setText(text, state.launchMessage || '正在准备安卓运行时…');
+      setText(tag, '启动中');
+      tag.className = 'brand-tag';
+    } else if (session.message) {
       dot.className = 'dot' + (session.stopping || session.switching ? ' warn' : session.running ? ' ok' : '');
       setText(text, session.message);
       setText(tag, session.stopping ? '停止中' : session.switching ? '切换中' : session.name || '运行状态');
@@ -859,30 +868,50 @@ async function syncSharedNow() {
 }
 
 async function launchApp(pkg) {
+  if (state.launching) return;
   const app = state.apps.find((a) => a.package === pkg);
   state.launchPkg = pkg;
+  state.launching = true;
+  state.launchMessage = '正在准备安卓运行时…';
+  renderRuntimeStatus();
   const t = toast({
     title: `正在打开 ${app ? app.label : pkg}`,
-    body: '首次启动需要预热运行时，请稍候…',
+    body: '正在准备安卓运行时…',
     sticky: true,
     spinner: true,
   });
-  const r = await api.launch(pkg);
-  if (r.ok) {
-    // 嵌入后宿主画黑帧时，程序会摘成独立窗口：必须说清楚，别让用户对着黑底以为又坏了
-    t.update(r.detached
-      ? {
-        title: '已在独立窗口打开',
-        body: '画面在「Android Emulator」窗口里，这里不再显示黑屏；下次启动会直接用它。',
-        type: 'ok',
-      }
-      : { title: '已启动', body: '应用正在独立窗口中运行（顶部可旋转屏幕）。', type: 'ok' });
-    setTimeout(t.dismiss, 1600);
-    setTimeout(() => api.winHide(), 900);
-    setTimeout(refreshApps, 1200);
-  } else {
-    t.update({ title: '启动失败', body: r.error, type: 'error' });
+  const unsubscribe = api.on('app:launchProgress', (progress) => {
+    if (progress?.package !== pkg || typeof progress.message !== 'string') return;
+    state.launchMessage = progress.message;
+    t.update({ body: progress.message });
+    renderRuntimeStatus();
+  });
+  try {
+    const r = await api.launch(pkg);
+    if (r.ok) {
+      // 嵌入后宿主画黑帧时，程序会摘成独立窗口：必须说清楚，别让用户对着黑底以为又坏了
+      t.update(r.detached
+        ? {
+          title: '已在独立窗口打开',
+          body: '画面在「Android Emulator」窗口里，这里不再显示黑屏；下次启动会直接用它。',
+          type: 'ok',
+        }
+        : { title: '已启动', body: '应用正在独立窗口中运行（顶部可旋转屏幕）。', type: 'ok' });
+      setTimeout(t.dismiss, 1600);
+      setTimeout(() => api.winHide(), 900);
+      setTimeout(refreshApps, 1200);
+    } else {
+      t.update({ title: '启动失败', body: r.error, type: 'error' });
+      setTimeout(t.dismiss, 6000);
+    }
+  } catch (e) {
+    t.update({ title: '启动失败', body: e?.message || '未能打开应用，请稍后重试。', type: 'error' });
     setTimeout(t.dismiss, 6000);
+  } finally {
+    unsubscribe();
+    state.launching = false;
+    state.launchMessage = '';
+    renderRuntimeStatus();
   }
 }
 

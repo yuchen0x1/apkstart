@@ -82,6 +82,22 @@ if ($Expected) {
   }
 }
 
+$rowsByPid = @{}
+$candidateIds = @($targets | ForEach-Object {
+  try {
+    $id = [int]$_.pid
+    if ($id -gt 0 -and $id -ne $PID) { $id }
+  } catch { }
+} | Select-Object -Unique)
+if ($candidateIds.Count -gt 0) {
+  try {
+    $filter = ($candidateIds | ForEach-Object { "ProcessId=$_" }) -join ' OR '
+    foreach ($row in @(Get-CimInstance Win32_Process -Filter $filter -Property ProcessId,CreationDate,CommandLine -ErrorAction Stop)) {
+      $rowsByPid[[string]$row.ProcessId] = $row
+    }
+  } catch { }
+}
+
 foreach ($entry in $targets) {
   if ($null -eq $entry) { continue }
   $targetPid = 0
@@ -108,10 +124,9 @@ foreach ($entry in $targets) {
     if (-not $started -or -not $exe) { continue }
     if ($started -cne $expectedStarted -or $exe -cne $expectedExe) { continue }
 
-    # CIM is read only for this exact PID. CreationDate protects against PID
-    # reuse; CommandLine hash protects against the same binary being relaunched
-    # with different arguments while we still hold the old handle.
-    $row = Get-CimInstance Win32_Process -Filter "ProcessId=$targetPid" -ErrorAction Stop
+    # One exact-PID CIM batch supplies command lines; every row still has to
+    # match this live handle's birth and the caller's complete identity.
+    $row = $rowsByPid[[string]$targetPid]
     if (-not $row -or -not $row.CommandLine -or -not $row.CreationDate) { continue }
     $cimStarted = $row.CreationDate.ToUniversalTime().ToFileTimeUtc()
     if ([Math]::Abs([decimal]$started - [decimal]$cimStarted) -ge 10) { continue }

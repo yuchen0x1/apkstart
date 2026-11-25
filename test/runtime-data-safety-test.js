@@ -61,6 +61,7 @@ function runtime(dir, overrides = {}, globals = {}) {
     listeners: async () => [...processes].map(([port, p]) => ({ port, pid: p.pid })),
     pidOnPort: async (port) => processes.get(port)?.pid || 0,
     getProcessInfo: async (pid) => [...processes.values()].find((p) => p.pid === pid) || null,
+    getProcessInfos: async (pids) => [...new Set(pids)].map((pid) => [...processes.values()].find((p) => p.pid === pid)).filter(Boolean),
     sameIdentity: (a, b) => !!a && !!b && a.pid === b.pid && a.started === b.started,
     terminateOwnedProcess: forbidden,
   };

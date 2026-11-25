@@ -128,6 +128,9 @@ function fixture(t, { isChild = true, id = 'child-a', allocator = { next: 49163 
         if (a[1] === 'getprop sys.boot_completed') out = '1\n';
         if (a[1] === 'ip -o addr') out = '2: wlan0 inet 10.0.2.15/24\n';
         if (a[1] === 'cmd wifi status') out = 'Wifi is connected\n';
+        if (a[1] === 'ip -o addr; echo __APKSTART_WIFI_STATUS__; cmd wifi status; echo __APKSTART_LINK_STATUS__; ip -o link') {
+          out = '2: wlan0 inet 10.0.2.15/24 scope global wlan0\n__APKSTART_WIFI_STATUS__\nWifi is connected\n__APKSTART_LINK_STATUS__\n2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\n';
+        }
       }
       const override = state.execHook?.(call, a);
       queueMicrotask(() => callback(override?.error || null, override?.stdout ?? out, override?.stderr || ''));
@@ -591,8 +594,8 @@ test('network and wifi calls use the same private binary/route as AdbClient', as
 });
 test('network readiness rejects an address left behind after Wi-Fi disconnects', async (t) => {
   const f = fixture(t); await f.init(); const emu = f.makeEmulator();
-  f.state.execHook = (_call, args) => args.includes('cmd wifi status')
-    ? { stdout: 'Wifi is disconnected\n' } : undefined;
+  f.state.execHook = (_call, args) => args.some((arg) => arg.includes('__APKSTART_WIFI_STATUS__'))
+    ? { stdout: '2: wlan0 inet 10.0.2.15/24 scope global wlan0\n__APKSTART_WIFI_STATUS__\nWifi is disconnected\n__APKSTART_LINK_STATUS__\n2: wlan0: <BROADCAST,MULTICAST,UP> mtu 1500 state DOWN\n' } : undefined;
   const result = await emu.checkNetwork();
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'wifi-not-connected');

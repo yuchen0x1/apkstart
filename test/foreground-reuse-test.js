@@ -112,6 +112,7 @@ function makeLaunchVm({
     settings: [],
     send: [],
     logs: [],
+    leases: [],
   };
   const appWin = {
     isOpen: true,
@@ -139,6 +140,13 @@ function makeLaunchVm({
     settings: { engine: { mode: engineMode } },
     emulator: { lcd: { w: 540, h: 960 } },
     beginApp: async () => {},
+    acquireForegroundLaunch: () => {
+      calls.leases.push('acquire');
+      return {
+        promote: async () => { calls.leases.push('promote'); },
+        release: async () => { calls.leases.push('release'); },
+      };
+    },
   };
   const installer = {
     launch: async () => {
@@ -211,6 +219,7 @@ test('same ready active package reuses the existing host through reveal only', a
   assert.equal(h.calls.close, 0);
   assert.deepEqual(h.appWin.state, beforeState);
   assert.equal(h.calls.directShow, 0);
+  assert.deepEqual(h.calls.leases, [], 'revealing a ready window does not need a startup lease');
 });
 
 for (const scenario of [
@@ -228,6 +237,7 @@ for (const scenario of [
     assert(h.calls.armAgent >= 1, 'normal path must reach the agent preparation');
     assert.equal(h.calls.installer, 1, 'fallback must reach installer.launch');
     assert.equal(h.calls.directShow, 0);
+    assert.deepEqual(h.calls.leases, ['acquire', 'promote', 'release'], 'failure always releases its foreground lease');
   });
 }
 
@@ -249,6 +259,38 @@ test('launchBusy standalone path calls reveal and never directly shows the hidde
   gate.resolve({ ok: true });
   const firstResult = await first;
   assert.equal(firstResult.ok, true);
+});
+
+test('normal launch promotes before foreground preparation and releases after the session is active', async () => {
+  const h = makeLaunchVm({ ready: false, windowMode: 'standalone' });
+  h.winAgent = null;
+  const client = { prepareForeground: async () => { h.calls.leases.push('prepare'); } };
+  h.installer.launch = async (_pkg, options) => {
+    options.onProgress('fixture: checking network');
+    await options.beforeStart({ client });
+    return { ok: true, engine: 'emulator' };
+  };
+  h.appWin.standalone = async () => true;
+  h.runtime.beginApp = async () => { h.calls.leases.push('session'); };
+  const result = await h.runLaunchInner('com.ready');
+  assert.equal(result.ok, true);
+  assert.deepEqual(h.calls.leases, ['acquire', 'promote', 'promote', 'prepare', 'session', 'release']);
+  assert(h.calls.send.some(([event, data]) => event === 'app:launchProgress'
+    && data.package === 'com.ready' && data.message === 'fixture: checking network'));
+});
+
+test('closing the launch window suppresses later progress and still releases the lease', async () => {
+  const h = makeLaunchVm({ ready: false });
+  h.installer.launch = async (_pkg, options) => {
+    h.appWin.win.isDestroyed = () => true;
+    const before = h.calls.send.length;
+    options.onProgress('late progress must not be sent');
+    assert.equal(h.calls.send.length, before);
+    return { ok: true };
+  };
+  const result = await h.runLaunchInner('com.ready');
+  assert.equal(result.ok, false);
+  assert.deepEqual(h.calls.leases, ['acquire', 'promote', 'release']);
 });
 
 for (const [retry, windowMode] of [[false, 'auto'], [true, 'auto'], [true, 'embedded']]) {

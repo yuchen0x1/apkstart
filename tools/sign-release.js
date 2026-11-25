@@ -4,7 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 const {
   assetNames, releaseAssetDescriptors, releaseFileNames, createLatestManifest,
-  verifyLatestManifest, matchLatestAsset, readManifest, repo,
+  verifyLatestManifest, matchLatestAsset, readManifest, canonicalJson, repo,
 } = require('../src/core/release-manifest');
 const { sha256File } = require('../src/core/download');
 
@@ -20,20 +20,36 @@ function isExpectedAssetUrl(value, tag, name, allowDraft) {
     && !url.search && !url.hash && draftPath.test(url.pathname);
 }
 
-async function run(command, dir, arg, uploadedLatestPath) {
+async function run(command, dir, arg, uploadedLatestPath, options = {}) {
   if (command === '--check-upload' || command === '--check-draft') {
     const checkDraft = command === '--check-draft';
-    const tag = process.env.TAG;
+    const tag = options.tag || process.env.TAG;
     if (!tag) throw Error('TAG 未设置，不能验证上传清单');
     const uploaded = JSON.parse(fs.readFileSync(arg, 'utf8')).assets;
     const names = fs.readdirSync(dir).sort();
     if (JSON.stringify(names) !== JSON.stringify(releaseFileNames(tag))) throw Error('Unexpected release files');
     if (!Array.isArray(uploaded) || uploaded.length !== names.length) throw Error('Unexpected number of uploaded assets');
+    const latestBytes = fs.readFileSync(uploadedLatestPath || path.join(dir, 'latest.json'));
+    const latest = verifyLatestManifest(latestBytes, options.publicKey);
+    if (!checkDraft) {
+      const localLatest = verifyLatestManifest(fs.readFileSync(path.join(dir, 'latest.json')), options.publicKey);
+      const payload = (manifest) => {
+        const body = { ...manifest };
+        delete body.publishedAt;
+        delete body.manifestSignature;
+        return canonicalJson(body);
+      };
+      // Re-running a failed post-publication check re-signs the same payload
+      // with a new timestamp. Keep the already signed remote timestamp intact.
+      if (payload(localLatest) !== payload(latest)) throw Error('已发布 latest.json 与本地签名载荷不一致');
+    }
     for (const name of names) {
       const file = path.join(dir, name);
       const asset = uploaded.find((entry) => entry.name === name);
-      if (!asset || asset.size !== fs.statSync(file).size
-        || asset.digest !== 'sha256:' + await sha256File(file)) {
+      const publishedLatest = !checkDraft && name === 'latest.json';
+      const size = publishedLatest ? latestBytes.length : fs.statSync(file).size;
+      const digest = publishedLatest ? await sha256FileBuffer(latestBytes) : await sha256File(file);
+      if (!asset || asset.size !== size || asset.digest !== 'sha256:' + digest) {
         throw Error('上传校验失败 ' + name);
       }
       if (!isExpectedAssetUrl(asset.url, tag, name, checkDraft)) {
@@ -42,8 +58,6 @@ async function run(command, dir, arg, uploadedLatestPath) {
       }
     }
 
-    const latestBytes = fs.readFileSync(uploadedLatestPath || path.join(dir, 'latest.json'));
-    const latest = verifyLatestManifest(latestBytes);
     const latestAsset = uploaded.find((entry) => entry.name === 'latest.json');
     if (!latestAsset || latestAsset.digest !== 'sha256:' + await sha256FileBuffer(latestBytes)) {
       throw Error('已上传 latest.json 与签名校验文件不一致');
@@ -121,7 +135,7 @@ async function sha256FileBuffer(bytes) {
   return crypto.createHash('sha256').update(bytes).digest('hex');
 }
 
-module.exports = { isExpectedAssetUrl };
+module.exports = { isExpectedAssetUrl, run };
 
 if (require.main === module) {
   run(...process.argv.slice(2)).catch(err => { console.error(err.message); process.exitCode = 1; });

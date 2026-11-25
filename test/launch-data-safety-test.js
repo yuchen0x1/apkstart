@@ -11,7 +11,7 @@ const { Installer } = require('../src/core/installer');
 const PKG = 'com.example.launchsafety';
 let passed = 0;
 
-async function test(name, mode, check) {
+async function test(name, mode, check, { network = '' } = {}) {
   const originalNow = Date.now;
   const originalTimeout = global.setTimeout;
   let clock = 1700000000000;
@@ -24,12 +24,18 @@ async function test(name, mode, check) {
   const sentinel = path.join(ROOT, `private-data-${passed}`);
   fs.writeFileSync(sentinel, 'login-token-and-unsaved-draft');
   const commands = [];
+  const guestCalls = [];
   const logs = [];
+  const progress = [];
+  const marks = [];
+  const networkCalls = [];
+  let cancelled = false;
   let starts = 0;
   let probes = 0;
   let touches = 0;
   const client = {
     async shell(cmd) {
+      guestCalls.push('shell');
       commands.push(cmd);
       if (/^pm clear\b/.test(cmd)) { fs.unlinkSync(sentinel); return 'Success'; }
       if (cmd.startsWith('pidof ')) {
@@ -40,23 +46,40 @@ async function test(name, mode, check) {
       }
       throw new Error('Unexpected fake command: ' + cmd);
     },
-    async startApp() { starts++; },
-    async grantRuntimePermissions() {},
-    async forceStop() {},
-    async dismissPermissionDialog() {},
-    async clearCache() { throw new Error('非崩溃证据路径不应清缓存'); },
+    async startApp() { guestCalls.push('startApp'); starts++; },
+    async grantRuntimePermissions() { guestCalls.push('grantRuntimePermissions'); },
+    async forceStop() { guestCalls.push('forceStop'); },
+    async dismissPermissionDialog() { guestCalls.push('dismissPermissionDialog'); },
+    async clearCache() { guestCalls.push('clearCache'); throw new Error('非崩溃证据路径不应清缓存'); },
   };
-  const runtime = { async ensure() { return { ok: true, engine: 'fake', client }; }, touch() { touches++; } };
+  const runtime = {
+    async ensure() { return { ok: true, engine: network ? 'emulator' : 'fake', client }; },
+    async waitForNetwork(options) {
+      assert(network, '非模拟器测试不应等待网络');
+      networkCalls.push(options.timeoutMs);
+      if (network === 'reject') throw new Error('fake network subprocess failure');
+      if (network === 'cancel') cancelled = true;
+      return { ok: false, reason: 'timeout' };
+    },
+    touch() { touches++; },
+  };
   const installer = new Installer(runtime, { desktopDir: ROOT });
   let error;
   let result;
   try {
-    try { result = await installer.launch(PKG, { onLog: message => logs.push(message) }); }
+    try {
+      result = await installer.launch(PKG, {
+        onLog: message => logs.push(message),
+        onProgress: message => progress.push(message),
+        onMark: message => marks.push(message),
+        shouldCancel: () => cancelled,
+      });
+    }
     catch (e) { error = e; }
     assert.strictEqual(fs.readFileSync(sentinel, 'utf8'), 'login-token-and-unsaved-draft', '普通启动不能删除应用私有数据');
     assert(!commands.some(cmd => /^pm clear\b/.test(cmd)), '不能下发 pm clear（即使执行失败也不行）');
     assert(!logs.some(message => /重置应用数据|清空应用数据/.test(message)), '进度文案不能承诺未经授权的数据重置');
-    await check({ error, result, starts, probes, touches });
+    await check({ error, result, starts, probes, touches, guestCalls, logs, progress, marks, networkCalls });
     passed++;
     console.log('  PASS ' + name);
   } finally {
@@ -87,6 +110,36 @@ async function test(name, mode, check) {
     assert.strictEqual(starts, 1);
     assert.strictEqual(touches, 1);
   });
+  for (const [network, label] of [['timeout', '联网超时'], ['reject', '网络检查异常']]) {
+    await test(`${label}后继续启动并确认存活，不清应用数据`, 'stable', ({
+      error, result, starts, probes, touches, logs, progress, marks, networkCalls,
+    }) => {
+      assert.ifError(error);
+      assert.deepStrictEqual(result, { ok: true, engine: 'emulator' });
+      assert.deepStrictEqual(networkCalls, [20000], '仅执行一次有界网络等待');
+      assert.strictEqual(starts, 1, '网络不可用不应触发应用重复启动');
+      assert(probes > 1, '仍须执行应用存活观察');
+      assert.strictEqual(touches, 1);
+      assert(marks.includes('network deferred'));
+      assert(logs.some(message => /网络还没就绪，先启动应用/.test(message)));
+      const waiting = progress.indexOf('正在等待安卓网络就绪（最多 20 秒）…');
+      const starting = progress.indexOf('正在启动应用…');
+      const stabilizing = progress.indexOf('正在确认应用稳定运行…');
+      assert(waiting >= 0 && starting > waiting && stabilizing > starting, '网络失败后阶段仍推进到启动和稳定检查');
+    }, { network });
+  }
+  await test('等待网络期间取消后不再访问客机或记录成功', 'stable', ({
+    error, result, starts, touches, guestCalls, marks, networkCalls,
+  }) => {
+    assert(error);
+    assert.strictEqual(error.code, 'LAUNCH_CANCELLED');
+    assert.strictEqual(result, undefined);
+    assert.deepStrictEqual(networkCalls, [20000]);
+    assert.deepStrictEqual(guestCalls, [], '取消后不得授权、启动、探测或强停应用');
+    assert.strictEqual(starts, 0);
+    assert.strictEqual(touches, 0);
+    assert(!marks.includes('network deferred'), '取消不能伪装成正常联网超时后继续启动');
+  }, { network: 'cancel' });
   let cancelled = false;
   const installer = new Installer({ ensure: async () => {
     cancelled = true;

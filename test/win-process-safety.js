@@ -199,10 +199,17 @@ test('Windows process safety: coexisting QEMU/terminal/instances never cross-kil
     const info = await waitInfo(victim.pid);
     t2.after(() => { try { victim.kill(); } catch (_) { /* ignore */ } });
 
+    const snapshot = await processOwner.getProcessTreeSnapshot(victim.pid);
+    assert(snapshot && processOwner.sameIdentity(info, snapshot.root), 'tree snapshot must retain the captured root birth');
+    assert(processOwner.sameIdentity(snapshot.root, snapshot.currentRoot), 'root must be freshly verified after the tree walk');
+    assert(Array.isArray(snapshot.processes), 'a leaf root still has a valid descendant snapshot');
+
     const idle = setPriority(info, 'idle');
     assert.equal(idle.status, 0, idle.stderr || idle.stdout);
     assert.match(String(idle.stdout), /CHANGED=1/, 'exact identity should change priority once');
     assert.equal(priorityClass(victim.pid), 'Idle', 'priority should actually be Idle');
+    assert.equal((await processOwner.getProcessTreeSnapshot(victim.pid)).currentRoot.priorityClass, 64,
+      'tree identity must report the live handle priority without caching');
 
     const normal = setPriority(info, 'normal');
     assert.match(String(normal.stdout), /CHANGED=1/, 'priority should be restored');
@@ -223,6 +230,27 @@ test('Windows process safety: coexisting QEMU/terminal/instances never cross-kil
 
     const empty = runPs(['-File', PRIORITY, '-Expected', '', '-Level', 'idle']);
     assert.match(String(empty.stdout), /CHANGED=0/);
+  });
+
+  await t.test('priority helper batch independently rejects a forged sibling identity', async (t2) => {
+    const first = track(spawnSentinel('priority-batch-first', PS, ['-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 120']));
+    const second = track(spawnSentinel('priority-batch-second', PS, ['-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 120']));
+    t2.after(() => { for (const proc of [first, second]) { try { proc.kill(); } catch (_) { /* ignore */ } } });
+    const infos = await Promise.all([waitInfo(first.pid), waitInfo(second.pid)]);
+    // Child processes can inherit a CI runner's priority; seed a known non-idle baseline.
+    const baseline = runPs(['-Command', `(Get-Process -Id ${Number(second.pid)} -ErrorAction Stop).PriorityClass = 'BelowNormal'`]);
+    assert.equal(baseline.status, 0, baseline.stderr || baseline.stdout);
+    assert.equal(priorityClass(second.pid), 'BelowNormal', 'forged sibling fixture must start below normal');
+    const expected = infos.map((info) => ({
+      pid: info.pid, started: info.started, exe: info.exe, cmdHash: sha256(info.commandLine),
+    }));
+    expected[1].started = tamperStarted(expected[1].started);
+    const payload = Buffer.from(JSON.stringify(expected)).toString('base64');
+    const result = runPs(['-File', PRIORITY, '-Expected', payload, '-Level', 'idle']);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(String(result.stdout), /CHANGED=1/, 'one matching row cannot authorize its forged sibling');
+    assert.equal(priorityClass(first.pid), 'Idle');
+    assert.equal(priorityClass(second.pid), 'BelowNormal', 'forged sibling priority must stay unchanged');
   });
 
   await t.test('window helper refuses missing or forged identity', async (t2) => {
