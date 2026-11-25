@@ -4,6 +4,27 @@
 >
 > **已修**：当前代码有明确修复和回归覆盖。**本轮新修**：在 0.10.4 中新增。**部分**：有诊断、降级或安全兜底，但仍需要对应 APK、硬件或系统复验。**平台/功能边界**：不是当前 Windows/Linux x86_64 内置后端能承诺的功能。
 
+## 2026-11-25 复核（v0.11.4）
+
+本次通过 GitHub API 重新核对上游提交、发行、开放 Issue 与近期评论。上游共有 **100 条开放 Issue**（排除 PR）；相较 11 月 23 日最初审计的 92 条，新增 #133、#135、#136、#140、#143、#144、#145、#146，其中 #140 已在 11 月 24 日复核。以下时间均为北京时间。
+
+- 上游 `main` 最新仍为 [`7e2c550`](https://github.com/RoutineMiku/apkstart/commit/7e2c5503b908c0a4d55283c85244a8e09b2725c7)，提交时间为 **2026-11-22 20:15**，内容为 Gitee 发行说明回填诊断。本次没有发现 11 月 24 日以后新增的主线提交。
+- 最高功能版本仍为 [v0.6.4](https://github.com/RoutineMiku/apkstart/releases/tag/v0.6.4)。上游 `/releases/latest` 返回后补发的 v0.6.3，不能将其发布日期当作更高版本号。
+- [PR #142 英文](https://github.com/RoutineMiku/apkstart/pull/142)、[PR #141 西语](https://github.com/RoutineMiku/apkstart/pull/141)、[PR #139 拆分包](https://github.com/RoutineMiku/apkstart/pull/139) 和 [PR #137 keymapEngine 作用域](https://github.com/RoutineMiku/apkstart/pull/137) 均尚未合并。本仓库已有语言入口和拆分包安装，但没有引入上游 `keymapEngine` 模块，因此不能把“不存在该引用链”表述为已移植其按键映射功能。
+
+| 上游问题 | 当前核对结果 | 证据与验收边界 |
+|---|---|---|
+| [#146 APK 启动失败 / 0xC0000005](https://github.com/RoutineMiku/apkstart/issues/146) | **部分覆盖，未证明根治** | 11 月 24 日 22:11 创建，11 月 25 日 12:55 有 ADB `device offline` 新评论。`emulator.js` 有访问冲突熔断、Vulkan 崩溃降级；`engine.js` 有 ADB 启动自愈；`adb.js` 有安装传输重试。帖子缺少 APK、硬件资料和完整日志，不能承诺对应机器已修复。 |
+| [#145 没有英文](https://github.com/RoutineMiku/apkstart/issues/145)、[#144 No English](https://github.com/RoutineMiku/apkstart/issues/144) | **入口与主要界面已覆盖** | `src/i18n/index.js`、设置语言下拉框和语言往返回归已存在；不代表所有核心诊断、手册和非英文词条都已完整翻译。 |
+| [#143 无 Windows 安装包](https://github.com/RoutineMiku/apkstart/issues/143) | **上游分发问题，本仓库未复现** | 本次核对的正式 v0.11.3 Release 已包含 `ApkStart-0.11.3-Setup.exe` 与便携 ZIP。后续版本继续由 Release 工作流构建 Windows / Linux 资产。 |
+| [#135 Vulkan 兼容](https://github.com/RoutineMiku/apkstart/issues/135) | **仍有能力差距** | host / lavapipe 选项及禁用 Vulkan 的崩溃回退不等于 Android 应用可用 Vulkan；尚无对应应用侧能力检测与真实 APK 验收。 |
+| [#136 Gitee 无制品 / GitHub 下载慢](https://github.com/RoutineMiku/apkstart/issues/136) | **本仓库已有下载回退，实测速率未知** | 维护者说明 Gitee 制品受大小限制。本仓库 v0.11.3 已发布官方优先、失败或持续低速后切换 GH-Proxy 的机制；没有中国大陆真实吞吐测量。 |
+| [#133 AMD 780M + Emulator 37.4.1 访问冲突](https://github.com/RoutineMiku/apkstart/issues/133) | **部分覆盖，待对应设备验证** | 已有同类诊断、降级和熔断，但未取得报告者环境的可复现日志，不能把止损当成驱动兼容性修复。 |
+
+另外确认一个**旧功能差距**：上游 v0.6.4 的 Windows `UserGpuPreferences` 系统默认 / 核显 / 独显偏好尚未移植。当前 `host`、`swangle`、`software` 是渲染后端选择，不等于指定物理显卡。中 / 英 / 西 / 越 / 俄语言入口存在，缺失词条会回退英文，也不等于所有语言都已全量翻译。
+
+本次定向回归覆盖自动启动逻辑、i18n 语言切换与词条往返；没有在 #133 / #146 报告者的设备、对应 APK 或 Vulkan 应用中完成端到端复验。没有替上游关闭这些未验收的问题。
+
 ## 2026-11-24 复核（v0.10.9）
 
 | 上游问题 | 影响范围 | 本仓库是否存在 | 结论 |

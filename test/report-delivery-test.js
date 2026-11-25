@@ -197,7 +197,7 @@ test('真实报告 IPC：准备/预览完全离线；手动确认只发送一次
   const prompt = f.prompts.at(-1);
   assert.equal(prompt.defaultId, 0);
   assert.equal(prompt.cancelId, 0);
-  assert(prompt.detail.includes(endpoint));
+  assert.equal(prompt.detail.split('\n')[0], endpoint);
   assert(prompt.detail.includes(JSON.stringify(f.sent[0][1], null, 2)), '确认必须展示实际完整 payload');
 });
 
@@ -298,7 +298,7 @@ test('兜底预览写明真实渠道、目的地和可检查摘要', async () =>
   assert.equal(f.sent.length, 1, '先尝试收集接口，失败后才进入兜底');
   assert.equal(f.prompts.length, 2);
   const prompt = f.prompts.at(-1);
-  assert(prompt.detail.includes(endpoint), '必须写明收集接口地址');
+  assert(prompt.detail.split('\n').includes(`• 收集接口：${endpoint}`), '必须写明完整收集接口地址');
   assert(prompt.detail.includes('offline'), '必须写明收集接口失败原因');
   assert(prompt.detail.includes('可能已经被接收'), '断线不能断言服务端没有收到');
   assert(prompt.detail.includes(prepared.bundle.summary.slice(0, 2400)), '必须展示可检查的摘要原文');

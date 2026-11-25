@@ -130,7 +130,7 @@ const post = (body, ip = '1.1.1.1', url = 'https://w.dev/') => new Request(url, 
     };
     await handle(post(REPORT, '8.8.8.8'), env2);
     assert.strictEqual(calls.length, 1, '应发一封邮件');
-    assert(calls[0].url.includes('api.resend.com'), calls[0].url);
+    assert.strictEqual(calls[0].url, 'https://api.resend.com/emails');
     const mail = JSON.parse(calls[0].init.body);
     assert.deepStrictEqual(mail.to, ['dev@example.com']);
     assert(mail.subject.includes('TIMEOUT'), '邮件标题要能一眼看出结论');
