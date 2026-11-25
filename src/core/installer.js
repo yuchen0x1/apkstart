@@ -415,7 +415,7 @@ class Installer {
     return true;
   }
 
-  async launch(pkg, { onLog = () => {}, beforeStart = null, onMark = () => {}, lcdOrientation = '', shouldCancel = () => false } = {}) {
+  async launch(pkg, { onLog = () => {}, onProgress = () => {}, beforeStart = null, onMark = () => {}, lcdOrientation = '', shouldCancel = () => false } = {}) {
     const checkCancelled = () => {
       if (!shouldCancel()) return;
       const err = new Error('应用启动已取消；已保留应用数据');
@@ -424,6 +424,7 @@ class Installer {
     };
     checkCancelled();
     const app = store.getApp(pkg);
+    onProgress('正在检查安卓运行时…');
     const rt = await this.runtime.ensure({ onLog, lcdOrientation });
     checkCancelled();
     onMark('ensure done');
@@ -446,7 +447,10 @@ class Installer {
     // 但启动路径上绝不能做破坏性动作（以前这里调过带冷启动重试的版本，结果 adb 设备
     // 在安装途中消失，直接变成「应用打不开」）：等不到就先启动，大不了页面稍后加载。
     if (rt.engine === 'emulator' || rt.engine === 'builtin') {
+      onProgress('正在等待安卓网络就绪（最多 20 秒）…');
       const net = await this.runtime.waitForNetwork({ onLog, timeoutMs: 20000 }).catch(() => null);
+      checkCancelled();
+      onMark(`network ${net?.ok ? 'ready' : 'deferred'}`);
       if (net && net.ok) {
         onLog(`虚拟机网络就绪（${net.ip || ''}）`);
       } else {
@@ -467,6 +471,7 @@ class Installer {
       checkCancelled();
       if (!new RegExp(`package:${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(pkgs)) {
         onLog('应用尚未安装，正在自动安装…');
+        onProgress('首次启动正在安装应用，可能需要几十秒…');
         try {
           if (app.bundle === true) {
             const b = await parseBundle(app.apkPath);
@@ -524,12 +529,14 @@ class Installer {
     try {
       // 先确保运行时权限齐备：安装时的 -g 在清过数据后可能失效，
       // 缺权限时应用会被系统授权框挡住，用户看到的就是「点了没反应/打不开」。
+      onProgress('正在准备应用权限…');
       await rt.client.grantRuntimePermissions(pkg).catch(() => {});
       onMark('permissions granted');
       let ok = false;
       let cacheRetried = false;
       for (let attempt = 1; attempt <= 3 && !ok; attempt += 1) {
         checkCancelled();
+        onProgress(attempt === 1 ? '正在启动应用…' : `正在重新启动应用（第 ${attempt} 次）…`);
         if (attempt > 1) {
           // eslint-disable-next-line no-await-in-loop
           await rt.client.forceStop(pkg).catch(() => {});
@@ -563,6 +570,7 @@ class Installer {
           started = false;
         }
         onMark(`am start #${attempt} ${started ? 'ok' : 'fail'}`);
+        if (started) onProgress('正在确认应用稳定运行…');
         // eslint-disable-next-line no-await-in-loop
         ok = started ? await staysAlive() : false;
         onMark(`alive #${attempt} ${ok}`);

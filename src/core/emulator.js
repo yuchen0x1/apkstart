@@ -40,6 +40,43 @@ const MANAGED_AVDS = [`${AVD_NAME}.avd`, ...BUILTIN_AVD_NAMES.map((x) => `${x}.a
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function networkCheckError(code) {
+  const error = new Error(code === 'NETWORK_CHECK_CANCELLED' ? '网络体检已取消' : '网络体检超过总时限');
+  error.code = code;
+  return error;
+}
+
+function networkReadTimeout(context, maximum = 8000) {
+  if (context?.signal?.aborted) throw networkCheckError('NETWORK_CHECK_CANCELLED');
+  if (!context) return maximum;
+  const remaining = context.deadline - Date.now();
+  if (remaining <= 0) throw networkCheckError('NETWORK_CHECK_TIMEOUT');
+  return Math.max(1, Math.min(maximum, remaining));
+}
+
+function ownershipReadOptions(context) {
+  return context ? { timeoutMs: networkReadTimeout(context), signal: context.signal } : undefined;
+}
+
+function waitForNetworkRead(ms, context) {
+  const delay = networkReadTimeout(context, ms);
+  return new Promise((resolve, reject) => {
+    let timer;
+    const finish = (error) => {
+      clearTimeout(timer);
+      context.signal?.removeEventListener('abort', onAbort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onAbort = () => finish(networkCheckError('NETWORK_CHECK_CANCELLED'));
+    timer = setTimeout(() => {
+      try { networkReadTimeout(context); finish(); } catch (error) { finish(error); }
+    }, delay);
+    context.signal?.addEventListener('abort', onAbort, { once: true });
+    if (context.signal?.aborted) onAbort();
+  });
+}
+
 /**
  * Windows 上把 emulator/qemu 的退出码翻译成人话。
  * 0xC0000005（3221225477）最常见：进程访问冲突。诱因可能是显卡/Vulkan，
@@ -340,24 +377,28 @@ class EmulatorEngine {
     });
   }
 
-  async ownedProcessOnPort(port = this.port) {
-    const pid = await processOwner.pidOnPort(port);
-    const info = await processOwner.getProcessInfo(pid);
+  async ownedProcessOnPort(port = this.port, context = null) {
+    const pid = await processOwner.pidOnPort(port, ownershipReadOptions(context));
+    const info = await processOwner.getProcessInfo(pid, ownershipReadOptions(context));
+    if (context) networkReadTimeout(context);
     return this.ownsProcess(info, { discoverRoot: true }) ? info : null;
   }
 
   /** Console and ADB endpoints must belong to this exact, birth-pinned AVD. */
-  async _ownedAdbTarget(expected = null, port = this.port) {
-    const target = await this.ownedProcessOnPort(port);
+  async _ownedAdbTarget(expected = null, port = this.port, context = null) {
+    const target = await this.ownedProcessOnPort(port, context);
+    if (context) networkReadTimeout(context);
     if (!target || (expected && !processOwner.sameIdentity(expected, target))) return null;
-    const pid = await processOwner.pidOnPort(Number(port) + 1);
+    const pid = await processOwner.pidOnPort(Number(port) + 1, ownershipReadOptions(context));
+    if (context) networkReadTimeout(context);
     if (pid !== target.pid || port !== this.port) return null;
-    const current = await processOwner.getProcessInfo(pid);
+    const current = await processOwner.getProcessInfo(pid, ownershipReadOptions(context));
+    if (context) networkReadTimeout(context);
     return processOwner.sameIdentity(target, current) ? current : null;
   }
 
-  async _requireAdbTarget(expected = null, port = this.port) {
-    const target = await this._ownedAdbTarget(expected, port);
+  async _requireAdbTarget(expected = null, port = this.port, context = null) {
+    const target = await this._ownedAdbTarget(expected, port, context);
     if (target) return target;
     const error = new Error('运行时 console/ADB 端口归属无法确认或已变化，已停止向客机发送命令');
     error.code = 'RUNTIME_OWNERSHIP_LOST';
@@ -382,17 +423,19 @@ class EmulatorEngine {
     };
   }
 
-  async _guestShell(adbPath, cmd, target, port, { timeout = 8000, includeErrors = false } = {}) {
-    await this._requireAdbTarget(target, port);
+  async _guestShell(adbPath, cmd, target, port, { timeout = 8000, includeErrors = false, context = null } = {}) {
+    await this._requireAdbTarget(target, port, context);
     const call = this._adbInvocation(adbPath, ['-s', `emulator-${port}`, 'shell', cmd]);
+    const options = { timeout: networkReadTimeout(context, timeout), windowsHide: true, env: call.env };
+    if (context?.signal) options.signal = context.signal;
     const result = await new Promise((resolve) => {
       try {
-        execFile(call.adb, call.args, { timeout, windowsHide: true, env: call.env }, (error, out, err) => {
+        execFile(call.adb, call.args, options, (error, out, err) => {
           resolve(includeErrors ? String(out || '') + String(err || '') : (error ? '' : String(out || '')));
         });
       } catch (_) { resolve(''); }
     });
-    await this._requireAdbTarget(target, port);
+    await this._requireAdbTarget(target, port, context);
     return result;
   }
 
@@ -949,14 +992,17 @@ class EmulatorEngine {
     if (process.platform !== 'win32') return Promise.resolve(0);
     const script = path.join(__dirname, 'win', 'priority.ps1');
     if (!fs.existsSync(script)) return 0;
-    let rootPid = this.proc && this.proc.pid ? Number(this.proc.pid) : 0;
-    if (!rootPid) {
-      const target = await this.ownedProcessOnPort().catch(() => null);
-      rootPid = target ? Number(target.pid) : 0;
-    }
-    if (!rootPid) return 0;
-    const tree = await processOwner.getProcessTree(rootPid);
-    const verified = tree.filter((p) => this.ownsProcess(p));
+    const procPid = this.proc && this.proc.pid ? Number(this.proc.pid) : 0;
+    const rootPid = procPid || await processOwner.pidOnPort(this.port);
+    const snapshot = await processOwner.getProcessTreeSnapshot(rootPid);
+    if (!snapshot) return 0;
+    const { root, currentRoot, processes: tree } = snapshot;
+    if (!this.ownsProcess(root)) return 0;
+    if (!this.ownsProcess(currentRoot) || !processOwner.sameIdentity(root, currentRoot)) return 0;
+    // An adopted QEMU can be the entire tree: include its captured, rechecked
+    // identity even when the process-tree helper returns only descendants.
+    const verified = [...new Map([currentRoot, ...tree]
+      .filter((p) => this.ownsProcess(p)).map((p) => [Number(p.pid), p])).values()];
     if (!verified.length) return 0;
     // The helper re-verifies these exact identities on one live process handle
     // immediately before changing priority. CommandLine is represented by a
@@ -1085,45 +1131,60 @@ class EmulatorEngine {
    * @param {string} [adbPath] 显式指定 adb 可执行文件（Runtime 有更权威的解析）
    * @returns {Promise<{ok:boolean, reason:string, gateway?:string, ip?:string}>}
    */
-  async checkNetwork(adbPath = '', { waitMs = 0, interval = 3000 } = {}) {
+  async checkNetwork(adbPath = '', { waitMs = 0, interval = 3000, timeoutMs = 8000, signal } = {}) {
+    const budget = Number.isFinite(Number(timeoutMs)) ? Math.max(0, Number(timeoutMs)) : 8000;
+    const context = { deadline: Date.now() + budget, signal };
     const port = this.port;
-    const target = await this._requireAdbTarget(null, port);
-    const sh = (cmd, timeout = 8000) => this._guestShell(adbPath, cmd, target, port, { timeout });
-    // 安卓的多路由表会让 `ip route` 的主表看起来是空的（默认路由在 per-interface 表里），
-    // 而且 shell 的 uid 不在应用的 network 组里，`ping` 经常误报 "Network is unreachable"，
-    // 哪怕 Wi-Fi 其实已经连上、应用也能正常上网。所以这里只认「有没有拿到 IPv4 地址」，
-    // 再叠加 `cmd wifi status` 的连接状态做交叉确认，不用 ping 判断。
-    const addr = await sh('ip -o addr');
-    const ips = [];
-    const re = /inet ((?:\d{1,3}\.){3}\d{1,3})\//g;
-    let m = re.exec(addr);
-    while (m) {
-      const ip = m[1];
-      if (!/^127\./.test(ip)) ips.push(ip);
-      m = re.exec(addr);
-    }
-    const wifi = await sh('cmd wifi status');
-    const connected = /Wi[- ]?Fi\s+is\s+connected/i.test(wifi);
-    const disconnected = /(?:Wi[- ]?Fi|wifi)\s+(?:is\s+)?(?:disconnected|disabled|unavailable|not\s+connected)/i.test(wifi);
-    if (!ips.length) {
-      // Wi-Fi 关联 + DHCP 往往比 sys.boot_completed 晚几十秒才完成。
-      // 调用方给了 waitMs 就继续等，不要在这一刻就断定「没有网络」。
-      if (waitMs > 0) {
-        const t0 = Date.now();
-        while (Date.now() - t0 < waitMs) {
-          // eslint-disable-next-line no-await-in-loop
-          await new Promise((r) => setTimeout(r, interval));
-          // eslint-disable-next-line no-await-in-loop
-          const again = await this.checkNetwork(adbPath, { waitMs: 0 });
-          if (again.ok) return again;
+    const waitUntil = Math.min(context.deadline, Date.now() + Math.max(0, Number(waitMs) || 0));
+    const pollMs = Number.isFinite(Number(interval)) && Number(interval) > 0 ? Number(interval) : 3000;
+    try {
+      const target = await this._requireAdbTarget(null, port, context);
+      const sh = (cmd) => this._guestShell(adbPath, cmd, target, port, { context });
+      // 地址与 Wi-Fi 状态交叉确认；shell 所属网络组会让 ping 误报不可达。
+      // 归属检查、每条 adb 命令和轮询共用同一截止时间，不递归刷新预算。
+      for (;;) {
+        const output = await sh('ip -o addr; echo __APKSTART_WIFI_STATUS__; cmd wifi status; echo __APKSTART_LINK_STATUS__; ip -o link');
+        const parts = String(output).split(/(?:^|\r?\n)__APKSTART_(WIFI_STATUS|LINK_STATUS)__(?:\r?\n|$)/);
+        if (parts.length !== 5 || parts[1] !== 'WIFI_STATUS' || parts[3] !== 'LINK_STATUS') return { ok: false, reason: 'network-status-unavailable' };
+        const [addr, , wifi, , links] = parts;
+        const addresses = [];
+        for (const line of addr.split(/\r?\n/)) {
+          const match = /^\d+:\s+(\S+)\s+inet\s+((?:\d{1,3}\.){3}\d{1,3})\/(\d{1,2})\b/.exec(line);
+          if (!match || !/\bscope\s+global\b/.test(line) || /\b(?:tentative|dadfailed|deprecated)\b/.test(line)) continue;
+          const octets = match[2].split('.').map(Number);
+          if (Number(match[3]) > 32 || octets.some((n) => n > 255) || !octets[0] || octets[0] >= 224
+            || octets[0] === 127 || (octets[0] === 169 && octets[1] === 254)) continue;
+          addresses.push({ interface: match[1].replace(/@.*$/, '').replace(/:$/, ''), ip: match[2] });
         }
+        const active = new Set();
+        for (const line of links.split(/\r?\n/)) {
+          const match = /^\d+:\s+([^:\s]+):?\s+<([^>]+)>/.exec(line);
+          if (!match) continue;
+          const flags = match[2].split(',').map((flag) => flag.trim());
+          if (flags.includes('UP') && flags.includes('LOWER_UP') && !flags.includes('NO-CARRIER')) active.add(match[1].replace(/@.*$/, ''));
+        }
+        const connected = /Wi[- ]?Fi\s+is\s+connected/i.test(wifi);
+        const disconnected = /(?:Wi[- ]?Fi|wifi)\s+(?:is\s+)?(?:disconnected|disabled|unavailable|not\s+connected)/i.test(wifi);
+        // Emulator Ethernet (10.0.2.15) and cellular links remain usable when
+        // Wi-Fi is disconnected. An address alone is not proof of a live link.
+        const independent = addresses.find((item) => /^(?:eth\d+|en[a-z0-9]+|rmnet(?:_data)?\d+|ccmni\d+|pdp\d+)$/i.test(item.interface) && active.has(item.interface));
+        const wireless = connected && !disconnected && addresses.find((item) => /^wlan\d+$/i.test(item.interface));
+        const ready = independent || wireless;
+        const ips = addresses.map((item) => item.ip);
+        if (ready) {
+          const { ip } = ready;
+          const gw = /^10\.0\.2\./.test(ip) ? '10.0.2.2' : ip.replace(/\.\d+$/, '.1');
+          return { ok: true, reason: '', gateway: gw, ip, interface: ready.interface, wifiConnected: connected && !disconnected };
+        }
+        const result = { ok: false, reason: ips.length || !connected ? 'wifi-not-connected' : 'no-ip-address', addrs: ips };
+        if (ips.length || Date.now() >= waitUntil) return result;
+        await waitForNetworkRead(Math.min(pollMs, waitUntil - Date.now()), context);
+        if (Date.now() >= waitUntil) return result;
       }
-      return { ok: false, reason: connected ? 'no-ip-address' : 'wifi-not-connected', addrs: ips };
+    } catch (error) {
+      if (error.code === 'NETWORK_CHECK_TIMEOUT') return { ok: false, reason: 'timeout' };
+      throw error;
     }
-    if (disconnected) return { ok: false, reason: 'wifi-not-connected', addrs: ips };
-    const ip = ips[0];
-    const gw = /^10\.0\.2\./.test(ip) ? '10.0.2.2' : ip.replace(/\.\d+$/, '.1');
-    return { ok: true, reason: '', gateway: gw, ip, wifiConnected: connected };
   }
 
   /**
@@ -1579,30 +1640,11 @@ class EmulatorEngine {
           // 装完新应用时 installer 会作废旧快照，避免恢复后应用消失。
           if (this.snapshotWorthSaving !== false) this.snapshotWorthSaving = true;
           onLog(`运行时就绪（${Math.round(bootMs / 1000)}s，${plan.label}）`);
-          // 开机成功不等于能用：顺手体检网络。虚拟机没网时，需要联网的页面会一直黑屏，
-          // 用户只会说「这个应用黑屏」，很难联想到是网络。这里主动查一次并说清楚。
-          let network = null;
-          try { network = await this.checkNetwork(); } catch (_) { /* 体检失败不算启动失败 */ }
-          // 没网时先自动修一次 Wi-Fi 关联（清撞车的保存网络 + 点一下重新关联），
-          // 修好了用户就完全无感；修不好才提示，且不再劝用户「重置数据」——
-          // 那会白丢已装应用，而真正的病根只是一份写坏的 wifi 配置。
-          if (network && !network.ok) {
-            onLog('检测到虚拟机网络异常，正在自动修复 Wi-Fi 关联…');
-            const rep = await this.repairWifi('', onLog).catch(() => null);
-            if (rep && rep.ok) {
-              onLog('虚拟机网络已恢复');
-              network = await this.checkNetwork().catch(() => network);
-            } else if (rep) {
-              onLog(`Wi-Fi 自动修复未成功（${rep.reason || 'unknown'}）`);
-            }
-          }
-          if (network && !network.ok) {
-            onLog('⚠ 安卓虚拟机当前没有网络：需要联网的应用打开后会一直黑屏。'
-              + '可在「设置 → 修复网络」重置安卓数据来修（应用清单会保留，点开时会自动重装）。');
-          }
+          // 网络由 Runtime.waitForNetwork 统一做限时只读体检。
+          // 此处已确认 Android 开机，不能再因 Wi-Fi 重连或设置页操作阻塞应用启动。
           return {
             ok: true, serial: this.serial, port, accel: accelInfo, logFile,
-            profile: plan, attempts: this.attempts, bootMs, quickBoot: true, network,
+            profile: plan, attempts: this.attempts, bootMs, quickBoot: true, network: null,
           };
         }
 

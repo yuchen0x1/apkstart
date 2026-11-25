@@ -1358,7 +1358,10 @@ async function withStartFixture(run) {
     assert(/waitForNetwork\(\{ onLog, timeoutMs: 20000 \}\)/.test(installSrc), '启动路径应只等 20 秒，不重启');
     assert(!/ensureNetwork/.test(installSrc), '启动路径不能调用会冷启动的 ensureNetwork');
     const engineSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'engine.js'), 'utf8');
-    assert(/device-offline/.test(engineSrc) && /45000/.test(engineSrc), '刚重启的设备掉线要给宽限，不能立刻判失败');
+    const waitStart = engineSrc.indexOf('  async waitForNetwork(');
+    const wait = engineSrc.slice(waitStart, engineSrc.indexOf('\n  repairNetwork(', waitStart));
+    assert(waitStart >= 0 && /deadline/.test(wait) && /signal: controller.signal/.test(wait), '网络重试和子命令必须共享总时限与取消信号');
+    assert(!/repairWifi|this\.stop\(/.test(wait), '启动联网检查不能进入 Wi-Fi 修复或停机路径');
     const repairStart = engineSrc.indexOf('  repairNetwork(');
     assert(repairStart >= 0, '必须提供独立网络修复入口');
     const repair = engineSrc.slice(repairStart, engineSrc.indexOf('\n  dispose(', repairStart));
@@ -1534,24 +1537,26 @@ async function withStartFixture(run) {
     assert(/cmdHash/.test(script), '必须复核命令行哈希');
     assert(!/\$Avd/.test(script), '不得按 AVD 名匹配进程');
     assert(!/CommandLine -like/.test(script), '不得按命令行子串匹配');
-    assert(!/Get-CimInstance\s+Win32_Process(?!\s+-Filter\s+"ProcessId=)/.test(script),
+    assert(/\$filter\s*=\s*\(\$candidateIds\s*\|\s*ForEach-Object\s*\{\s*"ProcessId=\$_"\s*\}\)\s*-join\s*' OR '/.test(script),
+      '批量过滤器只能由已提供的精确 PID 构成');
+    assert(!/Get-CimInstance\s+Win32_Process(?!\s+-Filter(?:\s+"ProcessId=|\s+\$filter\b))/.test(script),
       '脚本内部只能按精确 PID 读取进程信息，不得全表枚举');
     assert(!/qemu-system|ProcessName/i.test(script), '脚本内部不得再按镜像名兜底');
 
     // 拿不到经归属验证的进程树时必须失败关闭（返回 0），不能回退成扫名字。
     const owner = require('../src/core/process-owner');
-    const originalTree = owner.getProcessTree;
+    const originalTree = owner.getProcessTreeSnapshot;
     const originalProc = emu.proc;
     emu.proc = { pid: 4242 };
     emu.ownedProcessOnPort = async () => null;
-    owner.getProcessTree = async () => [];
+    owner.getProcessTreeSnapshot = async () => null;
     try {
       assert(await emu.setPriority('idle') === 0, '进程树为空时不得调用脚本');
-      owner.getProcessTree = async () => [{ pid: 4242 }];
+      owner.getProcessTreeSnapshot = async () => ({ root: { pid: 4242 }, currentRoot: { pid: 4242 }, processes: [] });
       emu.ownsProcess = () => false;
       assert(await emu.setPriority('idle') === 0, '归属验证不过的 PID 不得调整优先级');
     } finally {
-      owner.getProcessTree = originalTree;
+      owner.getProcessTreeSnapshot = originalTree;
       emu.proc = originalProc;
     }
 

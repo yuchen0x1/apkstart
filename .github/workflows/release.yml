@@ -242,18 +242,4 @@ jobs:
           node tools/release-notes.js "$TAG" --out RELEASE_NOTES.md
           node tools/sign-release.js "$TAG" artifacts RELEASE_NOTES.md
       - name: 在草稿中核对全部文件后发布
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo '该版本已有发行记录，请检查现有发行或草稿' >&2; exit 1
-          fi
-          gh release create "$TAG" --draft --verify-tag --title "ApkStart $TAG" --notes-file RELEASE_NOTES.md artifacts/*
-          mkdir -p uploaded-latest
-          gh release download "$TAG" --pattern latest.json --dir uploaded-latest
-          gh release view "$TAG" --json assets > uploaded.json
-          node tools/sign-release.js --check-draft artifacts uploaded.json uploaded-latest/latest.json
-          gh release edit "$TAG" --draft=false --latest
-          mkdir -p published-latest
-          gh release download "$TAG" --pattern latest.json --dir published-latest
-          gh release view "$TAG" --json assets > published.json
-          node tools/sign-release.js --check-upload artifacts published.json published-latest/latest.json
+        run: node tools/publish-release.js "$TAG" artifacts RELEASE_NOTES.md

@@ -1,7 +1,7 @@
 {
   "name": "apkstart",
   "productName": "ApkStart",
-  "version": "0.11.7",
+  "version": "0.11.8",
   "description": "极致轻量的安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行（Windows / Linux）",
   "main": "src/main.js",
   "desktopName": "apkstart.desktop",
@@ -48,7 +48,8 @@
     "test:acceleration": "node --test test/download-acceleration-test.js",
     "readme:sync": "node tools/update-readme.js",
     "readme:check": "node tools/update-readme.js --check",
-    "test:safety": "node --test test/bundle-backup-test.js test/download-identity-test.js test/i18n-roundtrip-test.js test/ipc-role-test.js test/launch-data-safety-test.js test/quit-lifecycle-test.js test/runtime-actions-test.js test/runtime-data-safety-test.js test/sync-boundary-test.js test/system-lifecycle-test.js test/vc-redist-safety-test.js test/snapshot-partition-safety-test.js test/window-embed-safety-test.js test/runtime-staging-test.js test/runtime-component-integrity-test.js test/instance-runtime-readonly-test.js test/instance-settings-test.js test/instances-test.js test/automation-test.js test/peripherals-test.js test/platform-capabilities-test.js test/host-profile-test.js test/i18n-language-test.js test/foreground-reuse-test.js test/instance-adb-test.js test/instance-system-readonly-test.js test/bench-runtime-safety-test.js test/win-process-safety.js test/gpu-info-test.js",
+    "test:safety": "node --test test/bundle-backup-test.js test/download-identity-test.js test/i18n-roundtrip-test.js test/ipc-role-test.js test/launch-data-safety-test.js test/quit-lifecycle-test.js test/runtime-actions-test.js test/runtime-data-safety-test.js test/sync-boundary-test.js test/system-lifecycle-test.js test/vc-redist-safety-test.js test/snapshot-partition-safety-test.js test/window-embed-safety-test.js test/runtime-staging-test.js test/runtime-component-integrity-test.js test/instance-runtime-readonly-test.js test/instance-settings-test.js test/instances-test.js test/automation-test.js test/peripherals-test.js test/platform-capabilities-test.js test/host-profile-test.js test/i18n-language-test.js test/foreground-reuse-test.js test/instance-adb-test.js test/instance-system-readonly-test.js test/bench-runtime-safety-test.js test/win-process-safety.js test/gpu-info-test.js && npm run test:launch",
+    "test:launch": "node --test test/launch-performance-test.js test/emulator-network-budget-test.js test/launch-progress-test.js",
     "test:sync": "node test/sync-test.js",
     "test:updater": "node test/updater-test.js",
     "test:security": "node test/security-test.js && node --test test/vc-redist-safety-test.js",

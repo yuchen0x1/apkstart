@@ -143,6 +143,9 @@ class Runtime {
     this._client = null;
     this._bootLog = [];
     this._activeApps = new Set();  // 容器会话：当前打开的应用窗口
+    this._foregroundLaunches = new Set();
+    this._priorityPromise = null;
+    this._idleTransitionPromise = null;
     this._accelRepairTried = false; // 全自动修复加速：一次运行只试一次，避免无限循环
     this.onAccelRepair = null;      // 由 main 注入（会弹管理员授权的 enableVirtualization）
     // 全自动修复（非加速类）：清锁、补文件、换渲染后端……都由 main 注入的动作执行器落地。
@@ -538,14 +541,14 @@ class Runtime {
 
   /** 空闲时保存 quickboot 快照：只在没有应用窗口时写盘，避免和应用启动抢 I/O */
   _armSnapshotSave(delay = 20000) {
-    if (this.emulator.snapshotSaveAllowed?.() === false) {
+    if (!this.containerIdle || this.emulator.snapshotSaveAllowed?.() === false) {
       this.emulator.cancelSnapshotSave();
       return;
     }
     if (!this.emulator.running()) return;
     this.emulator.scheduleSnapshotSave(this.adbPath(), {
       delay,
-      isIdle: () => this._activeApps.size === 0,
+      isIdle: () => this.containerIdle,
     });
   }
 
@@ -562,7 +565,7 @@ class Runtime {
   prewarm({ onLog = () => {} } = {}) {
     if (this._dataMaintenance || this._stopPromise || this._repairPromise) return Promise.resolve({ ok: false, skipped: 'maintenance' });
     if (this._prewarmPromise) return this._prewarmPromise;
-    if (this._activeApps.size > 0) return Promise.resolve({ ok: true, skipped: 'busy' });
+    if (!this.containerIdle) return Promise.resolve({ ok: true, skipped: 'busy' });
     // 高级模式是复用别人家已经跑起来的运行时，不该再替用户开一台自己的
     if (this.settings.engine.mode === 'attach') return Promise.resolve({ ok: false, skipped: 'attach' });
     const t0 = Date.now();
@@ -574,7 +577,7 @@ class Runtime {
         const r = await this.ensure({ onLog: (m) => onLog(`预热：${m}`), autoRepair: false });
         if (r && r.ok) {
           // 预热期间用户可能已经点开了应用：这时不能把它摁到 idle 优先级
-          if (this._activeApps.size === 0) await this.emulator.setPriority('idle').catch(() => {});
+          if (this.containerIdle) await this._queueContainerPriority().catch(() => {});
           const ms = Date.now() - t0;
           this.log(`预热完成（${Math.round(ms / 1000)}s）`);
           return { ok: true, bootMs: ms };
@@ -1056,13 +1059,12 @@ class Runtime {
   async emulatorPorts() {
     const ports = new Set();
     const owned = new Map();
-    for (const item of await processOwner.listeners()) {
+    const listeners = await processOwner.listeners();
+    const infos = await processOwner.getProcessInfos([...new Set(listeners.map((item) => item.pid))]);
+    for (const info of infos) owned.set(Number(info.pid), !!this.emulator.ownsProcess?.(info, { discoverRoot: true }));
+    for (const item of listeners) {
       if (!item.port) continue;
-      if (!owned.has(item.pid)) {
-        const info = await processOwner.getProcessInfo(item.pid);
-        owned.set(item.pid, !!this.emulator.ownsProcess?.(info, { discoverRoot: true }));
-      }
-      if (owned.get(item.pid)) ports.add(item.port);
+      if (owned.get(Number(item.pid))) ports.add(item.port);
     }
     const all = [...ports].sort((a, b) => a - b);
     // The console and adb ports are adjacent; prefer those with a matching pair.
@@ -1154,16 +1156,9 @@ class Runtime {
    */
   async activeRuntimeRoots() {
     if (process.platform !== 'win32') return [];
-    const ports = await this.emulatorPorts().catch(() => []);
-    if (!ports.length) return [];
-    const roots = new Set();
-    for (const port of ports) {
-      const info = await this.emulator.ownedProcessOnPort(port);
-      if (!info) continue;
-      const root = processOwner.emulatorRoot(info.exe);
-      if (root) roots.add(root);
-    }
-    return [...roots];
+    const info = await this.ownedRuntimeIdentity(this.emuSerial).catch(() => null);
+    const root = info && processOwner.emulatorRoot(info.exe);
+    return root ? [root] : [];
   }
 
   /**
@@ -1473,6 +1468,58 @@ class Runtime {
 
   // ---------------- 应用级容器会话 ----------------
 
+  _containerPriority() {
+    if (this.containerIdle) return 'idle';
+    return this.settings.engine?.priorityMode === 'performance' ? 'normal' : 'below';
+  }
+
+  _queueContainerPriority(requestedLevel) {
+    // Recompute after preceding writes settle: an old idle request must never
+    // finish after the foreground promotion and leave the emulator parked.
+    const p = (this._priorityPromise || Promise.resolve()).catch(() => {})
+      .then(() => this.emulator.setPriority(!requestedLevel || requestedLevel === 'idle' && !this.containerIdle
+        ? this._containerPriority() : requestedLevel));
+    this._priorityPromise = p;
+    return p;
+  }
+
+  /** Hold from the initial launch request until beginApp or launch cleanup. */
+  acquireForegroundLaunch() {
+    if (!this._foregroundLaunches) this._foregroundLaunches = new Set();
+    const token = {};
+    this._foregroundLaunches.add(token);
+    this.touch();
+    this.emulator.cancelSnapshotSave();
+    let released = false;
+    let promotion = null;
+    let promotedRuntime = null;
+    let release = null;
+    const lease = {
+      promote: ({ onlyIfRunning = false } = {}) => {
+        if (released) return Promise.resolve();
+        if (onlyIfRunning && !this.vmRunning && !this._activeApps.size) return Promise.resolve();
+        const current = { serial: this.emuSerial, emulator: this.emulator.proc, qemu: this.vmProc, level: this._containerPriority() };
+        if (!promotion || !promotedRuntime || Object.keys(current).some((key) => current[key] !== promotedRuntime[key])) {
+          promotedRuntime = current;
+          promotion = Promise.resolve(this._idleTransitionPromise).catch(() => {})
+            .then(() => released ? undefined : this._queueContainerPriority()).catch(() => {});
+        }
+        return promotion;
+      },
+      release: () => {
+        if (release) return release;
+        released = true;
+        this._foregroundLaunches.delete(token);
+        release = (this.containerIdle ? this._queueContainerPriority().catch(() => {}) : Promise.resolve()).then(() => {
+          if (this.containerIdle) this._armSnapshotSave(8000);
+        });
+        return release;
+      },
+    };
+    if (this.vmRunning) lease.promote({ onlyIfRunning: true });
+    return lease;
+  }
+
   /**
    * 「像容器一样打开」的具体实现：
    * Android 环境只引导一次并常驻（quickboot 快照 + adoptExisting 接管），
@@ -1490,13 +1537,11 @@ class Runtime {
     this._activeApps.add(pkg);
     this.touch();
     const state = container.nextSessionState([...this._activeApps], 'open', pkg);
-    const s = this.settings;
-    const perf = s.engine && s.engine.priorityMode === 'performance';
-
     if (first) {
       // 有应用要开了：把「空闲存快照」推迟，别在应用启动时抢磁盘
       this.emulator.cancelSnapshotSave();
-      await this.emulator.setPriority(perf ? 'normal' : 'below').catch(() => {});
+      await Promise.resolve(this._idleTransitionPromise).catch(() => {});
+      await this._queueContainerPriority().catch(() => {});
       if (shouldCancel()) return { ...state, cancelled: true };
       try { onActive(true); } catch (_) { /* 轮询启动失败不影响打开应用 */ }
     }
@@ -1545,14 +1590,20 @@ class Runtime {
     await sessionClient.forceStop(pkg).catch(() => {});
     const state = sessionState();
     if (shouldCancel()) return { ...state, cancelled: true };
-    if (state.idle) {
+    if (this.containerIdle) {
       const s = this.settings;
       const cmds = container.buildIdleCommands({ deep: !!(s.engine && s.engine.deepTrim) });
       if (shouldCancel()) return { ...state, cancelled: true };
-      await sessionClient.shell(cmds.join(' ; '), { timeout: 15000 }).catch(() => '');
+      if (!this.containerIdle) return state;
+      const parking = sessionClient.shell(cmds.join(' ; '), { timeout: 15000 }).catch(() => '');
+      this._idleTransitionPromise = parking;
+      try { await parking; }
+      finally { if (this._idleTransitionPromise === parking) this._idleTransitionPromise = null; }
       if (shouldCancel()) return { ...state, cancelled: true };
-      await this.emulator.setPriority('idle').catch(() => {});
+      if (!this.containerIdle) return state;
+      await this._queueContainerPriority().catch(() => {});
       if (shouldCancel()) return { ...state, cancelled: true };
+      if (!this.containerIdle) return state;
       // 现在最空闲：把内存状态存成快照，下次开机走恢复而不是冷启动
       this._armSnapshotSave(8000);
       if (shouldCancel()) { this.emulator.cancelSnapshotSave(); return { ...state, cancelled: true }; }
@@ -1563,7 +1614,7 @@ class Runtime {
   }
 
   get activeApps() { return [...this._activeApps]; }
-  get containerIdle() { return this._activeApps.size === 0; }
+  get containerIdle() { return this._activeApps.size === 0 && !this._foregroundLaunches?.size; }
 
   _systemAppsRestoreTarget(client) {
     if (this.settings.engine.mode === 'attach') {
@@ -1688,7 +1739,7 @@ class Runtime {
     return true;
   }
 
-  setGuestPriority(level) { return this.emulator.setPriority(level); }
+  setGuestPriority(level) { return this._queueContainerPriority(level); }
 
   // ---------------- 空闲回收 ----------------
 
@@ -1698,16 +1749,19 @@ class Runtime {
       const s = this.settings;
       const limit = (s.engine.idleShutdownMinutes || 0) * 60000;
       if (!limit) return;
+      if (!this.containerIdle || Date.now() - this.lastActivity < limit) return;
+      const activity = this.lastActivity;
       // 接管来的模拟器没有本地 proc 句柄，vmRunning 会是 false：
       // 以前这里直接 return，导致容器永不回收。改成同时看 adb 是否在线。
       if (!this.vmRunning) {
         const online = await this.client().isOnline().catch(() => false);
         if (!online) return;
       }
-      if (this._activeApps.size > 0 || Date.now() - this.lastActivity < limit) return;
+      if (!this.containerIdle || this.lastActivity !== activity || Date.now() - this.lastActivity < limit) return;
       try {
         const running = await this.client().runningPackages();
         const alive = running.filter((p) => !/launcher|systemui|settings|inputmethod|android\.systemui/i.test(p));
+        if (!this.containerIdle || this.lastActivity !== activity || Date.now() - this.lastActivity < limit) return;
         if (alive.length === 0) await this.stop();
         else this.lastActivity = Date.now();
       } catch (_) { /* ignore */ }
@@ -1970,44 +2024,66 @@ class Runtime {
    *
    * @returns {Promise<{ok:boolean,reason:string,ip?:string,gateway?:string}>}
    */
-  async waitForNetwork({ timeoutMs = 90000, onLog = () => {}, adbPath = '' } = {}) {
+  async waitForNetwork({ timeoutMs = 90000, onLog = () => {}, adbPath = '', signal } = {}) {
+    throwIfAborted(signal);
+    const budget = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 90000;
+    if (!budget) return { ok: false, reason: 'timeout' };
     const t0 = Date.now();
+    const deadline = t0 + budget;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const timer = setTimeout(abort, budget);
+    signal?.addEventListener('abort', abort, { once: true });
     let last = null;
-    let lastNotice = 0;
-    let repairTried = false;
-    // 刚重启的虚拟机会有一段时间连 adb 都还没上线，不能一看到 offline 就放弃
-    // （之前就是这样：重置数据后立刻返回 device-offline，被误判成「修复失败」）。
-    let offlineSince = 0;
-    while (Date.now() - t0 < timeoutMs) {
-      // eslint-disable-next-line no-await-in-loop
-      const online = await this.client().isOnline().catch(() => false);
-      if (!online) {
-        if (!offlineSince) offlineSince = Date.now();
-        if (Date.now() - offlineSince > 45000) return { ok: false, reason: 'device-offline' };
-      } else {
-        offlineSince = 0;
+    let lastNotice = t0;
+    // Only read-only probes may detach at the deadline. The shared abort signal
+    // also terminates their ADB/ownership children instead of leaving a retry loop.
+    const observe = async (probe) => {
+      if (controller.signal.aborted) return null;
+      let onAbort;
+      try {
+        return await Promise.race([
+          new Promise((resolve) => {
+            onAbort = () => resolve(null);
+            controller.signal.addEventListener('abort', onAbort, { once: true });
+          }),
+          Promise.resolve().then(() => controller.signal.aborted ? null : probe()),
+        ]);
+      } finally { controller.signal.removeEventListener('abort', onAbort); }
+    };
+    const pause = (ms) => new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(wait);
+        controller.signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const wait = setTimeout(finish, ms);
+      controller.signal.addEventListener('abort', finish, { once: true });
+      if (controller.signal.aborted) finish();
+    });
+    try {
+      while (!controller.signal.aborted && Date.now() < deadline) {
         // eslint-disable-next-line no-await-in-loop
-        last = await this.emulator.checkNetwork(adbPath || this.adbPath()).catch(() => null);
-        if (last && last.ok) return last;
-        // 等了一会儿还是没网：多半是 WifiConfigStore 里保存网络撞车（异常退出写坏）。
-        // 修一次通常 10 秒内恢复；修不好继续等，不阻塞启动。
-        if (!repairTried && Date.now() - t0 > 12000) {
-          repairTried = true;
-          onLog('检测到虚拟机网络异常，正在自动修复 Wi-Fi 关联…');
-          // eslint-disable-next-line no-await-in-loop
-          const rep = await this.emulator.repairWifi(adbPath || this.adbPath(), onLog).catch(() => null);
-          if (rep && rep.ok) onLog('虚拟机网络已恢复');
-          else if (rep) onLog(`Wi-Fi 自动修复未成功（${rep.reason || 'unknown'}）`);
+        last = await observe(() => this.emulator.checkNetwork(adbPath || this.adbPath(), {
+          timeoutMs: Math.max(1, Math.min(8000, deadline - Date.now())), signal: controller.signal,
+        })).catch(() => null);
+        throwIfAborted(signal);
+        if (controller.signal.aborted || Date.now() >= deadline) break;
+        if (last?.ok) return last;
+        if (Date.now() - lastNotice >= 10000) {
+          lastNotice = Date.now();
+          onLog(`正在等待安卓虚拟机联网… ${Math.round((Date.now() - t0) / 1000)}s`);
         }
+        // eslint-disable-next-line no-await-in-loop
+        await pause(Math.max(0, Math.min(3000, deadline - Date.now())));
       }
-      if (Date.now() - lastNotice > 10000) {
-        lastNotice = Date.now();
-        onLog(`正在等待安卓虚拟机联网… ${Math.round((Date.now() - t0) / 1000)}s`);
-      }
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => setTimeout(r, 3000));
+      throwIfAborted(signal);
+      return { ...last, ok: false, reason: 'timeout' };
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      controller.abort();
     }
-    return last || { ok: false, reason: 'timeout' };
   }
 
   /** 网络修复只重连 Wi-Fi；重置 /data 必须走独立的显式确认流程。 */

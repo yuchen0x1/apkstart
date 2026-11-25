@@ -1,7 +1,8 @@
 # Shared fail-closed Windows process identity/termination helper. No image-name kills.
 param(
-  [ValidateSet('', 'Inspect', 'Terminate', 'Tree')][string]$Action = '',
+  [ValidateSet('', 'Inspect', 'InspectMany', 'Terminate', 'Tree', 'TreeSnapshot')][string]$Action = '',
   [int]$TargetPid = 0,
+  [string]$TargetPids = '',
   [string]$Expected = ''
 )
 
@@ -14,6 +15,7 @@ public static class ApkRuntimeProcess {
     [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern uint GetPriorityClass(IntPtr h);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder name, ref int size);
     [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr h, uint code);
     [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
@@ -56,19 +58,36 @@ public static class ApkRuntimeProcess {
 '@
 }
 
-function Get-ApkRuntimeIdentityFromHandle([IntPtr]$Handle, [int]$ProcessId) {
+function Get-ApkRuntimeIdentityFromHandle([IntPtr]$Handle, [int]$ProcessId, $Row = $null) {
   try {
     $started = [ApkRuntimeProcess]::Started($Handle)
     $exe = [ApkRuntimeProcess]::Exe($Handle)
     if (-not $started -or -not $exe) { return $null }
-    $row = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+    if (-not $Row) { $Row = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop }
     if (-not $row -or -not $row.CommandLine -or -not $row.CreationDate) { return $null }
     # CIM is microsecond precision; GetProcessTimes is 100ns. They must identify the same birth.
     $cimStarted = $row.CreationDate.ToUniversalTime().ToFileTimeUtc()
     if ([Math]::Abs([decimal]$started - [decimal]$cimStarted) -ge 10) { return $null }
     if ([ApkRuntimeProcess]::Started($Handle) -ne $started) { return $null }
-    return [pscustomobject]@{ pid = $ProcessId; started = $started; exe = $exe; commandLine = [string]$row.CommandLine; argv = [ApkRuntimeProcess]::Arguments([string]$row.CommandLine) }
+    return [pscustomobject]@{ pid = $ProcessId; started = $started; exe = $exe; commandLine = [string]$row.CommandLine; argv = [ApkRuntimeProcess]::Arguments([string]$row.CommandLine); priorityClass = [ApkRuntimeProcess]::GetPriorityClass($Handle) }
   } catch { return $null }
+}
+
+function Get-ApkRuntimeIdentities($ProcessIds) {
+  $ids = @($ProcessIds | ForEach-Object { [int]$_ } | Where-Object { $_ -gt 0 -and $_ -ne $PID } | Select-Object -Unique)
+  if (-not $ids.Count) { return @() }
+  $filter = ($ids | ForEach-Object { "ProcessId=$_" }) -join ' OR '
+  $rows = @(Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop)
+  foreach ($row in $rows) {
+    $processId = [int]$row.ProcessId
+    if ($ids -notcontains $processId) { continue }
+    $h = [ApkRuntimeProcess]::OpenProcess(0x1000, $false, [uint32]$processId)
+    if ($h -eq [IntPtr]::Zero) { continue }
+    try {
+      $identity = Get-ApkRuntimeIdentityFromHandle $h $processId $row
+      if ($identity) { $identity }
+    } finally { [void][ApkRuntimeProcess]::CloseHandle($h) }
+  }
 }
 
 function Get-ApkRuntimeIdentity([int]$ProcessId) {
@@ -79,25 +98,60 @@ function Get-ApkRuntimeIdentity([int]$ProcessId) {
   finally { [void][ApkRuntimeProcess]::CloseHandle($h) }
 }
 
-function Get-ApkRuntimeTree([int]$Root) {
-  $found = New-Object System.Collections.Generic.List[object]
-  $queue = New-Object System.Collections.Queue
-  $seen = @{}
-  $queue.Enqueue($Root)
-  while ($queue.Count -gt 0 -and $seen.Count -lt 512) {
-    $parent = [int]$queue.Dequeue()
-    if ($seen[[string]$parent]) { continue }
-    $seen[[string]$parent] = $true
-    $rows = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$parent" -ErrorAction SilentlyContinue)
+function Get-ApkRuntimeTreeSnapshot([int]$Root) {
+  if ($Root -le 0 -or $Root -eq $PID) { return $null }
+  $rootHandle = [ApkRuntimeProcess]::OpenProcess(0x1000, $false, [uint32]$Root)
+  if ($rootHandle -eq [IntPtr]::Zero) { return $null }
+  try {
+    # One CIM snapshot supplies parent links and command lines. Each identity is
+    # still checked against its own live handle, never accepted from CIM alone.
+    $rows = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate,CommandLine -ErrorAction Stop)
+    $byPid = @{}
+    $children = @{}
     foreach ($row in $rows) {
-      $child = [int]$row.ProcessId
-      if ($child -le 0 -or $seen[[string]$child]) { continue }
-      $queue.Enqueue($child)
-      $identity = Get-ApkRuntimeIdentity $child
-      if ($identity) { $found.Add($identity) }
+      $key = [string]$row.ProcessId
+      $byPid[$key] = $row
+      $parentKey = [string]$row.ParentProcessId
+      if (-not $children.ContainsKey($parentKey)) { $children[$parentKey] = New-Object System.Collections.Generic.List[object] }
+      $children[$parentKey].Add($row)
     }
+    $rootRow = $byPid[[string]$Root]
+    if (-not $rootRow) { return $null }
+    $rootIdentity = Get-ApkRuntimeIdentityFromHandle $rootHandle $Root $rootRow
+    if (-not $rootIdentity) { return $null }
+    $found = New-Object System.Collections.Generic.List[object]
+    $queue = New-Object System.Collections.Queue
+    $seen = @{}
+    $queue.Enqueue($Root)
+    while ($queue.Count -gt 0 -and $seen.Count -lt 512) {
+      $parent = [int]$queue.Dequeue()
+      if ($seen[[string]$parent]) { continue }
+      $seen[[string]$parent] = $true
+      foreach ($row in $children[[string]$parent]) {
+        $child = [int]$row.ProcessId
+        if ($child -le 0 -or $child -eq $PID -or $seen[[string]$child]) { continue }
+        $handle = [ApkRuntimeProcess]::OpenProcess(0x1000, $false, [uint32]$child)
+        if ($handle -eq [IntPtr]::Zero) { continue }
+        try { $identity = Get-ApkRuntimeIdentityFromHandle $handle $child $row }
+        finally { [void][ApkRuntimeProcess]::CloseHandle($handle) }
+        if ($identity) { $found.Add($identity); $queue.Enqueue($child) }
+      }
+    }
+    if ($queue.Count -gt 0) { return $null }
+    # Re-open by PID and query its current CIM identity after the tree walk.
+    # Holding the first handle alone would not detect PID replacement.
+    $currentRoot = Get-ApkRuntimeIdentity $Root
+    if (-not $currentRoot -or $currentRoot.started -cne $rootIdentity.started -or $currentRoot.exe -cne $rootIdentity.exe -or $currentRoot.commandLine -cne $rootIdentity.commandLine) { return $null }
+    return [pscustomobject]@{ root = $rootIdentity; currentRoot = $currentRoot; processes = @($found.ToArray()) }
+  } finally { [void][ApkRuntimeProcess]::CloseHandle($rootHandle) }
+}
+
+function Get-ApkRuntimeTree([int]$Root) {
+  $snapshot = Get-ApkRuntimeTreeSnapshot $Root
+  if ($snapshot) {
+    return $snapshot.processes
   }
-  return $found
+  return @()
 }
 
 function Stop-ApkRuntimeIdentity($Identity) {
@@ -119,6 +173,15 @@ if ($Action -eq 'Inspect') {
   if ($identity) { $identity | ConvertTo-Json -Compress; exit 0 }
   exit 1
 }
+if ($Action -eq 'InspectMany') {
+  try {
+    $ids = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($TargetPids)) | ConvertFrom-Json
+    $identities = @(Get-ApkRuntimeIdentities $ids)
+    ConvertTo-Json -InputObject $identities -Compress
+    exit 0
+  } catch { }
+  exit 1
+}
 if ($Action -eq 'Terminate') {
   try {
     $identity = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Expected)) | ConvertFrom-Json
@@ -128,5 +191,12 @@ if ($Action -eq 'Terminate') {
 }
 if ($Action -eq 'Tree') {
   try { Get-ApkRuntimeTree $TargetPid | ConvertTo-Json -Compress; exit 0 } catch { }
+  exit 1
+}
+if ($Action -eq 'TreeSnapshot') {
+  try {
+    $snapshot = Get-ApkRuntimeTreeSnapshot $TargetPid
+    if ($snapshot) { $snapshot | ConvertTo-Json -Depth 5 -Compress; exit 0 }
+  } catch { }
   exit 1
 }

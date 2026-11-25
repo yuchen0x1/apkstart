@@ -1360,6 +1360,7 @@ function plainRuntimeFailure() {
 async function runLaunchInner(pkg) {
   const t0 = Date.now();
   const mark = (s) => appLog(`launch ${pkg} ${s} +${Date.now() - t0}ms`);
+  let launchLease = null;
   appLog(`launch start ${pkg}`);
   try {
     // 已就绪的同包窗口只需前置；不要重跑安装、网络准备或隐藏/嵌入链路。
@@ -1371,6 +1372,7 @@ async function runLaunchInner(pkg) {
         return { ok: true, reused: true };
       }
     }
+    launchLease = runtime.acquireForegroundLaunch();
     // 0) 先决定这个应用该用横屏还是竖屏 LCD。
     //    模拟器窗口比例开机锁死（issue #41），所以必须赶在拉起运行时之前定下来；
     //    窗口本身也先按这个比例打开，别等模拟器起来再改（改一次要重排画面）。
@@ -1387,12 +1389,20 @@ async function runLaunchInner(pkg) {
     const launchWindow = openAppWindow(pkg, '正在启动安卓运行时…', want ? lcd.orientBox(portraitSize(), want) : windowBox(),
       { hidden: wantStandalone });
     const launchCancelled = () => quitting || appWin.win !== launchWindow || launchWindow.isDestroyed();
+    const progress = (message) => {
+      if (launchCancelled()) return;
+      appWin.setState({ ready: false, tip: message });
+      send('app:launchProgress', { package: pkg, message });
+    };
+    progress('正在准备安卓运行时…');
     if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
     // 1) 先把「应用窗口」打开显示启动动画：整个过程看不到安卓桌面，也看不到模拟器窗口
     // 开机阶段把模拟器主窗 + qemu / netsimd 的控制台黑窗藏起来，避免任何闪现。
     // 压制是常驻的（embed 后它会自动跳过被嵌入的那一个窗口，见 appwin.embed）。
     // 这里必须 await：不等压制生效就往下走，黑窗会在启动瞬间露出来。
+    await launchLease.promote({ onlyIfRunning: true });
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
+    mark('window agent ready');
     // 「无头运行时」自愈（上游 issue #42）：即使 qemu 是上一个 ApkStart 进程
     // 接管过来的（没有当前进程的 emulator child handle），只要 ADB 已在线、guest
     // 已启动且 Qt 画面窗口两次探测都不存在，就安全重启；开机中途不做破坏性操作。
@@ -1426,9 +1436,11 @@ async function runLaunchInner(pkg) {
     const launchOptions = {
       lcdOrientation,
       shouldCancel: launchCancelled,
+      onProgress: progress,
       onLog: (m) => {
         send('runtime:log', m);
         appLog(`  rt ${m}`);
+        if (/正在开机|正在等待安卓虚拟机联网|应用未能稳定启动|正在自动重试/.test(String(m || ''))) progress(m);
         // 自动修复硬件加速会弹管理员授权（UAC）。用户这时只看到一个系统弹窗，
         // 不知道是谁弹的、该不该点 —— 必须在应用启动窗口里同步说清楚。
         if (/自动修复|硬件加速已修复|自动修复没能立即生效/.test(String(m || '')) && appWin.isOpen) {
@@ -1445,7 +1457,9 @@ async function runLaunchInner(pkg) {
         if (launchCancelled()) throw new Error('应用窗口已关闭或 ApkStart 正在退出，未打开应用');
         windowClients.set(launchWindow, rt.client);
         mark('engine ready');
-        appWin.setState({ tip: '正在打开应用…' });
+        await launchLease.promote();
+        if (launchCancelled()) throw new Error('应用窗口已关闭或 ApkStart 正在退出，未打开应用');
+        progress('正在准备应用画面…');
         // 沉浸式 + 关动画 + 收起锁屏：只做一次，之后每次启动都秒进
         await rt.client.prepareForeground().catch(() => {});
         mark('foreground ready');
@@ -1460,6 +1474,8 @@ async function runLaunchInner(pkg) {
     // armAgent 在窗口打开阶段只看到了 settings.runtime.dir，必须在运行时
     // 确认在线后再重发一次作用域，才能让代理找到实际的 emulator 窗口。
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* 诊断性兜底 */ } }
+    mark('window scope ready');
+    progress('正在连接安卓画面…');
 
     // 首次接入和延迟重试共用独立窗口的就绪路径。此时代理已前置画面，宿主已隐藏。
     const announceStandalone = () => {
@@ -1626,6 +1642,8 @@ async function runLaunchInner(pkg) {
     const msg = plain || technical;
     send('toast', { type: 'error', message: `启动失败：${msg}`, sticky: !!plain });
     return { ok: false, error: msg, technical };
+  } finally {
+    if (launchLease) await launchLease.release().catch((e) => appLog(`launch priority cleanup: ${e.message}`));
   }
 }
 

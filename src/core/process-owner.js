@@ -131,17 +131,22 @@ function sameIdentity(a, b) {
     && a.exe === b.exe && a.commandLine === b.commandLine;
 }
 
-function run(file, args) {
+function run(file, args, { timeoutMs = 10000, signal } = {}) {
   return new Promise((resolve) => {
-    execFile(file, args, { windowsHide: true, timeout: 10000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => resolve(err ? '' : String(out || '').trim()));
+    if (signal?.aborted) return resolve('');
+    const timeout = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : 10000;
+    try {
+      execFile(file, args, { windowsHide: true, timeout, signal, maxBuffer: 4 * 1024 * 1024 },
+        (err, out) => resolve(err ? '' : String(out || '').trim()));
+    } catch (_) { resolve(''); }
   });
 }
 
-async function getProcessInfo(pid) {
-  if (!validPid(pid)) return null;
+async function getProcessInfo(pid, options = {}) {
+  if (!validPid(pid) || options.signal?.aborted) return null;
   if (process.platform === 'win32') {
     try {
-      const out = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', WIN_HELPER, '-Action', 'Inspect', '-TargetPid', String(pid)]);
+      const out = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', WIN_HELPER, '-Action', 'Inspect', '-TargetPid', String(pid)], options);
       const data = JSON.parse(out.replace(/^\uFEFF/, ''));
       return data && Number(data.pid) === Number(pid) && data.started && realPath(data.exe)
         ? { ...data, exe: realPath(data.exe) } : null;
@@ -165,6 +170,29 @@ async function getProcessInfo(pid) {
   } catch (_) { return null; }
 }
 
+/** Inspect a listener snapshot in one helper, retaining each process's identity checks. */
+async function getProcessInfos(pids, options = {}) {
+  const ids = [...new Set((Array.isArray(pids) ? pids : []).filter(validPid).map(Number))];
+  if (!ids.length || options.signal?.aborted) return [];
+  if (process.platform !== 'win32') {
+    return (await Promise.all(ids.map((pid) => getProcessInfo(pid, options)))).filter(Boolean);
+  }
+  try {
+    const encoded = Buffer.from(JSON.stringify(ids)).toString('base64');
+    const out = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', WIN_HELPER, '-Action', 'InspectMany', '-TargetPids', encoded], options);
+    const data = JSON.parse(out.replace(/^\uFEFF/, ''));
+    const wanted = new Set(ids);
+    const found = new Map();
+    for (const item of Array.isArray(data) ? data : (data ? [data] : [])) {
+      const pid = Number(item?.pid);
+      const exe = item && realPath(item.exe);
+      if (wanted.has(pid) && item.started && exe && !found.has(pid)) found.set(pid, { ...item, pid, exe });
+    }
+    return [...found.values()];
+  } catch (_) { return []; }
+}
+
 /**
  * Synchronous variant for the update path: the identity of the running app
  * must be captured before its PID can be recycled. Only used once per update.
@@ -182,16 +210,34 @@ function getProcessInfoSync(pid) {
   } catch (_) { return null; }
 }
 
-/** Direct/descendant identities of one already-verified process (Windows only). */
-async function getProcessTree(pid) {
-  if (process.platform !== 'win32' || !validPid(pid)) return [];
+/** One birth-pinned snapshot with fresh root identities before and after enumeration. */
+async function getProcessTreeSnapshot(pid, options = {}) {
+  if (process.platform !== 'win32' || !validPid(pid) || options.signal?.aborted) return null;
   try {
-    const out = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', WIN_HELPER, '-Action', 'Tree', '-TargetPid', String(pid)]);
+    const out = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', WIN_HELPER, '-Action', 'TreeSnapshot', '-TargetPid', String(pid)], options);
     const data = JSON.parse(out.replace(/^\uFEFF/, ''));
-    return (Array.isArray(data) ? data : (data ? [data] : []))
-      .filter((x) => x && Number(x.pid) > 0 && x.started && realPath(x.exe))
-      .map((x) => ({ ...x, exe: realPath(x.exe) }));
-  } catch (_) { return []; }
+    const normalize = (info) => {
+      const exe = info && realPath(info.exe);
+      return info && validPid(info.pid) && info.started && exe && typeof info.commandLine === 'string'
+        ? { ...info, pid: Number(info.pid), exe } : null;
+    };
+    const root = normalize(data?.root);
+    const currentRoot = normalize(data?.currentRoot);
+    if (Number(root?.pid) !== Number(pid) || !sameIdentity(root, currentRoot) || !Array.isArray(data.processes)) return null;
+    const found = new Map();
+    for (const item of data.processes) {
+      const info = normalize(item);
+      if (info && info.pid !== Number(pid) && !found.has(info.pid)) found.set(info.pid, info);
+    }
+    return { root, currentRoot, processes: [...found.values()] };
+  } catch (_) { return null; }
+}
+
+/** Descendant-only compatibility view; priority callers also need the pinned root. */
+async function getProcessTree(pid, options = {}) {
+  const snapshot = await getProcessTreeSnapshot(pid, options);
+  return snapshot ? snapshot.processes : [];
 }
 
 // Linux has no race-free process.kill(pid) API in Node. Pin a pidfd before comparing
@@ -247,20 +293,21 @@ function parseListeners(text, windows) {
   return found;
 }
 
-async function listeners(port = 0) {
-  if (port && !validPort(port)) return [];
+async function listeners(port = 0, options = {}) {
+  if (port && !validPort(port) || options.signal?.aborted) return [];
   let out = '';
-  if (process.platform === 'win32') out = await run('netstat.exe', ['-ano', '-p', 'TCP']);
-  else if (process.platform === 'linux') out = await run('ss', ['-H', '-ltnp', ...(port ? [`sport = :${Number(port)}`] : [])]);
+  if (process.platform === 'win32') out = await run('netstat.exe', ['-ano', '-p', 'TCP'], options);
+  else if (process.platform === 'linux') out = await run('ss', ['-H', '-ltnp', ...(port ? [`sport = :${Number(port)}`] : [])], options);
   else return [];
   return parseListeners(out, process.platform === 'win32').filter((x) => (!port || x.port === Number(port)) && validPid(x.pid));
 }
 
-async function pidOnPort(port) {
-  if (!validPort(port)) return 0;
-  const pids = [...new Set((await listeners(Number(port))).map((x) => x.pid))];
+async function pidOnPort(port, options = {}) {
+  if (!validPort(port) || options.signal?.aborted) return 0;
+  const pids = [...new Set((await listeners(Number(port), options)).map((x) => x.pid))];
   return pids.length === 1 ? pids[0] : 0;
 }
 
 module.exports = { realPath, samePath, emulatorRoot, emulatorScopes, windowsArgv, optionValues,
-  ownsEmulator, sameIdentity, getProcessInfo, getProcessInfoSync, getProcessTree, terminateOwnedProcess, listeners, pidOnPort };
+  ownsEmulator, sameIdentity, getProcessInfo, getProcessInfos, getProcessInfoSync, getProcessTree, getProcessTreeSnapshot,
+  terminateOwnedProcess, listeners, pidOnPort };
