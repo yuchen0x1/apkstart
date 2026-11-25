@@ -55,6 +55,7 @@ public class ApkAgent
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetParent(IntPtr c, IntPtr p);
     [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr c);
+    [DllImport("user32.dll")] static extern IntPtr GetDesktopWindow();
     [DllImport("user32.dll", SetLastError = true)] static extern int GetWindowLong(IntPtr h, int i);
     [DllImport("user32.dll", SetLastError = true)] static extern int SetWindowLong(IntPtr h, int i, int v);
     [DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint f);
@@ -930,7 +931,11 @@ public class ApkAgent
         SetLastError(0);
         SetParent(child, parent);
         int error = Marshal.GetLastWin32Error();
-        if (!IsWindow(child) || GetParent(child) != parent)
+        IntPtr actual = GetParent(child);
+        // SetParent(child, NULL) moves a WS_CHILD window to the desktop. Until
+        // ReleaseEmulator clears WS_CHILD, GetParent returns that desktop HWND.
+        bool desktop = parent == IntPtr.Zero && actual == GetDesktopWindow();
+        if (!IsWindow(child) || (actual != parent && !desktop))
             return WindowFailure("set-parent-failed", error);
         return true;
     }

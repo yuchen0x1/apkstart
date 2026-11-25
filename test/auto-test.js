@@ -1171,8 +1171,10 @@ async function withStartFixture(run) {
       'embed 必须优先使用 Chromium 渲染子窗口，仅未就绪时暂挂宿主');
     assert(/style \|= WS_CHILD \| WS_CLIPCHILDREN \| WS_CLIPSIBLINGS;[\s\S]*if \(!Reparent\(emu, parent\)\)\s*\{[^}]*return false;/.test(embed),
       '必须以子窗口样式调用 Reparent，失败不能宣告嵌入成功');
-    assert(/SetLastError\(0\);\s*SetParent\(child, parent\);\s*int error = Marshal\.GetLastWin32Error\(\);\s*if \(!IsWindow\(child\) \|\| GetParent\(child\) != parent\)\s*return WindowFailure\("set-parent-failed", error\);/.test(reparent),
-      'Reparent 必须核验实际父窗口，不能用 SetParent 返回的旧父句柄判断成败');
+    assert(/SetLastError\(0\);\s*SetParent\(child, parent\);\s*int error = Marshal\.GetLastWin32Error\(\);\s*IntPtr actual = GetParent\(child\);/.test(reparent)
+      && /bool desktop = parent == IntPtr\.Zero && actual == GetDesktopWindow\(\);/.test(reparent)
+      && /if \(!IsWindow\(child\) \|\| \(actual != parent && !desktop\)\)\s*return WindowFailure\("set-parent-failed", error\);/.test(reparent),
+      'Reparent 必须核验实际父窗口；摘到桌面时兼容仍带 WS_CHILD 的桌面句柄');
     assert(/IntPtr cr = FindChromeRender\(_host\);\s*if \(cr != IntPtr\.Zero && ep != cr && !Reparent\(_emu, cr\)\)\s*\{\s*ShowWindow\(_emu, 0\);\s*return false;/.test(fit),
       '网页层建好后 Fit 必须补挂，失败应隐藏窗口且返回 false');
     assert(!/CreateRectRgn\(0, clipTop/.test(src), '不能给嵌入窗口设裁剪 region');
