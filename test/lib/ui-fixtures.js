@@ -91,6 +91,7 @@ function createFixture() {
         case 'app:info': return { version: '0.8.0', name: 'ApkStart', platform: { platform, canEmbed:isWin, canIntegrateShell:isWin, canProvision:true, support:isWin?'full':'external', acceleration:{kind:isWin?'whpx':'kvm',ok:true} }, dataDir, ...resolvedPaths(), sharedDir: settings.sharedDir };
         case 'settings:get': return settings;
         case 'settings:set': settings = merge(settings, payload); return settings;
+        case 'settings:restoreSystem': return true;
         case 'apps:list': return apps;
         case 'runtime:status': return { env: { adb: {ok:true}, emulator: {ok:true}, sysimg: {ok:true}, accel: {ok:true,kind:isWin?'whpx':'kvm'} }, adbOk: true, deviceOnline: true, android: '14', serial: 'ui-fixture', installed: true, freeform: true, vmRunning: true, mode: 'builtin' };
         case 'android:status': return { ok: true, sdk: 34, wifi: true, airplane: false, animationsOff: false, volume: 60, fontScale: 1, density: 320, brightness: 70 };
@@ -130,6 +131,7 @@ function createFixture() {
         case 'system:diskUsage': return { ok: true, totalText: '8.2 GB', systems: [] };
         case 'guest:state': return { ok: true, online: true, desired:'zh-CN', live:{localeChinese:true,locale:'zh-CN',groups:[{id:'demo',label:'示例预装应用',note:'仅用于界面测试',total:3,remaining:3}]}, locale: 'zh-CN', groups: [] };
         case 'display:state': return { ok: true, mode: 'window', size: '720x1280', portrait: true, width: 720, height: 1280 };
+        case 'display:set': settings = merge(settings, { display: payload }); return settings.display;
         case 'app:updateCheck': return { ok: true, available: false, current: '0.8.0', latest: '0.8.0' };
         case 'app:confirm': return false;
         case 'apk:pick': case 'dialog:openDir': return null;

@@ -29,6 +29,56 @@ const pointer = require('../src/core/pointer');
 const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src/core/adb');
 const { adbKeyHint } = require('../src/core/engine');
 
+async function withStartFixture(run) {
+  const { EmulatorEngine } = require('../src/core/emulator');
+  const gpu = require('../src/core/gpu');
+  const saved = Object.fromEntries(['freeDiskMB', 'freeAdbPort', 'freePortPair', 'autoProfile', 'writeReport']
+    .map((key) => [key, doctor[key]]));
+  const savedProbe = gpu.probe;
+  const emu = new EmulatorEngine(path.join(__dirname, '..'));
+  const calls = { spawn: [], killed: 0, gpuFailures: [], persisted: [] };
+  const settings = { engine: { gpuMode: 'auto', windowMode: 'standalone', keepSnapshot: false } };
+  Object.defineProperty(emu, 'settings', { value: settings });
+  const profile = doctor.chooseProfile({
+    host: { totalMB: 16384, freeMB: 12000, cores: 8, tmp: TMP },
+    accel: { ok: true, kind: 'whpx' }, emulatorVersion: '37.4.1', diskMB: 100000,
+    settings,
+  });
+  doctor.freeDiskMB = () => 100000;
+  doctor.freeAdbPort = async () => 5044;
+  doctor.freePortPair = async (port) => port;
+  doctor.autoProfile = () => ({ ...profile });
+  doctor.writeReport = () => ({ file: path.join(TMP, 'synthetic-start-report.txt') });
+  gpu.probe = async () => null;
+  emu.provisioner = {
+    paths: () => ({ avdHome: TMP }),
+    systemImageInfo: () => ({ ok: true }),
+    emulatorAccel: async () => ({ ok: true, kind: 'whpx' }),
+    emulatorVersion: async () => ({ version: '37.4.1' }),
+    invalidateEnvCache() {},
+  };
+  emu.locate = () => ({ emulatorExe: path.join(TMP, 'synthetic-emulator.exe'), root: TMP });
+  emu.imageChoice = () => ({ compat: false });
+  emu.ensureAvd = () => ({ ok: true });
+  emu._resetAdbServer = async () => true;
+  emu.killOrphanProcesses = async () => {};
+  emu._logWrite = () => {};
+  emu._waitSpawnSettled = async () => false;
+  emu.spawnOnce = (plan, { headless }) => {
+    calls.spawn.push({ plan, args: emu.buildArgs({ ...plan, headless }) });
+    emu.proc = { killed: false };
+  };
+  emu.killAttempt = async () => { calls.killed += 1; emu.proc = null; };
+  emu._noteGpuFailure = (plan) => calls.gpuFailures.push(plan);
+  emu._persistFailure = (failure) => calls.persisted.push(failure);
+  try {
+    return await run(emu, calls);
+  } finally {
+    Object.assign(doctor, saved);
+    gpu.probe = savedProbe;
+  }
+}
+
 (async () => {
   console.log('\n[doctor.js 自动参数]');
 
@@ -441,11 +491,11 @@ const { adbKeyHint } = require('../src/core/engine');
     let called = 0;
     rt.onAccelRepair = async () => { called += 1; return { ok: true, note: 'WHPX 已开启' }; };
     const r = await rt.autoRepair({ diagnosis: { code: 'TCG_CRASH' } });
-    assert(called === 1, 'TCG 崩溃时的唯一真修复是开加速，应调用加速修复');
+    assert(called === 1, '软件模拟重复崩溃时，应尝试现有的硬件加速修复入口');
     assert(r && r.retry, '加速可用后应允许重试');
   });
 
-  await test('多种软件后端都崩在 0xC0000005：判定 TCG 问题并停止等价重试', () => {
+  await test('多种软件后端都崩在 0xC0000005：保留访问冲突证据并停止等价重试', () => {
     const { EmulatorEngine } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     const d = doctor.diagnose(['emulator exit 3221225477']);
@@ -455,7 +505,7 @@ const { adbKeyHint } = require('../src/core/engine');
     assert(emu._softwareTcgCrashed(swangle, d) === false, '只有一次崩溃时还应继续重试');
     emu.attempts.push({ diagnosis: 'ACCESS_VIOLATION', gpu: 'swangle', accel: 'off', exitCode: 3221225477 });
     assert(emu._softwareTcgCrashed(swangle, d) === true, '两个软件后端同码崩溃后应止损');
-    assert(emu._softwareTcgCrashed({ gpu: 'host', accel: 'on' }, d) === false, '硬件加速崩溃不算 TCG 问题');
+    assert(emu._softwareTcgCrashed({ gpu: 'host', accel: 'on' }, d) === false, '硬件加速崩溃不计入软件模拟重复崩溃');
     assert(emu._softwareTcgCrashed(swangle, doctor.diagnose(['Address already in use'])) === false,
       '端口占用不能被算进崩溃次数');
 
@@ -469,6 +519,16 @@ const { adbKeyHint } = require('../src/core/engine');
     ];
     assert(emu._softwareTcgCrashed(swangle, gpuInit) === true,
       '诊断被 GPU_INIT 抢走时，同样要按「同码崩溃两次」止损');
+
+    emu.lastExitCode = 1;
+    emu.attempts = [
+      { diagnosis: 'GPU_INIT', gpu: 'swangle', accel: 'off', exitCode: 1 },
+      { diagnosis: 'GPU_INIT', gpu: 'software', accel: 'off', exitCode: 1 },
+    ];
+    assert(emu._softwareTcgCrashed(swangle, { code: 'GPU_INIT' }) === false,
+      '普通 exit 1 不能被改写成 0xC0000005 访问冲突');
+    emu.lastExitCode = null;
+    assert(emu._softwareTcgCrashed(swangle, gpuInit) === false, '没有进程退出码不能触发访问冲突止损');
 
     const advice = doctor.tcgCrashDiagnosis();
     assert(advice.code === 'TCG_CRASH' && /WHPX/.test(advice.hint) && /AEHD/.test(advice.hint),
@@ -610,6 +670,73 @@ const { adbKeyHint } = require('../src/core/engine');
     const realTrace = ['Selecting Vulkan device: Intel UHD 730', 'emulator exit 3221225477'];
     assert(emu._preferNoVulkan(variants, 0, d, realTrace) === true,
       '真正初始化 Vulkan 的日志仍应触发关 Vulkan');
+    for (const mixed of [
+      [realTrace[0], ...onlyBootProp],
+      [...onlyBootProp.slice(0, 1), 'androidboot.qemu.cpuvulkan.version=4206592', ...realTrace],
+    ]) {
+      const fresh = [{ gpu: 'host' }, { gpu: 'swangle' }];
+      assert(emu._preferNoVulkan(fresh, 0, d, mixed) === true && fresh[1].noVulkan === true,
+        '真实 Vulkan 初始化与 guest 属性混合时，只过滤属性行，且不能依赖日志顺序');
+    }
+  });
+
+  for (const crashesAgain of [false, true]) {
+    await test(`实际启动循环：混合 Vulkan 日志触发一次关闭 Vulkan 的兜底${crashesAgain ? '，再次访问冲突立即止损' : ''}`, async () => {
+      await withStartFixture(async (emu, calls) => {
+        emu._waitSpawnSettled = async () => {
+          if (calls.spawn.length > 1 && !crashesAgain) return false;
+          emu.log('INFO | Selecting Vulkan device: AMD Radeon 780M Graphics');
+          emu.log('INFO | androidboot.hardware.vulkan=ranchu');
+          emu.log('INFO | androidboot.qemu.cpuvulkan.version=4206592');
+          emu.log('emulator exit 3221225477');
+          emu.lastExitCode = 3221225477;
+          emu.proc = null;
+          return true;
+        };
+        let result;
+        let failure;
+        try {
+          result = await emu.start({ headless: true });
+        } catch (error) {
+          if (!crashesAgain) throw error;
+          failure = error;
+        }
+        assert(crashesAgain ? !!failure : result?.ok === true, '最终结果必须反映第二轮真实状态');
+        assert(calls.spawn.length === 2, `只能执行首轮和一次兜底，实际 ${calls.spawn.length} 轮`);
+        assert(!calls.spawn[0].args.includes('-Vulkan'), '首轮不能无条件关闭 Vulkan');
+        assert(calls.spawn[1].args.includes('-feature') && calls.spawn[1].args.includes('-Vulkan'),
+          '混合日志后的第二轮实际参数必须包含 -feature -Vulkan');
+        assert(calls.spawn.every(({ args }) => !args.includes('-wipe-data')), '任何兜底都不能清空安卓数据');
+        if (crashesAgain) {
+          assert(emu.lastDiagnosis.code === 'EMULATOR_CRASH_LOOP' && emu.lastDiagnosis.terminal === true,
+            '第二次访问冲突后保留终止诊断，不能继续换 GPU 或端口');
+          assert(failure.terminal === true && failure.diagnosis === emu.lastDiagnosis,
+            '启动异常必须保留同一份终止诊断');
+        }
+      });
+    });
+  }
+
+  await test('实际启动循环：终止性 ADB 探测失败保留根因并停止 GPU 重试', async () => {
+    await withStartFixture(async (emu, calls) => {
+      const diagnosis = {
+        code: 'ADB_SERVER_FAILED', title: 'ADB 服务恢复失败',
+        hint: 'ADB 服务恢复失败，已停止本次启动：INSTANCE_ADB_BIND_FAILED：synthetic listener failure',
+        terminal: true, causeCode: 'INSTANCE_ADB_BIND_FAILED',
+      };
+      const result = await emu.start({ headless: true, probe: async () => {
+        emu.lastDiagnosis = diagnosis;
+        return 'fatal';
+      } });
+      assert(result.ok === false && result.terminal === true, 'ADB 终止故障必须立即失败');
+      assert(result.diagnosis === diagnosis && result.causeCode === diagnosis.causeCode,
+        '不得把 ADB 原因替换成图形、超时或未知错误');
+      assert(calls.spawn.length === 1 && calls.killed === 1 && calls.gpuFailures.length === 0,
+        '探测失败后仅清理本轮，不能记坏 GPU 或拉起其他端口');
+      assert(result.attempts.length === 1 && result.attempts[0].stage === 'adb'
+        && result.attempts[0].causeCode === diagnosis.causeCode, 'attempt 必须记录 ADB 阶段与原始代码');
+      assert(calls.persisted.length === 1 && calls.persisted[0].why === 'adb', '必须保留 ADB 失败凭据');
+    });
   });
 
   await test('CPU 指令集：QEMU 的无害警告不许当成结论（#15 误诊回归）', () => {

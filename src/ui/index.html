@@ -368,7 +368,7 @@
         </button>
       </nav>
       <div class="set-side-foot">
-        <span class="inline-note">设置修改后立即生效</span>
+        <span class="inline-note">设置自动保存；部分需重启运行时</span>
       </div>
     </aside>
 
@@ -555,7 +555,7 @@
             </div>
             <div class="field">
               <div class="inline-note" id="autoProfileText">正在检测…</div>
-              <span class="sub">这是下一次打开应用时真正会用的参数。正在运行的安卓不会被打断，重开应用即按新参数启动。</span>
+              <span class="sub">这些参数会在停止运行时后重新启动时生效。关闭应用窗口只会停放安卓，不会立即应用新参数。</span>
             </div>
           </div>
 
@@ -567,7 +567,7 @@
                 <option value="balanced">均衡 · 自动识别低配机器并降级（推荐）</option>
                 <option value="smooth">流畅 · 全核 / 与前台同优先级（视频、游戏）</option>
               </select>
-              <span class="sub">决定安卓虚拟机吃多少 CPU、画面多细腻。「均衡」会自动识别低配电脑并改用更保守的参数；「省资源」「流畅」是你手动指定的固定档，选了就不再自动降级。改完下一次打开应用生效。</span>
+              <span class="sub">决定安卓虚拟机吃多少 CPU、画面多细腻。「均衡」会自动识别低配电脑并改用更保守的参数；「省资源」「流畅」是你手动指定的固定档，选了就不再自动降级。停止运行时后重新启动生效。</span>
             </div>
             <div class="field">
               <label>低配电脑自动优化</label>
@@ -711,19 +711,19 @@
               <label for="setDisplayMode">显示模式</label>
               <select id="setDisplayMode">
                 <option value="window">竖屏窗口（可自由拉伸，记住每个应用的大小）</option>
-                <option value="fullscreen">全屏（铺满屏幕，保持手机比例两侧留黑）</option>
+                <option value="fullscreen">全屏（最大化窗口，按运行时适配）</option>
               </select>
-              <span class="sub">随时按 <b>F11</b> 或右键托盘切换；全屏只放大窗口，不改变画面比例，切换不重启应用。</span>
+              <span class="sub">随时按 <b>F11</b> 或右键托盘切换；全屏会最大化嵌入窗口，并尝试切换横屏排版。切换不会重启运行时。</span>
             </div>
             <div class="field" id="portraitField">
-              <label for="setPortrait">竖屏画面大小</label>
+              <label for="setPortrait">备用竖屏尺寸</label>
               <select id="setPortrait">
                 <option value="720x1280">小 · 720 × 1280</option>
                 <option value="900x1600">中 · 900 × 1600</option>
                 <option value="1080x1920">大 · 1080 × 1920</option>
                 <option value="1440x2560">超大 · 1440 × 2560</option>
               </select>
-              <span class="sub">窗口模式下可拖动边框任意缩放；这里调的是 Android 内部渲染尺寸，越小越省性能。</span>
+              <span class="sub">运行时会优先使用自身的画面尺寸；这里仅作为无法读取实际尺寸时的备用值。窗口可拖动边框缩放；内部渲染尺寸请在「性能与资源」中调整。</span>
             </div>
             <div class="field">
               <label for="setWindowMode">应用窗口显示方式</label>

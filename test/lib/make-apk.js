@@ -86,7 +86,7 @@ const DEFAULTS = {
   debuggable: false,
   launchActivity: '.Main',
   permissions: [],
-  /** [{ name, required }] */
+  /** [{ name, required, version? }] */
   requiredFeatures: [],
   /** [{ name, required }] */
   usesLibraries: [],
@@ -136,12 +136,14 @@ function buildManifestAxml(opts = {}) {
   }
   for (const f of o.requiredFeatures) {
     const item = typeof f === 'string' ? { name: f, required: true } : f;
+    const attrs = [
+      A('name', item.name, { ns: false }),
+      { name: 'required', value: item.required !== false, type: 0x12 },
+    ];
+    if (item.version !== undefined) attrs.push({ name: 'version', value: item.version, type: 0x10 });
     root.children.push({
       name: 'uses-feature',
-      attrs: [
-        A('name', item.name, { ns: false }),
-        { name: 'required', value: item.required !== false, type: 0x12 },
-      ],
+      attrs,
       children: [],
     });
   }

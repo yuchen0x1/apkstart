@@ -85,6 +85,8 @@ const DEFAULT_SETTINGS = {
     mouseWheelMode: 'smooth', // smooth = 合并后注入一次滑动 | native = 交给 Qt | off = 不处理
     mouseSideButtons: false, // 侧键返回/前进：默认关闭，开启才多装一项映射
     deepTrim: false,         // 深度裁剪系统后台包（Play 商店/向导等），默认不动系统
+    deepTrimRestorePending: false, // 仅显式关闭或执行深度裁剪后标记，恢复经验证后清除
+    deepTrimRestoreTarget: '', // 待恢复的 AVD/镜像或显式外接设备，不随当前选择漂移
     priorityMode: 'balanced', // balanced=让出前台 | performance=qemu 用 Normal 优先级
     // 预热：启动 ApkStart 后在后台把安卓环境引导好，第一次点应用几乎不用等。
     // 代价是常驻约 1GB 内存（和 WSA / 应用宝电脑版一样的取舍），可随时关掉。

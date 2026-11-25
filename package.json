@@ -1,7 +1,7 @@
 {
   "name": "apkstart",
   "productName": "ApkStart",
-  "version": "0.11.4",
+  "version": "0.11.5",
   "description": "极致轻量的安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行（Windows / Linux）",
   "main": "src/main.js",
   "desktopName": "apkstart.desktop",
@@ -43,7 +43,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test": "node test/syntax-test.js && node --test test/store-integrity-test.js test/sources-test.js test/download-acceleration-test.js test/release-manifest-test.js test/release-tools-test.js test/proxy-auto-detect-test.js test/guest-locale-test.js test/renderer-script-test.js && npm run test:safety && node test/run-tests.js && node test/engine-test.js && node test/auto-test.js && node test/sync-test.js && node test/updater-test.js && node test/security-test.js && node test/compat-test.js && node test/backup-test.js && node test/uninstall-test.js && node test/i18n-test.js && node test/guest-test.js && node test/repair-test.js && node test/lowspec-test.js && node test/image-adapter-test.js && node test/report-test.js && node --test test/report-delivery-test.js test/atomic-json-test.js && node test/collector-test.js && node test/release-notes-test.js && node test/readme-test.js && node test/system-catalog-test.js && node test/system-providers-test.js && node test/system-task-manager-test.js && node test/build-size-test.js && node test/file-safety-test.js && node test/import-safety-test.js && node test/system-install-safety-test.js && node test/download-lifecycle-test.js && node test/runtime-ownership-test.js && node test/apk-orientation-test.js && node test/ui-theme-test.js",
+    "test": "node test/syntax-test.js && node --test test/store-integrity-test.js test/sources-test.js test/download-acceleration-test.js test/release-manifest-test.js test/release-tools-test.js test/proxy-auto-detect-test.js test/guest-locale-test.js test/renderer-script-test.js test/settings-feedback-test.js && npm run test:safety && node test/run-tests.js && node test/engine-test.js && node test/auto-test.js && node test/sync-test.js && node test/updater-test.js && node test/security-test.js && node test/compat-test.js && node test/backup-test.js && node test/uninstall-test.js && node test/i18n-test.js && node test/guest-test.js && node test/repair-test.js && node test/lowspec-test.js && node test/image-adapter-test.js && node test/report-test.js && node --test test/report-delivery-test.js test/atomic-json-test.js && node test/collector-test.js && node test/release-notes-test.js && node test/readme-test.js && node test/system-catalog-test.js && node test/system-providers-test.js && node test/system-task-manager-test.js && node test/build-size-test.js && node test/file-safety-test.js && node test/import-safety-test.js && node test/system-install-safety-test.js && node test/download-lifecycle-test.js && node test/runtime-ownership-test.js && node test/apk-orientation-test.js && node test/ui-theme-test.js",
     "test:sources": "node --test test/sources-test.js",
     "test:acceleration": "node --test test/download-acceleration-test.js",
     "readme:sync": "node tools/update-readme.js",

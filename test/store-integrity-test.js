@@ -49,6 +49,20 @@ test('麦克风开关可持久化，且非法类型不会覆盖默认值', () =>
   assert.equal(store.saveSettings({ engine: { microphone: true } }).engine.microphone, true);
 });
 
+test('deep-trim restoration pending survives persistence and rejects invalid types', () => {
+  reset();
+  assert.equal(store.getSettings().engine.deepTrimRestorePending, false);
+  assert.equal(store.getSettings().engine.deepTrimRestoreTarget, '');
+  store.saveSettings({ engine: { deepTrimRestorePending: true, deepTrimRestoreTarget: 'fixture-avd-image' } });
+  assert.equal(store.getSettings().engine.deepTrimRestorePending, true);
+  assert.equal(store.getSettings().engine.deepTrimRestoreTarget, 'fixture-avd-image');
+  assert.equal(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).engine.deepTrimRestorePending, true);
+  store.saveSettings({ engine: { deepTrimRestorePending: 'false' } });
+  assert.equal(store.getSettings().engine.deepTrimRestorePending, true);
+  store.saveSettings({ engine: { deepTrimRestorePending: false } });
+  assert.equal(store.getSettings().engine.deepTrimRestorePending, false);
+});
+
 test('自动更新默认开启，旧版默认关闭配置迁移为开启', () => {
   reset();
   assert.equal(store.getSettings().update.autoUpdate, true);

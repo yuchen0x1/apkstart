@@ -390,16 +390,38 @@ class Runtime {
       let errStreak = 0;
       let lastHeal = 0;
       let authHealed = false; // unauthorized 只自愈一次，避免反复删快照冷启动死循环
+      let adbFailure = null;
+      const failAdb = (error) => {
+        const causeCode = error?.code || 'ADB_SERVER_FAILED';
+        const message = `ADB 服务恢复失败，已停止本次启动：${causeCode}：${error?.message || error}`;
+        const diagnosis = { code: 'ADB_SERVER_FAILED', title: 'ADB 服务恢复失败', hint: message, terminal: true, causeCode };
+        adbFailure = { ok: false, terminal: true, code: causeCode, error: message, diagnosis };
+        this.emulator.lastDiagnosis = diagnosis;
+        onLog(message);
+        return 'fatal';
+      };
+      const resetAdb = async () => {
+        try {
+          await this.emulator.resetAdbServer();
+          this._probeClient = null;
+          return true;
+        } catch (error) {
+          if (!signal?.aborted) failAdb(error);
+          return false;
+        }
+      };
       const probe = async ({ serial }) => {
         if (signal && signal.aborted || !this.emulator.running()) return 'fatal';
+        if (adbFailure) { this.emulator.lastDiagnosis = adbFailure.diagnosis; return 'fatal'; }
         const identity = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
         if (signal?.aborted || !this.emulator.running()) return 'fatal';
         if (!identity) return 'pending';
-        if (!this._probeClient || this._probeClient.serial !== serial) {
-          this._probeClient = new AdbClient({ adbPath: this.adbPath(), serial });
-        }
-        const c = this._probeClient;
+        let c;
         try {
+          if (!this._probeClient || this._probeClient.serial !== serial) {
+            this._probeClient = new AdbClient({ adbPath: this.adbPath(), serial });
+          }
+          c = this._probeClient;
           const out = String(await waitStartupProbe(signal,
             () => c.shell('getprop sys.boot_completed; pm path android', { timeout: 8000 })));
           const current = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
@@ -414,6 +436,7 @@ class Runtime {
           if (signal?.aborted) return 'fatal';
           const current = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
           if (!processOwner.sameIdentity(identity, current)) return 'pending';
+          if (!c || /^INSTANCE_ADB_/.test(String(e?.code || ''))) return failAdb(e);
           errStreak += 1;
           // adb shell 报错可能是「还没开机」也可能是「授权对话框卡住」（上游 b7c4f06）。
           // 后者每轮 shell 都抛异常，只按普通 offline 处理会按 240s×4 组参数干等，
@@ -425,6 +448,8 @@ class Runtime {
           if (!unauthorized) {
             const st2 = await waitStartupProbe(signal, () => c.deviceState()).catch(() => '');
             if (signal?.aborted) return 'fatal';
+            const afterState = await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial));
+            if (!processOwner.sameIdentity(identity, afterState)) return 'pending';
             unauthorized = st2 === 'unauthorized';
           }
           if (unauthorized) {
@@ -440,8 +465,7 @@ class Runtime {
               onLog('adb 卡在「允许 USB 调试」授权对话框：作废旧快照并强制冷启动，重新注入调试授权…');
               try { this.emulator.invalidateSnapshot(); } catch (_) { /* ignore */ }
               this.emulator.forceColdBootOnNextStart();
-              await this.emulator.resetAdbServer().catch(() => {});
-              this._probeClient = null;
+              if (!(await resetAdb())) return 'fatal';
             }
             // 返回 fatal 让 start() 立刻换一轮（新 spawn 不加载快照），不再空等
             return 'fatal';
@@ -454,8 +478,7 @@ class Runtime {
           if (errStreak >= 6 && now - probeStart > 25000 && now - lastHeal > 30000) {
             lastHeal = now;
             onLog('adb 连接异常，重启 adb server 后继续等待…');
-            await this.emulator.resetAdbServer().catch(() => {});
-            this._probeClient = null;
+            if (!(await resetAdb())) return 'fatal';
           }
           return 'pending';
         }
@@ -471,6 +494,7 @@ class Runtime {
         signal,
       });
       if (signal?.aborted) return cancelledBoot();
+      if (adbFailure) return { ...adbFailure, attempts: st?.attempts || this.emulator.attempts || [], exitCode: st?.exitCode };
       // start() 失败时是「返回 {ok:false}」而不是抛异常（磁盘不足、多次重试仍失败等）。
       // 老实现不看这个字段，直接把 ok:true 往上返回 —— 上层于是认为「已经就绪」，
       // 接着 adb 一顿报 device not found，用户看到的是「点开没反应」而不是真实原因。
@@ -494,7 +518,7 @@ class Runtime {
       this.lastActivity = Date.now();
       this.emuSerial = serial;
       const client = this.client(serial);
-      await this.prepare(client);
+      await this.prepare(client, { signal });
       if (signal?.aborted) return cancelledBoot();
       // 快照改成「空闲时再存」：立刻存要写 1~3GB，会和用户刚点开的应用抢磁盘 I/O
       this._armSnapshotSave(20000);
@@ -502,7 +526,7 @@ class Runtime {
     } catch (e) {
       // 把自动重试/诊断结论原样抛给 UI，避免再包一层含糊的「启动失败」
       return {
-        ok: false, error: e.message, terminal: !!e.terminal,
+        ok: false, error: e.message, code: e.code, terminal: !!e.terminal,
         diagnosis: e.diagnosis, report: e.report, attempts: e.attempts,
       };
     } finally {
@@ -659,7 +683,7 @@ class Runtime {
     }
     if (!(await this.ownedRuntimeIdentity(QEMU_SERIAL))) return { ok: false, error: '无法确认 QEMU 的 ADB 端口归属' };
     this.emuSerial = QEMU_SERIAL;
-    await this.prepare(client);
+    await this.prepare(client, { signal });
     return { ok: true, client };
   }
 
@@ -734,7 +758,20 @@ class Runtime {
     return false;
   }
 
-  async prepare(client) {
+  async prepare(client, { signal } = {}) {
+    if (this.settings.engine.deepTrim !== true && this.settings.engine.deepTrimRestorePending === true) {
+      const pendingTarget = this.settings.engine.deepTrimRestoreTarget;
+      if (pendingTarget && pendingTarget === this._systemAppsRestoreTarget(client)) {
+        try {
+          await this.restoreSystemApps({ client, signal });
+        } catch (error) {
+          if (signal?.aborted || /^(?:INSTANCE_ADB_|RUNTIME_OWNERSHIP_LOST$|SYSTEM_APPS_RESTORE_CANCELLED$|ADB_DEVICE_NOT_READY$)/.test(error.code || '')) throw error;
+          this.log(`系统应用尚未恢复，下次准备运行时会重试：${error.message}`);
+        }
+      } else {
+        this.log('待恢复的系统应用属于其他或尚未确认的运行时，保留待恢复记录，未修改当前设备');
+      }
+    }
     // 接管 / 复用上一会话的模拟器时，本进程并不知道它当时是用横屏还是竖屏 LCD 起的；
     // 只有设备自己知道（Physical size 不受 wm size 覆盖影响）。
     // 这里读回来，窗口才能按真实比例打开，而不是拿竖屏框去套横屏画面。
@@ -1094,7 +1131,7 @@ class Runtime {
       this.emulator.port = port;
       onLog(`已接管正在运行的运行时（${serial}）`);
       // eslint-disable-next-line no-await-in-loop
-      await this.prepare(c);
+      await this.prepare(c, { signal });
       throwIfAborted(signal);
       return { ok: true, client: c, engine: 'emulator', reused: true };
     }
@@ -1294,7 +1331,7 @@ class Runtime {
         if (signal && signal.aborted) return cancelledBoot();
         const current = this.settings;
         if (online && current.engine.mode === 'attach' && String(current.device || '').trim() === serial) {
-          await this.prepare(client);
+          await this.prepare(client, { signal });
           if (signal && signal.aborted) return cancelledBoot();
           return { ok: true, client, engine: 'attach', reused: true };
         }
@@ -1312,7 +1349,7 @@ class Runtime {
       const identity = online ? await waitStartupProbe(signal, () => this.ownedRuntimeIdentity(serial)) : null;
       if (signal && signal.aborted) return cancelledBoot();
       if (online && processOwner.sameIdentity(target, identity)) {
-        await this.prepare(client);
+        await this.prepare(client, { signal });
         if (signal && signal.aborted) return cancelledBoot();
         return { ok: true, client, engine: 'builtin', reused: true };
       }
@@ -1466,15 +1503,27 @@ class Runtime {
 
     if (shouldCancel()) return { ...state, cancelled: true };
     const installed = store.getApps().map((a) => a && a.package).filter(Boolean);
-    const plan = container.buildSessionCommands({
+    let plan = container.buildSessionCommands({
       pkg,
       installed,
-      deep: !!(s.engine && s.engine.deepTrim),
+      deep: this.settings.engine.deepTrim === true,
       // App 刚 am start 完，此刻清后台可能误伤正在进前台的进程；清理放到 endApp
       killBackground: false,
     });
     if (shouldCancel()) return { ...state, cancelled: true };
     if (plan.commands.length) {
+      if (plan.disabled.length) {
+        const target = this._systemAppsRestoreTarget(sessionClient);
+        const pending = this.settings.engine;
+        if (!target || pending.deepTrimRestorePending && pending.deepTrimRestoreTarget !== target) {
+          this.log('其他运行时仍有待恢复的系统应用，未对当前设备执行新的深度裁剪');
+          plan = container.buildSessionCommands({ pkg, installed, deep: false, killBackground: false });
+        } else {
+          this._systemAppsRestoreSequence = (this._systemAppsRestoreSequence || 0) + 1;
+          store.saveSettings({ engine: { deepTrimRestorePending: true, deepTrimRestoreTarget: target } });
+        }
+      }
+      if (shouldCancel()) return { ...state, cancelled: true };
       await sessionClient.shell(plan.commands.join(' ; '), { timeout: 20000 }).catch(() => '');
       if (shouldCancel()) return { ...state, cancelled: true };
     }
@@ -1516,10 +1565,126 @@ class Runtime {
   get activeApps() { return [...this._activeApps]; }
   get containerIdle() { return this._activeApps.size === 0; }
 
+  _systemAppsRestoreTarget(client) {
+    if (this.settings.engine.mode === 'attach') {
+      const serial = String(this.settings.device || '').trim();
+      return serial && client?.serial === serial ? JSON.stringify({ mode: 'attach', serial }) : '';
+    }
+    const paths = this.provisioner.paths();
+    if (!/^emulator-\d+$/.test(String(client?.serial || ''))) {
+      if (client?.serial !== QEMU_SERIAL) return '';
+      const disk = this.settings.runtime.diskPath || paths.disk;
+      if (!disk) return '';
+      const iso = this.settings.runtime.isoPath || paths.iso;
+      return JSON.stringify({
+        mode: 'qemu', disk: path.resolve(disk), iso: iso ? path.resolve(iso) : '',
+        image: this.settings.runtime.activeImageId || '',
+      });
+    }
+    const home = paths.avdHome;
+    if (!home || !this.emulator.avdName) return '';
+    const avd = path.resolve(home, `${this.emulator.avdName}.avd`);
+    let image = {};
+    if (this.emulator.imageChoice) {
+      const choice = this.emulator.imageChoice();
+      image = { dir: choice.dir || '', id: choice.id || choice.flavor || '', api: choice.api || '', abi: choice.abi || '' };
+    }
+    return JSON.stringify({ mode: 'builtin', avd, image });
+  }
+
   /** 供设置页切换「深度裁剪」时恢复被禁用的系统包 */
-  async restoreSystemApps() {
-    const cmds = container.buildRestoreCommands();
-    await this.client().shell(cmds.join(' ; '), { timeout: 20000 }).catch(() => '');
+  async restoreSystemApps({ client, signal, shouldCancel = () => false } = {}) {
+    const sequence = (this._systemAppsRestoreSequence || 0) + 1;
+    this._systemAppsRestoreSequence = sequence;
+    store.saveSettings({ engine: { deepTrimRestorePending: true } });
+    const cancelled = () => {
+      throwIfAborted(signal);
+      if (shouldCancel() || sequence !== this._systemAppsRestoreSequence || this.settings.engine.deepTrim === true) {
+        const error = new Error('系统应用恢复已取消或被新的深度裁剪设置取代');
+        error.code = 'SYSTEM_APPS_RESTORE_CANCELLED';
+        throw error;
+      }
+    };
+    cancelled();
+    const captured = client || this.client();
+    const target = this._systemAppsRestoreTarget(captured);
+    const previousTarget = this.settings.engine.deepTrimRestoreTarget;
+    if (!target || previousTarget && previousTarget !== target) {
+      throw new Error('待恢复记录不属于当前运行时，请切回原系统后重试');
+    }
+    const attached = this.settings.engine.mode === 'attach';
+    const identity = attached ? null : await this.ownedRuntimeIdentity(captured.serial);
+    cancelled();
+    if (!attached && !identity) {
+      const error = new Error('无法确认运行时归属，未恢复系统应用');
+      error.code = 'RUNTIME_OWNERSHIP_LOST';
+      throw error;
+    }
+    const check = async () => {
+      cancelled();
+      const current = attached ? null : await this.ownedRuntimeIdentity(captured.serial);
+      cancelled();
+      if (target !== this._systemAppsRestoreTarget(captured) || !attached && !processOwner.sameIdentity(identity, current)) {
+        const error = new Error('运行时归属已变化，已停止恢复系统应用');
+        error.code = 'RUNTIME_OWNERSHIP_LOST';
+        throw error;
+      }
+    };
+    const state = await captured.deviceState();
+    await check();
+    if (state !== 'device') {
+      const error = new Error(`安卓设备未就绪（${state}），系统应用仍待恢复`);
+      error.code = 'ADB_DEVICE_NOT_READY';
+      throw error;
+    }
+    // A legacy request without a target can be bound only by this explicit,
+    // online, identity-checked call. prepare never guesses such a target.
+    if (!previousTarget) store.saveSettings({ engine: { deepTrimRestoreTarget: target } });
+    const run = async (command) => {
+      await check();
+      let result;
+      try { result = await captured.shell(command, { timeout: 15000 }); }
+      catch (error) {
+        await check();
+        if (/device (?:offline|not found)|unauthorized|no devices|protocol fault|closed/i.test(String(error.raw || error.message || error))) {
+          error.code = 'ADB_DEVICE_NOT_READY';
+        }
+        throw error;
+      }
+      const output = String(result || '').trim();
+      await check();
+      if (/(?:^|\n)\s*(?:error\b|failure\b|exception\b|securityexception\b)|java\.[\w.]*Exception/i.test(output)) {
+        throw new Error(`系统应用恢复失败：${output.slice(0, 600)}`);
+      }
+      return output;
+    };
+    const disabledPackages = async () => {
+      const output = await run('pm list packages -d --user 0');
+      const lines = output.split(/\r?\n/).filter(Boolean);
+      if (lines.some((line) => !/^package:[A-Za-z][A-Za-z0-9_.]+$/.test(line))) {
+        throw new Error(`无法确认被禁用的系统应用：${output.slice(0, 600)}`);
+      }
+      return new Set(lines.map((line) => line.slice(8)));
+    };
+    const disabled = await disabledPackages();
+    for (const pkg of container.OPTIONAL_SYSTEM) {
+      if (!disabled.has(pkg)) continue;
+      // pm can print an error and exit zero. Require its explicit state receipt.
+      const result = await run(`pm enable --user 0 ${pkg}`);
+      if (!result.split(/\r?\n/).some((line) => line.trim() === `Package ${pkg} new state: enabled`)) {
+        throw new Error(`未确认系统应用恢复成功：${pkg}${result ? `：${result.slice(0, 400)}` : ''}`);
+      }
+    }
+    await run('settings put global restricted_background_data 0');
+    if (await run('settings get global restricted_background_data') !== '0') {
+      throw new Error('安卓后台数据限制尚未解除，系统应用仍待恢复');
+    }
+    const remaining = await disabledPackages();
+    if (container.OPTIONAL_SYSTEM.some((pkg) => remaining.has(pkg))) {
+      throw new Error('仍有深度裁剪的系统应用被禁用，下次准备运行时会重试');
+    }
+    await check();
+    store.saveSettings({ engine: { deepTrimRestorePending: false, deepTrimRestoreTarget: '' } });
     return true;
   }
 

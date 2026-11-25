@@ -2207,7 +2207,7 @@ function bindSettings() {
       // 资源策略会连带改 liteMode / priorityMode / renderSize（主进程里翻译）
       state.settings = await api.setSettings({ engine: { resourceMode: e.target.value } });
       fillSettings(state.settings);
-      toast({ title: '资源策略已切换', body: '下一次打开应用生效', type: 'ok' });
+      toast({ title: '资源策略已切换', body: '停止运行时后重新启动生效', type: 'ok' });
       // 「流畅」会让低配机器不再自动降级，摘要要跟着变
       refreshProfileText();
     });
@@ -2220,7 +2220,7 @@ function bindSettings() {
       if (e.target.value === 'embedded') patch.engine.embeddedBlack = false;
       state.settings = await api.setSettings(patch);
       fillSettings(state.settings);
-      toast({ title: '显示方式已保存', body: '下一次打开应用生效', type: 'ok' });
+      toast({ title: '显示方式已保存', body: '停止运行时后重新启动生效', type: 'ok' });
     });
   }
   if ($('setImageFlavor')) {
@@ -2255,8 +2255,8 @@ function bindSettings() {
       toast({
         title: e.target.value === 'auto' ? '渲染后端已交还自动' : '渲染后端已固定',
         body: e.target.value === 'auto'
-          ? '下次开机会按机器性能重新挑选，失败自动降级'
-          : '下次开机固定使用这个后端，不再自动切换',
+          ? '停止运行时后重新启动，会按机器性能重新挑选，失败自动降级'
+          : '停止运行时后重新启动，固定使用这个后端，不再自动切换',
         type: 'ok',
       });
       refreshProfileText();
@@ -2388,11 +2388,33 @@ function bindSettings() {
   $('setMouseWheelMode').addEventListener('change', (e) => savePointer({ mouseWheelMode: e.target.value }));
   $('setMouseSideButtons').addEventListener('change', (e) => savePointer({ mouseSideButtons: e.target.checked }));
   $('setDeepTrim').addEventListener('change', async (e) => {
-    await save({ engine: { deepTrim: e.target.checked } });
-    // 关掉深度裁剪必须把之前 pm disable-user 的包恢复回来，否则影响是持久的
-    if (!e.target.checked) {
-      api.restoreSystemApps().catch(() => {});
-      toast({ title: '已恢复系统组件', body: '深度裁剪关闭，后台包正在恢复', type: 'info' });
+    const control = e.target;
+    const on = control.checked;
+    const previous = !!state.settings.engine.deepTrim;
+    control.disabled = true;
+    try {
+      try {
+        await save({ engine: { deepTrim: on } });
+      } catch (error) {
+        control.checked = previous;
+        toast({ title: '设置未保存', body: error.message, type: 'error' });
+        return;
+      }
+      // 恢复完成之前不能显示成功；离线时保留待恢复设置，连接后重试。
+      if (!on) {
+        try {
+          if (await api.restoreSystemApps() !== true) throw new Error('未能确认系统组件恢复完成');
+          toast({ title: '已恢复系统组件', body: '深度裁剪已关闭，后台包已恢复', type: 'ok' });
+        } catch (error) {
+          toast({
+            title: '深度裁剪已关闭，系统组件待恢复',
+            body: `${error.message}\n请连接原运行时后，将深度裁剪打开再关闭以重试恢复。`,
+            type: 'error',
+          });
+        }
+      }
+    } finally {
+      control.disabled = false;
     }
   });
   $('setCompat').addEventListener('change', async (e) => {
@@ -2416,14 +2438,35 @@ function bindSettings() {
   }
   $('wizLanguage')?.addEventListener('change', (e) => changeLanguage(e.target.value));
   $('setDisplayMode').addEventListener('change', async (e) => {
-    const mode = e.target.value;
-    $('portraitField').hidden = mode === 'fullscreen';
-    state.settings = await api.setSettings({ display: { mode } });
-    toast({ title: mode === 'fullscreen' ? '已切全屏' : '已切竖屏窗口', type: 'ok' });
+    const control = e.target;
+    $('setDisplayMode').disabled = $('setPortrait').disabled = true;
+    try {
+      const display = await api.displaySet({ mode: control.value });
+      state.settings = { ...state.settings, display: { ...state.settings.display, ...display } };
+      $('portraitField').hidden = display.mode === 'fullscreen';
+      toast({ title: '显示模式设置已保存', body: '已请求调整当前嵌入窗口；独立模拟器窗口保持原有显示方式。', type: 'ok' });
+    } catch (error) {
+      state.settings = await api.getSettings().catch(() => state.settings);
+      control.value = state.settings.display?.mode || 'window';
+      $('portraitField').hidden = control.value === 'fullscreen';
+      toast({ title: '显示模式未完全应用', body: `${error.message}\n请检查当前窗口后重试；已保存的设置会在下次打开窗口时使用。`, type: 'error' });
+    } finally {
+      $('setDisplayMode').disabled = $('setPortrait').disabled = false;
+    }
   });
   $('setPortrait').addEventListener('change', async (e) => {
-    state.settings = await api.setSettings({ display: { portrait: e.target.value } });
-    toast({ title: '画面大小已更新', body: '下次打开应用或切换应用时生效', type: 'ok' });
+    const control = e.target;
+    $('setDisplayMode').disabled = $('setPortrait').disabled = true;
+    try {
+      state.settings = await api.setSettings({ display: { portrait: control.value } });
+      toast({ title: '备用画面大小已保存', body: '运行时会优先使用自身的画面尺寸；这里仅作为无法读取实际尺寸时的备用值。', type: 'ok' });
+    } catch (error) {
+      state.settings = await api.getSettings().catch(() => state.settings);
+      control.value = state.settings.display?.portrait || '900x1600';
+      toast({ title: '备用画面大小未保存', body: error.message, type: 'error' });
+    } finally {
+      $('setDisplayMode').disabled = $('setPortrait').disabled = false;
+    }
   });
   $('btnRebuildShortcuts').addEventListener('click', async () => {
     const r = await api.rebuildShortcuts();

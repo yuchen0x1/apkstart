@@ -39,14 +39,17 @@ function live(record) {
     && record.proc.signalCode == null && !record.proc.killed;
 }
 function route() {
-  if (!context.isChild) return legacyBinding();
+  if (!context.isChild) {
+    if (restarting) throw fault('INSTANCE_ADB_NOT_READY', 'ADB 正在恢复，已暂停客户端命令');
+    return legacyBinding();
+  }
   if (disposed || phase !== 'ready' || !live(owned)) {
     throw fault('INSTANCE_ADB_NOT_READY', '分身私有 ADB 尚未初始化或已退出，已拒绝回退到其他 ADB 服务');
   }
   return binding;
 }
 function assertReady(captured) {
-  if (!context.isChild) return;
+  if (!context.isChild) { route(); return; }
   if (captured !== binding || route() !== captured) {
     throw fault('INSTANCE_ADB_ROUTE_CHANGED', '分身 ADB 路由不匹配');
   }
@@ -178,7 +181,7 @@ function startOwned(target, timeoutMs) {
           cwd: path.dirname(target.adbPath), env, windowsHide: true,
           detached: false, stdio: ['ignore', 'pipe', 'pipe'],
         });
-        record = { proc, exited: false };
+        record = { proc, exited: false, target };
         owned = record;
         proc.once('exit', (code, signal) => {
           record.exited = true;
@@ -249,6 +252,7 @@ function initialize({ adbPath = '', timeoutMs = 15000 } = {}) {
 function ensureServer({ adbPath = '', timeoutMs = 15000 } = {}) {
   if (context.isChild) return Promise.resolve().then(() => route());
   if (disposed) return Promise.reject(fault('INSTANCE_ADB_DISPOSED', 'ADB 已释放'));
+  if (restarting) return restarting;
   if (initializing) return initializing;
   const target = legacyBinding();
   if (live(owned)) return Promise.resolve(target);
@@ -280,17 +284,20 @@ function ensureServer({ adbPath = '', timeoutMs = 15000 } = {}) {
   return initializing;
 }
 function restartServer({ timeoutMs = 15000, adbPath = '' } = {}) {
-  if (!context.isChild) return ensureServer({ adbPath, timeoutMs });
   if (restarting) return restarting;
+  if (!context.isChild && (!live(owned) || initializing || disposed)) return ensureServer({ adbPath, timeoutMs });
   if (!binding || disposed || initializing) return Promise.reject(fault('INSTANCE_ADB_NOT_READY', '私有 ADB 未初始化或已释放'));
+  // Preserve the exact binary and port of the daemon this process launched.
+  // An unknown legacy listener never grants restart authority.
+  const target = context.isChild ? binding : owned.target;
   restarting = (async () => {
     phase = 'restarting';
     await stopOwned(owned);
     if (disposed) throw fault('INSTANCE_ADB_DISPOSED', '私有 ADB 已释放');
-    try { await startOwned(binding, timeoutMs); }
+    try { await startOwned(target, timeoutMs); }
     catch (error) { await stopOwned(owned).catch(() => {}); throw error; }
     publish(binding);
-    return route();
+    return context.isChild ? route() : binding;
   })().finally(() => { restarting = null; });
   return restarting;
 }

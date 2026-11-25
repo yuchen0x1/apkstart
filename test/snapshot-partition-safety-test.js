@@ -113,7 +113,7 @@ function fixture(t, { canEmbed = true } = {}) {
   const owner = { pid: 1234, started: 'fixture-birth', owned: true };
   const state = {
     owner, healthy: true, saveOk: true, toolFailure: null, noResize: false,
-    startupLines: [], accel: { ok: true, kind: 'whpx' },
+    startupLines: [], accel: { ok: true, kind: 'whpx' }, gpuInfo: null,
   };
   const processOwner = {
     pidOnPort: async () => state.owner?.pid || 0,
@@ -211,8 +211,7 @@ function fixture(t, { canEmbed = true } = {}) {
   const deps = {
     fs: tempFs, path, os: host, crypto: require('node:crypto'), net: { connect: forbidden },
     child_process: childProcess, './store': store, './provision': { Provisioner },
-    './gpu': { probe: async () => null },
-    './gpu': { probe: async () => null },
+    './gpu': { probe: async () => state.gpuInfo },
     './process-owner': processOwner, './adb': { AdbClient, isUnauthorizedError: () => false },
     './instance-adb': {
       route: () => ({ isChild: false, port: 5044, adbPath: p.adbExe }),
@@ -621,6 +620,51 @@ test('standalone launch retries software rendering after a failed host GPU', asy
   assert.deepEqual(f.calls.spawn.map(({ args }) => args[args.indexOf('-gpu') + 1]), ['host', 'swangle']);
   assert.equal(result.profile.gpu, 'swangle');
   assert.equal(f.settings.engine.badGpu, '37.4.1|host');
+});
+
+for (const backend of ['host', 'swangle', 'software', 'lavapipe']) {
+  test(`manual ${backend} survives failed production start retries without recording a bad GPU`, async (t) => {
+    const f = fixture(t);
+    Object.assign(f.settings.engine, {
+      windowMode: 'embedded', gpuMode: backend, badGpu: '37.4.1|host',
+    });
+    f.state.gpuInfo = {
+      capability: 'software', hardware: false, preferSoftware: true,
+      reasons: ['synthetic remote display adapter'],
+    };
+    f.prepareStart();
+    f.emu._waitSpawnSettled = async () => {
+      if (f.calls.spawn.length >= 3) return false;
+      f.emu.log('Failed to initialize GL emulation');
+      f.emu.lastExitCode = 1;
+      f.emu.proc = null;
+      return true;
+    };
+    const result = await f.emu.start();
+    assert.equal(result.ok, true);
+    assert.deepEqual(f.calls.spawn.map(({ args }) => args[args.indexOf('-gpu') + 1]), [backend, backend, backend]);
+    assert.deepEqual(f.calls.spawn.map(({ args }) => args.includes('-accel')), [false, true, true]);
+    assert.equal(result.profile.gpu, backend);
+    assert.equal(result.profile.gpuPinned, true);
+    assert.equal(result.profile.lastResort, true);
+    assert.equal(result.attempts.length, 2);
+    assert.equal(f.settings.engine.badGpu, '37.4.1|host');
+    assert(!f.writes.some((patch) => patch.engine && Object.hasOwn(patch.engine, 'badGpu')));
+  });
+}
+
+test('unknown GPU probe result does not force software in the production start path', async (t) => {
+  const f = fixture(t, { canEmbed: false });
+  f.settings.engine.windowMode = 'standalone';
+  f.state.gpuInfo = {
+    capability: 'unknown', hardware: false, preferSoftware: false,
+    reasons: ['synthetic unsupported probe'],
+  };
+  f.prepareStart();
+  const result = await f.emu.start();
+  assert.equal(result.ok, true);
+  assert.equal(f.calls.spawn[0].args[f.calls.spawn[0].args.indexOf('-gpu') + 1], 'host');
+  assert.equal(result.profile.gpu, 'host');
 });
 
 for (const requested of ['on', 'auto', 'off']) {

@@ -428,11 +428,16 @@ function parseApkZip(zip, filePath, stat) {
     .slice(0, 200);
 
   const features = children(manifest, 'uses-feature')
-    .map((n) => ({
-      name: attrValue(n, 'name', null) || '',
-      // 没写 required 时默认是 true（Android 的规则）
-      required: attrValue(n, 'required') !== false,
-    }))
+    .map((n) => {
+      const feature = {
+        name: attrValue(n, 'name', null) || '',
+        // 没写 required 时默认是 true（Android 的规则）
+        required: attrValue(n, 'required') !== false,
+      };
+      const version = attrValue(n, 'version');
+      if (Number.isInteger(version) && version >= 0) feature.version = version;
+      return feature;
+    })
     .filter((f) => f.name);
 
   const usesLibraries = children(app, 'uses-library')

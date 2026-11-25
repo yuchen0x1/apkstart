@@ -255,9 +255,51 @@ async function runUpstreamFeatures({ win, fixture, check, capture = async () => 
   await click('#setMicrophone');
   await waitForCall('settings:set', microphoneStart, call => call.payload?.engine?.microphone === true);
 
+  await js("document.getElementById('toastWrap').innerHTML=''");
+  const trimStart = fixture.calls.length;
+  await click('#setDeepTrim');
+  await waitForCall('settings:set', trimStart, call => call.payload?.engine?.deepTrim === true);
+  fixture.setResponse('settings:restoreSystem', async () => { throw new Error('fixture device offline'); });
+  await click('#setDeepTrim');
+  await waitFor("!document.getElementById('setDeepTrim').disabled && document.getElementById('toastWrap').textContent.includes('系统组件待恢复')");
+  check('关闭深度裁剪失败时保留关闭设置并明确系统组件待恢复',
+    await js("state.settings.engine.deepTrim===false && !document.getElementById('setDeepTrim').checked && !document.getElementById('toastWrap').textContent.includes('已恢复系统组件')")
+      && fixture.calls.slice(trimStart).some(call => call.channel === 'settings:restoreSystem'));
+  fixture.clearResponse('settings:restoreSystem');
+  await click('#setDeepTrim');
+  await click('#setDeepTrim');
+  await waitFor("!document.getElementById('setDeepTrim').disabled && document.getElementById('toastWrap').textContent.includes('已恢复系统组件')");
+  check('系统组件恢复确认成功后才显示恢复完成', await js("state.settings.engine.deepTrim===false && document.getElementById('toastWrap').textContent.includes('后台包已恢复')"));
+  await js("document.getElementById('toastWrap').innerHTML=''");
+  await capture('settings-feedback-performance');
+
   // Camera selection is saved through the real renderer event path and read back
   // after closing/reopening settings. "List host cameras" is fixture-only.
   await section('display');
+  const displayStart = fixture.calls.length;
+  await selectValue('setDisplayMode', 'fullscreen');
+  await waitFor("!document.getElementById('setDisplayMode').disabled && state.settings.display.mode==='fullscreen'");
+  check('显示模式通过即时显示接口应用且不覆盖其它设置',
+    fixture.calls.slice(displayStart).some(call => call.channel === 'display:set' && call.payload?.mode === 'fullscreen')
+      && !fixture.calls.slice(displayStart).some(call => call.channel === 'settings:set' && call.payload?.display)
+      && await js("document.getElementById('portraitField').hidden && !!state.settings.engine && !!state.settings.runtime"));
+  fixture.setResponse('display:set', async payload => {
+    await fixture.respond('settings:set', { display: payload });
+    throw new Error('fixture rotation denied');
+  });
+  await selectValue('setDisplayMode', 'window');
+  await waitFor("!document.getElementById('setDisplayMode').disabled && document.getElementById('toastWrap').textContent.includes('显示模式未完全应用')");
+  check('当前窗口切换失败会读回已保存的设置并显示原始错误', await js("state.settings.display.mode==='window' && document.getElementById('setDisplayMode').value==='window' && !document.getElementById('portraitField').hidden && document.getElementById('toastWrap').textContent.includes('fixture rotation denied')"));
+  fixture.clearResponse('display:set');
+  const portraitStart = fixture.calls.length;
+  await selectValue('setPortrait', '720x1280');
+  await waitFor("!document.getElementById('setPortrait').disabled && state.settings.display.portrait==='720x1280'");
+  check('备用尺寸只保存偏好并明确不代表当前运行时分辨率',
+    fixture.calls.slice(portraitStart).some(call => call.channel === 'settings:set' && call.payload?.display?.portrait === '720x1280')
+      && !fixture.calls.slice(portraitStart).some(call => call.channel === 'display:set')
+      && await js("state.settings.display.mode==='window' && !!state.settings.engine && !!state.settings.runtime && document.getElementById('toastWrap').textContent.includes('备用画面大小已保存')"));
+  await js("document.getElementById('toastWrap').innerHTML=''");
+  await capture('settings-feedback-display');
   const webcamStart = fixture.calls.length;
   await click('#btnListWebcams');
   const listed = await waitForCall('peripherals:webcams', webcamStart);

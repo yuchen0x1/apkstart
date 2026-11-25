@@ -1559,6 +1559,28 @@ class EmulatorEngine {
           interval = Math.min(1200, Math.round(interval * 1.6));
         }
 
+        // A terminal probe failure (such as an ADB service that could not be
+        // recovered) cannot be repaired by selecting another GPU or port.
+        if (fatal && this.lastDiagnosis?.terminal) {
+          const diagnosis = this.lastDiagnosis;
+          this.attempts.push({
+            plan: plan.label, stage: diagnosis.code === 'ADB_SERVER_FAILED' ? 'adb' : 'probe',
+            diagnosis: diagnosis.code, causeCode: diagnosis.causeCode,
+            exitCode: this.lastExitCode, params: doctor.describeAttempt(plan),
+            gpu: plan.gpu, accel: plan.accel,
+            acceleration: this._accelerationState(plan, this._attemptLines(logStart, 600)),
+          });
+          onLog(diagnosis.hint || diagnosis.title);
+          await this.killAttempt().catch(() => {});
+          this.lastDiagnosis = diagnosis;
+          this._persistFailure({ profile: plan, why: diagnosis.code === 'ADB_SERVER_FAILED' ? 'adb' : 'probe' });
+          return {
+            ok: false, code: diagnosis.code, causeCode: diagnosis.causeCode,
+            error: diagnosis.hint || diagnosis.title, diagnosis, terminal: true,
+            attempts: this.attempts, exitCode: this.lastExitCode,
+          };
+        }
+
         plan.acceleration = this._accelerationState(plan, this._attemptLines(logStart, 600));
         if (ok) {
           const bootMs = Date.now() - started;
@@ -1908,11 +1930,12 @@ class EmulatorEngine {
   }
 
   /**
-   * 纯软件模拟下的重复访问冲突：换 GPU 后端已经救不了，别再耗完 4 轮。
+   * 纯软件模拟路径下的重复访问冲突：停止本轮自动换参重试。
    *
    * 判据用 attempts（每轮独立记录）而不是日志文本，避免上一轮的崩溃串味。
    * 典型现场：机器没有 WHPX/AEHD，swiftshader / swangle / software 全部
-   * 以 0xC0000005 退出——病根在 TCG/模拟器本身，继续换后端只会白等十几分钟。
+   * 以 0xC0000005 退出。相同退出码不足以定位 TCG、GPU 或驱动根因，
+   * 这里只按已发生的重复崩溃限制重试，不把它当成组件归因。
    */
   _softwareTcgCrashed(plan, d) {
     if (!d) return false;
@@ -1921,14 +1944,14 @@ class EmulatorEngine {
     if (!plan || plan.accel !== 'off' || !this._isTcgGpu(plan.gpu)) return false;
     // 不能只认 ACCESS_VIOLATION：日志里只要带 Vulkan / ANGLE 字样，同一场崩溃就可能被
     // 判成 GPU_INIT（用户实测：4 组参数 4 次全崩，报告却还写着「已自动换用其他渲染后端」）。
-    // 判据回到事实本身 ——「关加速的软件路径 + 同一个非 0 退出码」出现两次，就说明换后端无效。
+    // 判据回到事实本身 ——「关加速的软件路径 + 同一个访问冲突退出码」出现两次，才触发此止损。
     // issue #5：host / lavapipe / guest 同样是 accel=off 下的 TCG 呈现路径（老版本 emulator
     // 的候选里 swangle 根本不存在，第一组就是 swiftshader_indirect，随后 host/lavapipe）。
     // 旧正则只数 software/swiftshader/swangle，host 轮同码崩溃被漏算，导致多白等一轮。
-    const exit = this.lastExitCode;
-    if (!exit) return false;
+    const exit = Number(this.lastExitCode);
+    if (exit !== 3221225477) return false;
     return this.attempts.filter((a) => a && a.accel === 'off'
-      && this._isTcgGpu(a.gpu) && a.exitCode === exit).length >= 2;
+      && this._isTcgGpu(a.gpu) && Number(a.exitCode) === exit).length >= 2;
   }
 
   /** 是否属于「关加速后的软件/TCG 呈现路径」。统一给止损与去重使用，避免正则各写各的漏项。 */
@@ -1953,7 +1976,7 @@ class EmulatorEngine {
     // 内核命令行的固定属性，正常启动也会打印，会把它当成「崩在 Vulkan」（歪打正着地
     // 关了 Vulkan，但判断依据本身是错的）。先把这类 androidboot.* 属性行剔掉，
     // 再看剩下的日志里有没有真正的 Vulkan / Guest Angle 初始化痕迹。
-    const meaningful = String((lines || []))
+    const meaningful = text
       .split(/\r?\n/)
       .filter((line) => !/androidboot\.hardware\.vulkan|androidboot\.[^\s]*vulkan/i.test(line))
       .join('\n');

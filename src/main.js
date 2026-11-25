@@ -2105,6 +2105,9 @@ function registerIpc() {
       const { activeImageId, ...rest } = patch.runtime;
       safePatch = { ...patch, runtime: rest };
     }
+    if (safePatch?.engine?.deepTrim === false && store.getSettings().engine?.deepTrim === true) {
+      safePatch = { ...safePatch, engine: { ...safePatch.engine, deepTrimRestorePending: true } };
+    }
     const next = store.saveSettings(safePatch);
     if (safePatch?.engine?.keepSnapshot === false) runtime?.emulator?.cancelSnapshotSave();
     if (safePatch && safePatch.theme !== undefined) syncTheme(next.theme);
@@ -2381,7 +2384,7 @@ function registerIpc() {
       if (full && !appWin.win.isMaximized()) appWin.win.maximize();
       if (!full && appWin.win.isMaximized()) appWin.win.unmaximize();
       // 全屏 = 平板横屏排版（见 toggleDisplayMode 的说明）
-      appWin.setLandscape(full, { fullscreen: full }).catch(() => {});
+      await appWin.setLandscape(full, { fullscreen: full });
       appWin.scheduleFit();
     }
     return next.display;
@@ -3044,7 +3047,7 @@ function registerIpc() {
       diskMB: doctor.freeDiskMB(store.DATA_DIR),
       gpuInfo,
     });
-    // 运行时正在用另一组参数（改完设置还没重开）时说明一句，避免「改了没反应」的错觉
+    // 关闭应用窗口可能只停放运行时，必须真正停止后再启动才会使用新参数。
     const running = runtime.emulator.profile;
     const sig = (x) => (x ? `${x.memoryMB}|${x.cores}|${x.lcd && x.lcd.w}x${x.lcd && x.lcd.h}|${x.gpu}|${x.snapshot !== false}` : '');
     const pending = !!running && sig(running) !== sig(p);
@@ -3052,7 +3055,7 @@ function registerIpc() {
       profile: p,
       text: doctor.describeProfile(p),
       // 低配降级的原因 / 哪些项是用户手动钉住的：设置页要能解释「为什么变保守了」
-      why: [doctor.describeTuning(p), pending ? '当前运行的安卓仍在使用上次的参数，改完重开应用即生效。' : '']
+      why: [doctor.describeTuning(p), pending ? '当前运行的安卓仍在使用上次的参数，停止运行时后重新启动才会生效。' : '']
         .filter(Boolean).join(' '),
       manual: doctor.describeManual(p),
       tier: p.tier || '',

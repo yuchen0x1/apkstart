@@ -68,6 +68,21 @@ const hasCode = (r, code) => r.reasons.some((x) => x.code === code);
     eq(info.debuggable, false);
   });
 
+  await test('硬件特性的版本和零级别保留下来，缺省或无效值不编造版本', () => {
+    const info = mkApk({
+      requiredFeatures: [
+        { name: 'android.hardware.vulkan.version', version: 4198400 },
+        { name: 'android.hardware.vulkan.level', version: 0 },
+        { name: 'android.hardware.camera' },
+        { name: 'com.example.invalid', version: -1 },
+      ],
+    });
+    eq(info.features[0].version, 4198400);
+    eq(info.features[1].version, 0);
+    assert(!Object.hasOwn(info.features[2], 'version'), '未声明版本时不应补成 0');
+    assert(!Object.hasOwn(info.features[3], 'version'), '负版本无效');
+  });
+
   console.log('\n[compat.js 判定]');
 
   await test('x86_64 原生库 → 完全兼容', () => {
@@ -165,6 +180,56 @@ const hasCode = (r, code) => r.reasons.some((x) => x.code === code);
       requiredFeatures: [{ name: 'android.hardware.camera', required: false }],
     }));
     eq(r.level, 'ok', JSON.stringify(r.reasons));
+  });
+
+  await test('必需 Vulkan 的版本和级别未经 Android 运行时验证，不能显示完全兼容', () => {
+    const r = compat.analyze(mkApk({
+      abis: ['x86_64'],
+      requiredFeatures: [
+        { name: 'android.hardware.vulkan.version', version: 4198400 },
+        { name: 'android.hardware.vulkan.level', version: 0 },
+        { name: 'android.software.vulkan.deqp.level', version: 132317953 },
+      ],
+    }));
+    eq(r.level, 'risky', JSON.stringify(r.reasons));
+    assert(compat.needsConfirm(r), '应在安装前要求确认未经验证的 Vulkan 能力');
+    const warning = r.reasons.find((x) => x.code === 'vulkan-unverified');
+    assert(warning && warning.kind === 'warn', JSON.stringify(r.reasons));
+    assert(/尚未从当前 Android 运行时内验证/.test(warning.text), warning.text);
+    assert(/vulkan\.version=4198400/.test(warning.text), warning.text);
+    assert(/vulkan\.level=0/.test(warning.text), warning.text);
+    assert(/主机显卡.*不能证明/.test(warning.text), warning.text);
+    eq(r.details.requiredVulkan.length, 3);
+    eq(r.details.requiredVulkan[0].version, 4198400);
+    eq(r.details.requiredVulkan[1].version, 0);
+  });
+
+  await test('仅有特性名称或调用方声称 Vulkan 可用，都不能代替运行时内验证', () => {
+    const r = compat.analyze({
+      ok: true, minSdk: 26, targetSdk: 34, abis: ['x86_64'],
+      features: ['android.hardware.vulkan.version'],
+    }, { vulkan: true, backend: 'host' });
+    eq(r.level, 'risky', JSON.stringify(r.reasons));
+    assert(hasCode(r, 'vulkan-unverified'), JSON.stringify(r.reasons));
+    assert(!Object.hasOwn(r.details.requiredVulkan[0], 'version'), '未知版本不能补成 0');
+  });
+
+  await test('非必需 Vulkan 不影响兼容性结论', () => {
+    const r = compat.analyze(mkApk({
+      abis: ['x86_64'],
+      requiredFeatures: [{ name: 'android.hardware.vulkan.version', required: false, version: 4198400 }],
+    }));
+    eq(r.level, 'ok', JSON.stringify(r.reasons));
+    assert(!hasCode(r, 'vulkan-unverified'), JSON.stringify(r.reasons));
+  });
+
+  await test('Vulkan 未验证不会覆盖已确认的不支持原因', () => {
+    const r = compat.analyze(mkApk({
+      minSdk: 99, abis: ['x86_64'], requiredFeatures: ['android.hardware.vulkan.version'],
+    }));
+    eq(r.level, 'unsupported', JSON.stringify(r.reasons));
+    assert(hasCode(r, 'min-sdk-too-high'), JSON.stringify(r.reasons));
+    assert(hasCode(r, 'vulkan-unverified'), JSON.stringify(r.reasons));
   });
 
   await test('★ 拆分 APK 单独安装 → 可能有问题（提示装完整包）', () => {

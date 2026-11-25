@@ -13,7 +13,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-runtime-safety-'));
 const forbidden = () => { throw new Error('unexpected host operation'); };
 const childProcess = { spawn: forbidden, spawnSync: forbidden, execFile: forbidden };
 const core = path.join(__dirname, '..', 'src', 'core');
-function load(file, deps) {
+function load(file, deps, globals = {}) {
   const source = fs.readFileSync(path.join(core, file), 'utf8');
   const module = { exports: {} };
   const req = (name) => {
@@ -22,8 +22,8 @@ function load(file, deps) {
     if (name === 'child_process') return childProcess;
     throw new Error(`unmocked dependency: ${name}`);
   };
-  const wrap = vm.runInThisContext(`(function (require, module, __dirname) {${source}\n})`, { filename: path.join(core, file) });
-  wrap(req, module, core);
+  const wrap = vm.runInThisContext(`(function (require, module, __dirname, Date) {${source}\n})`, { filename: path.join(core, file) });
+  wrap(req, module, core, globals.Date || Date);
   return module.exports;
 }
 function put(file, content = 'fixture') {
@@ -53,7 +53,7 @@ async function test(name, fn) {
   } finally { clearTimeout(timer); }
 }
 
-function runtime(dir, overrides = {}) {
+function runtime(dir, overrides = {}, globals = {}) {
   const settings = { engine: { mode: 'builtin' }, runtime: {}, device: '' };
   const writes = [];
   const processes = new Map();
@@ -66,7 +66,13 @@ function runtime(dir, overrides = {}) {
   };
   const store = {
     DATA_DIR: dir, getSettings: () => settings, ensureDirs: () => {},
-    saveSettings: (patch) => { writes.push(patch); Object.assign(settings, patch); },
+    saveSettings: (patch) => {
+      writes.push(patch);
+      for (const [key, value] of Object.entries(patch)) {
+        if (value && typeof value === 'object' && !Array.isArray(value)) settings[key] = { ...settings[key], ...value };
+        else settings[key] = value;
+      }
+    },
     saveApps: (apps) => { writes.push(apps); }, getApps: () => [],
   };
   const env = { emulator: { ok: false }, sysimg: { ok: false } };
@@ -83,7 +89,7 @@ function runtime(dir, overrides = {}) {
     './container': require('../src/core/container'), './guest': {}, './platform': { canProvision: true },
     './process-owner': processOwner, './layers': layers, './userdata': require('../src/core/userdata'),
     ...overrides,
-  });
+  }, globals);
   const rt = Object.create(Runtime.prototype);
   const root = path.join(dir, 'runtime');
   const avdHome = path.join(root, 'avd');
@@ -135,6 +141,37 @@ function provision(dir, download) {
   p.guardDisk = async () => {};
   p.inspectIso = (file) => ({ ok: fs.existsSync(file) && fs.readFileSync(file, 'utf8') !== 'invalid', size: 7, reason: 'bad ISO' });
   return { p, settings, imagesDir, iso };
+}
+
+function restorationFixture(dir) {
+  const f = runtime(dir);
+  const owner = { pid: 42, started: 'restore-birth', owned: true };
+  f.processes.set(5554, owner); f.processes.set(5555, owner);
+  f.settings.engine.deepTrim = false;
+  const state = { online: 'device', restricted: '1', hook: null };
+  const disabled = new Set(['com.android.vending', 'com.example.userdisabled']);
+  const commands = [];
+  const client = {
+    serial: 'emulator-5554',
+    deviceState: async () => state.online,
+    async shell(command) {
+      commands.push(command);
+      const custom = await state.hook?.(command);
+      if (custom !== undefined) return custom;
+      if (command === 'pm list packages -d --user 0') return [...disabled].map((pkg) => `package:${pkg}`).join('\n');
+      const enable = /^pm enable --user 0 ([\w.]+)$/.exec(command);
+      if (enable) { disabled.delete(enable[1]); return `Package ${enable[1]} new state: enabled`; }
+      if (command === 'settings put global restricted_background_data 0') { state.restricted = '0'; return ''; }
+      if (command === 'settings get global restricted_background_data') return state.restricted;
+      throw new Error(`unexpected restore command: ${command}`);
+    },
+  };
+  f.rt.client = () => client;
+  f.rt._freeformReady = f.rt._guestDefaultsReady = f.rt._chineseImeReady = f.rt._lcdNormalized = true;
+  f.rt.startWatchdog = () => {};
+  f.settings.engine.deepTrimRestoreTarget = f.rt._systemAppsRestoreTarget(client);
+  const prepare = (options) => f.Runtime.prototype.prepare.call(f.rt, client, options);
+  return { ...f, owner, state, disabled, commands, client, prepare };
 }
 
 async function main() {
@@ -202,6 +239,309 @@ async function main() {
       assert.equal(shells, 1);
       assert.equal(states, 0);
       assert.equal(repairs, 0);
+    });
+  }
+  await test('startup rejects unauthorized state read after guest birth changes', async (dir) => {
+    let processes, states = 0;
+    class ProbeClient {
+      constructor({ serial }) { this.serial = serial; }
+      async shell() { throw new Error('device offline'); }
+      async deviceState() {
+        states++;
+        const replacement = { pid: 42, started: 'reused-birth', owned: true };
+        processes.set(5554, replacement); processes.set(5555, replacement);
+        return 'unauthorized';
+      }
+    }
+    const f = runtime(dir, { './adb': { AdbClient: ProbeClient, isUnauthorizedError: () => false } });
+    processes = f.processes;
+    const owner = { pid: 42, started: 'original-birth', owned: true };
+    processes.set(5554, owner); processes.set(5555, owner);
+    f.rt.adbPath = () => 'fixture-adb';
+    f.rt.emulator.running = () => true;
+    f.rt.emulator.invalidateSnapshot = f.rt.emulator.forceColdBootOnNextStart = f.rt.emulator.resetAdbServer = forbidden;
+    f.rt.emulator.start = async ({ probe }) => {
+      assert.equal(await probe({ serial: 'emulator-5554' }), 'pending');
+      return { ok: false };
+    };
+    await f.rt.bootEmulator({ env: { accel: { ok: true } } });
+    assert.equal(states, 1);
+  });
+  for (const failure of ['construct', 'shell', 'reset-unauthorized', 'reset-offline']) {
+    await test(`ADB ${failure} failure is terminal and preserves its original cause`, async (dir) => {
+      let now = 1700000000000, constructions = 0, resets = 0;
+      class FakeDate extends Date { static now() { return now; } }
+      const original = Object.assign(new Error(`fixture ${failure} failed`), { code: 'INSTANCE_ADB_NOT_READY' });
+      class ProbeClient {
+        constructor({ serial }) { constructions++; if (failure === 'construct') throw original; this.serial = serial; }
+        async shell() { throw failure === 'shell' ? original : new Error('device offline'); }
+        async deviceState() { return failure === 'reset-unauthorized' ? 'unauthorized' : 'offline'; }
+      }
+      const f = runtime(dir, { './adb': { AdbClient: ProbeClient, isUnauthorizedError: () => false } }, { Date: FakeDate });
+      const owner = { pid: 42, started: 'owned-birth', owned: true };
+      f.processes.set(5554, owner); f.processes.set(5555, owner);
+      f.rt.adbPath = () => 'fixture-adb';
+      f.rt.emulator.running = () => true;
+      f.rt.emulator.invalidateSnapshot = f.rt.emulator.forceColdBootOnNextStart = () => {};
+      f.rt.emulator.resetAdbServer = async () => { resets++; throw original; };
+      f.rt.emulator.start = async ({ probe }) => {
+        const count = failure === 'reset-offline' ? 6 : 1;
+        for (let i = 0; i < count; i++) {
+          now += 31000;
+          assert.equal(await probe({ serial: 'emulator-5554' }), i === count - 1 ? 'fatal' : 'pending');
+        }
+        assert.equal(f.rt.emulator.lastDiagnosis.terminal, true);
+        assert.equal(f.rt.emulator.lastDiagnosis.causeCode, original.code);
+        // Even a base loop retry cannot construct another client or lose the cause.
+        assert.equal(await probe({ serial: 'emulator-5554' }), 'fatal');
+        return { ok: false, error: 'generic timeout must not hide original', attempts: [{ stage: 'adb' }] };
+      };
+      const result = await f.rt.bootEmulator({ env: { accel: { ok: true } } });
+      assert.equal(result.ok, false);
+      assert.equal(result.terminal, true);
+      assert.equal(result.code, original.code);
+      assert(result.error.includes(original.message));
+      assert.equal(result.diagnosis.code, 'ADB_SERVER_FAILED');
+      assert.equal(result.attempts[0].stage, 'adb');
+      assert.equal(constructions, 1);
+      assert.equal(resets, failure.startsWith('reset-') ? 1 : 0);
+    });
+  }
+  await test('default deepTrim=false never restores packages without a pending request', async (dir) => {
+    const f = restorationFixture(dir);
+    f.client.shell = forbidden;
+    await f.prepare();
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.commands.length, 0);
+    assert(f.disabled.has('com.android.vending'));
+  });
+  await test('pending restore enables only present optional packages and verifies readback', async (dir) => {
+    const f = restorationFixture(dir);
+    f.settings.engine.deepTrimRestorePending = true;
+    await f.prepare();
+    assert.equal(f.settings.engine.deepTrimRestorePending, false);
+    assert.equal(f.disabled.has('com.android.vending'), false);
+    assert.equal(f.disabled.has('com.example.userdisabled'), true);
+    assert.equal(f.state.restricted, '0');
+    assert.deepEqual(f.commands.filter((cmd) => cmd.startsWith('pm enable')), ['pm enable --user 0 com.android.vending']);
+    assert(f.commands.every((cmd) => !cmd.includes('|| true') && !cmd.includes('2>/dev/null')));
+    const count = f.commands.length;
+    await f.prepare();
+    assert.equal(f.commands.length, count, 'verified restore must not repeat without a new request');
+  });
+  for (const failure of ['throw', 'empty-enable', 'error-enable', 'empty-setting', 'still-disabled']) {
+    await test(`restore ${failure} stays pending and cannot report success`, async (dir) => {
+      const f = restorationFixture(dir);
+      f.state.hook = (command) => {
+        if (command.startsWith('pm enable')) {
+          if (failure === 'throw') throw new Error('fixture ADB exit 1');
+          if (failure === 'empty-enable') return '';
+          if (failure === 'error-enable') return 'Error: Permission denied';
+          if (failure === 'still-disabled') return 'Package com.android.vending new state: enabled';
+        }
+        if (failure === 'empty-setting' && command.startsWith('settings get')) return '';
+      };
+      await assert.rejects(f.rt.restoreSystemApps());
+      assert.equal(f.settings.engine.deepTrimRestorePending, true);
+      assert(!f.writes.some((patch) => patch.engine?.deepTrimRestorePending === false));
+    });
+  }
+  await test('prepare retries a failed pending restore on the next verified guest preparation', async (dir) => {
+    const f = restorationFixture(dir);
+    f.settings.engine.deepTrimRestorePending = true;
+    f.state.hook = (command) => { if (command.startsWith('pm enable')) throw new Error('fixture pm service unavailable'); };
+    await f.prepare();
+    assert.equal(f.settings.engine.deepTrimRestorePending, true);
+    f.state.hook = null;
+    await f.prepare();
+    assert.equal(f.settings.engine.deepTrimRestorePending, false);
+    assert.equal(f.disabled.has('com.android.vending'), false);
+  });
+  for (const reason of ['offline', 'unauthorized', 'unknown-owner', 'attach', 'cancelled']) {
+    await test(`restore rejects ${reason} before any guest mutation`, async (dir) => {
+      const f = restorationFixture(dir);
+      const controller = new AbortController();
+      if (reason === 'offline' || reason === 'unauthorized') f.state.online = reason;
+      if (reason === 'unknown-owner') f.processes.clear();
+      if (reason === 'attach') f.settings.engine.mode = 'attach';
+      if (reason === 'cancelled') controller.abort();
+      await assert.rejects(f.rt.restoreSystemApps({ signal: controller.signal }));
+      assert.equal(f.commands.length, 0);
+      assert.equal(f.settings.engine.deepTrimRestorePending, true);
+    });
+  }
+  for (const boundary of ['state', 'list', 'enable', 'readback']) {
+    await test(`restore birth change at ${boundary} prevents subsequent mutation and pending acknowledgement`, async (dir) => {
+      const f = restorationFixture(dir);
+      const replace = () => {
+        const owner = { pid: 42, started: 'replacement', owned: true };
+        f.processes.set(5554, owner); f.processes.set(5555, owner);
+      };
+      if (boundary === 'state') f.client.deviceState = async () => { replace(); return 'device'; };
+      f.state.hook = (command) => {
+        if (boundary === 'list' && command.startsWith('pm list')
+          || boundary === 'enable' && command.startsWith('pm enable')
+          || boundary === 'readback' && command.startsWith('settings get')) replace();
+      };
+      await assert.rejects(f.rt.restoreSystemApps(), /归属已变化/);
+      assert.equal(f.settings.engine.deepTrimRestorePending, true);
+      if (boundary === 'state' || boundary === 'list') assert(!f.commands.some((cmd) => cmd.startsWith('pm enable')));
+      if (boundary === 'enable') assert(!f.commands.some((cmd) => cmd.startsWith('settings put')));
+    });
+  }
+  await test('older restore cannot acknowledge a newer request or a re-enabled deep trim', async (dir) => {
+    const f = restorationFixture(dir);
+    const entered = deferred(), release = deferred();
+    let held = false;
+    f.state.hook = async (command) => {
+      if (!held && command.startsWith('pm list')) { held = true; entered.resolve(); await release.promise; }
+    };
+    const older = assert.rejects(f.rt.restoreSystemApps(), { code: 'SYSTEM_APPS_RESTORE_CANCELLED' });
+    await entered.promise;
+    assert.equal(await f.rt.restoreSystemApps(), true);
+    f.settings.engine.deepTrimRestorePending = true;
+    f.settings.engine.deepTrim = true;
+    release.resolve(); await older;
+    assert.equal(f.settings.engine.deepTrimRestorePending, true);
+  });
+  await test('prepare stops all subsequent initialization after restore loses guest ownership', async (dir) => {
+    const f = restorationFixture(dir);
+    f.settings.engine.deepTrimRestorePending = true;
+    f.rt._freeformReady = false;
+    f.client.ensureFreeform = forbidden;
+    f.state.hook = (command) => {
+      if (command.startsWith('pm list')) {
+        const replacement = { pid: 42, started: 'replacement', owned: true };
+        f.processes.set(5554, replacement); f.processes.set(5555, replacement);
+      }
+    };
+    await assert.rejects(f.prepare(), { code: 'RUNTIME_OWNERSHIP_LOST' });
+    assert.equal(f.settings.engine.deepTrimRestorePending, true);
+    assert(!f.commands.some((command) => command.startsWith('pm enable')));
+  });
+  for (const selection of ['avd', 'data-dir', 'image']) {
+    await test(`pending restore cannot enable another ${selection} and preserves the original target`, async (dir) => {
+      const f = restorationFixture(dir);
+      if (selection === 'image') {
+        let image = 'original-image';
+        f.rt.emulator.imageChoice = () => ({ dir: image, flavor: 'google_apis_playstore', api: 34 });
+        f.settings.engine.deepTrimRestoreTarget = f.rt._systemAppsRestoreTarget(f.client);
+        image = 'replacement-image';
+      } else if (selection === 'data-dir') {
+        const prior = f.rt.provisioner.paths;
+        f.rt.provisioner.paths = () => ({ ...prior(), avdHome: path.join(dir, 'different-avd-home') });
+      } else f.rt.emulator.avdName = 'apkstart-aosp';
+      f.settings.engine.deepTrimRestorePending = true;
+      const target = f.settings.engine.deepTrimRestoreTarget;
+      await assert.rejects(f.rt.restoreSystemApps(), /不属于当前运行时/);
+      assert.equal(f.commands.length, 0);
+      await f.prepare(); // another selected guest can still complete ordinary preparation
+      assert.equal(f.commands.length, 0);
+      assert.equal(f.settings.engine.deepTrimRestorePending, true);
+      assert.equal(f.settings.engine.deepTrimRestoreTarget, target);
+    });
+  }
+  for (const selection of ['disk', 'iso', 'image']) {
+    await test(`QEMU pending restore cannot enable another ${selection} and preserves the original target`, async (dir) => {
+      const f = restorationFixture(dir);
+      f.client.serial = '127.0.0.1:5555';
+      f.settings.runtime.diskPath = path.join(dir, 'original.qcow2');
+      f.settings.runtime.isoPath = path.join(dir, 'original.iso');
+      f.settings.runtime.activeImageId = 'original-image';
+      const target = f.rt._systemAppsRestoreTarget(f.client);
+      f.settings.engine.deepTrimRestoreTarget = target;
+      f.settings.engine.deepTrimRestorePending = true;
+      if (selection === 'disk') f.settings.runtime.diskPath = path.join(dir, 'replacement.qcow2');
+      if (selection === 'iso') f.settings.runtime.isoPath = path.join(dir, 'replacement.iso');
+      if (selection === 'image') f.settings.runtime.activeImageId = 'replacement-image';
+      await assert.rejects(f.rt.restoreSystemApps(), /不属于当前运行时/);
+      await f.prepare();
+      assert.equal(f.commands.length, 0);
+      assert.equal(f.settings.engine.deepTrimRestorePending, true);
+      assert.equal(f.settings.engine.deepTrimRestoreTarget, target);
+    });
+  }
+  await test('QEMU restore binds the provisioned default disk and ISO and verifies restoration', async (dir) => {
+    const f = restorationFixture(dir);
+    f.client.serial = '127.0.0.1:5555';
+    const prior = f.rt.provisioner.paths;
+    const disk = path.join(dir, 'default.qcow2'), iso = path.join(dir, 'default.iso');
+    f.rt.provisioner.paths = () => ({ ...prior(), disk, iso });
+    const target = f.rt._systemAppsRestoreTarget(f.client);
+    assert.deepEqual(JSON.parse(target), { mode: 'qemu', disk, iso, image: '' });
+    f.settings.engine.deepTrimRestoreTarget = target;
+    f.settings.engine.deepTrimRestorePending = true;
+    await f.prepare();
+    assert.equal(f.settings.engine.deepTrimRestorePending, false);
+    assert.equal(f.disabled.has('com.android.vending'), false);
+    f.rt.provisioner.paths = () => ({ ...prior(), disk: path.join(dir, 'other-default.qcow2'), iso });
+    assert.notEqual(f.rt._systemAppsRestoreTarget(f.client), target);
+  });
+  for (const selection of ['unknown-serial', 'missing-qemu-disk']) {
+    await test(`builtin restore with ${selection} never guesses an AVD target`, async (dir) => {
+      const f = restorationFixture(dir);
+      f.client.serial = selection === 'unknown-serial' ? '127.0.0.1:7555' : '127.0.0.1:5555';
+      f.settings.engine.deepTrimRestorePending = true;
+      assert.equal(f.rt._systemAppsRestoreTarget(f.client), '');
+      const target = f.settings.engine.deepTrimRestoreTarget;
+      await f.prepare();
+      await assert.rejects(f.rt.restoreSystemApps(), /不属于当前运行时/);
+      assert.equal(f.commands.length, 0);
+      assert.equal(f.settings.engine.deepTrimRestorePending, true);
+      assert.equal(f.settings.engine.deepTrimRestoreTarget, target);
+    });
+  }
+  await test('automatic preparation never guesses the target of a legacy pending request', async (dir) => {
+    const f = restorationFixture(dir);
+    f.settings.engine.deepTrimRestoreTarget = '';
+    f.settings.engine.deepTrimRestorePending = true;
+    await f.prepare();
+    assert.equal(f.commands.length, 0);
+    assert.equal(f.settings.engine.deepTrimRestorePending, true);
+    assert.equal(await f.rt.restoreSystemApps(), true); // explicit, online and owned binding
+    assert.equal(f.settings.engine.deepTrimRestorePending, false);
+  });
+  await test('configured attach restoration stays pinned to its explicit serial', async (dir) => {
+    const f = restorationFixture(dir);
+    f.settings.engine.mode = 'attach'; f.settings.device = f.client.serial;
+    f.settings.engine.deepTrimRestoreTarget = f.rt._systemAppsRestoreTarget(f.client);
+    f.processes.clear();
+    assert.equal(await f.rt.restoreSystemApps(), true);
+    assert.equal(f.settings.engine.deepTrimRestorePending, false);
+  });
+  await test('attach selection changed during restore never writes the replacement guest', async (dir) => {
+    const f = restorationFixture(dir);
+    f.settings.engine.mode = 'attach'; f.settings.device = f.client.serial;
+    f.settings.engine.deepTrimRestoreTarget = f.rt._systemAppsRestoreTarget(f.client);
+    f.state.hook = (command) => { if (command.startsWith('pm list')) f.settings.device = '127.0.0.1:7555'; };
+    await assert.rejects(f.rt.restoreSystemApps(), { code: 'RUNTIME_OWNERSHIP_LOST' });
+    assert.equal(f.settings.engine.deepTrimRestorePending, true);
+    assert(!f.commands.some((command) => command.startsWith('pm enable')));
+  });
+  await test('cancellation during package enumeration prevents enables and pending acknowledgement', async (dir) => {
+    const f = restorationFixture(dir);
+    const controller = new AbortController();
+    f.state.hook = (command) => { if (command.startsWith('pm list')) controller.abort(); };
+    await assert.rejects(f.rt.restoreSystemApps({ signal: controller.signal }), { code: 'START_CANCELLED' });
+    assert.equal(f.settings.engine.deepTrimRestorePending, true);
+    assert(!f.commands.some((command) => command.startsWith('pm enable')));
+  });
+  for (const priorTarget of ['another-runtime', '']) {
+    await test(`new deep trim preserves an outstanding ${priorTarget ? 'other' : 'unbound legacy'} restore request`, async (dir) => {
+      const f = restorationFixture(dir);
+      f.settings.engine.deepTrim = true;
+      f.settings.engine.deepTrimRestorePending = true;
+      f.settings.engine.deepTrimRestoreTarget = priorTarget;
+      f.rt.emulator.cancelSnapshotSave = () => {};
+      f.rt.emulator.setPriority = async () => {};
+      f.client.shell = async (command) => { f.commands.push(command); return ''; };
+      const result = await f.rt.beginApp('test.app', { client: f.client });
+      assert.deepEqual(result.plan.disabled, []);
+      assert(!f.commands.some((command) => /pm disable-user|restricted_background_data 1/.test(command)));
+      assert.equal(f.settings.engine.deepTrimRestorePending, true);
+      assert.equal(f.settings.engine.deepTrimRestoreTarget, priorTarget);
+      assert.equal(f.writes.length, 0);
+      assert(f.rt._bootLog.some(({ line }) => line.includes('未对当前设备执行新的深度裁剪')));
     });
   }
   await test('cancelled native discovery settles without late prepare or spawn', async (dir) => {
@@ -281,7 +621,7 @@ async function main() {
       rt.log = () => logs++;
       rt.emulator.cancelSnapshotSave = () => {};
       rt.emulator.setPriority = async () => { if (boundary === 'priority') { entered.resolve(); await release.promise; } };
-      const client = { shell: async () => { shells++; if (boundary === 'shell') { entered.resolve(); await release.promise; } } };
+      const client = { serial: 'emulator-5554', shell: async () => { shells++; if (boundary === 'shell') { entered.resolve(); await release.promise; } } };
       const pending = rt.beginApp('test.app', { client, shouldCancel: () => cancelled,
         onActive: () => { active++; if (boundary === 'active-callback') cancelled = true; } });
       if (boundary !== 'active-callback') { await entered.promise; cancelled = true; release.resolve(); }
