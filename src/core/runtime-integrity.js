@@ -109,6 +109,24 @@ function text(xml, tag) {
   return value;
 }
 
+function stripXmlComments(input) {
+  const source = String(input);
+  let output = '';
+  let cursor = 0;
+  while (cursor < source.length) {
+    const start = source.indexOf('<!--', cursor);
+    if (start < 0) return output + source.slice(cursor);
+    const end = source.indexOf('-->', start + 4);
+    if (end < 0) throw failure('Google 官方索引含未闭合注释');
+    const body = source.slice(start + 4, end);
+    if (body.includes('--')) throw failure('Google 官方索引含无效的注释内容');
+    output += source.slice(cursor, start);
+    output += ' '.repeat(end + 3 - start);
+    cursor = end + 3;
+  }
+  return output;
+}
+
 function parsePlatformTools(input, host = process.platform, arch = process.arch) {
   const hosts = {
     win32: { os: 'windows', suffix: 'win', arches: ['x64'] },
@@ -120,8 +138,8 @@ function parsePlatformTools(input, host = process.platform, arch = process.arch)
     throw failure(`没有适合 ${host}/${arch} 的可信 platform-tools 包，请按 Android 官方说明手动安装`);
   }
   const source = String(input);
-  const xml = source.replace(/<!--[\s\S]*?--!?>/g, '').trim();
   if (source.includes('--!>')) throw failure('Google 官方索引含无效的注释结束标记');
+  const xml = stripXmlComments(source).trim();
   // A malformed or nested comment must fail closed; never pass a residual
   // comment marker into the restricted tag scanner.
   if (/<!--|--!?>/.test(xml)

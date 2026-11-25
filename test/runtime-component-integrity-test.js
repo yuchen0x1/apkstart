@@ -201,6 +201,12 @@ test('官方 metadata 按稳定版、host-os、revision 和对应 checksum 成�
   }
 });
 
+test('well-formed XML comments are ignored without treating metadata as HTML', () => {
+  const xml = sdk(`<!-- repository metadata -->${pkg(archive('windows'))}<!-- end -->`);
+  const component = integrity().parsePlatformTools(xml, 'win32', 'x64');
+  assert.equal(component.version, '37.0.3');
+});
+
 for (const [label, xml] of [
   ['缺 checksum', metadata({ sum: null })],
   ['空 checksum', metadata({ sum: '' })],

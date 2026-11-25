@@ -166,11 +166,38 @@ test('an official HTTP failure falls back, while two failed routes leave no inst
   const deadOfficial = await releaseServer(data, { fail: true });
   const deadProxy = await releaseServer(data, { fail: true });
   const failedDest = path.join(tempRoot(), 'failed-release.zip');
+  const previous = Buffer.from('previous verified installer');
+  fs.writeFileSync(failedDest, previous);
   await assert.rejects(downloadWithFallback([
     { source: 'github', name: 'official', url: deadOfficial },
     { source: 'gh-proxy', name: 'proxy', url: deadProxy },
   ], failedDest, options(data)), /official[\s\S]*proxy|proxy[\s\S]*official/);
-  assert.equal(fs.existsSync(failedDest), false);
+  assert.deepEqual(fs.readFileSync(failedDest), previous, 'failed routes must not replace a verified old installer');
+});
+
+test('an untrusted redirect is rejected before following it and leaves the old destination intact', async () => {
+  const data = Buffer.alloc(128 * 1024, 0x13);
+  let forbiddenRequests = 0;
+  const forbidden = await listen((_req, res) => {
+    forbiddenRequests += 1;
+    res.end(data);
+  });
+  const redirect = await listen((_req, res) => {
+    res.writeHead(302, { Location: forbidden });
+    res.end();
+  });
+  const dest = path.join(tempRoot(), 'redirect-release.zip');
+  const previous = Buffer.from('previous verified installer');
+  fs.writeFileSync(dest, previous);
+  const redirectPort = new URL(redirect).port;
+  const allowRedirect = (target) => target.protocol === 'http:' && target.hostname === '127.0.0.1'
+    && target.port === redirectPort;
+
+  await assert.rejects(downloadWithFallback([
+    { source: 'github', name: 'official', url: redirect },
+  ], dest, options(data, { redirectAllowlist: allowRedirect })), /未授权/);
+  assert.equal(forbiddenRequests, 0);
+  assert.deepEqual(fs.readFileSync(dest), previous);
 });
 
 test('a partial download resumes only from the same route on the next attempt', async () => {
