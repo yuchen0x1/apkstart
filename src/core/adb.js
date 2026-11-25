@@ -413,16 +413,14 @@ class AdbClient {
 
   async isOnline() {
     try {
-      const { stdout } = await this.exec(['get-state'], { timeout: 8000 });
-      return stdout.trim() === 'device';
+      const { stdout } = await this.exec(['devices'], { withSerial: false, timeout: 8000 });
+      if (this.serial) return parseDeviceState(stdout, this.serial) === 'device';
+      // Without a serial ADB can select a target only when exactly one exists.
+      const rows = String(stdout).split(/\r?\n/).slice(1)
+        .map((line) => line.trim()).filter((line) => line && !line.startsWith('*'));
+      return rows.length === 1 && parseDeviceState(stdout, '') === 'device';
     } catch (_) {
-      // get-state 在未指定 serial 时不可用，退化用 devices 列表
-      try {
-        const { stdout } = await this.exec(['devices'], { withSerial: false, timeout: 8000 });
-        return stdout.split('\n').some((l) => l.startsWith(this.serial) && l.includes('device'));
-      } catch (_) {
-        return false;
-      }
+      return false;
     }
   }
 

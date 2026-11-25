@@ -334,6 +334,46 @@ test('display mode changes save preferences without maximizing or resizing a sup
   assert.equal(h.appWin._hidden, true);
 });
 
+test('live display settings wait for the current embedded window to finish adjusting', async () => {
+  const h = makeLaunchVm();
+  const rotation = deferred();
+  const actions = [];
+  let handler;
+  h.appWin.hostSuppressed = false;
+  h.appWin.win.isMaximized = () => false;
+  h.appWin.win.maximize = () => actions.push('maximize');
+  h.appWin.setLandscape = (full, options) => {
+    assert.equal(full, true);
+    assert.equal(options.fullscreen, true);
+    actions.push('rotate');
+    return rotation.promise;
+  };
+  h.appWin.scheduleFit = () => actions.push('fit');
+  h.store.saveSettings = patch => ({ display: patch.display });
+  h.ipcMain = { handle: (_channel, fn) => { handler = fn; } };
+  vm.runInNewContext(SET_DISPLAY, h, { filename: MAIN_FILE });
+  const result = handler(null, { mode: 'fullscreen' });
+  assert.deepEqual(actions, ['maximize', 'rotate']);
+  rotation.resolve(true);
+  assert.equal((await result).mode, 'fullscreen');
+  assert.deepEqual(actions, ['maximize', 'rotate', 'fit']);
+});
+
+test('live display settings preserve the saved preference but propagate adjustment errors', async () => {
+  const h = makeLaunchVm();
+  let handler;
+  const saved = [];
+  h.appWin.hostSuppressed = false;
+  h.appWin.win.isMaximized = () => true;
+  h.appWin.setLandscape = async () => { throw new Error('fixture rotation denied'); };
+  h.appWin.scheduleFit = () => assert.fail('failed rotation must not be reported as complete');
+  h.store.saveSettings = patch => { saved.push(patch.display.mode); return { display: patch.display }; };
+  h.ipcMain = { handle: (_channel, fn) => { handler = fn; } };
+  vm.runInNewContext(SET_DISPLAY, h, { filename: MAIN_FILE });
+  await assert.rejects(handler(null, { mode: 'fullscreen' }), /fixture rotation denied/);
+  assert.deepEqual(saved, ['fullscreen']);
+});
+
 test('VC++ repair cannot elevate on the automatic path; the explicit action remains available', async () => {
   let installs = 0;
   const h = { installVcRedistImpl: async () => { installs += 1; return { ok: true }; } };

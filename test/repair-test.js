@@ -56,13 +56,18 @@ test('超时 + 无加速：判为「慢」，给出低配重试，并要求 15 �
   assert(p.why.some((t) => /Android 12/.test(t)), '必须说明「换 12 也没用」，否则用户会继续试错方向');
 });
 
-test('TCG 崩溃：一键修复指向开启硬件加速，且不安排无意义的立刻重试', () => {
+test('TCG 模式下连续崩溃：保留加速入口，不断言根因或承诺修复', () => {
   const p = planOf('TCG_CRASH', { accel: { ok: false, kind: '', note: '' } });
   assert.strictEqual(p.level, 'slow');
   assert(p.actions.some((a) => a.id === 'accel' && a.kind === 'auto'), '缺「一键开启硬件加速」动作');
   assert.strictEqual(p.canAutoFix, true, '应当可以一键修复');
   assert(p.retry && p.retry.needsReboot === true, '开启后要重启，不能立刻重试');
-  assert(p.why.some((t) => /TCG/.test(t)), '要解释为什么换后端无效');
+  const text = [p.headline, ...p.why].join('；');
+  assert(/TCG/.test(text), '要保留发生崩溃时的软件模拟模式');
+  assert(/0xC0000005/.test(text), '要保留已记录的访问冲突退出码');
+  assert(/不能确认故障模块/.test(text), text);
+  assert(/不能保证修复访问冲突/.test(text), text);
+  assert(!/崩溃点在模拟器|而不是显卡驱动|唯一的真修复|才(?:能)?稳定开机/.test(text), text);
 });
 
 test('跨 GPU/加速组合连续崩溃：只导出报告，不自动再开机', () => {
@@ -143,6 +148,30 @@ test('只有 DLL 退出码时指出加载失败，不能断言缺 VC++ 或被杀
     assert(/尚未确认/.test(summary), summary);
   }
   assert.deepStrictEqual(selfHeal('DLL').actions, ['redeploy'], '未知原因不能触发系统运行库安装');
+});
+
+test('访问冲突的修复说明保留未知归因，不把显卡当成已确认原因', () => {
+  const { diagnose } = require('../src/core/doctor');
+  const { explainFailure } = require('../src/core/repair');
+  const diagnosis = diagnose(['emulator exit 3221225477']);
+  assert.strictEqual(diagnosis.code, 'ACCESS_VIOLATION');
+  const plan = buildPlan({ diagnosis, facts: facts() });
+  assert(/不能确定/.test(plan.headline), plan.headline);
+  assert(plan.why.some((text) => /不能直接归因于显卡/.test(text)), plan.why.join('；'));
+  assert(plan.actions.some(({ id }) => id === 'gpu-software'), '保留软件渲染排查入口');
+  assert(!/几乎都|都无关|一次就过|通常就能过|最有效/.test(JSON.stringify(plan)), JSON.stringify(plan));
+  const { summary } = explainFailure({ diagnosis, facts: facts() });
+  assert(/尚未确认/.test(summary), summary);
+  assert(!/显卡渲染那一层/.test(summary), summary);
+});
+
+test('渲染初始化失败的修复说明不保证软件渲染能开机或排除镜像', () => {
+  const plan = planOf('GPU_INIT');
+  const text = [plan.headline, ...plan.why].join('；');
+  assert(/初始化失败/.test(plan.headline), plan.headline);
+  assert(/不能排除/.test(text), text);
+  assert(/不能保证开机成功/.test(text), text);
+  assert(!/不是安卓镜像的问题|但能开机/.test(text), text);
 });
 
 test('镜像损坏：给重建数据与重下镜像，且都标记为「会动数据」', () => {

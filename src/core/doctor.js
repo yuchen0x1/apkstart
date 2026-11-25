@@ -132,6 +132,8 @@ function gpuCandidates(emulatorVersion) {
     : ['host', 'swiftshader_indirect', 'swiftshader', 'lavapipe'];
 }
 
+const MANUAL_GPU_MODES = new Set(['host', 'swangle', 'software', 'swiftshader', 'swiftshader_indirect', 'lavapipe', 'guest']);
+
 /** Windows 8.3 短路径：中文用户名 / 中文安装目录时 emulator 会找不到文件 */
 /** 屏幕规格：有硬件加速就上 720x1280（清晰），纯软件模拟降到 540x960（流畅优先） */
 function lcdFor({ accelOk = true, crisp = true } = {}) {
@@ -360,9 +362,12 @@ function chooseProfile({
   const dataMB = wantGB > 0 ? clamp(Math.round(wantGB * 1024), 2048, 65536) : autoDataMB;
 
   const gpus = gpuCandidates(emulatorVersion);
-  const gpuPinned = !!(overrides.gpuMode && overrides.gpuMode !== 'auto' && gpus.includes(overrides.gpuMode));
+  // Keep an explicit known backend even on an older runtime: if unsupported,
+  // report its GPU_MODE error instead of silently selecting a different one.
+  const gpuPinned = MANUAL_GPU_MODES.has(overrides.gpuMode);
   // 低配档把软件渲染排到最前；用户手动指定后端（gpuPinned）时完全不干预
-  let orderedGpus = !gpuPinned && spec ? [spec.gpu, ...gpus.filter((g) => g !== spec.gpu)] : gpus;
+  let orderedGpus = gpuPinned ? [overrides.gpuMode]
+    : spec ? [spec.gpu, ...gpus.filter((g) => g !== spec.gpu)] : gpus;
   // 远程桌面 / 只有 Microsoft Basic Display 的机器没有可用的宿主 OpenGL
   // 交换链。host 会白等 20 多秒再失败，直接把软件渲染排到第一位。
   if (!gpuPinned && gpuInfo && gpuInfo.preferSoftware) {
@@ -466,9 +471,10 @@ function planVariants(profile, { preferSoftware = false } = {}) {
   const out = [];
   const gpus = profile.gpuCandidates || [];
   const firstGpu = profile.gpu || gpus[0] || 'software';
-  const safeGpu = gpus.find((g) => /software|swiftshader/.test(g)) || firstGpu;
+  const safeGpu = profile.gpuPinned ? firstGpu
+    : gpus.find((g) => /software|swiftshader/.test(g)) || firstGpu;
   const fallbackGpus = gpus.filter((g) => g !== firstGpu && /software|swiftshader|swangle|lavapipe/.test(g));
-  const ordered = [firstGpu, ...fallbackGpus].slice(0, 2);
+  const ordered = profile.gpuPinned ? [firstGpu] : [firstGpu, ...fallbackGpus].slice(0, 2);
   if (preferSoftware && !profile.gpuPinned) {
     // 计划嵌入的 Windows 窗口优先「ANGLE + SwiftShader」(swangle)：它同样是软件渲染，不会出现 host
     // 后端失焦后交换链丢失导致的全黑，但合成路径对 WebView 友好得多。
@@ -599,13 +605,13 @@ const RULES = [
     // Windows 上 emulator/qemu 以 0xC0000005（十进制 3221225477）退出。
     // 只能说明「模拟器进程崩了」——常见诱因有显卡/Vulkan，也可能是 TCG、
     // 运行时与系统不兼容。实测存在 swiftshader / swangle / software 三种
-    // 软件后端全部同一退出码的情况，那时换后端毫无意义（见 tcgCrashDiagnosis）。
+    // 软件后端全部同一退出码的情况，应停止等价重试（见 tcgCrashDiagnosis）。
     // 必须排在 GPU_INIT 前面：崩溃日志里通常也带着渲染初始化信息，先判崩溃更准。
     re: /emulator exit 3221225477|exit code 3221225477|0xC0000005|STATUS_ACCESS_VIOLATION/i,
     title: '模拟器进程崩溃（0xC0000005 访问冲突）',
-    hint: '访问冲突只说明模拟器进程崩了，不一定是显卡：已自动换用其他渲染后端重试。'
-      + '若多个软件后端都崩在同一退出码，说明问题在模拟器/TCG 层，'
-      + '请启用 WHPX/AEHD 硬件加速或更新运行时，而不是反复调画质。',
+    hint: '访问冲突只说明模拟器进程崩了，不一定是显卡。启动流程会按当前配置进行有限重试。'
+      + '若多轮都崩在同一退出码，应停止重复尝试并导出报告；'
+      + '可启用 WHPX/AEHD 硬件加速或更新运行时，并排查驱动与系统组件。',
   },
   {
     code: 'GPU_INIT',
@@ -616,14 +622,14 @@ const RULES = [
     re: /Failed to initialize GL emulation|Could not initialize (OpenGL|emulated framebuffer)|Failed to create .*GLES|EGL_(BAD|NOT_INITIALIZED|CONTEXT_LOST)|Failed to (load|initialize) .*vulkan|Failed to create Vulkan instance|vulkan.*(failed|error)|UpdateLayeredWindowIndirect failed|emuglConfig_init.*failed|initOpenglesEmulation.*failed|No OpenGL ES (driver|renderer)|ANGLE.*(fail|error)/i,
     title: '显卡渲染后端初始化失败',
     hint: '日志里出现了 GL / Vulkan / ANGLE 初始化失败（常见是 VK_ERROR_INCOMPATIBLE_DRIVER）。'
-      + '已自动切换软件渲染重试；若仍黑屏，这是宿主渲染层的问题，安卓侧画面本身是好的。'
+      + '启动流程会按当前配置进行有限重试；手动指定的渲染后端会保持不变。'
       + '英特尔核显可以先更新显卡驱动，或在「设置 → 渲染后端」手动选 software。',
   },
   {
     code: 'GPU_MODE',
     re: /Unknown option|invalid .*-gpu|Unrecognized .*gpu|Unsupported gpu/i,
     title: '当前运行时不接受该 GPU 模式',
-    hint: '已自动按运行时版本挑选可用的 GPU 模式重试（老版本用 swiftshader_indirect，新版本用 software）。',
+    hint: '当前选择可能不受该运行时支持。请切回「自动」或更新运行时；手动指定的 GPU 模式不会被自动替换。',
   },
   {
     code: 'ACCEL',
@@ -802,19 +808,17 @@ function noAccelDiagnosis() {
 }
 
 /**
- * 「换了多种软件渲染后端，仍然全部 0xC0000005」的专用结论。
+ * 多轮 TCG 启动仍然以 0xC0000005 退出时的专用结论。
  *
- * 这时继续换 -gpu 参数是无效的：崩溃发生在模拟器/TCG 层，而不是 GLES 后端。
- * 典型现场：没有 WHPX/AEHD 的 Windows 机器被强制走 TCG，guest 内核命令行
- * 已经打印出来（说明镜像和引导没问题），随后 qemu 进程直接访问冲突。
- * 给出能真正改变结果的步骤：开硬件虚拟化、升级运行时、排查安全软件/RDP。
+ * 重复退出足以停止等价重试，但不能仅凭退出码定位到运行时或排除显卡驱动。
+ * 给出可以进一步排查的步骤：开硬件虚拟化、升级运行时、导出报告。
  */
 function tcgCrashDiagnosis() {
   return {
     code: 'TCG_CRASH',
-    title: '纯软件模拟（TCG）崩溃，换渲染后端无效',
-    hint: 'swiftshader / swangle / software 等多个软件后端都以 0xC0000005 退出，'
-      + '说明崩溃发生在模拟器本身而不是显卡驱动。请到「设置 → 性能与资源」点「一键开启硬件加速」，'
+    title: '纯软件模拟（TCG）下重复访问冲突',
+    hint: '多轮关闭硬件加速的启动尝试都以 0xC0000005 退出，'
+      + '当前证据不能确定是运行时、显卡驱动还是其他系统组件导致。请到「设置 → 性能与资源」点「一键开启硬件加速」，'
       + '程序会自动开启 WHPX 或安装 AEHD（会弹管理员授权，完成后重启电脑）；'
       + '若提示 BIOS 虚拟化未开，需先重启进 BIOS 打开 AMD SVM / Intel VT-x。'
       + '仍失败再更新运行时引擎并导出诊断报告。',
@@ -918,9 +922,11 @@ function describeProfile(p) {
     : p.accel === 'off' ? '请求软件模拟'
       : acceleration.confirmed === false ? '运行日志未确认硬件加速'
         : p.accelOk ? '检测到加速器（本次运行待确认）' : '未检测到可用加速器';
+  const gpuReason = !p.gpuPinned && /^(swangle|software|swiftshader(?:_indirect)?|lavapipe)$/.test(p.gpu)
+    && p.gpuInfo && p.gpuInfo.preferSoftware && p.gpuInfo.reasons && p.gpuInfo.reasons[0];
   return `${p.tuned ? '低配自动降级' : '自动'}：${(p.memoryMB / 1024).toFixed(1)}GB 内存 · ${p.cores} 核`
     + `${lcd ? ` · ${lcd}` : ''} · ${p.gpu} 渲染 · ${accel} · ${snap}`
-    + `${p.gpuInfo && p.gpuInfo.preferSoftware ? ' · 未检测到可用显卡，已自动软件渲染' : ''}`
+    + `${gpuReason ? ` · 自动软件渲染：${gpuReason}` : ''}`
     + `${p.lite ? ' · 轻量容器' : ''} · 端口 ${p.port}`;
 }
 

@@ -36,23 +36,27 @@ function classify(rows, { remoteSession = false, sessionName = '' } = {}) {
   const adapters = (Array.isArray(rows) ? rows : (rows ? [rows] : []))
     .map(normalizeRow).filter(Boolean);
   const physical = adapters.filter((a) => !PSEUDO.test(a.name) && !/^unknown$/i.test(a.name));
+  const pseudo = adapters.filter((a) => PSEUDO.test(a.name));
   const remote = !!remoteSession || /^rdp-/i.test(String(sessionName || ''));
   const hybrid = new Set(physical.map((a) => a.name.toLowerCase())).size >= 2;
+  const capability = physical.length ? 'hardware' : (pseudo.length ? 'software' : 'unknown');
   const reasons = [];
   if (remote) reasons.push('当前是远程桌面会话，宿主 OpenGL/Vulkan 交换链不可靠');
   if (!physical.length) {
-    reasons.push(adapters.length
-      ? `只检测到系统/远程伪显卡（${adapters.map((a) => a.name).join('、')}）`
-      : '未检测到显卡信息');
+    reasons.push(pseudo.length
+      ? `检测到系统/远程伪显卡（${pseudo.map((a) => a.name).join('、')}），未确认可用的物理显卡`
+      : '未能确认显卡能力（未获取到有效的显卡信息）');
   } else {
     reasons.push(`检测到 ${physical.map((a) => a.name).join(' + ')}${hybrid ? '（混合显卡）' : ''}`);
     const poor = physical.filter((a) => a.status && !/^ok$/i.test(a.status));
     if (poor.length) reasons.push(`显卡状态异常：${poor.map((a) => `${a.name}(${a.status})`).join('、')}`);
   }
-  const preferSoftware = remote || physical.length === 0;
+  // A failed/unsupported probe is not evidence that hardware rendering fails.
+  const preferSoftware = remote || (!physical.length && pseudo.length > 0);
   return {
     adapters,
     physical: physical.map((a) => a.name),
+    capability,
     hybrid,
     remoteSession: remote,
     hardware: physical.length > 0,
@@ -63,9 +67,9 @@ function classify(rows, { remoteSession = false, sessionName = '' } = {}) {
 
 function summary(info) {
   if (!info) return '未检测';
-  if (info.preferSoftware) return info.reasons[0] || '未检测到可用显卡';
-  const first = info.adapters.find((a) => !PSEUDO.test(a.name));
-  if (!first) return '未检测到可用显卡';
+  if (info.preferSoftware) return info.reasons[0] || '当前显示环境优先使用软件渲染';
+  const first = info.adapters.find((a) => !PSEUDO.test(a.name) && !/^unknown$/i.test(a.name));
+  if (!first) return info.reasons[0] || '未能确认显卡能力';
   return `${first.name}${first.driverVersion ? ` · 驱动 ${first.driverVersion}` : ''}`
     + `${info.hybrid ? ' · 混合显卡' : ''}`;
 }
@@ -87,6 +91,8 @@ async function probe({ force = false } = {}) {
   if (process.platform !== 'win32') {
     result = classify([], {});
     result.platform = process.platform;
+    result.error = 'unsupported-platform';
+    result.reasons = ['当前平台不支持显卡探测，显卡能力未知'];
   } else {
     const script = [
       '$rows = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |',
@@ -104,18 +110,20 @@ async function probe({ force = false } = {}) {
     ].join(' ');
     const text = await runPowerShell(script);
     let rows = [];
+    let error = text ? '' : 'wmi-unavailable';
     if (text) {
       try {
         const parsed = JSON.parse(text.replace(/^\uFEFF/, ''));
         rows = Array.isArray(parsed) ? parsed : [parsed];
-      } catch (_) { rows = []; }
+      } catch (_) { error = 'wmi-invalid-response'; }
     }
     result = classify(rows, {
       sessionName: process.env.SESSIONNAME || '',
       remoteSession: /^rdp-/i.test(process.env.SESSIONNAME || ''),
     });
     result.platform = 'win32';
-    if (!text) result.error = 'wmi-unavailable';
+    if (!error && !result.adapters.length) error = 'wmi-no-adapters';
+    if (error) result.error = error;
   }
   result.at = Date.now();
   result.summary = summary(result);

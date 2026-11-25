@@ -66,6 +66,12 @@ const UNSUPPORTED_FEATURES = {
   'android.hardware.microphone': '麦克风',
 };
 
+const VULKAN_FEATURES = new Set([
+  'android.hardware.vulkan.version',
+  'android.hardware.vulkan.level',
+  'android.software.vulkan.deqp.level',
+]);
+
 const LEVEL_TEXT = {
   ok: '完全兼容',
   partial: '基本兼容',
@@ -191,11 +197,16 @@ function analyze(info, env = {}) {
   // ── 硬件特性 ─────────────────────────────────────────────
   const feats = Array.isArray(info.features) ? info.features : [];
   const requiredMissing = [];
+  const requiredVulkan = [];
   for (const f of feats) {
     const name = typeof f === 'string' ? f : f.name;
     const required = typeof f === 'string' ? true : f.required !== false;
     if (!required) continue;
-    if (name === 'android.hardware.microphone' && e.audioInput === true) {
+    if (VULKAN_FEATURES.has(name)) {
+      const feature = { name };
+      if (Number.isInteger(f.version) && f.version >= 0) feature.version = f.version;
+      requiredVulkan.push(feature);
+    } else if (name === 'android.hardware.microphone' && e.audioInput === true) {
       add('info', 'microphone-available', '运行时支持麦克风输入（仅内置 Android Emulator 路径；是否真正可用还取决于系统隐私权限和主机设备）。');
     } else if (UNSUPPORTED_FEATURES[name]) {
       requiredMissing.push(UNSUPPORTED_FEATURES[name]);
@@ -206,6 +217,14 @@ function analyze(info, env = {}) {
     const uniq = [...new Set(requiredMissing)];
     add('warn', 'feature-missing',
       `要求这些硬件：${uniq.join('、')}。桌面运行时没有对应设备，相关功能会不可用（部分应用会因此直接拒绝启动）。`);
+  }
+  if (requiredVulkan.length) {
+    details.requiredVulkan = requiredVulkan;
+    degrade('risky');
+    const declared = requiredVulkan.map((f) => `${f.name}${f.version === undefined ? '' : `=${f.version}`}`).join('、');
+    add('warn', 'vulkan-unverified',
+      `应用要求 Vulkan（${declared}），但尚未从当前 Android 运行时内验证这些能力。`
+      + '主机显卡支持 Vulkan 或选择某个渲染后端，不能证明应用所需的 Vulkan 可用；应用可能无法启动。');
   }
 
   // ── 拆分 APK ─────────────────────────────────────────────

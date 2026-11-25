@@ -463,6 +463,76 @@ test('parent starts an owned foreground server only if the legacy port is free',
   assert.deepEqual(daemonCalls(f)[0].args, ['-L', 'tcp:localhost:5044', 'server', 'nodaemon']);
   assert.equal(f.calls.exec.length + f.calls.kill.length, 0);
 });
+test('parent explicit repair restarts only its owned daemon on the same binary and port', async (t) => {
+  const f = fixture(t, { isChild: false });
+  const sibling = fixture(t);
+  await f.helper.ensureServer({ adbPath: binary }); await sibling.init();
+  const route = f.helper.route();
+  const client = new f.AdbClient({ adbPath: binary, serial: 'emulator-5554' });
+  const repair = f.helper.restartServer({ adbPath: 'untrusted-replacement-adb' });
+  assert.equal(f.helper.restartServer({ adbPath: binary }), repair);
+  assert.equal(f.helper.ensureServer({ adbPath: binary }), repair);
+  assert.throws(() => f.helper.route(), { code: 'INSTANCE_ADB_NOT_READY' });
+  await assert.rejects(client.exec(['devices']), { code: 'INSTANCE_ADB_NOT_READY' });
+  assert.equal(await repair, route);
+  assert.equal(daemonCalls(f).length, 2);
+  assert.equal(f.calls.kill.length, 1);
+  assert.equal(f.calls.kill[0].proc, daemonCalls(f)[0].proc);
+  assert.deepEqual(daemonCalls(f)[1].args, daemonCalls(f)[0].args);
+  assert.equal(daemonCalls(f)[1].exe, binary);
+  assert.equal(f.calls.exec.length, 0);
+  assert.equal(sibling.calls.kill.length, 0);
+});
+test('parent repair cannot replace an owned daemon until its termination is confirmed', async (t) => {
+  const f = fixture(t, { isChild: false });
+  await f.helper.ensureServer({ adbPath: binary });
+  f.state.killMode = 'hang';
+  const rejected = assert.rejects(f.helper.restartServer(), { code: 'INSTANCE_ADB_STOP_TIMEOUT' });
+  await f.time.tick(5000); await rejected;
+  assert.equal(daemonCalls(f).length, 1);
+  assert.equal(f.calls.kill[0].proc, daemonCalls(f)[0].proc);
+  daemonCalls(f)[0].proc.exit(0);
+});
+test('parent repair bind race reports failure without touching the new listener', async (t) => {
+  const f = fixture(t, { isChild: false });
+  await f.helper.ensureServer({ adbPath: binary });
+  f.state.behavior = 'bind-race';
+  await assert.rejects(f.helper.restartServer(), { code: 'INSTANCE_ADB_EXITED' });
+  assert.equal(daemonCalls(f).length, 2);
+  assert.equal(f.calls.kill.length, 1);
+  assert.equal(f.calls.kill[0].proc, daemonCalls(f)[0].proc);
+  assert.equal(f.calls.exec.length + f.calls.connect.length, 0);
+});
+test('online checks require an exact authorized serial and never match a prefix', async (t) => {
+  const f = fixture(t); await f.init();
+  const serial = '127.0.0.1:5555';
+  const client = new f.AdbClient({ adbPath: binary, serial });
+  for (const [rows, expected] of [
+    [`${serial}\tdevice\n`, true],
+    [`${serial}0\tdevice\n`, false],
+    [`${serial}\toffline\n${serial}0\tdevice\n`, false],
+    [`${serial}\tunauthorized\n${serial}0\tdevice\n`, false],
+    [`${serial}\tno permissions\n`, false],
+    ['', false],
+  ]) {
+    f.state.execHook = () => ({ stdout: `List of devices attached\n${rows}` });
+    assert.equal(await client.isOnline(), expected, rows);
+  }
+});
+test('online checks without a serial require exactly one authorized device', async (t) => {
+  const f = fixture(t); await f.init();
+  const client = new f.AdbClient({ adbPath: binary });
+  for (const [rows, expected] of [
+    ['', false], ['a\tdevice\n', true], ['a\toffline\n', false],
+    ['a\tunauthorized\n', false], ['a\tdevice\nb\tdevice\n', false],
+    ['a\tdevice\nb\toffline\n', false],
+  ]) {
+    f.state.execHook = () => ({ stdout: `List of devices attached\n${rows}` });
+    assert.equal(await client.isOnline(), expected, rows);
+  }
+  f.state.execHook = () => ({ error: new Error('ADB unavailable') });
+  assert.equal(await client.isOnline(), false);
+});
 test('child clients cannot override route or issue server-control commands', async (t) => {
   const f = fixture(t); await f.init(); const client = new f.AdbClient({ adbPath: binary });
   for (const args of [['kill-server'], ['start-server'], ['-P', '5044', 'devices'], ['-L', 'tcp:5037', 'devices']]) {
