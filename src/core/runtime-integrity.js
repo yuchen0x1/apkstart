@@ -120,8 +120,8 @@ function parsePlatformTools(input, host = process.platform, arch = process.arch)
     throw failure(`没有适合 ${host}/${arch} 的可信 platform-tools 包，请按 Android 官方说明手动安装`);
   }
   const source = String(input);
-  if (/--!>/.test(source)) throw failure('Google 官方索引含无效的注释结束标记');
-  const xml = source.replace(/<!--[\s\S]*?(?:--!>|-->)/g, '').trim();
+  const xml = source.replace(/<!--[\s\S]*?--!?>/g, '').trim();
+  if (source.includes('--!>')) throw failure('Google 官方索引含无效的注释结束标记');
   // A malformed or nested comment must fail closed; never pass a residual
   // comment marker into the restricted tag scanner.
   if (/<!--|-->/.test(xml)
