@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { after, test } = require('node:test');
 const {
-  Sources, classifyFailure, getJsonResponse, rateLimitUntil,
+  Sources, buildGithubProxyUrl, classifyFailure, getJsonResponse, isGithubProxyHost, rateLimitUntil,
 } = require('../src/core/sources');
 const {
   createLatestManifest,
@@ -167,6 +167,38 @@ test('default static URL is the official Release latest.json endpoint', async ()
   });
   await sources.latest();
   assert.deepEqual(calls, [`${repo}/releases/latest/download/latest.json`]);
+});
+
+test('GH-Proxy URL is derived only for exact public ApkStart Release assets', () => {
+  const asset = releaseAssetDescriptors('v1.2.3')[0];
+  const official = releaseUrl('v1.2.3', asset.name);
+  assert.equal(
+    buildGithubProxyUrl(official),
+    `https://gh-proxy.org/${official}`,
+  );
+
+  const sources = new Sources(() => ({}));
+  assert.deepEqual(sources.releaseDownloadRoutes({ url: official }).map((route) => route.source), [
+    'github',
+    'gh-proxy',
+  ]);
+  for (const url of [
+    'https://github.com/yuchen0x1/apkstart/releases/latest/download/latest.json',
+    'https://github.com/yuchen0x1/apkstart/archive/refs/tags/v1.2.3.zip',
+    'https://github.com/other/repo/releases/download/v1.2.3/file.zip',
+    `https://github.com/yuchen0x1/apkstart/releases/download/v1.2.3/${asset.name}?token=secret`,
+    `https://user@github.com/yuchen0x1/apkstart/releases/download/v1.2.3/${asset.name}`,
+    `http://github.com/yuchen0x1/apkstart/releases/download/v1.2.3/${asset.name}`,
+    `https://github.com.evil.invalid/yuchen0x1/apkstart/releases/download/v1.2.3/${asset.name}`,
+  ]) {
+    assert.equal(buildGithubProxyUrl(url), '', url);
+  }
+  assert.deepEqual(sources.releaseDownloadRoutes({ url: 'https://api.github.com/releases/latest' }), []);
+  assert.equal(isGithubProxyHost('https://gh-proxy.org/file'), true);
+  assert.equal(isGithubProxyHost('https://sub.gh-proxy.org/file'), false);
+  assert.equal(isGithubProxyHost('http://gh-proxy.org/file'), false);
+  assert.equal(isGithubProxyHost('https://user@gh-proxy.org/file'), false);
+  assert.equal(isGithubProxyHost('https://gh-proxy.org:8443/file'), false);
 });
 
 test('static timeout falls back to exactly one GitHub latest-release request', async () => {

@@ -201,6 +201,12 @@ test('官方 metadata 按稳定版、host-os、revision 和对应 checksum 成�
   }
 });
 
+test('well-formed XML comments are ignored without treating metadata as HTML', () => {
+  const xml = sdk(`<!-- repository metadata -->${pkg(archive('windows'))}<!-- end -->`);
+  const component = integrity().parsePlatformTools(xml, 'win32', 'x64');
+  assert.equal(component.version, '37.0.3');
+});
+
 for (const [label, xml] of [
   ['缺 checksum', metadata({ sum: null })],
   ['空 checksum', metadata({ sum: '' })],
@@ -215,6 +221,9 @@ for (const [label, xml] of [
   ['重复稳定版本', sdk(pkg(archive('windows')), pkg(archive('windows')))],
   ['仅 preview', sdk(pkg(archive('windows'), { channel: 'channel-1' }))],
   ['仅注释里的包', sdk(`<!--${pkg(archive('windows'))}-->`)],
+  ['未闭合注释', sdk(`<!--${pkg(archive('windows'))}`)],
+  ['注释嵌套残留', sdk(`<!-- outer <!--${pkg(archive('windows'))}-->`)],
+  ['HTML 风格无效注释结束标记', sdk(`<!--${pkg(archive('windows'))}--!>`)],
   ['缺少根结束标记', metadata().replace('</sdk:sdk-repository>', '')],
   ['实体声明', '<!DOCTYPE sdk [<!ENTITY external SYSTEM="file:///private">]>' + metadata()],
 ]) {

@@ -21,7 +21,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { tidy } = require('./release-notes');
+const { tidy, escapeRe, hasVersionHeading } = require('./release-notes');
 
 const START = { version: '<!-- version:start -->', latest: '<!-- latest:start -->' };
 const END = { version: '<!-- version:end -->', latest: '<!-- latest:end -->' };
@@ -31,8 +31,7 @@ function changelogSection(root, version) {
   const p = path.join(root, 'CHANGELOG.md');
   if (!fs.existsSync(p)) return null;
   const lines = fs.readFileSync(p, 'utf8').replace(/\r\n?/g, '\n').split('\n');
-  const hit = new RegExp(`^## .*\\[${version.replace(/\./g, '\\.')}\\]`);
-  const i = lines.findIndex((l) => hit.test(l));
+  const i = lines.findIndex((line) => hasVersionHeading(line, version));
   if (i < 0) return null;
   const body = [];
   for (let j = i + 1; j < lines.length; j += 1) {
@@ -123,10 +122,6 @@ function applyBlocks(text, blocks) {
   return out;
 }
 
-function escapeRe(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /**
  * 计算 README 应有的内容。
  * @returns {{expected:string, current:string, version:string, changed:boolean, missingSection:boolean}}
@@ -136,7 +131,7 @@ function plan(opts = {}) {
   const readmePath = path.join(root, 'README.md');
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const version = String(opts.tag || pkg.version || '').replace(/^v/i, '');
-  if (!/^\d+\.\d+\.\d+/.test(version)) throw new Error(`版本号不合法：${version}`);
+  if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error(`版本号不合法：${version}`);
   const section = changelogSection(root, version);
   const current = fs.readFileSync(readmePath, 'utf8');
   const expected = tidy(applyBlocks(current, renderBlocks({ version, section })));

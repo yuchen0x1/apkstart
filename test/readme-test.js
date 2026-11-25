@@ -11,8 +11,9 @@
  */
 const assert = require('assert');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { plan, renderBlocks, sectionSummary, START, END } = require('../tools/update-readme');
+const { plan, renderBlocks, sectionSummary, changelogSection, START, END } = require('../tools/update-readme');
 
 const ROOT = path.join(__dirname, '..');
 const results = [];
@@ -70,6 +71,22 @@ async function test(name, fn) {
   await test('导语（CHANGELOG 段首的 > 摘要）会被带进 README', () => {
     const { intro } = sectionSummary('> 一句话总结本版。\n\n### 新增\n- 某条\n');
     assert(intro === '一句话总结本版。', `导语解析失败：${intro}`);
+  });
+
+  await test('CHANGELOG 版本标题按标签精确匹配，不解释正则元字符', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-readme-'));
+    fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), [
+      '## [1.2.3.*] — 2026-01-01',
+      '',
+      '字面量版本',
+      '',
+      '## [1.2.3XYZ] — 2026-01-01',
+      '',
+      '不应被通配符命中',
+    ].join('\n'), 'utf8');
+    const section = changelogSection(dir, '1.2.3.*');
+    assert(section && section.body.includes('字面量版本'));
+    assert(!section.body.includes('不应被通配符命中'));
   });
 
   await test('版本区块只替换标记之间的内容', () => {

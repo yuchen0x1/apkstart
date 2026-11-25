@@ -359,6 +359,76 @@ async function main() {
     assert(fs.existsSync(zip) && fs.existsSync(job.payload), '拒绝时保留载荷和原始 ZIP');
   });
 
+  await test('Updater.prepare 使用顺序下载线路，并在安装前继续校验签名资产', async () => {
+    const root = mkTmp();
+    const crypto = require('crypto');
+    const http = require('http');
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+    const version = '9.9.9';
+    const { repo, assetNames } = require('../src/core/release-manifest');
+    const name = assetNames('v' + version).portable;
+    const archive = writeZip(path.join(root, name), [
+      { name: 'ApkStart.exe', data: 'MZ-new' },
+      { name: 'resources/app/package.json', data: JSON.stringify({ version }) },
+      { name: 'resources/app/src/main.js', data: 'code-new' },
+    ]);
+    const bytes = fs.readFileSync(archive);
+    const hash = crypto.createHash('sha256').update(bytes).digest('hex');
+    const proofData = Buffer.from(JSON.stringify({
+      schema: 1, repository: repo, tag: 'v' + version,
+      assets: [{ name, size: bytes.length, sha256: hash }],
+    }));
+    const signature = crypto.sign(null, proofData, privateKey).toString('base64');
+    const info = {
+      version, tag: 'v' + version, manifestKind: 'legacy',
+      proof: `<!-- apkstart-manifest ${proofData.toString('base64')} ${signature} -->`,
+      asset: {
+        name, size: bytes.length, digest: `sha256:${hash}`,
+        url: `${repo}/releases/download/v${version}/${name}`,
+      },
+    };
+
+    let requests = 0;
+    let authorizationSeen = false;
+    const server = http.createServer((req, res) => {
+      requests += 1;
+      authorizationSeen ||= Boolean(req.headers.authorization);
+      const range = /^bytes=(\d+)-(\d*)$/.exec(String(req.headers.range || ''));
+      if (range && range[1] === '0' && range[2] === '0') {
+        res.writeHead(206, {
+          'Content-Length': 1,
+          'Content-Range': `bytes 0-0/${bytes.length}`,
+          ETag: '"updater-fixture"',
+        });
+        res.end(bytes.subarray(0, 1));
+        return;
+      }
+      res.writeHead(200, { 'Content-Length': bytes.length, ETag: '"updater-fixture"' });
+      res.end(bytes);
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    try {
+      const u = mkUpdater(root, { publicKey });
+      const localUrl = `http://127.0.0.1:${server.address().port}/release.zip`;
+      u.sources.releaseDownloadRoutes = () => [{
+        source: 'github', name: 'GitHub official', url: localUrl,
+      }];
+      const job = await u.prepare(info);
+      eq(job.version, version);
+      eq(job.mode, 'zip');
+      eq(job.sha256, hash);
+      assert(requests >= 2, 'must probe and download the signed release payload');
+      eq(authorizationSeen, false);
+      assert(fs.existsSync(job.payload), 'only the verified payload is returned for installation');
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   await test('apply 前置校验：载荷不存在时直接拒绝，不生成脚本', async () => {
     const root = mkTmp();
     const u = mkUpdater(root);
