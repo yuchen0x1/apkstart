@@ -311,7 +311,7 @@ async function applyLocale(client, locale = LOCALE_TAG) {
   }
   const setting = String(await client.shell('settings get system system_locales', { timeout: 10000 })
     .catch(() => '')).trim();
-  const want = String(locale).replace('-', '-');
+  const want = String(locale);
   const ok = setting.split(',').map((x) => x.trim()).includes(want);
   return { ok, setting, results, error: ok ? '' : `系统语言写入失败（当前值：${setting || '空'}）` };
 }

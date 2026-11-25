@@ -215,6 +215,8 @@ for (const [label, xml] of [
   ['重复稳定版本', sdk(pkg(archive('windows')), pkg(archive('windows')))],
   ['仅 preview', sdk(pkg(archive('windows'), { channel: 'channel-1' }))],
   ['仅注释里的包', sdk(`<!--${pkg(archive('windows'))}-->`)],
+  ['未闭合注释', sdk(`<!--${pkg(archive('windows'))}`)],
+  ['注释嵌套残留', sdk(`<!-- outer <!--${pkg(archive('windows'))}-->`)],
   ['缺少根结束标记', metadata().replace('</sdk:sdk-repository>', '')],
   ['实体声明', '<!DOCTYPE sdk [<!ENTITY external SYSTEM="file:///private">]>' + metadata()],
 ]) {

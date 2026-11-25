@@ -26,6 +26,19 @@ const { execFileSync } = require('child_process');
 
 const DEFAULT_REPO = 'yuchen0x1/apkstart';
 
+/** Escape arbitrary text before embedding it in a regular expression. */
+function escapeRe(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function hasVersionHeading(line, version) {
+  if (!String(line).startsWith('## ')) return false;
+  for (const match of String(line).matchAll(/\[([^\]]+)\]/g)) {
+    if (match[1] === String(version)) return true;
+  }
+  return false;
+}
+
 /** 去掉正文开头重复的 H1 版本标题（`# ApkStart v0.6.4` / `# ApkStart v0.3.5 发行说明`） */
 function stripTitle(raw) {
   let s = String(raw || '').replace(/^﻿/, '').replace(/\r\n?/g, '\n');
@@ -57,10 +70,9 @@ function fromChangelog(root, tag) {
   if (!fs.existsSync(p)) return null;
   const ver = String(tag).replace(/^v/i, '');
   const lines = fs.readFileSync(p, 'utf8').replace(/\r\n?/g, '\n').split('\n');
-  const hit = new RegExp(`^## .*\\[${ver.replace(/\./g, '\\.')}\\]`);
   const isHeading = (l) => /^## /.test(l);
   const isFooter = (l) => /^\[\d+\.\d+\.\d+[^\]]*\]:\s/.test(l);
-  let i = lines.findIndex((l) => hit.test(l));
+  let i = lines.findIndex((line) => hasVersionHeading(line, ver));
   if (i < 0) return null;
   const out = [];
   for (let j = i + 1; j < lines.length; j += 1) {
@@ -171,7 +183,7 @@ function buildNotes(opts = {}) {
   const root = opts.root || path.resolve(__dirname, '..');
   const tag = String(opts.tag || '').replace(/^v/i, '');
   const repo = opts.repo || DEFAULT_REPO;
-  if (!/^\d+\.\d+\.\d+/.test(tag)) throw new Error(`版本号不合法：${opts.tag}`);
+  if (!/^\d+\.\d+\.\d+$/.test(tag)) throw new Error(`版本号不合法：${opts.tag}`);
   const vtag = `v${tag}`;
   const attempts = [
     ['release-notes', () => fromFile(root, vtag)],
@@ -185,7 +197,10 @@ function buildNotes(opts = {}) {
   throw new Error(`找不到 ${vtag} 的任何发行说明来源（release-notes 文件 / CHANGELOG / git log）`);
 }
 
-module.exports = { buildNotes, stripTitle, tidy, fromFile, fromChangelog, fromGit, appendBasics, supportsLinux };
+module.exports = {
+  buildNotes, stripTitle, tidy, fromFile, fromChangelog, fromGit, appendBasics,
+  supportsLinux, escapeRe, hasVersionHeading,
+};
 
 if (require.main === module) {
   const argv = process.argv.slice(2);

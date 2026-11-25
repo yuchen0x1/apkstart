@@ -141,6 +141,21 @@ test('合并标题（[8.0.0] / [7.0.0]）里任一版本都能命中', () => {
   assert.strictEqual(fromChangelog(dir, 'v8.0.0').trim(), '两个版本一起发');
 });
 
+test('CHANGELOG 版本标题按标签精确匹配，不解释正则元字符', () => {
+  const dir = fixture({
+    'CHANGELOG.md': [
+      '## [1.2.3.*] — 2026-01-01',
+      '',
+      '字面量版本',
+      '',
+      '## [1.2.3XYZ] — 2026-01-01',
+      '',
+      '不应被通配符命中',
+    ].join('\n'),
+  });
+  assert.strictEqual(fromChangelog(dir, 'v1.2.3.*').trim(), '字面量版本');
+});
+
 test('三级兜底：都没有时用 git log 生成提交列表（不是 Full Changelog 一行）', () => {
   let gitOk = true;
   try { execFileSync('git', ['--version'], { stdio: 'ignore' }); } catch (_) { gitOk = false; }

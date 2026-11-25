@@ -24,6 +24,7 @@ const REPOSITORY = 'apkstart';
 const API_BASE = `https://api.github.com/repos/${OWNER}/${REPOSITORY}`;
 
 const MANIFEST_URL = `https://github.com/${OWNER}/${REPOSITORY}/releases/latest/download/${latestManifestName}`;
+const GITHUB_PROXY_HOST = 'gh-proxy.org';
 const CACHE_TTL = 30 * 60 * 1000;
 const MAX_BACKOFF_MS = 6 * 60 * 60 * 1000;
 const MAX_JSON_BYTES = 4 * 1024 * 1024;
@@ -34,6 +35,27 @@ const MAX_JSON_BYTES = 4 * 1024 * 1024;
  * 会把「延迟高但带宽大」的源误判成慢。256KB 能把两者分开，流量也可以接受。
  */
 const SAMPLE_BYTES = 256 * 1024;
+
+/**
+ * GH-Proxy is only a transport fallback for known public ApkStart Release assets.
+ * Keep manifest/API URLs and arbitrary GitHub URLs on their original hosts.
+ */
+function buildGithubProxyUrl(raw) {
+  let url;
+  try { url = new URL(raw); } catch (_) { return ''; }
+  if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com'
+    || url.username || url.password || url.port || url.search || url.hash) return '';
+  const match = /^\/yuchen0x1\/apkstart\/releases\/download\/(v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\/([^/]+)$/.exec(url.pathname);
+  if (!match || !new Set(Object.values(assetNames(match[1]))).has(match[2])) return '';
+  return `https://${GITHUB_PROXY_HOST}/${url.href}`;
+}
+
+function isGithubProxyHost(target) {
+  let url;
+  try { url = target instanceof URL ? target : new URL(target); } catch (_) { return false; }
+  return url.protocol === 'https:' && !url.username && !url.password && !url.port
+    && url.hostname.toLowerCase() === GITHUB_PROXY_HOST;
+}
 
 class HttpStatusError extends Error {
   constructor(url, response) {
@@ -103,7 +125,7 @@ function classifyFailure(error, response) {
 function allowlistedManifestRedirect(raw) {
   let url;
   try { url = new URL(raw); } catch (_) { return false; }
-  if (url.protocol !== 'https:') return false;
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return false;
   const host = url.hostname.toLowerCase();
   return host === 'github.com' || host === 'api.github.com'
     || host === 'githubusercontent.com' || host.endsWith('.githubusercontent.com')
@@ -525,7 +547,8 @@ class Sources {
       }, (target) => {
         try {
           const final = target instanceof URL ? target : new URL(target);
-          return final.protocol === 'https:' && final.hostname.toLowerCase() === new URL(this.apiBase).hostname.toLowerCase();
+          return final.protocol === 'https:' && !final.username && !final.password && !final.port
+            && final.hostname.toLowerCase() === new URL(this.apiBase).hostname.toLowerCase();
         } catch (_) { return false; }
       });
       if (response.status < 200 || response.status >= 300) {
@@ -536,7 +559,8 @@ class Sources {
       }
       if (response.finalUrl) {
         const final = new URL(response.finalUrl);
-        if (final.protocol !== 'https:' || final.hostname.toLowerCase() !== new URL(this.apiBase).hostname.toLowerCase()) {
+        if (final.protocol !== 'https:' || final.username || final.password || final.port
+          || final.hostname.toLowerCase() !== new URL(this.apiBase).hostname.toLowerCase()) {
           throw new Error('GitHub API 重定向到不受信任的地址');
         }
       }
@@ -620,6 +644,17 @@ class Sources {
     return out;
   }
 
+  /** Official Release first; add one proxy transport only for an exact known asset URL. */
+  releaseDownloadRoutes(asset) {
+    const officialUrl = asset && typeof asset.url === 'string' ? asset.url : '';
+    const proxyUrl = buildGithubProxyUrl(officialUrl);
+    if (!proxyUrl) return [];
+    return [
+      { source: 'github', name: 'GitHub 官方线路', url: officialUrl },
+      { source: 'gh-proxy', name: 'GH-Proxy 备用线路', url: proxyUrl },
+    ];
+  }
+
   /**
    * 按实测速度排序候选地址。测速结果缓存 30 分钟；
    * 全部测速失败就退回原始顺序（保证「最坏情况还是能下」）。
@@ -681,4 +716,5 @@ class Sources {
 module.exports = {
   Sources, measure, openUrl, getJsonResponse, HttpStatusError,
   rateLimitUntil, isRateLimited, classifyFailure,
+  buildGithubProxyUrl, isGithubProxyHost,
 };

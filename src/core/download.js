@@ -303,6 +303,48 @@ function discardPartial(dest) {
   for (const file of [dest, `${dest}.download.json`, `${dest}.chunks.json`]) fs.rmSync(file, { force: true });
 }
 
+/**
+ * Download destinations live below the app-owned update directory. Refuse
+ * aliases before any stream or rename can follow them into another directory.
+ * Missing components are allowed because the caller creates the parent first.
+ */
+function assertSafeDownloadPath(file, { allowMissing = true, label = '下载文件' } = {}) {
+  const absolute = path.resolve(file);
+  let leaf = null;
+  try {
+    leaf = fs.lstatSync(absolute);
+  } catch (error) {
+    if (!allowMissing || error.code !== 'ENOENT') throw error;
+  }
+  if (leaf) {
+    if (leaf.isSymbolicLink()) throw new Error(`${label}不能是符号链接或 junction`);
+    if (!leaf.isFile()) throw new Error(`${label}不是普通文件`);
+    if (leaf.nlink > 1) throw new Error(`${label}不能是硬链接`);
+  }
+
+  let current = path.dirname(absolute);
+  for (;;) {
+    let stat;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        const parent = path.dirname(current);
+        if (parent === current) break;
+        current = parent;
+        continue;
+      }
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new Error(`${label}父路径不能包含符号链接或 junction`);
+    if (!stat.isDirectory()) throw new Error(`${label}父路径不是目录`);
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return absolute;
+}
+
 function contentRange(res) {
   const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(res.headers['content-range'] || ''));
   if (!m) return null;
@@ -731,7 +773,9 @@ async function downloadMulti(urls, dest, opt = {}) {
 
   const list = [...new Set((urls || []).filter(Boolean))];
   if (!list.length) throw new Error('没有可用的下载地址');
-  if (list.length === 1) return downloadParallel(list[0], dest, opt);
+  const forceMulti = opt.forceMulti === true;
+  if (forceMulti && !checksum) throw new Error('顺序线路分块续传需要可信文件摘要');
+  if (list.length === 1 && !forceMulti) return downloadParallel(list[0], dest, opt);
   // 没有可信摘要时，多个镜像只能作为故障转移，不能把不同镜像的块拼在一起。
   // downloadAnyParallel 仍保留单个源的 ETag/final URL 锁定与分块能力。
   if (!checksum) return downloadAnyParallel(list, dest, opt);
@@ -769,7 +813,7 @@ async function downloadMulti(urls, dest, opt = {}) {
   // 地址排除，因此基准必须取测速后排在最前面的可用地址。
   const total = usable[0].total;
   const same = usable.filter((p) => p.total === total);
-  if (same.length === 1 || total < minChunk * 2) {
+  if ((!forceMulti && same.length === 1) || total < minChunk * 2) {
     return downloadParallel(same[0].url, dest, opt);
   }
 
@@ -982,6 +1026,106 @@ async function downloadMulti(urls, dest, opt = {}) {
   return { file: dest, size, parallel: n, sources: same.length, multi: true, resumed: resume };
 }
 
+/**
+ * Try transport routes in the supplied order, keeping a separate resumable file
+ * per route. This is for signed release assets where route priority matters.
+ */
+async function downloadWithFallback(routes, dest, opt = {}) {
+  if (opt.signal && opt.signal.aborted) throw new Error('下载已取消');
+  const list = (routes || []).filter((route) => route && route.url);
+  if (!list.length) throw new Error('没有可用的下载地址');
+  const slowBps = Number(opt.slowBps) > 0 ? Number(opt.slowBps) : 128 * 1024;
+  const slowWindowMs = Number(opt.slowWindowMs) > 0 ? Number(opt.slowWindowMs) : 15000;
+  const slowWindows = Math.max(1, Math.floor(Number(opt.slowWindows) || 2));
+  const errors = [];
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  assertSafeDownloadPath(dest, { label: '更新目标文件' });
+
+  for (let index = 0; index < list.length; index += 1) {
+    const route = list[index];
+    const staged = `${dest}.route-${index + 1}.part`;
+    assertSafeDownloadPath(staged, { label: `${route.name || `线路 ${index + 1}`}暂存文件` });
+    assertSafeDownloadPath(`${staged}.download.json`, { label: `${route.name || `线路 ${index + 1}`}下载状态` });
+    assertSafeDownloadPath(`${staged}.chunks.json`, { label: `${route.name || `线路 ${index + 1}`}分块状态` });
+    const controller = new AbortController();
+    let slowError = null;
+    let externallyAborted = false;
+    let sampleAt = 0;
+    let sampleBytes = 0;
+    let lowWindows = 0;
+    const abortFromCaller = () => {
+      externallyAborted = true;
+      controller.abort();
+    };
+    if (opt.signal) {
+      opt.signal.addEventListener('abort', abortFromCaller, { once: true });
+      if (opt.signal.aborted) abortFromCaller();
+    }
+    const onProgress = (progress) => {
+      opt.onProgress?.({ ...progress, route: route.source || '' });
+      if (!progress || !Number.isFinite(progress.got) || progress.got <= 0 || controller.signal.aborted) return;
+      const now = Date.now();
+      if (!sampleAt) {
+        sampleAt = now;
+        sampleBytes = progress.got;
+        return;
+      }
+      const elapsed = now - sampleAt;
+      if (elapsed < slowWindowMs) return;
+      const speed = Math.max(0, (progress.got - sampleBytes) / (elapsed / 1000));
+      lowWindows = speed < slowBps ? lowWindows + 1 : 0;
+      sampleAt = now;
+      sampleBytes = progress.got;
+      if (lowWindows >= slowWindows) {
+        slowError = new Error(`下载速度连续低于 ${Math.round(slowBps / 1024)} KB/s`);
+        controller.abort();
+      }
+    };
+
+    try {
+      opt.onRoute?.({ route, index, previousError: errors.at(-1) || '' });
+      // Run one route at a time. Signed-checksum chunk metadata makes retries
+      // resumable without mixing bytes from the next route.
+      const result = await downloadMulti([route.url], staged, {
+        ...opt,
+        forceMulti: true,
+        redirectAllowlist: route.redirectAllowlist || opt.redirectAllowlist,
+        signal: controller.signal,
+        onProgress,
+      });
+      if (externallyAborted || (opt.signal && opt.signal.aborted)) throw new Error('下载已取消');
+      const size = fs.statSync(staged).size;
+      if (Number(opt.expectedSize) > 0 && size !== Number(opt.expectedSize)) {
+        fs.rmSync(staged, { force: true });
+        fs.rmSync(`${staged}.download.json`, { force: true });
+        fs.rmSync(`${staged}.chunks.json`, { force: true });
+        throw new Error(`下载文件大小不符（收到 ${size}，期望 ${Number(opt.expectedSize)} 字节）`);
+      }
+
+      // The staged file has passed its signed SHA-256 and size checks. The
+      // same-directory rename publishes it atomically, replacing an old cache.
+      assertSafeDownloadPath(staged, { label: `${route.name || `线路 ${index + 1}`}暂存文件` });
+      assertSafeDownloadPath(dest, { label: '更新目标文件' });
+      fs.renameSync(staged, dest);
+      for (let routeIndex = 0; routeIndex < list.length; routeIndex += 1) {
+        const other = `${dest}.route-${routeIndex + 1}.part`;
+        for (const suffix of ['', '.download.json', '.chunks.json']) {
+          fs.rmSync(`${other}${suffix}`, { force: true });
+        }
+      }
+      return { ...result, file: dest, size, url: route.url, source: route.source || '' };
+    } catch (error) {
+      if (externallyAborted || (opt.signal && opt.signal.aborted)) throw new Error('下载已取消');
+      const reason = slowError || error;
+      const name = String(route.name || `线路 ${index + 1}`).replace(/[\r\n]/g, ' ').slice(0, 80);
+      errors.push(`${name}：${reason.message || reason}`);
+    } finally {
+      if (opt.signal) opt.signal.removeEventListener('abort', abortFromCaller);
+    }
+  }
+  throw new Error(`所有下载线路均失败：${errors.join('；')}`);
+}
+
 /** 依次尝试多个源（并行分块版），任一成功即返回 */
 async function downloadAnyParallel(urls, dest, opt = {}) {
   const errors = [];
@@ -999,5 +1143,6 @@ async function downloadAnyParallel(urls, dest, opt = {}) {
 }
 
 module.exports = {
-  download, downloadAny, downloadParallel, downloadAnyParallel, downloadMulti, head, sha256File, hashFile, openStream,
+  download, downloadAny, downloadParallel, downloadAnyParallel, downloadMulti,
+  downloadWithFallback, assertSafeDownloadPath, head, sha256File, hashFile, openStream,
 };

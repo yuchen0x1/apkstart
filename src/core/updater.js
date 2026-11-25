@@ -19,13 +19,13 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const { downloadAnyParallel, downloadMulti, sha256File } = require('./download');
+const { downloadAnyParallel, downloadWithFallback, sha256File } = require('./download');
 const { ZipFile, safeEntryPath } = require('./zip');
 const { cmpVer } = require('./version');
 const {
   assetNames, readManifest, matchAsset, marker, verifyLatestManifest, matchLatestAsset,
 } = require('./release-manifest');
-const { Sources } = require('./sources');
+const { Sources, isGithubProxyHost } = require('./sources');
 const processOwner = require('./process-owner');
 
 const OWNER = 'yuchen0x1';   // 只检查本仓库的发布
@@ -42,7 +42,7 @@ const SKIP_ENTRY = /(^|\/)(__MACOSX|\.DS_Store|Thumbs\.db)(\/|$)/i;
 function isGithubDownloadHost(target) {
   let url;
   try { url = target instanceof URL ? target : new URL(target); } catch (_) { return false; }
-  if (url.protocol !== 'https:') return false;
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return false;
   const host = url.hostname.toLowerCase();
   return host === 'github.com' || host === 'githubusercontent.com'
     || host.endsWith('.githubusercontent.com')
@@ -299,16 +299,31 @@ class Updater {
       await this._downloadParts(it.asset, file, conns, total);
     } else {
       this.onProgress({ stage: 'download', percent: 1, message: `正在下载 ${it.asset.name}…` });
-      // The signed manifest supplies the only release URL; proxy handling is automatic.
-      const cands = this.sources.candidates(it.asset);
-      const ranked = await this.sources.rank(cands, { onProgress: (p) => this.onProgress(p) }).catch(() => cands);
-      const sizes = it.asset.sizes || {};
-      for (const u of ranked) {
-        if (sizes[u]) { total = sizes[u]; break; }
+      const routes = this.sources.releaseDownloadRoutes(it.asset).map((route) => ({
+        ...route,
+        redirectAllowlist: route.source === 'gh-proxy'
+          ? (target) => isGithubDownloadHost(target) || isGithubProxyHost(target)
+          : isGithubDownloadHost,
+      }));
+      if (!routes.length || routes[0].source !== 'github') {
+        throw new Error('签名清单没有可用的官方 Release 下载地址');
       }
-      await downloadMulti(ranked, file, {
+      total = it.asset.size || total;
+      await downloadWithFallback(routes, file, {
         connections: conns,
-        redirectAllowlist: isGithubDownloadHost,
+        retries: 2,
+        expectedSize: it.asset.size,
+        expectSha256: it.asset.digest.replace(/^sha256:/, ''),
+        slowBps: 128 * 1024,
+        slowWindowMs: 15000,
+        slowWindows: 2,
+        onRoute: ({ index }) => this.onProgress({
+          stage: 'download',
+          percent: 1,
+          message: index === 0
+            ? '正在连接官方下载线路…'
+            : '官方线路暂不可用或速度过慢，正在切换备用加速线路…',
+        }),
         onProgress: (pr) => {
           const pct = pr.percent != null ? pr.percent : (total ? Math.round((pr.got / total) * 100) : 0);
           const mb = `${(pr.got / 1048576).toFixed(1)} MB${total ? ` / ${(total / 1048576).toFixed(1)} MB` : ''}`;
@@ -316,7 +331,7 @@ class Updater {
           this.onProgress({
             stage: 'download',
             percent: Math.max(1, Math.min(99, pct)),
-            message: `下载中 ${mb}${sp}`,
+            message: `下载中 ${mb}${sp}${pr.route === 'gh-proxy' ? ' · 备用线路' : ''}`,
             speed: pr.speed,
           });
         },

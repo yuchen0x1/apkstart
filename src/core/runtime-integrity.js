@@ -120,7 +120,11 @@ function parsePlatformTools(input, host = process.platform, arch = process.arch)
     throw failure(`没有适合 ${host}/${arch} 的可信 platform-tools 包，请按 Android 官方说明手动安装`);
   }
   const xml = String(input).replace(/<!--[\s\S]*?-->/g, '').trim();
-  if (/<!/.test(xml) || !/^(?:<\?xml[^?]*\?>\s*)?<((?:[\w-]+:)?sdk-repository)\b[^>]*>[\s\S]*<\/\1>\s*$/.test(xml)) {
+  // A malformed or nested comment must fail closed; never pass a residual
+  // comment marker into the restricted tag scanner.
+  if (/<!--|-->/.test(xml)
+    || /<!/.test(xml)
+    || !/^(?:<\?xml[^?]*\?>\s*)?<((?:[\w-]+:)?sdk-repository)\b[^>]*>[\s\S]*<\/\1>\s*$/.test(xml)) {
     throw failure('Google 官方索引不是完整的 SDK repository XML');
   }
   const packages = elements(xml, 'remotePackage').filter((entry) => {
