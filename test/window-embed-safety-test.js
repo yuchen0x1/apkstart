@@ -245,7 +245,8 @@ function mockNativeSource(original) {
     GetClassNameW: 's.Append(h == FakeWindows.Render ? "Chrome_RenderWidgetHostHWND" : "QWindowIcon"); return s.Length;',
     GetWindowTextW: 's.Append("Android Emulator - apkstart:5554"); return s.Length;',
     IsWindow: 'return FakeWindows.Rects.ContainsKey(h);',
-    GetParent: 'return FakeWindows.Parents.ContainsKey(c) ? FakeWindows.Parents[c] : IntPtr.Zero;',
+    GetParent: 'return FakeWindows.ReportedParent(c);',
+    GetDesktopWindow: 'return FakeWindows.Desktop;',
     GetAncestor: 'return FakeWindows.Parents.ContainsKey(h) ? FakeWindows.Parents[h] : IntPtr.Zero;',
     SetParent: 'return FakeWindows.Parent(c, p);',
     SetLastError: 'FakeWindows.LastError = (int)error;',
@@ -282,7 +283,7 @@ function mockNativeSource(original) {
 const nativeHarness = String.raw`
 public static class FakeWindows
 {
-    public static readonly IntPtr Host = new IntPtr(100), Emu = new IntPtr(200), Render = new IntPtr(300), Foreign = new IntPtr(400);
+    public static readonly IntPtr Host = new IntPtr(100), Emu = new IntPtr(200), Render = new IntPtr(300), Foreign = new IntPtr(400), Desktop = new IntPtr(500);
     public static readonly System.Collections.Generic.Dictionary<IntPtr, WindowSafetyAgent.RECT> Rects = new System.Collections.Generic.Dictionary<IntPtr, WindowSafetyAgent.RECT>();
     public static readonly System.Collections.Generic.Dictionary<IntPtr, IntPtr> Parents = new System.Collections.Generic.Dictionary<IntPtr, IntPtr>();
     public static readonly System.Collections.Generic.Dictionary<string, int> Styles = new System.Collections.Generic.Dictionary<string, int>();
@@ -310,7 +311,9 @@ public static class FakeWindows
         Rects[Emu] = new WindowSafetyAgent.RECT { L = -1650, T = 80, R = -1150, B = 880 };
         Rects[Render] = new WindowSafetyAgent.RECT { L = -1800, T = 20, R = -1400, B = 620 };
         Rects[Foreign] = new WindowSafetyAgent.RECT();
+        Rects[Desktop] = new WindowSafetyAgent.RECT { R = 3840, B = 2160 };
         Parents[Host] = Parents[Emu] = Parents[Foreign] = IntPtr.Zero;
+        Parents[Desktop] = IntPtr.Zero;
         Parents[Render] = Host;
         foreach (IntPtr h in Rects.Keys) { Styles[h + ":-16"] = 0x00CF0000; Styles[h + ":-20"] = 0; }
         NativeWindowSafety.Set("_host", Host); NativeWindowSafety.Set("_emu", Emu);
@@ -320,15 +323,23 @@ public static class FakeWindows
     }
     public static bool EnumTop(WindowSafetyAgent.EnumProc cb, IntPtr p)
     {
-        if (Parents[Emu] == IntPtr.Zero) cb(Emu, p);
+        if (Parents[Emu] == IntPtr.Zero || Parents[Emu] == Desktop) cb(Emu, p);
         return true;
+    }
+    public static IntPtr ReportedParent(IntPtr hwnd)
+    {
+        if (!Parents.ContainsKey(hwnd)) return IntPtr.Zero;
+        IntPtr parent = Parents[hwnd];
+        // SetParent(child, NULL) attaches to the desktop before WS_CHILD is cleared.
+        return parent == Desktop && (Styles[hwnd + ":-16"] & 0x40000000) == 0 ? IntPtr.Zero : parent;
     }
     public static IntPtr Parent(IntPtr child, IntPtr parent)
     {
         Log.Add("parent:" + child);
         if (FailParent) { LastError = 5; return IntPtr.Zero; }
         if (LieParent) return new IntPtr(777);
-        IntPtr previous = Parents[child]; Parents[child] = parent;
+        IntPtr previous = Parents[child];
+        Parents[child] = parent == IntPtr.Zero && (Styles[child + ":-16"] & 0x40000000) != 0 ? Desktop : parent;
         return previous;
     }
     public static bool Position(IntPtr hwnd, IntPtr after, int x, int y, int w, int h, uint flags)
@@ -413,6 +424,9 @@ public static class NativeWindowSafety
         WindowSafetyAgent.RECT original = FakeWindows.Rects[FakeWindows.Emu];
         Check(Embed() && Fit(-8, 49, 916, 1317), "embed before detach");
         Check((bool)Call("Detach"), "detach");
+        Check(FakeWindows.Parents[FakeWindows.Emu] == FakeWindows.Desktop, "detach must accept the actual desktop parent while WS_CHILD is set");
+        Check((FakeWindows.Styles[FakeWindows.Emu + ":-16"] & 0x40000000) == 0, "detach must finish restoring top-level style");
+        Check(FakeWindows.ReportedParent(FakeWindows.Emu) == IntPtr.Zero && FakeWindows.Visible, "detached top-level window is visible");
         Check(Same(original, FakeWindows.Rects[FakeWindows.Emu]), "detach restores original screen and size");
         for (int i = 0; i < 3; i++)
         {
