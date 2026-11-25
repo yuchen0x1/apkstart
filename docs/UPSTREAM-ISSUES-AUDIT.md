@@ -4,6 +4,21 @@
 >
 > **已修**：当前代码有明确修复和回归覆盖。**本轮新修**：在 0.10.4 中新增。**部分**：有诊断、降级或安全兜底，但仍需要对应 APK、硬件或系统复验。**平台/功能边界**：不是当前 Windows/Linux x86_64 内置后端能承诺的功能。
 
+## 2026-11-25 自动 GPU 恢复复核（v0.11.7）
+
+本次通过 GitHub API 复核的上游 `main` 仍为 [`7e2c5503`](https://github.com/RoutineMiku/apkstart/commit/7e2c5503b908c0a4d55283c85244a8e09b2725c7)。自动 GPU 选择的相关实现来自两个既有提交：
+
+- [`f172f906`](https://github.com/RoutineMiku/apkstart/commit/f172f9060a37bc736e3742f4c535ae35b927805e)：Windows AMD 的 `host` 启动禁用 Vulkan，并通过 `badGpuVulkanTried` 为同一 emulator 版本提供一次恢复尝试，避免历史 `badGpu=host` 记录长期迫使软件渲染。
+- [`df7ef86d`](https://github.com/RoutineMiku/apkstart/commit/df7ef86dab6bad5ef50eabfe834fe9924de55cb5)：删除按 AMD 厂商无条件优先 `swangle` 的逻辑，默认 `host` 优先并保留软件渲染候选。`host` 后端选择不等于指定物理独显或证明客机已经采用硬件渲染。
+
+本仓库此前已有 Windows AMD `-feature -Vulkan`、自动窗口的 `host` 优先和逐级回退，但仍沿用缺少原因、时间与环境证据的长期失败记录。本轮改为只接受明确 `GPU_INIT` / `GPU_MODE` 证据，对同一运行时、驱动与显示环境最多退避 24 小时；旧记录、过期或环境变化恢复正常候选顺序，原失败后端启动成功后清除记录。手动后端继续固定，低配、远程显示与明确嵌入模式保留各自的兼容策略。
+
+本轮真实启动还发现 Qt `UpdateLayeredWindowIndirect failed` 单条宿主窗口合成警告被归为 `GPU_INIT`，会把仍在开机的客机提前中止并记入 GPU 失败记录。现仅保留诊断说明，不再以该警告单独证明安卓显卡初始化失败；行为回归覆盖警告跨过早期检查时间后仍继续开机且不写失败记录。
+
+性能设置页同时区分当前实际运行参数和下次启动计划，另行标明下次选档依据；两组参数不同不必是用户刚保存过设置，也不能把下一次的策略解释为当前故障原因。最终完整 `npm test` 与隔离 Electron 界面审计已通过；PowerShell 原生窗口行为等用例按本机环境条件跳过，未改变系统策略。
+
+本机使用生产 `EmulatorEngine`、隔离配置和全新 AVD，以自动模式及旧 `37.4.2.0|host` 记录启动，实际选择 `host` 并完成冷启动；日志确认 WHPX，客机 SurfaceFlinger 报告 NVIDIA RTX 5060 / OpenGL ES 3.1。本次运行时约 48 秒就绪（含前置检查总约 69 秒），仅为一次启动观察，不是性能提升基准。哔哩哔哩安装和 `MainActivityV2` 启动成功，Android 客机截图显示首次隐私确认页；未代用户同意或登录，未验收到应用主页面。视频性能、帧率、长时间稳定性和其他显卡环境未验收，少量首帧统计不能作为流畅度证据；不能据此关闭上游 #133 / #146 或宣称显卡兼容性已根治。Windows 物理显卡偏好 `UserGpuPreferences` 仍未移植。
+
 ## 2026-11-25 修复复核（v0.11.5）
 
 上游 `main` 仍为 11 月 22 日的 `7e2c550`。本次又发现 [#147 请求 Linux 版](https://github.com/RoutineMiku/apkstart/issues/147)（11 月 25 日 14:06 创建）；本仓库已有 Linux x86_64 AppImage / deb，但这不包含 GNOME / Wayland 原生嵌入能力。自有仓库本轮检查无开放 Issue，也无开放 CodeQL、Dependabot 或 Secret Scanning 告警。

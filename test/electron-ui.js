@@ -315,6 +315,23 @@ app.whenReady().then(async () => {
     check('切换系统详情只呈现所选系统日志', await js("document.getElementById('sysDetailLogs').textContent.includes('bliss-os') && !document.getElementById('sysDetailLogs').textContent.includes('android-x86')"));
     fixture.clearResponse('system:detail');
     await js("sysUI.selected=''; renderSysDetail()");
+    currentStage = 'performance-profile-regressions';
+    fixture.setResponse('doctor:profile', () => ({
+      text: '自动：8.0GB 内存 · 8 核 · 720×1280 · host 渲染',
+      running: '自动：6.0GB 内存 · 6 核 · 720×1280 · swangle 渲染 · 硬件加速（运行日志已确认）',
+      pending: true,
+      fallbackReason: '本次显卡渲染失败，已回退软件渲染。',
+      profile: { host: { totalMB: 81920, freeMB: 47820, cores: 32 } },
+    }));
+    await js("(async () => { await openSettings({section:'performance'}); await refreshProfileText(); document.getElementById('setBody').scrollTop=0; })()");
+    check('性能页分开显示实际软件渲染与下次显卡渲染，不把预期当作已生效', await js("document.getElementById('runningProfileText').textContent.includes('swangle') && !document.getElementById('runningProfileText').textContent.includes('host 渲染') && document.getElementById('autoProfileText').textContent.includes('host 渲染')"));
+    check('性能页将选档依据明确标为下次启动，不把参数差异声称为设置未生效', await js("!document.getElementById('profileFallbackText').hidden && document.getElementById('profileFallbackText').textContent.startsWith('下次启动选档依据：') && !document.getElementById('profilePendingText').hidden && document.getElementById('profilePendingText').textContent==='当前运行参数与下次启动计划不同；停止运行时后重新启动将按计划重新尝试。'"));
+    await shot('performance-actual-and-next');
+    fixture.setResponse('doctor:profile', () => ({ text: '自动：8.0GB 内存 · 8 核 · host 渲染', running: '', pending: false }));
+    await js('refreshProfileText()');
+    check('安卓停止后实际参数不残留，旧回退与重启提示确实隐藏', await js("document.getElementById('runningProfileText').textContent==='安卓尚未运行' && getComputedStyle(document.getElementById('profileFallbackText')).display==='none' && getComputedStyle(document.getElementById('profilePendingText')).display==='none'"));
+    fixture.clearResponse('doctor:profile');
+    await js('refreshProfileText()');
     currentStage = 'capacity-maintenance-regressions';
     const savedCapacity = Number((await fixture.respond('settings:get')).engine.dataPartitionGB) || 0;
     await js("openSettings({section:'performance'})");

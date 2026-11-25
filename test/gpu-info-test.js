@@ -9,11 +9,27 @@ const doctor = require('../src/core/doctor');
 
 const HOST = { totalMB: 32768, freeMB: 16384, cores: 16, tmp: os.tmpdir() };
 
-function profileFor(engine, gpuInfo = null, emulatorVersion = '37.4.2.0') {
+function profileFor(engine, gpuInfo = null, emulatorVersion = '37.4.2.0', options = {}) {
   return doctor.chooseProfile({
     host: HOST, accel: { ok: true }, emulatorVersion, diskMB: 50000,
     settings: { engine }, overrides: doctor.overridesFromSettings(engine), gpuInfo,
+    ...options,
   });
+}
+
+const GPU_NOW = 1700000000000;
+const HARDWARE_GPU = gpu.classify([
+  { name: 'AMD Radeon 610M', driverVersion: '1.0', status: 'OK' },
+  { name: 'NVIDIA GeForce RTX 5060', driverVersion: '2.0', status: 'OK' },
+]);
+
+function rememberedHostFailure(overrides = {}) {
+  return {
+    gpuMode: 'auto', windowMode: 'auto', badGpu: '37.4.2.0|host',
+    badGpuAt: GPU_NOW - 1000, badGpuReason: 'GPU_INIT',
+    badGpuContext: doctor.gpuFailureContext({ gpuInfo: HARDWARE_GPU }),
+    ...overrides,
+  };
 }
 
 function isolatedGpu({ platform = 'win32', sessionName = 'Console', stdout = '', error = null } = {}) {
@@ -200,6 +216,94 @@ test('auto profile: real hybrid GPU keeps host first', () => {
   });
   assert.equal(p.gpu, 'host');
   assert.equal(p.gpuInfo.hybrid, true);
+});
+
+test('GPU backoff context is stable across adapter enumeration and probe timestamps', () => {
+  const context = doctor.gpuFailureContext({ gpuInfo: HARDWARE_GPU });
+  assert.equal(doctor.gpuFailureContext({ gpuInfo: {
+    ...HARDWARE_GPU, adapters: [...HARDWARE_GPU.adapters].reverse(), at: GPU_NOW,
+    summary: 'another display label', reasons: ['another explanation'],
+  } }), context);
+  for (const change of [
+    { gpuInfo: { ...HARDWARE_GPU, adapters: HARDWARE_GPU.adapters.map(a => ({ ...a, driverVersion: 'updated' })) } },
+    { gpuInfo: { ...HARDWARE_GPU, remoteSession: true } },
+    { windowMode: 'standalone' }, { headless: true }, { accel: 'off' },
+  ]) {
+    assert.notEqual(doctor.gpuFailureContext({ gpuInfo: HARDWARE_GPU, ...change }), context);
+  }
+});
+
+test('recent evidenced GPU backoff changes the predicted first hardware-accelerated plan', () => {
+  const engine = rememberedHostFailure();
+  for (const reason of ['GPU_INIT', 'GPU_MODE']) {
+    const profile = profileFor({ ...engine, badGpuReason: reason }, HARDWARE_GPU, '37.4.2.0', { now: GPU_NOW });
+    const plans = doctor.planVariants(profile);
+    assert.equal(profile.gpu, 'swangle');
+    assert.equal(profile.gpuCandidates[0], profile.gpu);
+    assert.equal(plans[0].gpu, profile.gpu);
+    assert.equal(plans[0].accel, 'on', 'GPU backoff must not move a TCG fallback ahead of hardware acceleration');
+    assert.match(profile.gpuFallbackReason, /host.*swangle.*24/);
+  }
+});
+
+for (const [name, change, version = '37.4.2.0'] of [
+  ['legacy metadata is absent', { badGpuAt: 0, badGpuContext: '', badGpuReason: '' }],
+  ['24-hour boundary is reached', { badGpuAt: GPU_NOW - doctor.GPU_BACKOFF_MS }],
+  ['failure timestamp is in the future', { badGpuAt: GPU_NOW + 1 }],
+  ['failure timestamp is invalid', { badGpuAt: NaN }],
+  ['reason is a generic crash', { badGpuReason: 'ACCESS_VIOLATION' }],
+  ['reason is a timeout', { badGpuReason: 'TIMEOUT' }],
+  ['display context changed', { badGpuContext: 'previous-display-context' }],
+  ['runtime version changed', {}, '37.4.3.0'],
+]) {
+  test(`GPU backoff restores host when ${name}`, () => {
+    const engine = rememberedHostFailure(change);
+    const profile = profileFor(engine, HARDWARE_GPU, version, { now: GPU_NOW });
+    assert.equal(profile.gpu, 'host');
+    assert.equal(doctor.rememberedGpuFailure(engine, profile.gpuContext, version, GPU_NOW), '');
+  });
+}
+
+test('manual host ignores valid GPU backoff and is described as manual rendering', () => {
+  const profile = profileFor(rememberedHostFailure({ gpuMode: 'host' }), HARDWARE_GPU, '37.4.2.0', { now: GPU_NOW });
+  assert.equal(profile.gpu, 'host');
+  assert.equal(profile.gpuPinned, true);
+  assert.match(doctor.describeProfile(profile), /^手动渲染：/);
+  assert.equal(profile.gpuFallbackReason, '');
+});
+
+for (const [name, engine, info, options] of [
+  ['driver update', {}, { ...HARDWARE_GPU, adapters: HARDWARE_GPU.adapters.map(a => ({ ...a, driverVersion: 'updated' })) }, {}],
+  ['remote session', {}, gpu.classify(HARDWARE_GPU.adapters, { remoteSession: true }), {}],
+  ['window mode change', { windowMode: 'standalone' }, HARDWARE_GPU, {}],
+  ['headless mode change', {}, HARDWARE_GPU, { headless: true }],
+  ['acceleration change', {}, HARDWARE_GPU, { accel: { ok: false } }],
+]) {
+  test(`profile no longer applies the previous GPU failure after ${name}`, () => {
+    const settings = rememberedHostFailure(engine);
+    const profile = profileFor(settings, info, '37.4.2.0', { now: GPU_NOW, ...options });
+    assert.equal(doctor.rememberedGpuFailure(settings, profile.gpuContext, '37.4.2.0', GPU_NOW), '');
+    assert.doesNotMatch(profile.gpuFallbackReason, /上次 host/);
+    if (name !== 'remote session' && name !== 'acceleration change') assert.equal(profile.gpu, 'host');
+  });
+}
+
+for (const [name, options, backend] of [
+  ['visible embedded Windows mode', { headless: false, canEmbed: true }, 'swangle'],
+  ['headless embedded mode', { headless: true, canEmbed: true }, 'host'],
+  ['platform without embedding', { headless: false, canEmbed: false }, 'host'],
+]) {
+  test(`profile predicts ${backend} for ${name}`, () => {
+    const profile = profileFor({ windowMode: 'embedded' }, HARDWARE_GPU, '37.4.2.0', options);
+    assert.equal(profile.gpu, backend);
+    assert.equal(doctor.planVariants(profile)[0].gpu, backend);
+    assert.equal(Boolean(profile.gpuFallbackReason), backend === 'swangle');
+  });
+}
+
+test('unrelated unsupported command-line options are not classified as GPU mode failures', () => {
+  assert.equal(doctor.diagnose(['Unknown option: -unrelated-flag']).code, 'UNKNOWN');
+  assert.equal(doctor.diagnose(['Unknown option: -gpu backend']).code, 'GPU_MODE');
 });
 
 test('GPU probe returns a stable cached shape on this platform', { skip: process.platform !== 'win32' }, async () => {

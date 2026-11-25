@@ -3040,28 +3040,39 @@ function registerIpc() {
     const accel = (env && env.accel)
       || (runtime.emulator.profile ? { ok: runtime.emulator.profile.accelOk } : undefined);
     const gpuInfo = await gpu.probe().catch(() => null);
+    const settings = store.getSettings();
     const p = doctor.autoProfile({
-      settings: store.getSettings(),
+      settings,
       accel,
       emulatorVersion: (env && env.emulator && env.emulator.version) || '',
       diskMB: doctor.freeDiskMB(store.DATA_DIR),
       gpuInfo,
+      headless: settings.engine.headless !== false,
+      canEmbed: platform.canEmbed,
     });
     // 关闭应用窗口可能只停放运行时，必须真正停止后再启动才会使用新参数。
-    const running = runtime.emulator.profile;
-    const sig = (x) => (x ? `${x.memoryMB}|${x.cores}|${x.lcd && x.lcd.w}x${x.lcd && x.lcd.h}|${x.gpu}|${x.snapshot !== false}` : '');
+    const running = runtime.emulator.running() ? runtime.emulator.profile : null;
+    const sig = (x) => (x ? `${x.memoryMB}|${x.cores}|${x.lcd && x.lcd.w}x${x.lcd && x.lcd.h}|${x.gpu}|${x.accel}|${!!x.lite}|${x.snapshot !== false}` : '');
     const pending = !!running && sig(running) !== sig(p);
+    let runningText = running ? doctor.describeProfile(running) : '';
+    if (!running) {
+      try {
+        if (await runtime.client().isOnline()) runningText = '已连接安卓，实际启动参数待确认';
+      } catch (_) { runningText = '安卓运行状态待确认'; }
+    }
     return {
       profile: p,
       text: doctor.describeProfile(p),
+      pending,
+      fallbackReason: p.gpuFallbackReason || '',
       // 低配降级的原因 / 哪些项是用户手动钉住的：设置页要能解释「为什么变保守了」
-      why: [doctor.describeTuning(p), pending ? '当前运行的安卓仍在使用上次的参数，停止运行时后重新启动才会生效。' : '']
+      why: [doctor.describeTuning(p), pending ? '当前运行参数与下次启动计划不同；停止运行时后重新启动将按计划重新尝试。' : '']
         .filter(Boolean).join(' '),
       manual: doctor.describeManual(p),
       tier: p.tier || '',
       tuned: !!p.tuned,
       gpu: p.gpuInfo ? { summary: gpu.summary(p.gpuInfo), hybrid: !!p.gpuInfo.hybrid, preferSoftware: !!p.gpuInfo.preferSoftware, adapters: p.gpuInfo.adapters } : null,
-      running: running ? doctor.describeProfile(running) : '',
+      running: runningText,
     };
   });
 

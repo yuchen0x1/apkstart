@@ -160,3 +160,129 @@ test('settings save atomically marks restoration only for an enabled-to-disabled
     assert.equal(result.engine.deepTrimRestorePending, previous === true ? true : undefined);
   }
 });
+
+function rendererProfile(respond) {
+  const elements = new Map(['autoProfileText', 'runningProfileText', 'profilePendingText',
+    'profileFallbackText', 'profileFallbackReason', 'hostSpecText', 'autoTierText']
+    .map(id => [id, { textContent: '', hidden: false }]));
+  elements.get('profileFallbackText').textContent = '下次启动选档依据：';
+  const start = renderer.indexOf('let profileRequest = 0;');
+  const end = renderer.indexOf('\n/* ---------------- 自定义镜像', start);
+  assert(start >= 0 && end > start, 'missing production profile summary');
+  const h = { $: id => elements.get(id), api: { doctorProfile: respond } };
+  vm.runInNewContext(renderer.slice(start, end), h);
+  return { element: id => elements.get(id), run: () => h.refreshProfileText() };
+}
+
+test('performance settings label actual runtime separately from the next startup plan', async () => {
+  const h = rendererProfile(async () => ({
+    text: '自动：8.0GB 内存 · 8 核 · host 渲染',
+    running: '自动：6.0GB 内存 · 6 核 · swangle 渲染 · 硬件加速（运行日志已确认）',
+    pending: true,
+    fallbackReason: '本次显卡渲染失败，已回退软件渲染。',
+    profile: { host: { totalMB: 81920, freeMB: 47820, cores: 32 } },
+  }));
+  await h.run();
+  assert.match(h.element('runningProfileText').textContent, /6\.0GB.*swangle.*运行日志已确认/);
+  assert.match(h.element('autoProfileText').textContent, /8\.0GB.*host/);
+  assert.equal(h.element('profilePendingText').hidden, false);
+  assert.equal(h.element('profilePendingText').textContent,
+    '当前运行参数与下次启动计划不同；停止运行时后重新启动将按计划重新尝试。');
+  assert.equal(h.element('profileFallbackText').hidden, false);
+  assert.equal(h.element('profileFallbackText').textContent, '下次启动选档依据：');
+  assert.equal(h.element('profileFallbackReason').textContent, '本次显卡渲染失败，已回退软件渲染。');
+  assert.match(h.element('hostSpecText').textContent, /80 GB 内存.*32 线程/);
+  const html = fs.readFileSync(path.join(root, 'src/ui/index.html'), 'utf8');
+  assert.match(html, /当前运行实际参数：<\/span><span id="runningProfileText"/);
+  assert.match(html, /下次启动预期参数：<\/span><span id="autoProfileText"/);
+  assert.match(html, /id="profileFallbackText" hidden><span>下次启动选档依据：<\/span><span id="profileFallbackReason"><\/span>/);
+});
+
+test('automatic software rendering without a failed attempt does not invent a GPU failure', async () => {
+  const h = rendererProfile(async () => ({
+    text: '自动：2.0GB 内存 · 2 核 · swangle 渲染',
+    running: '自动：2.0GB 内存 · 2 核 · swangle 渲染',
+    pending: false,
+    why: '远程显示会话使用软件渲染。',
+  }));
+  await h.run();
+  assert.equal(h.element('profilePendingText').hidden, true);
+  assert.equal(h.element('profilePendingText').textContent, '');
+  assert.equal(h.element('profileFallbackText').hidden, true);
+  assert.equal(h.element('profileFallbackText').textContent, '下次启动选档依据：');
+  assert.equal(h.element('profileFallbackReason').textContent, '');
+  assert.equal(h.element('autoTierText').textContent, '远程显示会话使用软件渲染。');
+});
+
+test('stopping Android clears the previous actual profile and stale restart warnings', async () => {
+  let response = { text: '下次 host', running: '当前 swangle', pending: true, fallbackReason: '本次已回退软件渲染。' };
+  const h = rendererProfile(async () => response);
+  await h.run();
+  response = { text: '下次 host', running: '', pending: false };
+  await h.run();
+  assert.equal(h.element('runningProfileText').textContent, '安卓尚未运行');
+  assert.equal(h.element('profilePendingText').hidden, true);
+  assert.equal(h.element('profileFallbackText').hidden, true);
+  assert.equal(h.element('profileFallbackText').textContent, '下次启动选档依据：');
+  assert.equal(h.element('profileFallbackReason').textContent, '');
+});
+
+test('a failed profile read does not claim Android is stopped or retain an old actual backend', async () => {
+  let fail = false;
+  const h = rendererProfile(async () => {
+    if (fail) throw new Error('IPC unavailable');
+    return { text: 'host', running: 'swangle', pending: true, fallbackReason: '已回退' };
+  });
+  await h.run();
+  fail = true;
+  await h.run();
+  assert.equal(h.element('runningProfileText').textContent, '读取失败，暂时无法确认');
+  assert.equal(h.element('autoProfileText').textContent, '读取失败，暂时无法确认');
+  assert.equal(h.element('profilePendingText').hidden, true);
+  assert.equal(h.element('profileFallbackText').hidden, true);
+  assert.equal(h.element('profileFallbackReason').textContent, '');
+});
+
+test('an adopted Android runtime keeps the backend confirmation message instead of claiming it stopped', async () => {
+  const h = rendererProfile(async () => ({
+    text: '自动：8.0GB 内存 · 8 核 · host 渲染',
+    running: '已连接安卓，实际启动参数待确认',
+    pending: false,
+  }));
+  await h.run();
+  assert.equal(h.element('runningProfileText').textContent, '已连接安卓，实际启动参数待确认');
+  assert.equal(h.element('profilePendingText').hidden, true);
+});
+
+test('a late profile response cannot overwrite a newer settings or runtime refresh', async () => {
+  const first = deferred();
+  let calls = 0;
+  const h = rendererProfile(() => ++calls === 1 ? first.promise : Promise.resolve({
+    text: '新的预期 host', running: '新的实际 host', pending: false,
+  }));
+  const older = h.run();
+  await h.run();
+  first.resolve({ text: '旧的预期 swangle', running: '旧的实际 swangle', pending: true });
+  await older;
+  assert.equal(h.element('runningProfileText').textContent, '新的实际 host');
+  assert.equal(h.element('autoProfileText').textContent, '新的预期 host');
+  assert.equal(h.element('profilePendingText').hidden, true);
+});
+
+test('runtime status refresh updates profiles only while the performance settings page is open', async () => {
+  const start = renderer.indexOf('async function refreshStatus() {');
+  const end = renderer.indexOf('\n}\n', start) + '\n}'.length;
+  assert(start >= 0 && end > start, 'missing production runtime status refresh');
+  for (const [opened, section, expected] of [[true, 'performance', 1], [false, 'performance', 0], [true, 'runtime', 0]]) {
+    let refreshed = 0;
+    const h = {
+      $: id => id === 'settingsMask' ? { classList: { contains: name => name === 'on' && opened } } : null,
+      settingsSec: section, state: {}, sysUI: { statusRequest: 0 },
+      api: { runtimeStatus: async () => ({}), systemStatus: async () => ({ ok: true, current: {} }) },
+      renderRuntimeStatus() {}, refreshProfileText() { refreshed++; },
+    };
+    vm.runInNewContext(renderer.slice(start, end), h);
+    await h.refreshStatus();
+    assert.equal(refreshed, expected, `opened=${opened}, section=${section}`);
+  }
+});

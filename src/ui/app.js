@@ -312,6 +312,8 @@ async function refreshStatus() {
     sysUI.status = system?.ok && system.current ? system : null;
     sysUI.statusError = sysUI.status ? '' : (system?.error || '无法确认当前系统状态');
     renderRuntimeStatus();
+    const settingsMask = $('settingsMask');
+    if (settingsMask?.classList.contains('on') && settingsSec === 'performance') refreshProfileText();
   } catch (e) {
     if (request === sysUI.statusRequest) $('statusText').textContent = `状态检查失败：${e.message}`;
   }
@@ -1386,13 +1388,31 @@ async function applyDataCapacity(gb) {
 }
 
 /**
- * 拉一次「自动参数摘要」：实跑参数 + 低配降级原因 + 哪些项被手动钉住。
+ * 分开展示当前实跑参数和下次启动计划，避免把软件回退后的运行状态显示成 host。
  * 设置页展示、切换资源策略/内存/核心/渲染后端之后都走这里 ——
- * 只维护一个来源，界面上就不可能和实跑参数对不上。
+ * 回退与待生效原因由主进程提供，不从参数差异推断失败原因。
  */
+let profileRequest = 0;
 async function refreshProfileText() {
+  const request = ++profileRequest;
   const r = await api.doctorProfile().catch(() => null);
-  if ($('autoProfileText')) $('autoProfileText').textContent = (r && r.text) || '自动模式';
+  if (request !== profileRequest) return r;
+  const unavailable = '读取失败，暂时无法确认';
+  if ($('autoProfileText')) $('autoProfileText').textContent = (r && r.text) || unavailable;
+  if ($('runningProfileText')) {
+    $('runningProfileText').textContent = (r && r.running) || (r ? '安卓尚未运行' : unavailable);
+  }
+  const pendingEl = $('profilePendingText');
+  if (pendingEl) {
+    pendingEl.hidden = !(r && r.pending);
+    pendingEl.textContent = r && r.pending
+      ? '当前运行参数与下次启动计划不同；停止运行时后重新启动将按计划重新尝试。' : '';
+  }
+  const fallbackEl = $('profileFallbackText');
+  const fallbackReasonEl = $('profileFallbackReason');
+  const fallbackReason = (r && r.fallbackReason) || '';
+  if (fallbackReasonEl) fallbackReasonEl.textContent = fallbackReason;
+  if (fallbackEl) fallbackEl.hidden = !fallbackReason;
   // 把「你的电脑有多少内存/多少线程」直接摆出来：只写「自动：3GB」用户没法判断
   // 是程序没看配置，还是这就是它算出来的结果。
   const hostEl = $('hostSpecText');
@@ -1405,7 +1425,7 @@ async function refreshProfileText() {
   const tierEl = $('autoTierText');
   if (tierEl) {
     const why = [r && r.why, r && r.manual].filter(Boolean).join(' ');
-    tierEl.textContent = why || (r ? '这台机器不需要降级，参数按均衡档自动选择。' : '自动模式');
+    tierEl.textContent = why || (r ? '参数已按本机配置与所选资源策略计算。' : unavailable);
   }
   return r;
 }

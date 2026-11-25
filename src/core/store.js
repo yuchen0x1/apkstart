@@ -37,9 +37,11 @@ const DEFAULT_SETTINGS = {
     // 带窗口保留原生输入；客机刷新率可配置，但不代表应用帧率或宿主呈现帧率。
     headless: false,
     gpuMode: 'auto',         // auto = 按 emulator 版本自动挑后端并逐级降级
-    // 上次「拉起就崩」的渲染后端（格式 `<emulator版本>|<gpu>`）；auto 模式下下次把它排到最后，
-    // 免得每次开机都先白等 20 多秒再退到软件渲染。升级运行时会自动失效。
+    // 只有明确的 GPU 初始化/模式失败才短期退避；无证据的旧记录不再压制显卡。
     badGpu: '',
+    badGpuAt: 0,
+    badGpuContext: '',
+    badGpuReason: '',
     // 上次「存快照把模拟器写崩」的组合（格式 `<emulator版本>|<gpu>`，上游 #46）。
     // 命中就跳过保存快照：宁可下次冷启动多等 20 秒，也不让用户的应用窗口突然消失。
     snapshotUnsafe: '',
