@@ -124,7 +124,7 @@ function parsePlatformTools(input, host = process.platform, arch = process.arch)
   if (source.includes('--!>')) throw failure('Google 官方索引含无效的注释结束标记');
   // A malformed or nested comment must fail closed; never pass a residual
   // comment marker into the restricted tag scanner.
-  if (/<!--|-->/.test(xml)
+  if (/<!--|--!?>/.test(xml)
     || /<!/.test(xml)
     || !/^(?:<\?xml[^?]*\?>\s*)?<((?:[\w-]+:)?sdk-repository)\b[^>]*>[\s\S]*<\/\1>\s*$/.test(xml)) {
     throw failure('Google 官方索引不是完整的 SDK repository XML');
