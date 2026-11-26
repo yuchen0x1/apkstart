@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.11.8**（2026-11-26）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.11.9**（2026-11-26）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,16 +46,13 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.11.8
+### v0.11.9
 
-> 修复打开应用时被全机进程扫描、重复联网修复和空闲优先级拖住的问题，并显示真实启动阶段。
+> 清理开发仓库中的本机缓存残留，并阻止 PowerShell 模块分析缓存再次误入项目目录。
 
-- 发现残留安卓运行时改用单次批量进程查询，仍校验每个进程的出生时间、可执行路径、AVD 和端口归属；窗口接管只查询当前已验证的运行时，不再逐个扫描电脑上的监听进程。
-- 安卓开机成功后立即进入上层准备流程，不再同步打开 Wi-Fi 设置页反复修复。应用启动只做共享总时限的只读网络检查，20 秒到期先打开应用；网络尚未就绪时明确提示，可在设置中主动重连 Wi-Fi。
-- 启动请求从准备开始即持有前台租约，已有运行时先恢复前台优先级，预热完成、关窗停放和快照保存不会把启动中的模拟器降到空闲状态或抢占启动磁盘 I/O。
-- 启动提示和主界面状态栏随实际阶段更新；重复点击不再产生竞争请求，IPC 异常后停止转圈并恢复可重试状态。
-- 启动失败后立即重试会创建独立的进度提示，旧错误提示的关闭计时器不会移除新的启动提示。
-- 保留应用持续存活检查、崩溃重试与数据保护，不以单次进程出现冒充应用成功打开。包含上一版本对旧 GPU 失败记录和 Qt 窗口警告误判的修复。
+- 忽略仓库根目录下的 PowerShell `ModuleAnalysisCache`，避免本机运行工具时产生的缓存被误提交。
+- 清理本地 PowerShell 缓存和过期测试日志；不影响应用运行、用户配置或数据。
+- 本版本只包含开发仓库卫生与版本元数据调整，没有应用功能、安全或兼容性行为变化。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。
