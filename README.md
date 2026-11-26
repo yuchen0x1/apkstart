@@ -22,7 +22,7 @@
 </p>
 
 <!-- version:start -->
-> 当前版本：**0.11.9**（2026-11-26）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
+> 当前版本：**0.12.0**（2026-11-26）。完整变更记录见 [CHANGELOG.md](CHANGELOG.md) 与 [GitHub Releases](https://github.com/yuchen0x1/apkstart/releases)。
 <!-- version:end -->
 
 ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载和管理所需的 Android 运行时，
@@ -46,13 +46,16 @@ ApkStart 是一个独立维护的 Windows / Linux 桌面应用。它负责下载
 [查看 GitHub 当前正式发行及分平台下载](https://github.com/yuchen0x1/apkstart/releases/latest)
 
 <!-- latest:start -->
-### v0.11.9
+### v0.12.0
 
-> 清理开发仓库中的本机缓存残留，并阻止 PowerShell 模块分析缓存再次误入项目目录。
+> 同步上游近期改进：网络加速可选 DNS 服务器，窗口隐藏时暂停轮询，托盘只在状态变化时重建；俄语 / 越南语补充上游词条。
 
-- 忽略仓库根目录下的 PowerShell `ModuleAnalysisCache`，避免本机运行工具时产生的缓存被误提交。
-- 清理本地 PowerShell 缓存和过期测试日志；不影响应用运行、用户配置或数据。
-- 本版本只包含开发仓库卫生与版本元数据调整，没有应用功能、安全或兼容性行为变化。
+- 设置 → 网络、声音与后台新增「DNS 服务器」：国内（阿里 / 腾讯，默认）、Cloudflare、Google。仅开启网络加速时生效，下次启动安卓运行时应用；关闭加速时不传 `-dns-server`，未知配置回落国内（上游 #150）。
+- 俄语词典补充 336 条、越南语补充 310 条上游可直接对应的译文；未翻译条目继续回落英文。
+- 主窗口隐藏或最小化到托盘时暂停运行状态、应用列表、环境自检与系统面板轮询；回到前台立即补刷，减少后台跨进程调用和界面重排。
+- 托盘菜单按应用列表、更新版本、界面语言和显示模式生成状态指纹，状态未变化时不重建；切换语言重建托盘时先销毁旧图标并清理刷新定时器。
+- `docs/UPSTREAM-ISSUES-AUDIT.md` 记录上游 a694e53 与 #148 / #149 / #150 / #151 / #152 的适配结论和边界。
+- Windows 本地完整 `npm test` 通过；隔离 Electron 界面审计 419 个界面 / 状态，无脚本错误、未标注控件或越界。
 <!-- latest:end -->
 
 完整发行历史见 [发行说明](docs/releases/release-notes.md)；开发变更记录见 [CHANGELOG.md](CHANGELOG.md)。

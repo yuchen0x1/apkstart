@@ -1346,6 +1346,10 @@ function fillSettings(s) {
   if ($('setWindowMode')) $('setWindowMode').value = eng.windowMode || 'auto';
   if ($('setDataGB')) $('setDataGB').value = String(Number(eng.dataPartitionGB || 0));
   if ($('setFastDns')) $('setFastDns').checked = eng.fastDns !== false;
+  if ($('setDnsServers')) {
+    $('setDnsServers').value = eng.dnsServers || 'cn';
+    $('setDnsServers').disabled = eng.fastDns === false;
+  }
   if ($('setKeepSnapshot')) $('setKeepSnapshot').checked = eng.keepSnapshot !== false;
   const peripheral = s.peripherals || {};
   for (const [id, key] of [['setCameraBack', 'cameraBack'], ['setCameraFront', 'cameraFront']]) {
@@ -2311,8 +2315,14 @@ function bindSettings() {
       refreshProfileText();
     });
   }
+  if ($('setDnsServers')) {
+    $('setDnsServers').addEventListener('change', (e) => save({ engine: { dnsServers: e.target.value } }));
+  }
   if ($('setFastDns')) {
-    $('setFastDns').addEventListener('change', (e) => save({ engine: { fastDns: e.target.checked } }));
+    $('setFastDns').addEventListener('change', (e) => {
+      if ($('setDnsServers')) $('setDnsServers').disabled = !e.target.checked;
+      save({ engine: { fastDns: e.target.checked } });
+    });
   }
   if ($('setKeepSnapshot')) {
     $('setKeepSnapshot').addEventListener('change', (e) => save({ engine: { keepSnapshot: e.target.checked } }));
@@ -3707,9 +3717,44 @@ async function init() {
   selfCheck();
   await bindWizard();
   bindSystems();
-  setInterval(refreshStatus, 6000);
-  setInterval(refreshApps, 15000);
-  setInterval(selfCheck, 60000);
+  startPolling();
+}
+
+/**
+ * 后台轮询调度：窗口隐藏/最小化到托盘时暂停周期性刷新，可见时恢复。
+ * 这些轮询每次都要跨进程取状态、重建列表 DOM；窗口看不见时纯属白烧 CPU/内存，
+ * 而且会阻止渲染进程进入空闲。恢复时立刻刷新一次，保证界面不会显示旧数据。
+ */
+let pollTimers = [];
+let pollingActive = false;
+function startPolling() {
+  if (pollingActive) return;
+  pollingActive = true;
+  const tasks = [
+    [refreshStatus, 6000],
+    [refreshApps, 15000],
+    [selfCheck, 60000],
+    [pollSystems, 12000],
+  ];
+  const schedule = () => {
+    stopPollTimers();
+    if (document.hidden) return; // 窗口不可见：不排任何定时器
+    pollTimers = tasks.map(([fn, ms]) => setInterval(fn, ms));
+  };
+  document.addEventListener('visibilitychange', () => {
+    schedule();
+    if (!document.hidden) {
+      // 回到前台：立即补齐一次，不让用户看到停机期间的旧状态
+      refreshStatus().catch(() => {});
+      refreshApps().catch(() => {});
+      pollSystems();
+    }
+  });
+  schedule();
+}
+function stopPollTimers() {
+  for (const t of pollTimers) clearInterval(t);
+  pollTimers = [];
 }
 
 /* ==================== 多系统选择 + 运行状态任务（Provider 架构） ==================== */
@@ -4355,7 +4400,7 @@ function bindSystems() {
     });
     api.on('system:log', scheduleSysLogs);
   }
-  setInterval(pollSystems, 12000);
+  // 轮询由 startPolling() 统一调度：窗口隐藏时一并暂停，回到前台再恢复。
 }
 
 /* ---------------- 环境自检 ---------------- */

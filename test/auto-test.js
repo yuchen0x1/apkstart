@@ -625,6 +625,25 @@ async function withStartFixture(run) {
     assert(!normal.includes('-Vulkan'), '正常轮不该关 Vulkan');
   });
 
+  await test('网络加速 DNS 预设：默认国内，可切 Cloudflare / Google，未知值回落', () => {
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    const argsFor = (engine) => {
+      Object.defineProperty(emu, 'settings', { value: { engine }, configurable: true });
+      return emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2 }).join(' ');
+    };
+    const cn = argsFor({ fastDns: true, dnsServers: 'cn' });
+    assert(/-dns-server 223\.5\.5\.5,119\.29\.29\.29/.test(cn), `默认预设错误：${cn}`);
+    const cf = argsFor({ fastDns: true, dnsServers: 'cloudflare' });
+    assert(/-dns-server 1\.1\.1\.1,1\.0\.0\.1/.test(cf), `Cloudflare 预设错误：${cf}`);
+    const google = argsFor({ fastDns: true, dnsServers: 'google' });
+    assert(/-dns-server 8\.8\.8\.8,8\.8\.4\.4/.test(google), `Google 预设错误：${google}`);
+    const unknown = argsFor({ fastDns: true, dnsServers: 'bogus' });
+    assert(/-dns-server 223\.5\.5\.5,119\.29\.29\.29/.test(unknown), '未知预设应回落国内 DNS');
+    const off = argsFor({ fastDns: false, dnsServers: 'google' });
+    assert(!off.includes('-dns-server'), '关闭网络加速时不应传 -dns-server');
+  });
+
   await test('issue #5：无加速的多核小内存机器收紧 TCG 核数', () => {
     // 现场：Xeon E5-2650 v3 / 20 核 / 8GB 内存(可用 4.8GB) / 无加速 → 原实现给 8 核 TCG，
     // 8 份 TB 缓存线程在 4.8GB 可用内存上极易 0xC0000005。无加速时上限应收紧到 4 核。

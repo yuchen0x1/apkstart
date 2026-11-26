@@ -335,6 +335,7 @@ const ICON_PNG = loadBrandIcon().toPNG();
 
 let mainWindow = null;
 let tray = null;
+let trayTimer = null;
 let runtime = null;
 // 「哪些窗口算我们的」由 whenReady 里赋值（见 agentScope）。放模块级是因为
 // runLaunch / 预热定时器都早于那段代码定义，闭包里的 const 在它们的作用域外看不到。
@@ -835,14 +836,35 @@ function send(channel, payload) {
 // ---------------- 托盘 ----------------
 
 function buildTray() {
+  // 切语言时会重建托盘：先销毁旧图标并停掉它的刷新定时器，
+  // 否则任务栏里会堆出两个图标、旧定时器还会往已销毁的对象上写菜单。
+  if (tray) {
+    try { tray.destroy(); } catch (_) { /* ignore */ }
+    tray = null;
+  }
+  if (trayTimer) {
+    clearInterval(trayTimer);
+    trayTimer = null;
+  }
   const icon = loadBrandIcon(16);
   try {
     tray = new Tray(icon);
   } catch (_) {
     return;
   }
+  let lastTrayFingerprint = '';
   const refresh = () => {
     const apps = store.getApps().slice(0, 8);
+    // 托盘每 5 秒刷一次，但绝大多数时候状态没变。先算指纹，没变化就不重建菜单，
+    // 避免每 5 秒白造一个 Menu 对象（含一堆闭包）带来的 CPU/内存抖动。
+    const fingerprint = JSON.stringify([
+      apps.map((a) => [a.package, a.label]),
+      updateInfo && updateInfo.hasUpdate ? updateInfo.tag : '',
+      i18n.getLanguage(),
+      displaySettings().mode,
+    ]);
+    if (fingerprint === lastTrayFingerprint && tray && tray.getContextMenu) return;
+    lastTrayFingerprint = fingerprint;
     const menu = Menu.buildFromTemplate([
       { label: i18n.t('打开 ApkStart'), click: () => showWindow() },
       { type: 'separator' },
@@ -917,7 +939,8 @@ function buildTray() {
   tray.on('click', () => showWindow());
   tray.on('double-click', () => showWindow());
   refresh();
-  setInterval(refresh, 5000).unref?.();
+  trayTimer = setInterval(refresh, 5000);
+  trayTimer.unref?.();
 }
 
 // ---------------- 核心动作 ----------------
@@ -2135,7 +2158,6 @@ function registerIpc() {
     if (patch && patch.language !== undefined) {
       i18n.setLanguage(i18n.resolve(next.language, app.getLocale()));
       appLog(`i18n language switched to ${i18n.getLanguage()}`);
-      try { if (tray) tray.destroy(); } catch (_) { /* ignore */ }
       buildTray();
     }
     if (patch && patch.display && appWin && appWin.isOpen) {

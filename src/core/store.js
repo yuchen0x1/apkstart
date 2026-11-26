@@ -76,6 +76,9 @@ const DEFAULT_SETTINGS = {
     // 网络加速：给模拟器指定国内公共 DNS。安卓默认的 10.0.2.3 要走主机 DNS，
     // VPN / 公司网 / 某些运营商下解析会拖到几百毫秒，视频类应用首屏会明显发卡。
     fastDns: true,
+    // 网络加速使用的 DNS 预设：cn（阿里 / 腾讯）| cloudflare | google。
+    // 海外网络或主机挂着海外 VPN 时，国内 DNS 反而更慢；未知值一律按 cn 处理。
+    dnsServers: 'cn',
     // 快照：quickboot 内存快照让二次启动只要几秒，代价是磁盘上多一份约 2~3GB 的
     // ram.bin。磁盘紧张时可以关掉（只影响启动速度，不影响应用数据）。
     keepSnapshot: true,

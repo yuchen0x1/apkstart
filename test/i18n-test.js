@@ -209,7 +209,7 @@ test('新语言缺本地译文时回落英文，英文也缺时保留中文原�
   const missingZh = '这是一句故意没进词典的文案 42';
   for (const lang of NEW_LANGS) {
     i18n.setLanguage(lang);
-    assert.strictEqual(i18n.t('诊断报告已导出'), 'The diagnostic report has been exported', `${lang} 没有回落英文`);
+    assert.strictEqual(i18n.t('发送摘要'), 'Send summary', `${lang} 没有回落英文`);
     assert.strictEqual(i18n.t(missingZh), missingZh, `${lang} 应保留中文原文而不是空串`);
   }
   i18n.setLanguage('zh-CN');
@@ -233,7 +233,7 @@ test('运行载荷含本地译文和英文回落，renderer 可一次取全', ()
     const p = withSettings('auto', () => i18n.payload(systemLocale));
     assert.strictEqual(p.lang, expectedLang);
     assert.strictEqual(p.dict['退出'], expectedQuit);
-    assert.strictEqual(p.dict['诊断报告已导出'], 'The diagnostic report has been exported');
+    assert.strictEqual(p.dict['发送摘要'], 'Send summary');
     assert(p.languages.some((l) => l.id === 'ru-RU'));
   }
 });

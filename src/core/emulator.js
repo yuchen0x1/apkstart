@@ -40,6 +40,18 @@ const MANAGED_AVDS = [`${AVD_NAME}.avd`, ...BUILTIN_AVD_NAMES.map((x) => `${x}.a
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 网络加速可选的 DNS 预设；海外网络可换 Cloudflare / Google（upstream #150）。 */
+const DNS_PRESETS = Object.freeze({
+  cn: '223.5.5.5,119.29.29.29',
+  cloudflare: '1.1.1.1,1.0.0.1',
+  google: '8.8.8.8,8.8.4.4',
+});
+
+function dnsServersFor(settings) {
+  const preset = String((settings && settings.engine && settings.engine.dnsServers) || 'cn');
+  return DNS_PRESETS[preset] || DNS_PRESETS.cn;
+}
+
 function networkCheckError(code) {
   const error = new Error(code === 'NETWORK_CHECK_CANCELLED' ? '网络体检已取消' : '网络体检超过总时限');
   error.code = code;
@@ -840,10 +852,10 @@ class EmulatorEngine {
     // 模拟器的保守配置，视频类应用（红果、抖音）首屏就会明显慢半拍。
     args.push('-netdelay', 'none', '-netspeed', 'full');
     // DNS：安卓默认用 10.0.2.3（转发到主机 DNS）。主机走 VPN / 公司网 / 某些运营商
-    // 时，一次解析能拖到几百毫秒，表现为「页面转圈半天才开始加载」。给一份国内公共
-    // DNS 作为首选，失败时系统仍会回退。用户可在设置里关掉（内网域名场景）。
+    // 时，一次解析能拖到几百毫秒，表现为「页面转圈半天才开始加载」。按用户选的预设
+    // 指定公共 DNS，失败时系统仍会回退。用户可在设置里关掉（内网域名场景）。
     if (this.settings?.engine?.fastDns !== false) {
-      args.push('-dns-server', '223.5.5.5,119.29.29.29');
+      args.push('-dns-server', dnsServersFor(this.settings));
     }
     if (lcd) args.push('-skin', `${lcd.w}x${lcd.h}`);
     if (headless) {

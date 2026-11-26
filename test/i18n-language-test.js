@@ -131,7 +131,7 @@ test('本地语言缺译文时回落英文，英文也缺失时回落中文源�
   const unknown = '一条专门用于回落测试的文案 987654';
   for (const lang of LANGS) {
     i18n.setLanguage(lang);
-    assert.strictEqual(i18n.t('诊断报告已导出'), 'The diagnostic report has been exported', `${lang} 英文回落`);
+    assert.strictEqual(i18n.t('发送摘要'), 'Send summary', `${lang} 英文回落`);
     assert.strictEqual(i18n.t(unknown), unknown, `${lang} 中文最终回落`);
   }
   i18n.setLanguage('zh-CN');
@@ -156,7 +156,7 @@ test('payload 为每种支持语言提供可用词典和英文回落', () => {
     if (lang === 'zh-CN') assert.strictEqual(Object.keys(payload.dict).length, 0);
     else {
       assert.strictEqual(payload.dict['退出'], EXPECTED[lang]?.quit || 'Quit');
-      assert.strictEqual(payload.dict['诊断报告已导出'], 'The diagnostic report has been exported');
+      assert.strictEqual(payload.dict['发送摘要'], 'Send summary');
       assert(Object.keys(payload.dict).length >= Object.keys(source).length);
     }
   }

@@ -651,6 +651,15 @@
               </div>
               <input type="checkbox" id="setFastDns" class="switch" />
             </div>
+            <div class="field">
+              <label for="setDnsServers">DNS 服务器</label>
+              <select id="setDnsServers">
+                <option value="cn">国内（阿里 / 腾讯，默认）</option>
+                <option value="cloudflare">Cloudflare</option>
+                <option value="google">Google</option>
+              </select>
+              <span class="sub">仅在开启网络加速时生效，下次启动安卓运行时应用。海外网络或主机挂着海外 VPN 时，国内 DNS 反而更慢，可换成 Cloudflare / Google。</span>
+            </div>
             <div class="field switch-field">
               <div>
                 <label for="setAudio">安卓播放声音</label>
